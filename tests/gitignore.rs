@@ -5,6 +5,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const KEY: &str = "figmogignorefixture123";
 
@@ -94,6 +95,120 @@ fn existing_broad_ignore_is_respected_and_nested_negations_are_overridden() {
         fs::read_to_string(nested.join(".gitignore")).unwrap(),
         "!.figmog/\n.figmog/\n"
     );
+}
+
+#[test]
+fn a_contents_only_ignore_with_an_exposed_mirror_is_replaced_by_a_directory_ignore() {
+    let repo = repository();
+    let ignore = repo.path().join(".gitignore");
+    fs::write(&ignore, format!(".figmog/*\n!.figmog/{KEY}/\n")).unwrap();
+    let exposed = repo.path().join(".figmog").join(KEY).join("db/mirror-data");
+    fs::create_dir_all(exposed.parent().unwrap()).unwrap();
+    fs::write(&exposed, "synthetic mirror data").unwrap();
+    assert_eq!(
+        git()
+            .args(["check-ignore", "--no-index", "--quiet", "--"])
+            .arg(&exposed)
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .code(),
+        Some(1)
+    );
+
+    pull(repo.path());
+
+    assert_eq!(
+        fs::read_to_string(ignore).unwrap(),
+        format!(".figmog/*\n!.figmog/{KEY}/\n.figmog/\n")
+    );
+    assert!(
+        git()
+            .args(["check-ignore", "--no-index", "--quiet", "--"])
+            .arg(&exposed)
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+fn fifo(path: &Path) {
+    assert!(Command::new("mkfifo").arg(path).status().unwrap().success());
+}
+
+#[test]
+fn fifo_ignore_at_the_root_or_an_ancestor_warns_without_blocking_a_pull() {
+    let repo = repository();
+    fifo(&repo.path().join(".gitignore"));
+    let nested = repo.path().join("app");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join(".gitignore"), "existing\n").unwrap();
+
+    // The nested regular file is the nearest append destination, but
+    // Git would still read the root FIFO unless all ancestors are checked.
+    for cwd in [repo.path(), nested.as_path()] {
+        let out = figmog()
+            .timeout(Duration::from_secs(30))
+            .current_dir(cwd)
+            .args(["pull", KEY, "--from-file"])
+            .arg(response(cwd))
+            .assert()
+            .success();
+        let output = out.get_output();
+        let churn: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(churn["added"], 18);
+        let warning: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(
+            warning["warning"]
+                .as_str()
+                .unwrap()
+                .contains("not a regular file")
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(nested.join(".gitignore")).unwrap(),
+        "existing\n"
+    );
+}
+
+#[test]
+fn a_blocking_external_exclude_file_times_out_without_failing_the_pull() {
+    let repo = repository();
+    let external = tempfile::tempdir().unwrap();
+    let exclude = external.path().join("exclude");
+    fifo(&exclude);
+    assert!(
+        git()
+            .args(["config", "core.excludesFile"])
+            .arg(&exclude)
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = figmog()
+        // Exercise system Git directly; user-installed Git launchers may
+        // detach their own children outside the process group being tested.
+        .env("PATH", "/usr/bin:/bin")
+        .timeout(Duration::from_secs(30))
+        .current_dir(repo.path())
+        .args(["pull", KEY, "--from-file"])
+        .arg(response(repo.path()))
+        .assert()
+        .success();
+    let output = out.get_output();
+    let churn: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(churn["added"], 18);
+    let warning: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        warning["warning"]
+            .as_str()
+            .unwrap()
+            .contains("Git ignore check timed out")
+    );
+    assert!(!repo.path().join(".gitignore").exists());
 }
 
 #[test]

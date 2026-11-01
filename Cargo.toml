@@ -23,6 +23,9 @@ thiserror = "2"
 # interactive tokens without terminal echo or command-line arguments.
 keyring = { version = "3.6.3", features = ["apple-native", "sync-secret-service", "crypto-rust", "vendored"] }
 rpassword = "7.5"
+# O_NOFOLLOW and O_NONBLOCK keep ignore-file opens from following a
+# swapped symlink or blocking on a swapped FIFO (libc is already transitive).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

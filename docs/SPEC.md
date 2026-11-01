@@ -477,6 +477,14 @@ closest existing `.gitignore` within the repository; create the root
 `.gitignore` if absent. Preserve existing content and line endings.
 Failed pulls, explicit `--db` paths, and directories outside Git do not
 change ignore rules. Symlink/nonregular ignore files are not modified.
+All in-repository ancestor ignore files are checked before invoking Git,
+and the Git check is limited to two seconds so external exclude files
+cannot stall a completed pull indefinitely. The query checks `.figmog`
+without a trailing slash to distinguish a directory ignore from a
+contents-only rule with descendant exceptions. Appends read and write
+through one descriptor; on Unix, `O_NOFOLLOW` and `O_NONBLOCK` prevent
+swapped symlinks/FIFOs from redirecting or blocking the open. `libc` is
+used directly for these OS flags (it was already a transitive dependency).
 Ignore-update failures emit a JSON warning on stderr without failing an
 already successful pull. This does not untrack committed files or share
 mirror data between worktrees.

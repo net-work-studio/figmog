@@ -16,14 +16,40 @@ struct Credential {
     source: &'static str,
 }
 
-fn entry() -> Result<Entry, String> {
+#[cfg(test)]
+struct TestAuth {
+    entry: Entry,
+    environment: Option<OsString>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AUTH: std::cell::RefCell<Option<TestAuth>> = const { std::cell::RefCell::new(None) };
+}
+
+fn environment_token() -> Option<OsString> {
+    #[cfg(test)]
+    if let Some(environment) =
+        TEST_AUTH.with(|auth| auth.borrow().as_ref().map(|auth| auth.environment.clone()))
+    {
+        return environment;
+    }
+    std::env::var_os("FIGMA_TOKEN")
+}
+
+fn entry<T>(use_entry: impl FnOnce(&Entry) -> Result<T, String>) -> Result<T, String> {
+    #[cfg(test)]
+    if TEST_AUTH.with(|auth| auth.borrow().is_some()) {
+        return TEST_AUTH.with(|auth| use_entry(&auth.borrow().as_ref().unwrap().entry));
+    }
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err(
             "saved credentials are supported on macOS and Linux; set FIGMA_TOKEN on this platform"
                 .into(),
         );
     }
-    Entry::new(SERVICE, ACCOUNT).map_err(|_| storage_error("open"))
+    let entry = Entry::new(SERVICE, ACCOUNT).map_err(|_| storage_error("open"))?;
+    use_entry(&entry)
 }
 
 // Do not format backend errors: BadEncoding, for example, can contain
@@ -65,7 +91,7 @@ fn resolve_with(
 }
 
 fn resolve() -> Result<Option<Credential>, String> {
-    resolve_with(std::env::var_os("FIGMA_TOKEN"), || read_saved(&entry()?))
+    resolve_with(environment_token(), || entry(read_saved))
 }
 
 /// Shared by serve, network pulls, and direct image downloads.
@@ -73,15 +99,21 @@ pub(crate) fn token() -> Result<Option<String>, String> {
     // A locked/unavailable store must not prevent an idle MCP server or
     // cached images from working offline. Network callers report missing
     // credentials; `auth status` keeps the storage error visible.
-    let credential = resolve_with(std::env::var_os("FIGMA_TOKEN"), || {
-        Ok(entry().and_then(|entry| read_saved(&entry)).unwrap_or(None))
-    })?;
+    let credential = resolve_with(
+        environment_token(),
+        || Ok(entry(read_saved).unwrap_or(None)),
+    )?;
     Ok(credential.map(|credential| credential.value))
 }
 
 pub(crate) fn missing_token(operation: &str) -> String {
+    let reason = if environment_token().is_some_and(|value| value.is_empty()) {
+        "FIGMA_TOKEN is empty, which disables saved credentials; unset FIGMA_TOKEN to use saved credentials"
+    } else {
+        "FIGMA_TOKEN not set and no saved token is available"
+    };
     format!(
-        "FIGMA_TOKEN not set and no saved token is available — required for {operation}; run `figmog auth login` or set FIGMA_TOKEN (`figmog auth status` checks credential-store access)"
+        "{reason} — required for {operation}; run `figmog auth login` or set FIGMA_TOKEN (`figmog auth status` checks credential-store access)"
     )
 }
 
@@ -107,11 +139,11 @@ fn save_to(entry: &Entry, token: &str) -> Result<(), String> {
 pub(crate) fn login(token: &str) -> Result<Value, String> {
     // Reject invalid input before accessing the system store.
     let token = normalize_token(token)?;
-    save_to(&entry()?, token)?;
+    entry(|entry| save_to(entry, token))?;
     Ok(json!({
         "saved": true,
         "storage": "credential_store",
-        "environment_override": std::env::var_os("FIGMA_TOKEN").is_some(),
+        "environment_override": environment_token().is_some(),
     }))
 }
 
@@ -133,10 +165,10 @@ fn remove_from(entry: &Entry) -> Result<bool, String> {
 }
 
 pub(crate) fn logout() -> Result<Value, String> {
-    let removed = remove_from(&entry()?)?;
+    let removed = entry(remove_from)?;
     Ok(json!({
         "removed": removed,
-        "environment_override": std::env::var_os("FIGMA_TOKEN").is_some(),
+        "environment_override": environment_token().is_some(),
     }))
 }
 
@@ -147,6 +179,106 @@ mod tests {
 
     fn mock_entry() -> Entry {
         Entry::new_with_credential(Box::new(MockCredential::default()))
+    }
+
+    struct MockAuth;
+
+    impl MockAuth {
+        fn new(environment: Option<OsString>) -> Self {
+            TEST_AUTH.with(|auth| {
+                assert!(auth.borrow().is_none());
+                *auth.borrow_mut() = Some(TestAuth {
+                    entry: mock_entry(),
+                    environment,
+                });
+            });
+            Self
+        }
+
+        fn set_environment(&self, environment: Option<OsString>) {
+            TEST_AUTH.with(|auth| auth.borrow_mut().as_mut().unwrap().environment = environment);
+        }
+    }
+
+    impl Drop for MockAuth {
+        fn drop(&mut self) {
+            TEST_AUTH.with(|auth| auth.borrow_mut().take());
+        }
+    }
+
+    #[test]
+    fn auth_commands_share_the_saved_credential() {
+        let auth = MockAuth::new(None);
+        assert_eq!(
+            status().unwrap(),
+            json!({"configured": false, "source": null, "validated": false})
+        );
+        let saved = login("figd_command_round_trip").unwrap();
+        assert_eq!(
+            saved,
+            json!({"saved": true, "storage": "credential_store", "environment_override": false})
+        );
+        TEST_AUTH.with(|auth| {
+            assert_eq!(
+                auth.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .entry
+                    .get_password()
+                    .unwrap(),
+                "figd_command_round_trip"
+            );
+        });
+        assert_eq!(token().unwrap().as_deref(), Some("figd_command_round_trip"));
+        let configured = status().unwrap();
+        assert_eq!(
+            configured,
+            json!({"configured": true, "source": "credential_store", "validated": false})
+        );
+        assert!(!configured.to_string().contains("figd_command_round_trip"));
+
+        auth.set_environment(Some("".into()));
+        assert!(token().unwrap().is_none());
+        assert_eq!(status().unwrap()["configured"], false);
+        auth.set_environment(None);
+        assert_eq!(token().unwrap().as_deref(), Some("figd_command_round_trip"));
+
+        assert_eq!(
+            logout().unwrap(),
+            json!({"removed": true, "environment_override": false})
+        );
+        TEST_AUTH.with(|auth| {
+            assert!(matches!(
+                auth.borrow().as_ref().unwrap().entry.get_password(),
+                Err(keyring::Error::NoEntry)
+            ));
+        });
+        assert!(token().unwrap().is_none());
+        assert_eq!(
+            status().unwrap(),
+            json!({"configured": false, "source": null, "validated": false})
+        );
+        assert_eq!(logout().unwrap()["removed"], false);
+    }
+
+    #[test]
+    fn missing_token_distinguishes_empty_and_unset_environment() {
+        let auth = MockAuth::new(None);
+        let unset = missing_token("network pulls");
+        assert!(unset.contains("FIGMA_TOKEN not set"));
+        auth.set_environment(Some("".into()));
+        let empty = missing_token("network pulls");
+        assert!(empty.contains("FIGMA_TOKEN is empty"));
+        assert!(empty.contains("disables saved credentials"));
+        assert!(empty.contains("unset FIGMA_TOKEN to use saved credentials"));
+        assert!(!empty.contains("FIGMA_TOKEN not set"));
+        for message in [unset, empty] {
+            assert!(message.contains("network pulls"));
+            assert!(message.contains("figmog auth login"));
+            assert!(message.contains("set FIGMA_TOKEN"));
+            assert!(message.contains("figmog auth status"));
+            assert!(message.contains("credential-store access"));
+        }
     }
 
     #[test]

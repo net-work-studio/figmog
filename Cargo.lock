@@ -668,6 +668,7 @@ dependencies = [
  "clap",
  "fold",
  "keyring",
+ "libc",
  "postcard",
  "rpassword",
  "serde",

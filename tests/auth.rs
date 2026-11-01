@@ -5,6 +5,27 @@ mod common;
 use serde_json::{Value, json};
 
 #[test]
+fn network_pull_explains_how_to_restore_saved_credentials_after_an_empty_override() {
+    let cwd = tempfile::tempdir().unwrap();
+    let out = common::command()
+        .current_dir(cwd.path())
+        .args(["pull", "syntheticfile123"])
+        .assert()
+        .failure()
+        .code(1);
+    let output = out.get_output();
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("FIGMA_TOKEN is empty"));
+    assert!(message.contains("disables saved credentials"));
+    assert!(message.contains("unset FIGMA_TOKEN to use saved credentials"));
+    assert!(message.contains("figmog auth login"));
+    assert!(message.contains("figmog auth status"));
+    assert!(!cwd.path().join(".figmog").exists());
+}
+
+#[test]
 fn auth_status_works_without_a_mirror_and_never_prints_the_token() {
     let cwd = tempfile::tempdir().unwrap();
     let out = common::command()

@@ -1285,7 +1285,8 @@ fn socket_call_figmog_sync_reaches_the_owning_process_not_a_local_lock_error() {
         .as_str()
         .unwrap_or_else(|| panic!("expected an \"error\" string field, got: {parsed}"));
     assert!(
-        err.contains("FIGMA_TOKEN not set"),
+        err.contains("FIGMA_TOKEN is empty")
+            && err.contains("unset FIGMA_TOKEN to use saved credentials"),
         "expected serve's own sync error, got: {err}"
     );
     assert!(
