@@ -53,7 +53,7 @@ pub const FILL: &str = "fill";
 /// (spec §5: "a repeat request on an unchanged file spends zero budget");
 /// every miss gets this exact per-item manifest error instead of a wasted
 /// (guaranteed-401) network attempt.
-const NO_TOKEN_MSG: &str = "FIGMA_TOKEN not set — required for image downloads";
+const NO_TOKEN_MSG: &str = "FIGMA_TOKEN not set and no saved token — required for image downloads; run `figmog auth login` or set FIGMA_TOKEN";
 
 /// Content blocks over roughly this many bytes are excluded from the MCP
 /// tool's inline content (spec §5's "1MB" cap) — 1 MiB exactly, matching
