@@ -209,6 +209,148 @@ fn pull_fresh_turns_geometry_back_off() {
     assert!(!stored, "--fresh must reset the sticky geometry flag");
 }
 
+/// Include records ordinary pull deliberately preserves, even at the same
+/// file version. Fresh must reset these along with the file and indexes.
+fn seed_fresh_reset_state(db: &std::path::Path) -> Vec<figmog::model::Id> {
+    use figmog::model::{Id, ImageBlobRec, Rec};
+
+    let export = serde_json::from_str(include_str!("fixtures/variables-export.json")).unwrap();
+    let mut recs = figmog::vars::parse_variables_export(&export).unwrap();
+    recs.push((
+        Id::ImageBlob("synthetic-image".into()),
+        Rec::ImageBlob(ImageBlobRec {
+            key_hash: "synthetic-image".into(),
+            kind: "render".into(),
+            subject: "1:1".into(),
+            format: "png".into(),
+            scale_milli: 1000,
+            file_version: "100".into(),
+            bytes: vec![1, 2, 3],
+        }),
+    ));
+    let mut st = figmog::open_store!(db);
+    st.wtx(|tx| {
+        for (id, rec) in &recs {
+            tx.upsert(id, rec);
+        }
+    });
+    figmog::store::upsert_mirror_config(&mut st, true);
+    figmog::cache::store(
+        &mut st,
+        "get_code",
+        "{}",
+        "100",
+        &serde_json::json!({"synthetic": true}),
+    )
+    .unwrap();
+    let mut ids: Vec<_> = recs.into_iter().map(|(id, _)| id).collect();
+    ids.push(Id::ProxyCache(figmog::cache::cache_key("get_code", "{}")));
+    ids
+}
+
+#[test]
+fn pull_fresh_invalid_response_preserves_every_existing_store_file() {
+    for invalid in ["{", r#"{"name":"Synthetic","version":"1","document":{}}"#] {
+        let (dir, db) = fixture_db();
+        let db_path = std::path::Path::new(&db);
+        let ids = seed_fresh_reset_state(db_path);
+        let before = common::store_snapshot(db_path);
+        let input = dir.path().join("invalid.json");
+        std::fs::write(&input, invalid).unwrap();
+
+        let out = common::command()
+            .args(["pull", "--fresh", "--from-file"])
+            .arg(&input)
+            .args(["--db", &db])
+            .assert()
+            .failure()
+            .code(1);
+        let error: serde_json::Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains(if invalid == "{" {
+                    "parsing"
+                } else {
+                    "lastModified"
+                })
+        );
+        assert_eq!(common::store_snapshot(db_path), before);
+
+        let st = figmog::open_store!(db_path);
+        for id in ids {
+            assert!(st.get(&id).is_some(), "lost {id:?}");
+        }
+        st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, config, _)| {
+            assert_eq!(nodes.iter().count(), 12);
+            assert_eq!(meta.get(&0).unwrap().version, "100");
+            assert!(figmog::store::read_geometry(&config));
+        });
+    }
+}
+
+#[test]
+fn pull_fresh_resets_file_imports_config_and_same_version_caches() {
+    let (dir, db) = fixture_db();
+    let db_path = std::path::Path::new(&db);
+    let ids = seed_fresh_reset_state(db_path);
+    let input = dir.path().join("resp.json");
+
+    // Ordinary pulls keep imported variables, sticky config, and caches.
+    common::command()
+        .args(["pull", "--from-file"])
+        .arg(&input)
+        .args(["--db", &db])
+        .assert()
+        .success();
+    {
+        let st = figmog::open_store!(db_path);
+        for id in &ids {
+            assert!(st.get(id).is_some(), "ordinary pull lost {id:?}");
+        }
+    }
+
+    let mut replacement = common::fixture_other();
+    replacement["version"] = serde_json::json!("100");
+    std::fs::write(&input, replacement.to_string()).unwrap();
+    std::fs::write(
+        db_path.join("sentinel"),
+        "fresh replaces the whole directory",
+    )
+    .unwrap();
+    let out = common::command()
+        .args(["pull", "--fresh", "--from-file"])
+        .arg(&input)
+        .args(["--db", &db])
+        .assert()
+        .success();
+    let churn: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        churn,
+        serde_json::json!({"added": 3, "changed": 0, "removed": 0, "unchanged": 0})
+    );
+    assert!(!db_path.join("sentinel").exists());
+
+    let st = figmog::open_store!(db_path);
+    for id in ids {
+        assert!(st.get(&id).is_none(), "fresh retained {id:?}");
+    }
+    st.rtx(
+        |((nodes, _, text, ..), components, sets, styles, _, _, meta, _, config, _)| {
+            assert_eq!(nodes.iter().count(), 3);
+            assert!(nodes.get(&"1:2".into()).is_none());
+            assert!(text.search("garden", 5).is_empty());
+            assert_eq!(text.search("zephyr", 5).len(), 1);
+            assert_eq!(components.iter().count(), 0);
+            assert_eq!(sets.iter().count(), 0);
+            assert_eq!(styles.iter().count(), 0);
+            assert_eq!(meta.get(&0).unwrap().name, "OtherFixture");
+            assert!(!figmog::store::read_geometry(&config));
+        },
+    );
+}
+
 #[test]
 fn status_pages_tree_get_find() {
     let (_dir, db) = fixture_db();

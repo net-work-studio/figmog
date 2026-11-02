@@ -206,6 +206,19 @@ the one `store::evict_stale_cache` function. This runs after every
 `pull`/`figmog_sync`/watch-tick pull that changes the version, and is
 bundled into `pull --fresh`'s whole-store wipe too.
 
+**Fresh replacement:** file and optional variables responses are validated
+before opening or resetting the mirror. Every direct CLI and server-session
+store handle holds a persistent sibling lock (`db.figmog-lock` for a
+directory named `db`) until the store closes. A fresh pull first opens the
+existing store, checking fjall's own writer lock too, then keeps the sibling
+lock while closing, deleting, and rebuilding the database directory. A
+running serve therefore makes a valid fresh pull fail with a clean ownership
+error; invalid input leaves the existing mirror untouched. Deletion errors
+are reported. The sibling lock file is never deleted during normal operation:
+its stable inode coordinates replacement, and its OS lock releases when the
+handle closes or the process exits. This does not promise recovery from an
+unopenable/corrupt store or rollback after filesystem failures during reset.
+
 ## 6. `figmog serve`: multi-file sessions, watch, MCP
 
 One `figmog serve` process owns every mirrored file's store via a

@@ -483,6 +483,65 @@ fn cli_read_against_a_store_serve_holds_fails_clean_not_with_a_panic() {
     assert!(status.success(), "figmog serve exited with {status:?}");
 }
 
+#[test]
+fn fresh_pull_preserves_a_store_owned_by_serve() {
+    let (dir, db) = common::fixture_db();
+    let (mut guard, mut stdin, rx) = spawn_serve(&db);
+    handshake(&mut stdin, &rx);
+    let before = common::store_snapshot(&db);
+    let input = dir.path().join("fresh.json");
+
+    for (response, expected_error) in [
+        (common::fixture_other(), "store is locked"),
+        (
+            json!({"name": "Synthetic", "version": "1", "document": {}}),
+            "lastModified",
+        ),
+    ] {
+        std::fs::write(&input, response.to_string()).unwrap();
+        let out = common::command()
+            .args(["pull", "--fresh", "--from-file"])
+            .arg(&input)
+            .arg("--db")
+            .arg(&db)
+            .assert()
+            .failure()
+            .code(1);
+        let error: Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains(expected_error),
+            "{error}"
+        );
+        assert_eq!(common::store_snapshot(&db), before);
+    }
+
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+            "params": {"name": "figmog_status", "arguments": {}}
+        }),
+    );
+    let response = recv(&rx);
+    let status: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(status["name"], "Fixture");
+    assert_eq!(status["nodes"], 12);
+
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+
+    // The persistent sidecar must release ownership when serve exits.
+    std::fs::write(&input, common::fixture_other().to_string()).unwrap();
+    common::command()
+        .args(["pull", "--fresh", "--from-file"])
+        .arg(&input)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+}
+
 // ---- cached-proxy e2e: figmog serve against an in-process HTTP fake ----
 //
 // Minimal hand-rolled HTTP/1.1 server (std `TcpListener`, no new deps) that
