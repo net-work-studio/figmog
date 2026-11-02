@@ -1,0 +1,14 @@
+AGENTS.md
+  h_75f73f9fd69b93 33-34,55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9c0ac972f1a23045b8869e28b223b7c3d369e9e5",
+  "prompts": {},
+  "humans": {
+    "h_75f73f9fd69b93": {
+      "author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
