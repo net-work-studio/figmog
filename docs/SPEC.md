@@ -450,6 +450,18 @@ also checks that a key is a single normal path component. Explicit pull
 file references still accept Figma URLs, and `--db` selects its given path
 without consulting `.figmog/current`.
 
+Before every direct CLI or server-session store open, figmog creates the
+database directory with mode 0700 and tightens an existing directory to
+0700. This includes explicit `--db` paths, `--fresh` rebuilds, and serve
+with `--no-socket`. Directory traversal is the privacy boundary: journal
+and table files remain inaccessible to other OS users even if their own
+modes permit reading. Existing permissive stores migrate on their next
+open; no recursive data-file chmod is needed. Missing ancestors are
+created with mode 0700; existing ancestors keep their modes. Writing
+`.figmog/current` also protects `.figmog` itself. A failure to protect a
+selected directory, including a final symlink, produces a clean JSON error
+before opening the store or writing the pointer.
+
 **Credentials.** `figmog auth login` reads a personal access token from a
 hidden terminal prompt, or from stdin with `--token-stdin`. It rejects
 empty, multiline, non-ASCII, and oversized tokens (4096-byte maximum),

@@ -179,13 +179,7 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// way, since every path that reaches this point is this process's own
 /// root to run as its owner sees fit.
 fn bind_socket(figmog_root: &Path) -> Result<(UnixListener, PathBuf), String> {
-    std::fs::create_dir_all(figmog_root)
-        .map_err(|e| format!("creating {}: {e}", figmog_root.display()))?;
-    let mut dir_perms = std::fs::metadata(figmog_root)
-        .map_err(|e| e.to_string())?
-        .permissions();
-    dir_perms.set_mode(0o700);
-    std::fs::set_permissions(figmog_root, dir_perms).map_err(|e| e.to_string())?;
+    crate::private_dir::ensure(figmog_root)?;
 
     let path = socket_path(figmog_root);
 

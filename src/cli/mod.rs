@@ -430,7 +430,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // generic over `P: Push<..>` — `P::Reader<'tx, R>` would be an
             // opaque associated type there, and a tuple pattern can't
             // destructure an unconstrained associated type.
-            let st = open_store_checked(|| crate::open_store!(&db.path))?;
+            let st = open_store_checked(&db.path, || crate::open_store!(&db.path))?;
             match other {
                 Cmd::Status => st.rtx(
                     |((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _, _)| {
@@ -876,6 +876,10 @@ fn db_path_for(key: &str) -> Result<PathBuf, String> {
 /// panic (exit 101).
 const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Query the server instead (figmog call/tools), or stop it first.";
 
+/// Establish a private directory at `path` before invoking `open`, including
+/// on existing mirrors. Failure to protect it is a clean error and never
+/// reaches fold, which may write journal data while opening the store.
+///
 /// `open_store!` (via `fold::stream::Stream::new`) panics rather than
 /// returning a `Result` when the underlying store can't be opened — most
 /// commonly because another process (`figmog serve`) already holds fjall's
@@ -918,8 +922,10 @@ const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Q
 /// or accepting a possibly-missing banner rather than treating one as a
 /// hard requirement.
 pub(crate) fn open_store_checked<T>(
+    path: &Path,
     open: impl FnOnce() -> T + std::panic::UnwindSafe,
 ) -> Result<T, String> {
+    crate::private_dir::ensure(path)?;
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(open);
@@ -974,7 +980,7 @@ mod tests {
         // the life of its process.
         let _held = crate::open_store!(&db_path);
 
-        let result = open_store_checked(|| crate::open_store!(&db_path));
+        let result = open_store_checked(&db_path, || crate::open_store!(&db_path));
         assert_eq!(result.err().as_deref(), Some(STORE_LOCKED_MSG));
     }
 
@@ -983,7 +989,7 @@ mod tests {
     fn open_store_checked_passes_through_a_successful_open() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db");
-        let result = open_store_checked(|| crate::open_store!(&db_path));
+        let result = open_store_checked(&db_path, || crate::open_store!(&db_path));
         assert!(result.is_ok());
     }
 

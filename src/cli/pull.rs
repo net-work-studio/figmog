@@ -129,7 +129,7 @@ pub(super) fn do_pull(
             let stored_geometry = if fresh || !db.path.exists() {
                 false
             } else {
-                open_store_checked(|| crate::open_store!(&db.path))
+                open_store_checked(&db.path, || crate::open_store!(&db.path))
                     .map(|st| st.rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config)))
                     .unwrap_or(false)
             };
@@ -150,7 +150,7 @@ pub(super) fn do_pull(
 
     let mut flattened = flatten_file(&resp).map_err(|e| e.to_string())?;
 
-    let mut st = open_store_checked(|| crate::open_store!(&db.path))?;
+    let mut st = open_store_checked(&db.path, || crate::open_store!(&db.path))?;
     let mut prior: BTreeSet<crate::model::Id> =
         st.rtx(|((nodes, ..), components, component_sets, styles, ..)| {
             collect_sweepable(&nodes, &components, &component_sets, &styles)
@@ -248,7 +248,7 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 pub(crate) fn write_current(key: &str) -> Result<(), String> {
-    std::fs::create_dir_all(".figmog").map_err(|e| e.to_string())?;
+    crate::private_dir::ensure(std::path::Path::new(".figmog"))?;
     std::fs::write(CURRENT_FILE, key).map_err(|e| e.to_string())
 }
 

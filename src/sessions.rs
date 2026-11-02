@@ -212,7 +212,7 @@ pub(crate) fn open_session_at(
 ) -> Result<FileSession, String> {
     let token = api_token.map(str::to_string);
     let network_key = network_key.map(str::to_string);
-    let st = Rc::new(RefCell::new(open_store_checked(|| {
+    let st = Rc::new(RefCell::new(open_store_checked(&path, || {
         crate::open_store!(&path)
     })?));
 
