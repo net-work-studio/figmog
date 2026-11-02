@@ -1,0 +1,33 @@
+Cargo.toml
+  s_d4ddc7b027ee19::t_a73623873c41c2 11
+README.md
+  s_d4ddc7b027ee19::t_a73623873c41c2 28,238,256
+docs/releases/v0.0.3.md
+  s_d4ddc7b027ee19::t_a73623873c41c2 1-54
+Cargo.lock
+  s_19bd0b60087cb1::t_70ef2d80e45874 665
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4dac53391750ea034dda783e98e9c87fd89e80e9",
+  "prompts": {},
+  "sessions": {
+    "s_19bd0b60087cb1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a196f3-3896-7301-8ebf-c1258a20dc1e",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    },
+    "s_d4ddc7b027ee19": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19b41-80b4-78c0-92ed-cb3aba45e8fa",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
