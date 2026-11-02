@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   resolve:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       commit: ${{ steps.release.outputs.commit }}
@@ -47,11 +47,11 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-15
+            runner: blacksmith-6vcpu-macos-15
           - target: x86_64-apple-darwin
-            runner: macos-15
+            runner: blacksmith-6vcpu-macos-15
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: blacksmith-4vcpu-ubuntu-2404
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -86,7 +86,7 @@ jobs:
 
   publish:
     needs: [resolve, build]
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
     steps:

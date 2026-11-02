@@ -262,6 +262,9 @@ That needs a Rust toolchain and network access, since the build fetches
 
 ### Building release tarballs
 
+CI and release jobs run on Blacksmith, using Ubuntu 24.04 for Linux and
+macOS 15 on Apple Silicon for both macOS targets.
+
 CI runs tests on pushes to `main` and on pull requests. It does not build
 release tarballs. The separate [Release workflow](https://github.com/net-work-studio/figmog/actions/workflows/release.yml)
 starts when a `v*` tag is pushed, or when a maintainer runs it manually.
