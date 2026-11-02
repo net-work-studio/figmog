@@ -1,0 +1,23 @@
+README.md
+  s_7c46e85a625c4c::t_5d80a27357aaf9 263-294
+.github/workflows/ci.yml
+  s_7c46e85a625c4c::t_5d80a27357aaf9 16,19,27
+.github/workflows/release.yml
+  s_7c46e85a625c4c::t_5d80a27357aaf9 22,27,54,59,81,89,93,97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0ac1282204c693adb1cb83706b62909f432bc264",
+  "prompts": {},
+  "sessions": {
+    "s_7c46e85a625c4c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19b9b-0f25-7823-8d79-c91c6e38f769",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
