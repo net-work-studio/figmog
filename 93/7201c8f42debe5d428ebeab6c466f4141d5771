@@ -1,0 +1,39 @@
+tests/common/mod.rs
+  s_e10e12a9661c03::t_3b3350dba325ac 200-203
+  s_e10e12a9661c03::t_780cf819e18ef7 179-199,204-214
+src/cli/pull.rs
+  s_e10e12a9661c03::t_3b3350dba325ac 276-279
+  s_e10e12a9661c03::t_401da71e7a7fb5 119-121,273-275,280-301
+  s_e10e12a9661c03::t_133c47d144cde4 146-147,149-163,166-168,173
+  s_e10e12a9661c03::t_ac68f485bad3eb 302
+tests/cli.rs
+  s_e10e12a9661c03::t_3b3350dba325ac 238-245,253,269-278,317-321,329-332,339-351
+  s_e10e12a9661c03::t_ed3d4df927baac 212-237,246-252,254-268,279-316,322-328,333-338,352-353
+docs/SPEC.md
+  s_e10e12a9661c03::t_401da71e7a7fb5 209-221
+src/cli/mod.rs
+  s_e10e12a9661c03::t_133c47d144cde4 24-26,887-888,934-942,948,956-957
+tests/serve.rs
+  s_e10e12a9661c03::t_ed3d4df927baac 486-495,500-510,515-517,525,528-544
+  s_e10e12a9661c03::t_3b3350dba325ac 496-499,511-514,518-524,526-527
+src/cli/store_lock.rs
+  s_e10e12a9661c03::t_3b3350dba325ac 38-40,112-120,122-125,145-148
+  s_e10e12a9661c03::t_133c47d144cde4 1-37,41-98
+  s_e10e12a9661c03::t_401da71e7a7fb5 99-111,121,126-144,149-151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "937201c8f42debe5d428ebeab6c466f4141d5771",
+  "prompts": {},
+  "sessions": {
+    "s_e10e12a9661c03": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19dd0-1937-7142-b4c6-55b411b7211c",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
