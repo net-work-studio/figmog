@@ -298,7 +298,12 @@ exit through a guard held for `run_serve`'s whole scope. A pre-existing
 socket file is probed with a connect first (`serve::classify_probe`):
 connect succeeds ⇒ another `serve` owns this root, and this process exits
 with the standard `{"error": ...}` JSON; any connect failure ⇒ the file
-is stale, so it is unlinked and rebound. `--no-socket` skips binding.
+is stale, so it is unlinked and rebound, except invalid addresses (including
+AF_UNIX address-length errors), which fail without unlinking. Connect and
+bind use a short relative address when the verified root is beneath the
+working directory; permissions and cleanup use the verified absolute path.
+This preserves default socket startup in deep checkouts. `--no-socket`
+skips binding.
 
 Frames on the socket are the same newline-delimited JSON-RPC the stdio
 loop reads. `initialize` is optional for socket clients: `tools/call` is
@@ -457,7 +462,8 @@ with `--no-socket`. Directory traversal is the privacy boundary: journal
 and table files remain inaccessible to other OS users even if their own
 modes permit reading. Existing permissive stores migrate on their next
 open; no recursive data-file chmod is needed. Missing ancestors are
-created with mode 0700; existing ancestors keep their modes. Every path
+created with mode 0700; existing ancestors keep their modes. Entries created
+concurrently are re-read and checked like existing entries. Every path
 component must be owned by the current user or root. Group- or
 other-writable ancestors are rejected unless sticky directory semantics
 protect the owned child from replacement (as under `/tmp`). Ancestor

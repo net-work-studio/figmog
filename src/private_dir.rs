@@ -71,7 +71,14 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
         let metadata = match fs::symlink_metadata(&next) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                DirBuilder::new().mode(0o700).create(&next)?;
+                match DirBuilder::new().mode(0o700).create(&next) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+                // Another legitimate initializer may have created it. Read
+                // fresh metadata and apply all the same checks below, even
+                // when the entry that won the race is a symlink or file.
                 fs::symlink_metadata(&next)?
             }
             Err(error) => return Err(error),
@@ -118,4 +125,43 @@ fn unsafe_ancestor(path: &Path, reason: &str) -> io::Error {
         io::ErrorKind::PermissionDenied,
         format!("unsafe mirror ancestor {}: {reason}", path.display()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn concurrent_initialization_allows_distinct_stores_under_shared_new_ancestors() {
+        let work = tempfile::tempdir().unwrap();
+        let barrier = Barrier::new(160);
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..160)
+                .map(|key| {
+                    let path = work.path().join("shared/new").join(format!("key-{key}/db"));
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        ensure(&path)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let errors: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "concurrent initialization failed: {errors:?}"
+        );
+        for path in results.into_iter().map(Result::unwrap) {
+            assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+        }
+    }
 }
