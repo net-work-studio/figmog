@@ -19,6 +19,7 @@ pub(crate) mod ident;
 pub mod images;
 pub(crate) mod mcp;
 pub mod model;
+mod private_dir;
 mod proxy;
 pub(crate) mod query;
 mod serve;

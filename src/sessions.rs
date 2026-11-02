@@ -212,8 +212,8 @@ pub(crate) fn open_session_at(
 ) -> Result<FileSession, String> {
     let token = api_token.map(str::to_string);
     let network_key = network_key.map(str::to_string);
-    let st = Rc::new(RefCell::new(open_store_checked(|| {
-        crate::open_store!(&path)
+    let st = Rc::new(RefCell::new(open_store_checked(&path, |path| {
+        crate::open_store!(path)
     })?));
 
     // The pull-and-sync cycle (build design §12's do_pull-equivalent

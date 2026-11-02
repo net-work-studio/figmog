@@ -23,6 +23,67 @@ use serde_json::{Value, json};
 /// the server hang fails the test instead of the test run.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+fn deep_working_directory() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("a".repeat(90)).join("b".repeat(90));
+    std::fs::create_dir_all(&work).unwrap();
+    assert!(work.join(".figmog/serve.sock").as_os_str().len() > 128);
+    (dir, work)
+}
+
+#[test]
+fn deep_working_directory_keeps_the_default_socket_address_short() {
+    let (_dir, work) = deep_working_directory();
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("figmog"));
+    cmd.args(["serve", "--no-watch", "--no-upstream"])
+        .current_dir(&work);
+    let (mut guard, mut stdin, rx) = spawn_child(cmd);
+    handshake(&mut stdin, &rx);
+    assert!(work.join(".figmog/serve.sock").exists());
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    assert!(!work.join(".figmog/serve.sock").exists());
+}
+
+#[test]
+fn deep_working_directory_preserves_an_existing_live_socket() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixListener;
+
+    let (_dir, work) = deep_working_directory();
+    // Bind at a short address, then move the directory. The listening socket
+    // stays live at its new pathname, just like an older server that bound
+    // `.figmog/serve.sock` relative to the deep working directory.
+    let staging = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(staging.path().join("serve.sock")).unwrap();
+    std::fs::rename(staging.path(), work.join(".figmog")).unwrap();
+    let socket = work.join(".figmog/serve.sock");
+    let before = std::fs::metadata(&socket).unwrap();
+
+    let output = common::command()
+        .args(["serve", "--no-watch", "--no-upstream"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+
+    assert!(socket.exists(), "live socket was unlinked: {output:?}");
+    let after = std::fs::metadata(&socket).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("another figmog serve owns this root")
+    );
+    listener.set_nonblocking(true).unwrap();
+    assert!(
+        listener.accept().is_ok(),
+        "probe never reached the live listener"
+    );
+}
+
 /// Kills the child on drop so a failed assertion (which unwinds past the
 /// rest of the test body, skipping the normal stdin-close/wait sequence)
 /// never leaves an orphaned `figmog serve` process behind.

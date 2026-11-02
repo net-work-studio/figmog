@@ -21,7 +21,7 @@ pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String>
         serde_json::from_str(&content).map_err(|e| format!("parsing {}: {e}", path.display()))?;
     let recs = crate::vars::parse_variables_export(&v).map_err(|e| e.to_string())?;
 
-    let mut st = open_store_checked(|| crate::open_store!(&db.path))?;
+    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
     st.wtx(|tx| {
         for (id, rec) in &recs {
             tx.upsert(id, rec);
@@ -124,7 +124,7 @@ pub(super) fn cmd_call(
     }
 
     let (mut upstream, upstream_status) = attach_upstream(upstream_url, no_upstream);
-    let mut st = open_store_checked(|| crate::open_store!(&db.path))?;
+    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
 
     let result: Result<Value, String> = if proxy::is_local_tool(&tool) {
         match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, r)) {

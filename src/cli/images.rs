@@ -125,7 +125,7 @@ fn fetch_direct(
         .ok_or_else(|| "no file key: pass a file key or figma.com URL".to_string())?;
     let node_ids = images::normalize_ids(ids);
     let scale_m = images::scale_milli(scale);
-    let mut st = open_store_checked(|| crate::open_store!(&db.path))?;
+    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
     let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images_table)| {
         images::scan(&nodes, &meta, &images_table, &node_ids, format, scale_m)
     });

@@ -430,7 +430,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // generic over `P: Push<..>` — `P::Reader<'tx, R>` would be an
             // opaque associated type there, and a tuple pattern can't
             // destructure an unconstrained associated type.
-            let st = open_store_checked(|| crate::open_store!(&db.path))?;
+            let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
             match other {
                 Cmd::Status => st.rtx(
                     |((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _, _)| {
@@ -876,6 +876,12 @@ fn db_path_for(key: &str) -> Result<PathBuf, String> {
 /// panic (exit 101).
 const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Query the server instead (figmog call/tools), or stop it first.";
 
+/// Establish a private directory at `path` before invoking `open`, including
+/// on existing mirrors. Failure to protect it is a clean error and never
+/// reaches fold, which may write journal data while opening the store.
+/// `open` receives the verified absolute path and must use it for the store.
+/// Unsafe ancestor ownership or write permissions fail before the callback.
+///
 /// `open_store!` (via `fold::stream::Stream::new`) panics rather than
 /// returning a `Result` when the underlying store can't be opened — most
 /// commonly because another process (`figmog serve`) already holds fjall's
@@ -918,11 +924,13 @@ const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Q
 /// or accepting a possibly-missing banner rather than treating one as a
 /// hard requirement.
 pub(crate) fn open_store_checked<T>(
-    open: impl FnOnce() -> T + std::panic::UnwindSafe,
+    path: &Path,
+    open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
 ) -> Result<T, String> {
+    let path = crate::private_dir::ensure(path)?;
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(open);
+    let result = std::panic::catch_unwind(|| open(&path));
     std::panic::set_hook(prev_hook);
 
     result.map_err(|payload| {
@@ -974,7 +982,7 @@ mod tests {
         // the life of its process.
         let _held = crate::open_store!(&db_path);
 
-        let result = open_store_checked(|| crate::open_store!(&db_path));
+        let result = open_store_checked(&db_path, |path| crate::open_store!(path));
         assert_eq!(result.err().as_deref(), Some(STORE_LOCKED_MSG));
     }
 
@@ -983,8 +991,45 @@ mod tests {
     fn open_store_checked_passes_through_a_successful_open() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("db");
-        let result = open_store_checked(|| crate::open_store!(&db_path));
+        let result = open_store_checked(&db_path, |path| crate::open_store!(path));
         assert!(result.is_ok());
+    }
+
+    /// Synchronize an attacker at the old post-protection/path-open window.
+    /// A shared non-sticky parent lets it replace even a 0700 child. The
+    /// safe outcome is to reject that parent before this closure can run.
+    #[test]
+    fn open_store_checked_rejects_replaceable_paths_before_the_open_callback() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::sync::Barrier;
+
+        let work = tempfile::tempdir().unwrap();
+        let shared = work.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let db = shared.join("db");
+        std::fs::DirBuilder::new().mode(0o700).create(&db).unwrap();
+        let result = open_store_checked(&db, |path| {
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                let attacker = scope.spawn(|| {
+                    barrier.wait();
+                    std::fs::rename(&db, shared.join("displaced")).unwrap();
+                    std::fs::DirBuilder::new().mode(0o777).create(&db).unwrap();
+                    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o777)).unwrap();
+                });
+                barrier.wait();
+                attacker.join().unwrap();
+                // Represents the subsequent path-based journal open. It
+                // must never be reached for this replaceable pathname.
+                std::fs::write(path.join("synthetic.jnl"), b"private synthetic payload").unwrap();
+            });
+        });
+        assert!(
+            result.is_err(),
+            "unsafe path reached the store-open callback"
+        );
+        assert!(!db.join("synthetic.jnl").exists());
     }
 
     /// `panic_message` is what tells a lock panic (reworded to

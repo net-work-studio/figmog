@@ -135,7 +135,7 @@ enum StaleProbe {
     /// A connect succeeded: some other process is actively listening — this
     /// instance must not touch the file.
     Owned,
-    /// A connect failed: nothing is actually listening (a leftover file
+    /// A connect failed with a valid address: nothing is actually listening (a leftover file
     /// from an unclean exit, or garbage that was never a socket at all) —
     /// safe to unlink and rebind.
     Stale,
@@ -145,14 +145,17 @@ enum StaleProbe {
 /// path, split from the actual `UnixStream::connect` call so the decision
 /// itself is unit-testable without a real socket. Spec §1 only names the
 /// two outcomes that matter in practice — refused (stale) vs. success
-/// (owned) — but *any* connect failure is treated as stale: a path that
+/// (owned). Invalid addresses (including an overlong AF_UNIX address) do
+/// not establish staleness and must leave the file untouched. Other connect
+/// failures are treated as stale: a path that
 /// exists but isn't a live listening socket at all (garbage left by
 /// something else, or a filesystem error) means this instance can't reach
 /// a live owner through it either way, so it's safe to reclaim.
-fn classify_probe(connect_result: std::io::Result<()>) -> StaleProbe {
+fn classify_probe(connect_result: std::io::Result<()>) -> std::io::Result<StaleProbe> {
     match connect_result {
-        Ok(()) => StaleProbe::Owned,
-        Err(_) => StaleProbe::Stale,
+        Ok(()) => Ok(StaleProbe::Owned),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Err(error),
+        Err(_) => Ok(StaleProbe::Stale),
     }
 }
 
@@ -179,22 +182,27 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// way, since every path that reaches this point is this process's own
 /// root to run as its owner sees fit.
 fn bind_socket(figmog_root: &Path) -> Result<(UnixListener, PathBuf), String> {
-    std::fs::create_dir_all(figmog_root)
-        .map_err(|e| format!("creating {}: {e}", figmog_root.display()))?;
-    let mut dir_perms = std::fs::metadata(figmog_root)
-        .map_err(|e| e.to_string())?
-        .permissions();
-    dir_perms.set_mode(0o700);
-    std::fs::set_permissions(figmog_root, dir_perms).map_err(|e| e.to_string())?;
+    let figmog_root = crate::private_dir::ensure(figmog_root)?;
 
-    let path = socket_path(figmog_root);
+    let path = socket_path(&figmog_root);
+    // AF_UNIX limits the supplied address string, not the resolved filesystem
+    // path. When cwd is an ancestor of the verified root, it shares that
+    // checked, non-replaceable chain and securely anchors this short address.
+    // Keep the absolute path for chmod, unlink, and the cleanup guard.
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let address = match figmog_root.strip_prefix(&cwd) {
+        Ok(relative_root) => socket_path(relative_root),
+        Err(_) => path.clone(),
+    };
 
     if path.exists() {
-        let connect_result = UnixStream::connect(&path).and_then(|stream| {
+        let connect_result = UnixStream::connect(&address).and_then(|stream| {
             stream.set_read_timeout(Some(SOCKET_PROBE_TIMEOUT))?;
             Ok(())
         });
-        match classify_probe(connect_result) {
+        match classify_probe(connect_result)
+            .map_err(|e| format!("probing socket {}: {e}", address.display()))?
+        {
             StaleProbe::Owned => {
                 return Err("another figmog serve owns this root".to_string());
             }
@@ -205,8 +213,8 @@ fn bind_socket(figmog_root: &Path) -> Result<(UnixListener, PathBuf), String> {
         }
     }
 
-    let listener =
-        UnixListener::bind(&path).map_err(|e| format!("binding socket {}: {e}", path.display()))?;
+    let listener = UnixListener::bind(&address)
+        .map_err(|e| format!("binding socket {}: {e}", address.display()))?;
     let mut perms = std::fs::metadata(&path)
         .map_err(|e| e.to_string())?
         .permissions();
@@ -1107,13 +1115,13 @@ mod tests {
 
     #[test]
     fn classify_probe_connect_success_means_owned() {
-        assert_eq!(classify_probe(Ok(())), StaleProbe::Owned);
+        assert_eq!(classify_probe(Ok(())).unwrap(), StaleProbe::Owned);
     }
 
     #[test]
     fn classify_probe_connection_refused_means_stale() {
         let err = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-        assert_eq!(classify_probe(Err(err)), StaleProbe::Stale);
+        assert_eq!(classify_probe(Err(err)).unwrap(), StaleProbe::Stale);
     }
 
     #[test]
@@ -1122,7 +1130,16 @@ mod tests {
         // (garbage, or some other filesystem error) is treated the same
         // as a refused connection — see `classify_probe`'s doc comment.
         let err = std::io::Error::other("not a socket");
-        assert_eq!(classify_probe(Err(err)), StaleProbe::Stale);
+        assert_eq!(classify_probe(Err(err)).unwrap(), StaleProbe::Stale);
+    }
+
+    #[test]
+    fn classify_probe_invalid_address_does_not_mean_stale() {
+        let error = std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            classify_probe(Err(error)).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
@@ -1233,6 +1250,24 @@ mod tests {
         let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "figmog-root should be tightened to 0700");
         drop(listener);
+    }
+
+    #[test]
+    fn bind_socket_preserves_a_live_socket_when_its_address_is_too_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a".repeat(90)).join("b".repeat(90));
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let _listener = UnixListener::bind(socket_path(staging.path())).unwrap();
+        std::fs::rename(staging.path(), &root).unwrap();
+        let path = socket_path(&root);
+        let before = std::fs::metadata(&path).unwrap();
+
+        let error = bind_socket(&root).unwrap_err();
+
+        assert!(error.contains("probing socket"), "{error}");
+        let after = std::fs::metadata(&path).expect("invalid address must not unlink live socket");
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
     }
 
     // ---- review fix round: C1/C2/m1-m6 ----

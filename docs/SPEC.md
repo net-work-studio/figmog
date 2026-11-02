@@ -298,7 +298,12 @@ exit through a guard held for `run_serve`'s whole scope. A pre-existing
 socket file is probed with a connect first (`serve::classify_probe`):
 connect succeeds ⇒ another `serve` owns this root, and this process exits
 with the standard `{"error": ...}` JSON; any connect failure ⇒ the file
-is stale, so it is unlinked and rebound. `--no-socket` skips binding.
+is stale, so it is unlinked and rebound, except invalid addresses (including
+AF_UNIX address-length errors), which fail without unlinking. Connect and
+bind use a short relative address when the verified root is beneath the
+working directory; permissions and cleanup use the verified absolute path.
+This preserves default socket startup in deep checkouts. `--no-socket`
+skips binding.
 
 Frames on the socket are the same newline-delimited JSON-RPC the stdio
 loop reads. `initialize` is optional for socket clients: `tools/call` is
@@ -449,6 +454,25 @@ or deleting a store, including during socket routing. Path construction
 also checks that a key is a single normal path component. Explicit pull
 file references still accept Figma URLs, and `--db` selects its given path
 without consulting `.figmog/current`.
+
+Before every direct CLI or server-session store open, figmog creates the
+database directory with mode 0700 and tightens an existing directory to
+0700. This includes explicit `--db` paths, `--fresh` rebuilds, and serve
+with `--no-socket`. Directory traversal is the privacy boundary: journal
+and table files remain inaccessible to other OS users even if their own
+modes permit reading. Existing permissive stores migrate on their next
+open; no recursive data-file chmod is needed. Missing ancestors are
+created with mode 0700; existing ancestors keep their modes. Entries created
+concurrently are re-read and checked like existing entries. Every path
+component must be owned by the current user or root. Group- or
+other-writable ancestors are rejected unless sticky directory semantics
+protect the owned child from replacement (as under `/tmp`). Ancestor
+symlinks and their targets undergo the same checks; subsequent store
+access uses the verified absolute path. Final symlinks are rejected even
+with trailing `/` or `/.`. These checks also precede `--fresh` deletion.
+Writing `.figmog/current` also protects `.figmog` itself. A failure to
+protect a selected directory produces a clean JSON error before opening
+the store or writing the pointer.
 
 **Credentials.** `figmog auth login` reads a personal access token from a
 hidden terminal prompt, or from stdin with `--token-stdin`. It rejects
