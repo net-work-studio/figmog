@@ -545,7 +545,7 @@ figmog serve running? ...` error (exit 1), never fold's raw lock panic
   at the pipeline root's tail, so reader tuples grow at the end.
 - `fold`/`bogkit` is upstream: never vendored, never patched — figmog
   consumes only the pinned git dependency's public API (see the crate's
-  `CLAUDE.md`).
+  `AGENTS.md`).
 
 ## 12. Node addressing
 
