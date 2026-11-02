@@ -1,0 +1,24 @@
+README.md
+  s_5d790181b86fa2::t_eac7c18f36d170 30-32
+src/cli/mod.rs
+  s_5d790181b86fa2::t_eac7c18f36d170 49-50,295-297,579-580,768-769
+  s_5d790181b86fa2::t_9c5390ff5daff3 28-32
+docs/SPEC.md
+  s_5d790181b86fa2::t_00263caebcb37c 423-427
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1ce4c657e7d2c5210a8dbeb40780f64c1edfd729",
+  "prompts": {},
+  "sessions": {
+    "s_5d790181b86fa2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19c16-71b7-7cb1-a2d2-64438b0474a5",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
