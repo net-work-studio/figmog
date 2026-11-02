@@ -1,0 +1,19 @@
+docs/SPEC.md
+  s_f27e4d16f4db0c::t_3aa80d72875da7 548
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "857ad3f375d8c98aa4e51b65f4631bd0278df3c8",
+  "prompts": {},
+  "sessions": {
+    "s_f27e4d16f4db0c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a17c64-38c0-7cc0-a27c-b107a427866e",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
