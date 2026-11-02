@@ -106,25 +106,93 @@ fn standalone_pull_tightens_existing_permissive_mirrors_and_keeps_fresh_private(
 
 #[test]
 fn standalone_pull_refuses_a_symlink_db_before_writing_or_chmodding_its_target() {
+    for spelling in ["db", "db/", "db/."] {
+        let work = tempfile::tempdir().unwrap();
+        let target = work.path().join("unrelated");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, work.path().join("db")).unwrap();
+
+        let output = run_pull(work.path(), &["--db", spelling]);
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("protecting mirror directory")
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(mode(&target), 0o755);
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn standalone_pull_rejects_replaceable_ancestors_without_writing() {
+    for existing in [false, true] {
+        let work = tempfile::tempdir().unwrap();
+        let shared = work.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::os::unix::fs::symlink("shared", work.path().join("alias")).unwrap();
+        if existing {
+            pull(work.path(), &["--db", "shared/db"]);
+            std::fs::write(shared.join("db/sentinel"), b"keep existing contents").unwrap();
+        }
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        for (spelling, fresh) in [
+            ("shared/db", false),
+            ("shared/db", true),
+            ("alias/db", false),
+            ("shared/../other-db", false),
+        ] {
+            let mut args = vec!["--db", spelling];
+            if fresh {
+                args.push("--fresh");
+            }
+            let output = run_pull(work.path(), &args);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert!(
+                error["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unsafe mirror ancestor")
+            );
+            assert_eq!(mode(&shared), 0o777);
+            assert_eq!(shared.join("db").exists(), existing);
+            assert!(!work.path().join("other-db").exists());
+            if existing {
+                assert_eq!(
+                    std::fs::read(shared.join("db/sentinel")).unwrap(),
+                    b"keep existing contents"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn standalone_pull_allows_sticky_parents_and_resolves_safe_ancestor_symlinks() {
     let work = tempfile::tempdir().unwrap();
-    let target = work.path().join("unrelated");
-    std::fs::create_dir(&target).unwrap();
-    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::os::unix::fs::symlink(&target, work.path().join("db")).unwrap();
+    let shared = work.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    std::os::unix::fs::symlink("shared", work.path().join("alias")).unwrap();
 
-    let output = run_pull(work.path(), &["--db", "db"]);
+    pull(work.path(), &["--db", "alias/db/."]);
 
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert!(
-        error["error"]
-            .as_str()
-            .unwrap()
-            .contains("protecting mirror directory")
+    assert_eq!(mode(&shared.join("db")), 0o700);
+    assert_eq!(
+        std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+        0o1777
     );
-    assert!(output.stdout.is_empty());
-    assert_eq!(mode(&target), 0o755);
-    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    assert!(
+        std::fs::symlink_metadata(work.path().join("alias"))
+            .unwrap()
+            .is_symlink()
+    );
 }
 
 #[test]

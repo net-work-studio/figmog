@@ -14,7 +14,7 @@ use crate::ident::parse_file_ref;
 use crate::store::{self, Churn, collect_sweepable, collect_variable_ids, sync};
 use crate::watch::BACKOFF_CAP;
 
-use super::{CURRENT_FILE, Db, open_store_checked, write_json};
+use super::{Db, open_store_checked, write_json};
 
 /// Errors from [`do_pull`]: either a typed API failure (so callers can act
 /// on rate limits) or any other pull-mechanics failure. `Display` matches
@@ -129,7 +129,7 @@ pub(super) fn do_pull(
             let stored_geometry = if fresh || !db.path.exists() {
                 false
             } else {
-                open_store_checked(&db.path, || crate::open_store!(&db.path))
+                open_store_checked(&db.path, |path| crate::open_store!(path))
                     .map(|st| st.rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config)))
                     .unwrap_or(false)
             };
@@ -145,12 +145,13 @@ pub(super) fn do_pull(
     };
 
     if fresh {
-        std::fs::remove_dir_all(&db.path).ok();
+        let path = crate::private_dir::ensure(&db.path)?;
+        std::fs::remove_dir_all(&path).map_err(|e| format!("removing {}: {e}", path.display()))?;
     }
 
     let mut flattened = flatten_file(&resp).map_err(|e| e.to_string())?;
 
-    let mut st = open_store_checked(&db.path, || crate::open_store!(&db.path))?;
+    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
     let mut prior: BTreeSet<crate::model::Id> =
         st.rtx(|((nodes, ..), components, component_sets, styles, ..)| {
             collect_sweepable(&nodes, &components, &component_sets, &styles)
@@ -248,8 +249,8 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 pub(crate) fn write_current(key: &str) -> Result<(), String> {
-    crate::private_dir::ensure(std::path::Path::new(".figmog"))?;
-    std::fs::write(CURRENT_FILE, key).map_err(|e| e.to_string())
+    let root = crate::private_dir::ensure(std::path::Path::new(".figmog"))?;
+    std::fs::write(root.join("current"), key).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

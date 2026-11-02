@@ -179,9 +179,9 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// way, since every path that reaches this point is this process's own
 /// root to run as its owner sees fit.
 fn bind_socket(figmog_root: &Path) -> Result<(UnixListener, PathBuf), String> {
-    crate::private_dir::ensure(figmog_root)?;
+    let figmog_root = crate::private_dir::ensure(figmog_root)?;
 
-    let path = socket_path(figmog_root);
+    let path = socket_path(&figmog_root);
 
     if path.exists() {
         let connect_result = UnixStream::connect(&path).and_then(|stream| {

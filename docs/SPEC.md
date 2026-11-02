@@ -457,10 +457,16 @@ with `--no-socket`. Directory traversal is the privacy boundary: journal
 and table files remain inaccessible to other OS users even if their own
 modes permit reading. Existing permissive stores migrate on their next
 open; no recursive data-file chmod is needed. Missing ancestors are
-created with mode 0700; existing ancestors keep their modes. Writing
-`.figmog/current` also protects `.figmog` itself. A failure to protect a
-selected directory, including a final symlink, produces a clean JSON error
-before opening the store or writing the pointer.
+created with mode 0700; existing ancestors keep their modes. Every path
+component must be owned by the current user or root. Group- or
+other-writable ancestors are rejected unless sticky directory semantics
+protect the owned child from replacement (as under `/tmp`). Ancestor
+symlinks and their targets undergo the same checks; subsequent store
+access uses the verified absolute path. Final symlinks are rejected even
+with trailing `/` or `/.`. These checks also precede `--fresh` deletion.
+Writing `.figmog/current` also protects `.figmog` itself. A failure to
+protect a selected directory produces a clean JSON error before opening
+the store or writing the pointer.
 
 **Credentials.** `figmog auth login` reads a personal access token from a
 hidden terminal prompt, or from stdin with `--token-stdin`. It rejects
