@@ -1,10 +1,14 @@
 //! Parsing of user-supplied file references and node ids.
 
+/// A bare Figma file key, with no URL or path components.
+pub(crate) fn is_file_key(input: &str) -> bool {
+    input.len() >= 10 && input.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// Extract a file key from a bare key or a figma.com URL
 /// (`figma.com/design/<key>/…`, `figma.com/file/<key>/…`).
 pub fn parse_file_ref(input: &str) -> Option<String> {
-    let is_key = |s: &str| s.len() >= 10 && s.chars().all(|c| c.is_ascii_alphanumeric());
-    if is_key(input) {
+    if is_file_key(input) {
         return Some(input.to_string());
     }
     let rest = input.split_once("figma.com/").map(|(_, r)| r)?;
@@ -14,7 +18,7 @@ pub fn parse_file_ref(input: &str) -> Option<String> {
         _ => return None,
     }
     let key = parts.next()?;
-    is_key(key).then(|| key.to_string())
+    is_file_key(key).then(|| key.to_string())
 }
 
 /// Canonicalize a node id: URLs write `12:34` as `12-34`. Ids that are not
