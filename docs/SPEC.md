@@ -442,6 +442,14 @@ requires a resolved mirror — no established `.figmog/current` and no
 `--db` needed. `figmog call` does need one, since local tool dispatch
 reads the store.
 
+Default mirror paths are `.figmog/<key>/db`. Persisted `.figmog/current`
+contents are trimmed and must be a bare key of at least 10 ASCII
+alphanumeric characters; nonempty malformed contents fail before opening
+or deleting a store, including during socket routing. Path construction
+also checks that a key is a single normal path component. Explicit pull
+file references still accept Figma URLs, and `--db` selects its given path
+without consulting `.figmog/current`.
+
 **Credentials.** `figmog auth login` reads a personal access token from a
 hidden terminal prompt, or from stdin with `--token-stdin`. It rejects
 empty, multiline, non-ASCII, and oversized tokens (4096-byte maximum),

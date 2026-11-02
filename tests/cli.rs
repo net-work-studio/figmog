@@ -604,6 +604,209 @@ fn tools_works_with_no_established_mirror() {
 }
 
 #[test]
+fn fresh_pull_rejects_persisted_paths_before_deleting_external_db() {
+    for absolute in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let root = work.join(".figmog");
+        let victim = dir.path().join("victim");
+        let sentinel = victim.join("db/sentinel");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, "keep this synthetic data").unwrap();
+        let key = if absolute {
+            victim.display().to_string()
+        } else {
+            "../../victim".to_string()
+        };
+        std::fs::write(root.join("current"), &key).unwrap();
+        std::fs::write(work.join("input.json"), "{}").unwrap();
+
+        let out = common::command()
+            .current_dir(&work)
+            .args(["pull", "--fresh", "--from-file", "input.json"])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).ok().as_deref(),
+            Some("keep this synthetic data"),
+            "persisted path {key:?} must not delete external data"
+        );
+        assert_eq!(out.status.code(), Some(1));
+        let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains(".figmog/current"),
+            "must reject the persisted key before parsing input: {error}"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("current")).unwrap(), key);
+
+        let explicit = common::command()
+            .current_dir(&work)
+            .args(["pull", &key, "--fresh", "--from-file", "input.json"])
+            .assert()
+            .failure()
+            .code(1);
+        let error: serde_json::Value =
+            serde_json::from_slice(&explicit.get_output().stderr).unwrap();
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("not a Figma file key or URL")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "keep this synthetic data"
+        );
+    }
+}
+
+#[test]
+fn malformed_persisted_keys_fail_before_opening_or_creating_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let root = work.join(".figmog");
+    let external = dir.path().join("external");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        work.join("input.json"),
+        serde_json::to_string(&common::fixture_v1()).unwrap(),
+    )
+    .unwrap();
+
+    for key in [
+        "",
+        " \n\t",
+        "abcdefghi",
+        "abcdefghij_",
+        "abcdefghij-",
+        "abcdefghijé",
+        "abcdefghij\nklmnopqrst",
+        ".",
+        "..",
+        "../../external",
+        external.to_str().unwrap(),
+        "abcdefghij/../klmnopqrst",
+        "abcdefghij\\klmnopqrst",
+        "https://www.figma.com/design/abcdefghij/Fixture",
+    ] {
+        std::fs::write(root.join("current"), key).unwrap();
+        for args in [
+            vec!["pull", "--fresh", "--from-file", "input.json"],
+            vec!["pull", "--from-file", "input.json"],
+            vec!["status"],
+            vec!["status", "--no-socket"],
+            vec!["call", "figmog_status", "--no-upstream"],
+        ] {
+            let out = common::command()
+                .current_dir(&work)
+                .args(&args)
+                .assert()
+                .failure()
+                .code(1);
+            let error: serde_json::Value =
+                serde_json::from_slice(&out.get_output().stderr).unwrap();
+            assert!(error["error"].is_string(), "{key:?}, {args:?}: {error}");
+            if !key.trim().is_empty() {
+                assert!(
+                    error["error"].as_str().unwrap().contains(".figmog/current"),
+                    "{key:?}, {args:?}: {error}"
+                );
+            }
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "{key:?}");
+            assert!(
+                !external.exists(),
+                "must not open external path for {key:?}"
+            );
+            assert_eq!(std::fs::read_to_string(root.join("current")).unwrap(), key);
+        }
+    }
+}
+
+#[test]
+fn explicit_file_refs_and_valid_persisted_keys_resolve_the_same_mirror() {
+    const KEY: &str = "aBcDeF1234";
+    for file in [
+        KEY,
+        "https://www.figma.com/design/aBcDeF1234/Fixture?node-id=0-1",
+        "https://www.figma.com/file/aBcDeF1234/Fixture",
+        "https://www.figma.com/board/aBcDeF1234/Fixture",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".figmog");
+        std::fs::create_dir(&root).unwrap();
+        // An explicit reference supersedes a corrupt persisted pointer.
+        std::fs::write(root.join("current"), "../../external").unwrap();
+        std::fs::write(
+            dir.path().join("input.json"),
+            serde_json::to_string(&common::fixture_v1()).unwrap(),
+        )
+        .unwrap();
+        common::command()
+            .current_dir(dir.path())
+            .args(["pull", file, "--fresh", "--from-file", "input.json"])
+            .assert()
+            .success();
+        assert!(root.join(KEY).join("db").is_dir());
+        assert_eq!(std::fs::read_to_string(root.join("current")).unwrap(), KEY);
+
+        // Trimming surrounding whitespace remains supported on reload.
+        std::fs::write(root.join("current"), format!(" \n{KEY}\r\n")).unwrap();
+        common::command()
+            .current_dir(dir.path())
+            .args(["pull", "--fresh", "--from-file", "input.json"])
+            .assert()
+            .success();
+        let out = common::command()
+            .current_dir(dir.path())
+            .arg("status")
+            .assert()
+            .success();
+        let status: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(status["name"], "Fixture");
+        assert_eq!(std::fs::read_to_string(root.join("current")).unwrap(), KEY);
+    }
+}
+
+#[test]
+fn explicit_db_keeps_its_path_and_bypasses_invalid_persisted_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let root = work.join(".figmog");
+    let db = dir.path().join("chosen/db");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("current"), "../../external").unwrap();
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(db.join("sentinel"), "explicitly selected for replacement").unwrap();
+    std::fs::write(
+        work.join("input.json"),
+        serde_json::to_string(&common::fixture_v1()).unwrap(),
+    )
+    .unwrap();
+    common::command()
+        .current_dir(&work)
+        .args(["pull", "--fresh", "--from-file", "input.json", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    assert!(!db.join("sentinel").exists());
+    let out = common::command()
+        .current_dir(&work)
+        .args(["status", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let status: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(status["name"], "Fixture");
+    assert_eq!(
+        std::fs::read_to_string(root.join("current")).unwrap(),
+        "../../external"
+    );
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+}
+
+#[test]
 fn failed_pull_does_not_persist_current_or_create_store() {
     let dir = tempfile::tempdir().unwrap();
 

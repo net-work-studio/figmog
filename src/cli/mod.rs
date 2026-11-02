@@ -7,12 +7,12 @@
 //! keeps the clap types, top-level dispatch, `run`, and the store-opening/
 //! JSON-writing helpers every submodule shares.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
-use crate::ident::parse_file_ref;
+use crate::ident::{is_file_key, parse_file_ref};
 
 mod auth;
 mod call;
@@ -386,14 +386,14 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let parsed_args = if tool == "figmog_open" {
                 parsed_args
             } else {
-                with_current_file(parsed_args)
+                with_current_file(parsed_args)?
             };
             if let Some(result) = socket::try_call(root, tool, parsed_args) {
                 note_ignored_upstream_flags(upstream, *no_upstream);
                 return write_json(&result?);
             }
         } else if let Some((tool, tool_args)) = cmd_as_tool_call(&cli.cmd) {
-            let tool_args = with_current_file(strip_nulls(tool_args));
+            let tool_args = with_current_file(strip_nulls(tool_args))?;
             if let Some(result) = socket::try_call(root, tool, tool_args) {
                 return write_json(&strip_routed_upstream_field(result?));
             }
@@ -635,14 +635,14 @@ fn note_ignored_upstream_flags(upstream: &str, no_upstream: bool) {
 /// (no `--args`) succeed over the socket while the exact same invocation
 /// fails direct, breaking the very byte-compatibility this routing exists
 /// to preserve (see `dispatch::cmd_as_tool_call`'s caller).
-fn with_current_file(mut args: Value) -> Value {
+fn with_current_file(mut args: Value) -> Result<Value, String> {
     if let Some(obj) = args.as_object_mut() {
         let has_file = obj.get("file").is_some_and(|v| !v.is_null());
-        if !has_file && let Some(key) = read_current_key() {
+        if !has_file && let Some(key) = read_current_key()? {
             obj.insert("file".to_string(), json!(key));
         }
     }
-    args
+    Ok(args)
 }
 
 /// Drop every key whose value is JSON `null` from a routed read command's
@@ -802,30 +802,38 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
     if let Cmd::Pull { file: Some(f), .. } = &cli.cmd {
         let key = parse_file_ref(f).ok_or_else(|| format!("not a Figma file key or URL: {f}"))?;
         return Ok(Db {
-            path: db_path_for(&key),
+            path: db_path_for(&key)?,
             key: Some(key),
         });
     }
 
-    let key = read_current_key().ok_or_else(|| no_mirror_msg(cli))?;
+    let key = read_current_key()?.ok_or_else(|| no_mirror_msg(cli))?;
     Ok(Db {
-        path: db_path_for(&key),
+        path: db_path_for(&key)?,
         key: Some(key),
     })
 }
 
-/// Best-effort read of `.figmog/current` — `None` on any I/O error or an
+/// Best-effort read of `.figmog/current` — `Ok(None)` on any I/O error or an
 /// empty file (the same "no established mirror" cases [`resolve_db`]
 /// turns into an error; socket routing instead treats `None` as "let
 /// serve's own default apply, unchanged" — see [`with_current_file`]).
 /// Shared so both call sites derive the current mirror identically.
-fn read_current_key() -> Option<String> {
-    let key = std::fs::read_to_string(CURRENT_FILE).ok()?;
+/// Nonempty contents must be a bare key, never a URL or filesystem path;
+/// corruption is an error even when socket routing could use a default.
+fn read_current_key() -> Result<Option<String>, String> {
+    let Ok(key) = std::fs::read_to_string(CURRENT_FILE) else {
+        return Ok(None);
+    };
     let key = key.trim();
     if key.is_empty() {
-        None
+        Ok(None)
+    } else if !is_file_key(key) {
+        Err(format!(
+            "invalid mirror key in {CURRENT_FILE}: expected at least 10 ASCII alphanumeric characters"
+        ))
     } else {
-        Some(key.to_string())
+        Ok(Some(key.to_string()))
     }
 }
 
@@ -846,8 +854,19 @@ fn no_mirror_msg(cli: &Cli) -> String {
     }
 }
 
-fn db_path_for(key: &str) -> PathBuf {
-    PathBuf::from(".figmog").join(key).join("db")
+/// Keys must stay one normal component at the path-construction boundary,
+/// even if a future caller bypasses file-reference or persisted-key parsing.
+fn db_path_for(key: &str) -> Result<PathBuf, String> {
+    let mut components = Path::new(key).components();
+    if !is_file_key(key)
+        || !matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        )
+    {
+        return Err("invalid mirror key: expected a single bare Figma file key".to_string());
+    }
+    Ok(PathBuf::from(".figmog").join(key).join("db"))
 }
 
 /// The clean, user-facing error every CLI store-opening call site below
@@ -1029,7 +1048,7 @@ mod tests {
     fn with_current_file_never_overrides_an_explicit_non_null_file() {
         // No filesystem dependency either way: an explicit `file` short-
         // circuits before `read_current_key` is ever consulted.
-        let args = with_current_file(json!({"id": "1:1", "file": "explicitkey12345678"}));
+        let args = with_current_file(json!({"id": "1:1", "file": "explicitkey12345678"})).unwrap();
         assert_eq!(args["file"], json!("explicitkey12345678"));
     }
 }
