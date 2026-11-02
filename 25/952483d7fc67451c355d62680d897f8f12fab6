@@ -1,0 +1,45 @@
+src/cli/call.rs
+  s_c608929946f808::t_a9475d1b4927e9 24,127
+src/sessions.rs
+  s_c608929946f808::t_a9475d1b4927e9 215
+src/cli/pull.rs
+  s_c608929946f808::t_d7743ff8642f7c 251
+  s_c608929946f808::t_a9475d1b4927e9 132,153
+src/lib.rs
+  s_c608929946f808::t_d7743ff8642f7c 22
+src/cli/mod.rs
+  s_c608929946f808::t_a9475d1b4927e9 433,983,992
+  s_c608929946f808::t_be7238ddefaff2 879-882
+  s_c608929946f808::t_d7743ff8642f7c 925,928
+src/cli/images.rs
+  s_c608929946f808::t_a9475d1b4927e9 128
+docs/SPEC.md
+  s_c608929946f808::t_d14488fa933fc6 453-464
+tests/permissions.rs
+  s_c608929946f808::t_be7238ddefaff2 53-104,152
+  s_c608929946f808::t_d14488fa933fc6 5,8-12,24,31,105-118,125-127
+  s_c608929946f808::t_30eeef4e536c80 1-4,6-7,13-17,26-30,32-52
+  s_c608929946f808::t_44bc09c8147297 25,139-146
+  s_c608929946f808::t_9477b38a13c282 18-23,128-138,147-151
+  s_c608929946f808::t_d40a5aff532aef 119-124
+src/private_dir.rs
+  s_c608929946f808::t_d7743ff8642f7c 1-22
+src/serve.rs
+  s_c608929946f808::t_d7743ff8642f7c 182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "25952483d7fc67451c355d62680d897f8f12fab6",
+  "prompts": {},
+  "sessions": {
+    "s_c608929946f808": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19d5c-48cc-7621-b952-2fc6b65dbfc8",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
