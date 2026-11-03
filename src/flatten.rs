@@ -122,10 +122,17 @@ fn walk(
     let own_page = matches!(node_type.as_str(), "DOCUMENT" | "CANVAS");
     let page = if own_page { id } else { page_id.unwrap_or(id) };
 
-    let mut raw = node.clone();
-    if let Some(obj) = raw.as_object_mut() {
-        obj.remove("children");
-    }
+    // Filter before cloning: cloning the whole node would copy every
+    // descendant subtree just to discard it, repeating that work per ancestor.
+    // An id-bearing node is necessarily an object; the map stays sorted.
+    let raw = Value::Object(
+        node.as_object()
+            .expect("node with an id is an object")
+            .iter()
+            .filter(|(key, _)| key.as_str() != "children")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
 
     let bound_variables = scan_bound_variables(&raw);
 
