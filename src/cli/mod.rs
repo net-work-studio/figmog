@@ -21,6 +21,9 @@ mod images;
 mod pull;
 mod read;
 mod socket;
+mod store_lock;
+
+use store_lock::{OwnedStore, StoreOwner};
 
 pub(crate) use pull::{PullError, now_ms, pull_failure_wait, write_current};
 
@@ -881,6 +884,9 @@ const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Q
 /// reaches fold, which may write journal data while opening the store.
 /// `open` receives the verified absolute path and must use it for the store.
 /// Unsafe ancestor ownership or write permissions fail before the callback.
+/// The returned handle also holds a permanent in-store lock file for its
+/// entire lifetime, so `pull --fresh` cannot unlink a live writer's store.
+/// Opens and fresh resets need no write access to the store's parent.
 ///
 /// `open_store!` (via `fold::stream::Stream::new`) panics rather than
 /// returning a `Result` when the underlying store can't be opened — most
@@ -926,14 +932,21 @@ const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Q
 pub(crate) fn open_store_checked<T>(
     path: &Path,
     open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
-) -> Result<T, String> {
-    let path = crate::private_dir::ensure(path)?;
+) -> Result<OwnedStore<T>, String> {
+    open_store_owned(StoreOwner::acquire(path)?, open)
+}
+
+fn open_store_owned<T>(
+    owner: StoreOwner,
+    open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
+) -> Result<OwnedStore<T>, String> {
+    let path = crate::private_dir::ensure(&owner.path)?;
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(|| open(&path));
     std::panic::set_hook(prev_hook);
 
-    result.map_err(|payload| {
+    let store = result.map_err(|payload| {
         let msg = panic_message(&*payload);
         if msg.contains("Locked") {
             STORE_LOCKED_MSG.to_string()
@@ -941,7 +954,8 @@ pub(crate) fn open_store_checked<T>(
             eprintln!("{}", json!({"error": format!("internal panic: {msg}")}));
             std::process::exit(101);
         }
-    })
+    })?;
+    Ok(OwnedStore::new(store, owner))
 }
 
 /// Best-effort text for a caught panic's payload: `&str`/`String` cover

@@ -116,10 +116,9 @@ pub(super) fn do_pull(
             // Peek the mirror's stored geometry setting (spec §4) *before*
             // fetching, so a plain re-pull of a mirror that was ever
             // pulled with `--geometry` keeps asking for it. `--fresh`
-            // wipes the store below and never consults it (the documented
-            // way to turn geometry back off), so this never opens a store
-            // that's about to be discarded — and a first-ever pull (no
-            // store on disk yet) never opens one at all, so a token
+            // ignores its stored config (the documented way to turn
+            // geometry back off). A first pull (no store on disk yet)
+            // never opens one here at all, so a token
             // failure above still leaves no store trace (unchanged from
             // pre-v0.0.2 — see `failed_pull_does_not_persist_current_or_
             // create_store`). When a store does exist, this is a second,
@@ -144,21 +143,34 @@ pub(super) fn do_pull(
         }
     };
 
-    if fresh {
-        let path = crate::private_dir::ensure(&db.path)?;
-        std::fs::remove_dir_all(&path).map_err(|e| format!("removing {}: {e}", path.display()))?;
+    apply_pull(db, &resp, vars_resp.as_ref(), fresh, geometry)
+}
+
+/// Validate both responses before opening or changing a mirror. Fresh
+/// replacement preserves an in-store ownership anchor while clearing contents.
+fn apply_pull(
+    db: &Db,
+    resp: &Value,
+    vars_resp: Option<&Value>,
+    fresh: bool,
+    geometry: bool,
+) -> Result<(Churn, String, String), PullError> {
+    let mut flattened = flatten_file(resp).map_err(|e| e.to_string())?;
+    if let Some(v) = vars_resp {
+        flattened
+            .recs
+            .extend(crate::vars::parse_variables_export(v).map_err(|e| e.to_string())?);
     }
 
-    let mut flattened = flatten_file(&resp).map_err(|e| e.to_string())?;
-
     let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    if fresh {
+        st = st.reset(|path| crate::open_store!(path))?;
+    }
     let mut prior: BTreeSet<crate::model::Id> =
         st.rtx(|((nodes, ..), components, component_sets, styles, ..)| {
             collect_sweepable(&nodes, &components, &component_sets, &styles)
         });
-    if let Some(v) = &vars_resp {
-        let var_recs = crate::vars::parse_variables_export(v).map_err(|e| e.to_string())?;
-        flattened.recs.extend(var_recs);
+    if vars_resp.is_some() {
         let stored_var_ids = st.rtx(
             |(_, _, _, _, variables, variable_collections, _, _, _, _)| {
                 collect_variable_ids(&variables, &variable_collections)
@@ -257,6 +269,35 @@ pub(crate) fn write_current(key: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::watch::BACKOFF_START;
+
+    #[test]
+    fn invalid_variables_fail_before_fresh_opens_or_resets_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let file = serde_json::json!({
+            "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
+            "document": {"id": "0:0", "name": "Document", "type": "DOCUMENT"}
+        });
+        let invalid_vars = serde_json::json!({"meta": {"variables": {}}});
+
+        let error = apply_pull(&db, &file, Some(&invalid_vars), true, false).unwrap_err();
+        assert!(error.to_string().contains("variableCollections"));
+        assert!(!db.path.exists(), "invalid data must not create a store");
+
+        apply_pull(&db, &file, None, false, true).unwrap();
+        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        let meta = st.get(&crate::model::Id::Meta);
+        let config = st.get(&crate::model::Id::MirrorConfig);
+        // Holding the store also proves validation precedes ownership checks:
+        // the error must describe the variables response, not contention.
+        let error = apply_pull(&db, &file, Some(&invalid_vars), true, false).unwrap_err();
+        assert!(error.to_string().contains("variableCollections"));
+        assert_eq!(st.get(&crate::model::Id::Meta), meta);
+        assert_eq!(st.get(&crate::model::Id::MirrorConfig), config);
+    }
 
     #[test]
     fn rate_limited_waits_max_of_interval_and_retry_after() {

@@ -176,3 +176,39 @@ pub fn command() -> Command {
     command.env("FIGMA_TOKEN", "");
     command
 }
+
+/// Capture names, inode identities, and bytes without opening the database.
+/// Useful while serve owns the writer lock: a rejected fresh pull must not
+/// unlink or modify any of its files or directories.
+#[allow(dead_code)]
+pub fn store_snapshot(
+    path: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, (u64, Vec<u8>)> {
+    use std::os::unix::fs::MetadataExt;
+
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, (u64, Vec<u8>)>,
+    ) {
+        let metadata = std::fs::metadata(path).unwrap();
+        let bytes = if metadata.is_file() {
+            std::fs::read(path).unwrap()
+        } else {
+            Vec::new()
+        };
+        out.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            (metadata.ino(), bytes),
+        );
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                visit(root, &entry.unwrap().path(), out);
+            }
+        }
+    }
+
+    let mut out = std::collections::BTreeMap::new();
+    visit(path, path, &mut out);
+    out
+}
