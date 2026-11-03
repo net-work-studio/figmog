@@ -1054,6 +1054,79 @@ mod tests {
     use crate::upstream::FakeUpstream;
 
     #[test]
+    fn watch_tick_reconciles_once_despite_different_endpoint_timestamps() {
+        use crate::api::{ApiError, FileMetaResp};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct ScriptedApi {
+            meta_calls: Cell<usize>,
+            file_calls: Cell<usize>,
+        }
+
+        impl FigmaApi for ScriptedApi {
+            fn file_meta(&self, _key: &str) -> Result<FileMetaResp, ApiError> {
+                self.meta_calls.set(self.meta_calls.get() + 1);
+                Ok(FileMetaResp {
+                    name: "Synthetic".into(),
+                    last_touched_at: "2026-01-01T12:00:00.123Z".into(),
+                })
+            }
+
+            fn file(&self, _key: &str, _geometry: bool) -> Result<Value, ApiError> {
+                self.file_calls.set(self.file_calls.get() + 1);
+                Ok(json!({
+                    "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T12:00:00Z",
+                    "document": {"id": "0:0", "name": "Synthetic", "type": "DOCUMENT"}
+                }))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let api = Rc::new(ScriptedApi {
+            meta_calls: Cell::new(0),
+            file_calls: Cell::new(0),
+        });
+        let session = sessions::open_session_with_api(
+            dir.path().join("db"),
+            "ABC123".into(),
+            Some("ABC123"),
+            Some(api.clone()),
+            false,
+        )
+        .unwrap();
+        let mut manager = SessionManager {
+            sessions: vec![session],
+            root: dir.path().to_path_buf(),
+            token: None,
+            default_key: Some("ABC123".into()),
+        };
+        let mut next_idx = 0;
+        let interval = Duration::from_secs(10);
+
+        watch_tick(&mut manager, &mut next_idx, interval, false, Some(&*api));
+        assert_eq!(api.meta_calls.get(), 1);
+        assert_eq!(api.file_calls.get(), 1);
+        assert_eq!(
+            manager.list()[0]["version"],
+            "1",
+            "the pull synced the store"
+        );
+        assert!(matches!(
+            manager.sessions[0].watcher.tick(&*api, "ABC123"),
+            Tick::Unchanged
+        ));
+
+        watch_tick(&mut manager, &mut next_idx, interval, false, Some(&*api));
+        assert_eq!(api.meta_calls.get(), 3, "both watch ticks polled metadata");
+        assert_eq!(
+            api.file_calls.get(),
+            1,
+            "unchanged polls must not fetch again"
+        );
+    }
+
+    #[test]
     fn serve_answers_local_requests_and_resumes_polling_after_http_timeout() {
         let peer = Peer::new(vec![
             Reply::Stall(""),

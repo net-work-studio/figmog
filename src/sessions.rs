@@ -207,7 +207,7 @@ pub(crate) fn open_session_at(
 
 /// Shared construction with the REST boundary supplied explicitly, so
 /// session bookkeeping and real store syncs can be exercised offline.
-fn open_session_with_api(
+pub(crate) fn open_session_with_api(
     path: PathBuf,
     key: String,
     network_key: Option<&str>,
