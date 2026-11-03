@@ -396,7 +396,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 return write_json(&result?);
             }
         } else if let Some((tool, tool_args)) = cmd_as_tool_call(&cli.cmd) {
-            let tool_args = with_current_file(strip_nulls(tool_args))?;
+            let tool_args = with_current_file(strip_null_options(tool_args))?;
             if let Some(result) = socket::try_call(root, tool, tool_args) {
                 return write_json(&strip_routed_upstream_field(result?));
             }
@@ -648,26 +648,12 @@ fn with_current_file(mut args: Value) -> Result<Value, String> {
     Ok(args)
 }
 
-/// Drop every key whose value is JSON `null` from a routed read command's
-/// argument object (review C2): `json!` always emits a null-valued key for
-/// an absent `Option<T>` field rather than omitting it (e.g.
-/// `cmd_as_tool_call`'s `Cmd::Where` arm always has an `equals` key, `null`
-/// when `--equals` was omitted), but `dispatch_read_tool`'s arg helpers use
-/// *presence*, not truthiness — `figmog_where`'s `equals:
-/// args.get("equals").cloned()` treats a present-but-null `equals` as
-/// "match literal null" rather than "no filter", silently returning zero
-/// rows for the common no-`--equals` case over the socket while direct
-/// mode returns every row with that pointer present. Applied once,
-/// generically, to every `cmd_as_tool_call` translation — rather than
-/// hand-rolling conditional insertion in each match arm — so this class of
-/// bug can't recur as new routed commands are added. (One accepted
-/// imprecision: `--equals null` explicitly, an obscure invocation, is now
-/// indistinguishable from omitting `--equals` entirely, since both encode
-/// as a null-valued key before this strip runs either way — direct mode
-/// keeps the finer distinction via `Option<Value>` at the Rust level.)
-fn strip_nulls(mut args: Value) -> Value {
+/// Omit absent optional flags that `json!` encoded as null in a mapped
+/// read command. `equals` carries an arbitrary JSON value, including
+/// literal null, so `cmd_as_tool_call` omits that key itself when absent.
+fn strip_null_options(mut args: Value) -> Value {
     if let Some(obj) = args.as_object_mut() {
-        obj.retain(|_, v| !v.is_null());
+        obj.retain(|key, v| key == "equals" || !v.is_null());
     }
     args
 }
@@ -758,15 +744,17 @@ fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
             equals,
             page,
             under,
-        } => Some((
-            "figmog_where",
-            json!({
+        } => {
+            let mut args = json!({
                 "pointer": pointer,
-                "equals": equals.as_deref().map(read::parse_equals),
                 "page": page,
                 "under": under,
-            }),
-        )),
+            });
+            if let Some(equals) = equals {
+                args["equals"] = read::parse_equals(equals);
+            }
+            Some(("figmog_where", args))
+        }
         Cmd::At { x, y } => Some(("figmog_at", json!({"x": x, "y": y}))),
         Cmd::Version
         | Cmd::Auth { .. }
@@ -1067,8 +1055,8 @@ mod tests {
     // ---- socket-routing helpers (review C1/C2/m1 fix round) ----
 
     #[test]
-    fn strip_nulls_drops_null_keys_and_keeps_everything_else() {
-        let args = strip_nulls(json!({
+    fn strip_null_options_preserves_literal_null_equality() {
+        let args = strip_null_options(json!({
             "pointer": "/layoutMode",
             "equals": null,
             "page": null,
@@ -1077,14 +1065,14 @@ mod tests {
         }));
         assert_eq!(
             args,
-            json!({"pointer": "/layoutMode", "under": "1:1", "limit": 0})
+            json!({"pointer": "/layoutMode", "equals": null, "under": "1:1", "limit": 0})
         );
     }
 
     #[test]
-    fn strip_nulls_is_a_no_op_on_an_object_with_no_nulls() {
+    fn strip_null_options_is_a_no_op_on_an_object_with_no_nulls() {
         let args = json!({"id": "1:1", "children": true});
-        assert_eq!(strip_nulls(args.clone()), args);
+        assert_eq!(strip_null_options(args.clone()), args);
     }
 
     #[test]

@@ -296,19 +296,9 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         }
         "figmog_where" => Some((|| {
             let pointer = require_str(args, "pointer")?;
-            // A present-but-`Value::Null` `equals` is treated the same as
-            // an absent one (review C2, defense in depth): the primary fix
-            // lives on the CLI's socket-routing side (`cli::strip_nulls`,
-            // since `json!` always emits a null-valued key for an absent
-            // `Option<T>` field rather than omitting it), but any other
-            // caller building this call's JSON by hand — a future tool
-            // client, a hand-rolled MCP request — could reproduce the same
-            // "present null ⇒ silently matches nothing" trap without going
-            // through the CLI at all. This is the one arg here that can't
-            // use `arg_str`/`arg_usize`'s existing `Value::Null.as_*()` ⇒
-            // `None` null-safety, since it carries an arbitrary JSON value
-            // rather than a typed scalar.
-            let equals = args.get("equals").cloned().filter(|v| !v.is_null());
+            // Presence means equality to this JSON value, including null;
+            // only an omitted key means "pointer exists".
+            let equals = args.get("equals").cloned();
             let page = arg_str(args, "page");
             let under = arg_str(args, "under");
             query::where_(&nodes, &children, &pointer, equals, page, under)
@@ -506,7 +496,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "pointer": {"type": "string", "description": "RFC 6901 pointer into the node's raw JSON, e.g. /layoutMode."},
-                    "equals": {"description": "JSON value to match; omitted means \"pointer exists\"."},
+                    "equals": {"description": "JSON value to match, including null; omitted means \"pointer exists\"."},
                     "page": {"type": "string"},
                     "under": {"type": "string", "description": "Scope to the subtree rooted at this node id (inclusive)."}
                 },
