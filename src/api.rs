@@ -5,12 +5,15 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+mod http;
 #[cfg(test)]
 pub(crate) mod test_http;
+#[cfg(test)]
+pub(crate) mod test_https;
 
 // Large file/image transfers get two minutes, including headers, redirects,
-// and body reads. ureq keeps this absolute deadline on its response reader,
-// so activity (including a slow trickle) cannot restart the budget.
+// and body reads. The shared transport enforces the deadline below TLS
+// record processing and clamps each redirected connection to what remains.
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Errors surfaced by [`FigmaApi`] implementations.
@@ -169,7 +172,7 @@ pub(crate) fn error_from_status(status: u16, retry_after: Option<&str>, msg: Str
 pub struct UreqApi {
     token: String,
     base_url: String,
-    request_timeout: Duration,
+    http: http::Client,
 }
 
 impl UreqApi {
@@ -183,37 +186,37 @@ impl UreqApi {
         UreqApi {
             token,
             base_url,
-            request_timeout: HTTP_REQUEST_TIMEOUT,
+            http: http::Client::new(HTTP_REQUEST_TIMEOUT),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
+        self.http.timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tls_config(
+        mut self,
+        config: std::sync::Arc<ureq::rustls::ClientConfig>,
+    ) -> Self {
+        self.http.tls = config;
         self
     }
 
     fn get_json(&self, path: &str) -> Result<Value, ApiError> {
         let url = format!("{}{}", self.base_url, path);
-        match ureq::get(&url)
-            .timeout(self.request_timeout)
-            .set("X-Figma-Token", &self.token)
-            .call()
-        {
-            Ok(resp) => resp.into_json().map_err(|e| {
+        self.http
+            .get(&url, Some(&self.token))?
+            .into_json()
+            .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::TimedOut {
                     ApiError::Network(e.to_string())
                 } else {
                     ApiError::Parse(e.to_string())
                 }
-            }),
-            Err(ureq::Error::Status(status, resp)) => {
-                let retry = resp.header("Retry-After").map(str::to_string);
-                let msg = resp.into_string().unwrap_or_default();
-                Err(error_from_status(status, retry.as_deref(), msg))
-            }
-            Err(e) => Err(ApiError::Network(e.to_string())),
-        }
+            })
     }
 }
 
@@ -260,22 +263,17 @@ pub fn download_bytes(url: &str) -> Result<Vec<u8>, ApiError> {
 }
 
 fn download_bytes_with_timeout(url: &str, timeout: Duration) -> Result<Vec<u8>, ApiError> {
-    match ureq::get(url).timeout(timeout).call() {
-        Ok(resp) => {
-            let mut buf = Vec::new();
-            use std::io::Read;
-            resp.into_reader()
-                .read_to_end(&mut buf)
-                .map_err(|e| ApiError::Network(e.to_string()))?;
-            Ok(buf)
-        }
-        Err(ureq::Error::Status(status, resp)) => {
-            let retry = resp.header("Retry-After").map(str::to_string);
-            let msg = resp.into_string().unwrap_or_default();
-            Err(error_from_status(status, retry.as_deref(), msg))
-        }
-        Err(e) => Err(ApiError::Network(e.to_string())),
-    }
+    download_bytes_with_client(url, &http::Client::new(timeout))
+}
+
+fn download_bytes_with_client(url: &str, client: &http::Client) -> Result<Vec<u8>, ApiError> {
+    let resp = client.get(url, None)?;
+    let mut buf = Vec::new();
+    use std::io::Read;
+    resp.into_reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    Ok(buf)
 }
 
 /// Whether a `variables_local` failure means "this plan can't see
@@ -292,6 +290,189 @@ fn variables_local_is_gated(e: &ApiError) -> bool {
 mod tests {
     use super::*;
     use test_http::{Peer, RESPONSE_BOUND, Reply, TEST_TIMEOUT};
+
+    #[test]
+    fn tls_handshake_trickles_cannot_renew_the_request_deadline() {
+        for download in [false, true] {
+            let peer = test_https::TlsPeer::new(vec![test_https::Reply::HandshakeTrickle]);
+            let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+                .with_timeout(TEST_TIMEOUT);
+            let start = std::time::Instant::now();
+            let err = if download {
+                download_bytes_with_timeout(&peer.url, TEST_TIMEOUT).unwrap_err()
+            } else {
+                api.file("ABC123", false).unwrap_err()
+            };
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "TLS exceeded budget: {:?}",
+                start.elapsed()
+            );
+            assert!(matches!(err, ApiError::Network(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn encrypted_body_fragments_cannot_renew_the_request_deadline() {
+        for download in [false, true] {
+            let peer = test_https::TlsPeer::new(vec![test_https::Reply::EncryptedTrickle(
+                "HTTP/1.1 200 OK\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
+            )]);
+            let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+                .with_timeout(TEST_TIMEOUT)
+                .with_tls_config(test_https::client_config());
+            let start = std::time::Instant::now();
+            let err = if download {
+                download_bytes_with_client(&peer.url, &api.http).unwrap_err()
+            } else {
+                api.file("ABC123", false).unwrap_err()
+            };
+            // Prove a trusted handshake and HTTP headers completed: a
+            // certificate rejection must not masquerade as a timeout.
+            peer.requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|e| panic!("HTTPS request not received: {e}; client: {err:?}"));
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "encrypted body exceeded budget: {:?}",
+                start.elapsed()
+            );
+            assert!(matches!(err, ApiError::Network(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn redirected_connect_uses_the_remaining_request_budget() {
+        let budget = Duration::from_secs(1);
+        for download in [false, true] {
+            let blocked = test_http::StalledConnect::new();
+            let peer = Peer::new(vec![Reply::Redirect {
+                location: blocked.url.clone(),
+                after: Duration::from_millis(700),
+            }]);
+            let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+                .with_timeout(budget);
+            let start = std::time::Instant::now();
+            let err = if download {
+                download_bytes_with_timeout(&peer.url, budget).unwrap_err()
+            } else {
+                api.file("ABC123", false).unwrap_err()
+            };
+            assert!(
+                start.elapsed() < Duration::from_millis(1400),
+                "redirect exceeded budget: {:?}",
+                start.elapsed()
+            );
+            // Resetting even a one-second connect budget after this
+            // redirect would take 1.7s, beyond the assertion above.
+            assert!(start.elapsed() >= Duration::from_millis(900));
+            assert!(matches!(err, ApiError::Network(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn encrypted_error_body_timeout_preserves_retry_after() {
+        for download in [false, true] {
+            let peer = test_https::TlsPeer::new(vec![test_https::Reply::EncryptedTrickle(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 17\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
+            )]);
+            let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+                .with_timeout(TEST_TIMEOUT)
+                .with_tls_config(test_https::client_config());
+            let start = std::time::Instant::now();
+            let err = if download {
+                download_bytes_with_client(&peer.url, &api.http).unwrap_err()
+            } else {
+                api.file("ABC123", false).unwrap_err()
+            };
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(
+                matches!(err, ApiError::RateLimited { retry_after }
+                if retry_after == Duration::from_secs(17)),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn https_keeps_certificate_verification_and_successful_body_reads() {
+        for trusted in [false, true] {
+            let peer = test_https::TlsPeer::new(vec![test_https::Reply::Complete(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )]);
+            let mut api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+                .with_timeout(TEST_TIMEOUT);
+            if trusted {
+                api = api.with_tls_config(test_https::client_config());
+            }
+            match api.file("ABC123", false) {
+                Ok(value) => {
+                    assert!(trusted);
+                    assert_eq!(value, serde_json::json!({"ok":true}));
+                }
+                Err(ApiError::Network(message)) => {
+                    assert!(!trusted, "{message}");
+                    assert!(message.contains("certificate"), "{message}");
+                }
+                other => panic!("unexpected HTTPS result: {other:?}"),
+            }
+        }
+        let peer = test_https::TlsPeer::new(vec![test_https::Reply::Complete(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nPNG",
+        )]);
+        let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+            .with_timeout(TEST_TIMEOUT)
+            .with_tls_config(test_https::client_config());
+        assert_eq!(
+            download_bytes_with_client(&peer.url, &api.http).unwrap(),
+            b"PNG"
+        );
+        assert!(
+            !peer
+                .requests
+                .recv_timeout(RESPONSE_BOUND)
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("x-figma-token")
+        );
+    }
+
+    #[test]
+    fn relative_redirects_and_redirect_limits_are_preserved() {
+        let peer = Peer::new(vec![
+            Reply::Redirect {
+                location: "../redirected".into(),
+                after: Duration::ZERO,
+            },
+            Reply::Complete("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}"),
+        ]);
+        let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+            .with_timeout(TEST_TIMEOUT);
+        assert_eq!(api.file("ABC123", false).unwrap(), serde_json::json!({}));
+        let _ = peer.requests.recv_timeout(RESPONSE_BOUND).unwrap();
+        let redirected = peer.requests.recv_timeout(RESPONSE_BOUND).unwrap();
+        assert!(redirected.starts_with("GET /v1/redirected "));
+        assert!(
+            redirected
+                .to_ascii_lowercase()
+                .contains("x-figma-token: synthetic-token")
+        );
+
+        let peer = Peer::new(
+            (0..5)
+                .map(|_| Reply::Redirect {
+                    location: "/again".into(),
+                    after: Duration::ZERO,
+                })
+                .collect(),
+        );
+        let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+            .with_timeout(Duration::from_secs(2));
+        assert!(
+            matches!(api.file("ABC123", false), Err(ApiError::Network(message))
+            if message.contains("max redirects"))
+        );
+    }
 
     #[test]
     fn rest_withheld_headers_time_out() {

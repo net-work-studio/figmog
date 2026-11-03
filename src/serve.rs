@@ -1061,12 +1061,59 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"file\":{\"name\":\"Fixture\",\"last_touched_at\":\"t\"}}",
             ),
         ]);
+        let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+            .with_timeout(TEST_TIMEOUT);
+        assert_serve_recovers(
+            api,
+            &peer.requests,
+            "GET /v1/files/ABC123/meta ",
+            RESPONSE_BOUND,
+        );
+    }
+
+    #[test]
+    fn serve_resumes_after_fragmented_tls_handshake() {
+        assert_serve_recovers_from_tls(
+            crate::api::test_https::Reply::HandshakeTrickle,
+            "TLS handshake started",
+        );
+    }
+
+    #[test]
+    fn serve_resumes_after_fragmented_encrypted_body() {
+        assert_serve_recovers_from_tls(
+            crate::api::test_https::Reply::EncryptedTrickle(
+                "HTTP/1.1 200 OK\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
+            ),
+            "GET /v1/files/ABC123/meta ",
+        );
+    }
+
+    fn assert_serve_recovers_from_tls(reply: crate::api::test_https::Reply, first: &str) {
+        use crate::api::test_https;
+        let peer = test_https::TlsPeer::new(vec![
+            reply,
+            test_https::Reply::Complete(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"file\":{\"name\":\"Fixture\",\"last_touched_at\":\"t\"}}",
+            ),
+        ]);
+        let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+            .with_timeout(TEST_TIMEOUT)
+            .with_tls_config(test_https::client_config());
+        assert_serve_recovers(api, &peer.requests, first, Duration::from_secs(1));
+    }
+
+    fn assert_serve_recovers(
+        api: UreqApi,
+        requests: &mpsc::Receiver<String>,
+        first_prefix: &str,
+        response_bound: Duration,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
-        let url = peer.url.clone();
         let (tx, rx) = mpsc::channel();
         let (client, socket) = UnixStream::pair().unwrap();
-        client.set_read_timeout(Some(RESPONSE_BOUND)).unwrap();
+        client.set_read_timeout(Some(response_bound)).unwrap();
         socket.set_write_timeout(Some(RESPONSE_BOUND)).unwrap();
         let worker = std::thread::spawn(move || {
             let mut session =
@@ -1080,8 +1127,6 @@ mod tests {
             };
             let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
             registry.lock().unwrap().insert(1, socket);
-            let api =
-                UreqApi::with_base_url("synthetic-token".into(), url).with_timeout(TEST_TIMEOUT);
             serve_loop(
                 manager,
                 None,
@@ -1097,9 +1142,10 @@ mod tests {
         });
 
         // Queue a local request while the first meta poll is blocked on
-        // headers. Its response must arrive before the peer closes (4s).
-        let first = peer.requests.recv_timeout(Duration::from_secs(15)).unwrap();
-        assert!(first.starts_with("GET /v1/files/ABC123/meta "));
+        // transport. Its response must arrive before the peer closes
+        // its deliberately incomplete response/record (at least 3s).
+        let first = requests.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(first.starts_with(first_prefix), "{first}");
         let first_poll = Instant::now();
         let mut reader = BufReader::new(client);
         let request = |id| {
@@ -1122,11 +1168,11 @@ mod tests {
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
         assert_eq!(files[0]["key"], json!("ABC123"));
-        assert!(first_poll.elapsed() < RESPONSE_BOUND);
+        assert!(first_poll.elapsed() < response_bound);
 
         // The ordinary five-second failure backoff expires, and a new
         // HTTP poll succeeds. The same loop still answers local calls.
-        let next = peer.requests.recv_timeout(Duration::from_secs(8)).unwrap();
+        let next = requests.recv_timeout(Duration::from_secs(8)).unwrap();
         assert!(next.starts_with("GET /v1/files/ABC123/meta "));
         assert!(first_poll.elapsed() >= Duration::from_secs(5));
         tx.send(request(2)).unwrap();
