@@ -376,16 +376,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             no_upstream,
         } = &cli.cmd
         {
-            let parsed_args: Value = match args {
-                Some(raw) => {
-                    serde_json::from_str(raw).map_err(|e| format!("--args: invalid JSON: {e}"))?
-                }
-                None => json!({}),
-            };
-            // C1: route to the current mirror, exactly like direct mode's
-            // own `resolve_db` would — except `figmog_open`, whose `file`
-            // argument means "the file to open", not a routing hint (see
-            // `with_current_file`'s doc comment).
+            let parsed_args = call::parse_args(args.as_deref())?;
+            // Use current only after explicit file and URL inference,
+            // exactly like direct mode's `resolve_db` — except
+            // `figmog_open`, whose `file` argument means "the file to
+            // open", not a routing hint (see `with_current_file`).
             let parsed_args = if tool == "figmog_open" {
                 parsed_args
             } else {
@@ -614,9 +609,19 @@ fn note_ignored_upstream_flags(upstream: &str, no_upstream: bool) {
     }
 }
 
+/// Prefer an explicit `file` over a pasted node URL, matching serve's
+/// session routing. Validation of an explicit file ref happens when the
+/// chosen mirror is resolved; an invalid explicit ref never falls back.
+fn requested_file(args: &Value) -> Option<String> {
+    args.get("file")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| crate::dispatch::infer_file_from_node_ref(args))
+}
+
 /// Inject `.figmog/current`'s key as the routed `file` argument, when one
-/// is established and the call doesn't already carry an explicit `file`
-/// (review C1): without this, a socket-routed call carries no `file` at
+/// is established and neither an explicit `file` nor a node URL selects
+/// a file (review C1): without this, a socket-routed call carries no `file` at
 /// all, so serve answers from *its own* default session
 /// (`SessionManager::effective_default_key`) — which can silently diverge
 /// from the mirror `.figmog/current` (and thus direct mode) actually
@@ -639,11 +644,12 @@ fn note_ignored_upstream_flags(upstream: &str, no_upstream: bool) {
 /// fails direct, breaking the very byte-compatibility this routing exists
 /// to preserve (see `dispatch::cmd_as_tool_call`'s caller).
 fn with_current_file(mut args: Value) -> Result<Value, String> {
-    if let Some(obj) = args.as_object_mut() {
-        let has_file = obj.get("file").is_some_and(|v| !v.is_null());
-        if !has_file && let Some(key) = read_current_key()? {
-            obj.insert("file".to_string(), json!(key));
-        }
+    let has_file = requested_file(&args).is_some();
+    if let Some(obj) = args.as_object_mut()
+        && !has_file
+        && let Some(key) = read_current_key()?
+    {
+        obj.insert("file".to_string(), json!(key));
     }
     Ok(args)
 }
@@ -798,7 +804,22 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
         });
     }
 
-    let key = read_current_key()?.ok_or_else(|| no_mirror_msg(cli))?;
+    // A call's explicit file wins over URL inference; current is only a
+    // fallback. Reuse the read command's tool arguments so `id`, `under`,
+    // and `target` follow the same URL inference as the socket/server path.
+    // `figmog_open` keeps its separate file-to-open semantics.
+    let file = match &cli.cmd {
+        Cmd::Call { tool, args, .. } if tool != "figmog_open" => {
+            requested_file(&call::parse_args(args.as_deref())?)
+        }
+        cmd => cmd_as_tool_call(cmd).and_then(|(_, args)| requested_file(&args)),
+    };
+    let key = match file {
+        Some(file) => {
+            parse_file_ref(&file).ok_or_else(|| format!("not a Figma file key or URL: {file}"))?
+        }
+        None => read_current_key()?.ok_or_else(|| no_mirror_msg(cli))?,
+    };
     Ok(Db {
         path: db_path_for(&key)?,
         key: Some(key),
