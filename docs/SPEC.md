@@ -72,6 +72,25 @@ Two commands spend Figma's API budget deliberately and explicitly: `pull`
 store.rs` path independently (one opens a single store at a CLI-resolved
 path; the other opens one store per mirrored file) — see §5.
 
+**HTTP deadlines:** every Figma REST request and signed image download
+has a two-minute overall HTTP budget, covering response headers and the
+entire success or error body, including redirects. The same absolute
+deadline is enforced before each raw TLS socket read/write, including
+handshakes and fragmented encrypted records; a slow trickle cannot renew
+that budget. Redirects are followed explicitly, with each TCP connection
+limited to the smaller of 30 seconds and the remaining overall budget.
+These are per-request bounds, not a deadline for a whole pull
+or multi-image tool call; ureq's blocking DNS lookup cannot be interrupted
+by its HTTP deadline. Requests run inline in `serve`, so a stalled HTTP
+peer delays dispatch until its request times out, then normal serving
+and polling resume with the existing error/backoff handling.
+
+`webpki-roots` and `url`, already transitive ureq dependencies, are direct
+dependencies for this transport: the TLS wrapper uses the same Mozilla
+trust roots as ureq, and redirect handling needs standard relative-URL
+resolution. No TLS verification is disabled, and no worker is abandoned
+after a timeout.
+
 ## 3. Data model
 
 Every mirrored record is keyed by an [`Id`](../src/model.rs) and carries a

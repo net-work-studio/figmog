@@ -17,6 +17,12 @@ fold = { git = "https://github.com/flowercomputers/bogkit", rev = "20f2ca50d5d06
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
+# Already transitive through ureq. Needed to retain its Mozilla trust roots
+# when wrapping TLS socket I/O with our absolute request deadline.
+webpki-roots = "0.26"
+# Already transitive through ureq. Resolve relative redirects while
+# recomputing each connection's share of the overall request budget.
+url = "2"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 # Native credential storage avoids plaintext token files; rpassword reads
