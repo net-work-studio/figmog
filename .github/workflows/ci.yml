@@ -4,16 +4,24 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        runner: [blacksmith-4vcpu-ubuntu-2404, blacksmith-6vcpu-macos-15]
+        # Keep the existing Ubuntu check name for PRs and main pushes.
+        # macOS runs only on demand through Actions → CI → Run workflow.
+        runner:
+          - ${{ github.event_name == 'workflow_dispatch' && 'blacksmith-6vcpu-macos-15' || 'blacksmith-4vcpu-ubuntu-2404' }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
@@ -42,3 +50,8 @@ jobs:
 
       - name: cargo fmt --check
         run: cargo fmt --check
+
+      - name: cargo doc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

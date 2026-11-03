@@ -268,8 +268,18 @@ That needs a Rust toolchain and network access, since the build fetches
 CI and release jobs run on Blacksmith, using Ubuntu 24.04 for Linux and
 macOS 15 on Apple Silicon for both macOS targets.
 
-CI runs tests on pushes to `main` and on pull requests. It does not build
-release tarballs. The separate [Release workflow](https://github.com/net-work-studio/figmog/actions/workflows/release.yml)
+CI runs tests, Clippy, formatting, and documentation checks on Ubuntu for
+pushes to `main` and pull requests. The same checks run on macOS only
+on demand via Actions → CI → Run workflow;
+select a branch to check macOS compatibility before merging when needed.
+From the GitHub CLI, run:
+
+```sh
+gh workflow run ci.yml --repo net-work-studio/figmog --ref main
+```
+
+New commits cancel older CI runs for the same event and ref. CI does not
+build release tarballs. The separate [Release workflow](https://github.com/net-work-studio/figmog/actions/workflows/release.yml)
 starts when a `v*` tag is pushed, or when a maintainer runs it manually.
 Merging a PR, bumping `Cargo.toml`, or having an existing tag does not start
 a release by itself.
