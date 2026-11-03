@@ -147,7 +147,7 @@ pub(super) fn do_pull(
 }
 
 /// Validate both responses before opening or changing a mirror. Fresh
-/// replacement holds ownership outside the directory being removed.
+/// replacement preserves an in-store ownership anchor while clearing contents.
 fn apply_pull(
     db: &Db,
     resp: &Value,

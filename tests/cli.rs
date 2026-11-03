@@ -314,11 +314,7 @@ fn pull_fresh_resets_file_imports_config_and_same_version_caches() {
     let mut replacement = common::fixture_other();
     replacement["version"] = serde_json::json!("100");
     std::fs::write(&input, replacement.to_string()).unwrap();
-    std::fs::write(
-        db_path.join("sentinel"),
-        "fresh replaces the whole directory",
-    )
-    .unwrap();
+    std::fs::write(db_path.join("sentinel"), "fresh removes prior contents").unwrap();
     let out = common::command()
         .args(["pull", "--fresh", "--from-file"])
         .arg(&input)

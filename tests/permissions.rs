@@ -235,6 +235,16 @@ fn existing_store_under_non_writable_parent_needs_no_sibling_lock_provisioning()
     if sibling.exists() {
         std::fs::remove_file(&sibling).unwrap();
     }
+    std::fs::set_permissions(
+        work.path().join("fixture.json"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!(
+        mode(&work.path().join("fixture.json")) & 0o444,
+        0o444,
+        "input fixture must be readable after dropping root privileges"
+    );
 
     // Seed as an older binary would, without provisioning a sibling lock.
     // Also support root CI runners: test the actual DAC failure as uid 65534.
@@ -254,7 +264,7 @@ fn existing_store_under_non_writable_parent_needs_no_sibling_lock_provisioning()
             }
         }
     }
-    std::fs::write(db.join("sentinel"), "preserve on rejected reset").unwrap();
+    std::fs::write(db.join("sentinel"), "remove on successful reset").unwrap();
     own_tree(&db, uid, gid);
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
     // Restore permissions even if a regression assertion unwinds.
@@ -265,6 +275,8 @@ fn existing_store_under_non_writable_parent_needs_no_sibling_lock_provisioning()
         }
     }
     let _restore = RestoreParent(&parent);
+    let directory_before = std::fs::metadata(&db).unwrap();
+    let anchor_before = std::fs::metadata(db.join(".figmog-lock")).unwrap();
 
     // Avoid requiring traversal through a root-owned build directory when
     // dropping privileges in CI. All input and executable fixtures are local.
@@ -293,17 +305,17 @@ fn existing_store_under_non_writable_parent_needs_no_sibling_lock_provisioning()
     let output = run(&["serve", "--no-socket", "--no-watch", "--no-upstream"]);
     assert!(output.status.success(), "{output:?}");
     let output = run(&["pull", "--fresh", "--from-file", "fixture.json"]);
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert!(
-        error["error"]
-            .as_str()
-            .unwrap()
-            .contains("checking reset parent")
+    assert!(output.status.success(), "{output:?}");
+    assert!(!db.join("sentinel").exists());
+    let directory_after = std::fs::metadata(&db).unwrap();
+    let anchor_after = std::fs::metadata(db.join(".figmog-lock")).unwrap();
+    assert_eq!(
+        (directory_before.dev(), directory_before.ino()),
+        (directory_after.dev(), directory_after.ino())
     );
     assert_eq!(
-        std::fs::read_to_string(db.join("sentinel")).unwrap(),
-        "preserve on rejected reset"
+        (anchor_before.dev(), anchor_before.ino()),
+        (anchor_after.dev(), anchor_after.ino())
     );
     let output = run(&["status", "--no-socket"]);
     assert!(output.status.success(), "{output:?}");

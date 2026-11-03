@@ -208,25 +208,25 @@ bundled into `pull --fresh`'s whole-store wipe too.
 
 **Fresh replacement:** file and optional variables responses are validated
 before opening or resetting the mirror. Every direct CLI and server-session
-store handle holds a persistent external lock until the store closes. Locks
-live in `/tmp/figmog-locks-<effective-uid>/`, protected with mode 0700 and the
-same ownership, ancestor, and symlink checks as mirrors. Each filename is
-the FNV-1a 64 hash of the verified absolute store path's raw Unix bytes, plus
-`.lock`. The location is independent of `HOME` and `TMPDIR`; aliases of a
-store resolve to the same lock. Hash collisions only serialize unrelated
-stores. Ordinary opens, pulls, and server sessions need no write access to
-the database's parent and no administrator-provisioned sibling file. Fresh
-replacement still requires parent write access, checked before deletion so
-an unwritable parent does not leave the writable database emptied. A fresh
-pull first opens the existing store, checking fjall's own writer lock too,
-then keeps the external
-lock while closing, deleting, and rebuilding the database directory. A
-running serve therefore makes a valid fresh pull fail with a clean ownership
-error; invalid input leaves the existing mirror untouched. Deletion errors
-are reported. External lock files are never deleted during normal operation:
-their stable inodes coordinate replacement, and their OS locks release when
-the handles close or processes exit. This does not promise recovery from an
-unopenable/corrupt store or rollback after filesystem failures during reset.
+store handle holds a lock on the permanent `.figmog-lock` file inside the
+database directory until the store closes. The anchor is a regular file,
+owned by the current user, mode 0600 on creation, with no hard links or
+symlink following; its directory is protected with mode 0700. Every view of
+the physical mirror opens the same anchor, including case/Unicode-equivalent
+spellings and filesystem namespaces with isolated `/tmp` directories.
+A fresh pull first opens the existing store, checking fjall's own writer
+lock too, then holds the anchor while closing, clearing every other entry,
+and reopening the store. Both the directory and anchor stay linked; resets
+preserve the anchor by filesystem identity, not filename spelling. Symlinks
+among the discarded entries are unlinked without following their targets.
+Reads, ordinary pulls, server sessions, and fresh resets need no write access
+to the database's parent and no administrator-provisioned sibling file.
+A running serve makes a valid fresh pull fail with a clean ownership error;
+invalid input leaves the existing mirror untouched. Deletion errors are
+reported. Never remove the anchor while a process owns the mirror; its OS
+lock releases when the handle closes or the process exits. This does not
+promise recovery from an unopenable/corrupt store or rollback after filesystem
+failures during reset.
 
 ## 6. `figmog serve`: multi-file sessions, watch, MCP
 
