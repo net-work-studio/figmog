@@ -598,15 +598,23 @@ omitted `--equals` tests pointer existence, while explicit `--equals null`
 matches only present null values; the matching MCP tool distinguishes an
 absent `equals` key from `"equals": null` the same way (`figmog call`'s own
 `--args` payload is passed through untouched). Both direct
-and socket reads select an explicit `call` argument `file` first (key or
-Figma URL), then the file inferred from a node URL in `id`, `under`, or
-`target`, then `.figmog/current`. An explicit `--db` takes precedence
+and socket reads for per-file local tools select an explicit `call`
+argument `file` first (key or Figma URL), then the file inferred from a
+node URL in `id`, `under`, or `target`, then `.figmog/current`.
+An explicit `--db` takes precedence
 over all of these. Current is injected as a routed `file` argument only
-when neither the call nor a node URL selects a file;
-`figmog call figmog_open` is the exception, since there `file` names the
+when no explicit non-null `file` was supplied and no node URL selects a
+file; `figmog call figmog_open` is the exception, since there `file` names the
 file to open rather than a routing target. A routed `figmog_status`
 result drops the `upstream` field serve splices in, keeping the CLI's
 output byte-identical on both paths.
+
+Desktop-proxy calls do not interpret `file` or node URLs as mirror
+selectors (§8): direct mode opens the current mirror (or an explicit
+`--db`), while serve forwards desktop calls without resolving a mirror.
+Both paths forward uncached. Explicit
+non-null `file` values, including objects and numbers, pass through to
+upstream unchanged.
 
 `pull` is a writer and always opens the store directly. While `serve`
 holds that store, `pull`'s lock error additionally says "or ask the

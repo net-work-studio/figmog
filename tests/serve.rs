@@ -598,6 +598,14 @@ fn spawn_fake_upstream(
     results: Vec<Value>,
     handshake_each_call: bool,
 ) -> (String, std::thread::JoinHandle<()>) {
+    spawn_fake_upstream_with_args(results, handshake_each_call, json!({"nodeId": "1:2"}))
+}
+
+fn spawn_fake_upstream_with_args(
+    results: Vec<Value>,
+    handshake_each_call: bool,
+    expected_args: Value,
+) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let handle = std::thread::spawn(move || {
@@ -678,7 +686,7 @@ fn spawn_fake_upstream(
                     let call: Value = serde_json::from_str(&body).unwrap();
                     assert_eq!(call["method"], "tools/call");
                     assert_eq!(call["params"]["name"], "get_code");
-                    assert_eq!(call["params"]["arguments"], json!({"nodeId": "1:2"}));
+                    assert_eq!(call["params"]["arguments"], expected_args);
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": request_id(&body),
@@ -1359,6 +1367,92 @@ fn routing_fixture() -> tempfile::TempDir {
         ],
         ROUTING_A,
     )
+}
+
+fn assert_proxy_cli_preserves_args_and_current_mirror(args: Value, socket: bool) {
+    let dir = routing_fixture();
+    let result =
+        json!({"content": [{"type": "text", "text": r#"{"code":"CODE_HERE"}"#}], "isError": false});
+    let (address, upstream) = spawn_fake_upstream_with_args(vec![result], false, args.clone());
+    let server = if socket {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("figmog"));
+        command
+            .args([
+                "serve",
+                "--no-watch",
+                "--upstream",
+                &address,
+                ROUTING_A,
+                ROUTING_B,
+            ])
+            .current_dir(dir.path())
+            .env("FIGMA_TOKEN", "");
+        let (guard, mut stdin, rx) = spawn_child(command);
+        handshake(&mut stdin, &rx);
+        Some((guard, stdin))
+    } else {
+        None
+    };
+    // Holding B's store makes an accidental direct-mode selection of B
+    // fail on its writer lock. A desktop argument must not select B.
+    let other_db = dir.path().join(".figmog").join(ROUTING_B).join("db");
+    let other_store = (!socket).then(|| figmog::open_store!(&other_db));
+    let mut command = common::command();
+    command
+        .args(["call", "get_code", "--args", &args.to_string()])
+        .current_dir(dir.path());
+    if !socket {
+        command.args(["--no-socket", "--upstream", &address]);
+    }
+    let output = command.assert().success();
+    let mut value: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    if !socket {
+        value = serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap();
+    }
+    assert_eq!(value["code"], "CODE_HERE");
+    upstream.join().unwrap();
+    if let Some((mut guard, stdin)) = server {
+        drop(stdin);
+        assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    }
+    drop(other_store);
+
+    // Desktop calls remain uncached, regardless of their file arguments.
+    for key in [ROUTING_A, ROUTING_B] {
+        let db = dir.path().join(".figmog").join(key).join("db");
+        let store = figmog::open_store!(&db);
+        store.rtx(|(_, _, _, _, _, _, _, cache, _, _)| {
+            assert!(cache.iter().next().is_none(), "desktop cache for {key}");
+        });
+    }
+}
+
+#[test]
+fn direct_proxy_cli_ignores_file_and_node_url_mirror_hints() {
+    for args in [
+        json!({"nodeId": "1:1", "file": ROUTING_B}),
+        json!({"id": format!("https://www.figma.com/design/{ROUTING_B}/Fixture?node-id=1-1")}),
+    ] {
+        assert_proxy_cli_preserves_args_and_current_mirror(args, false);
+    }
+}
+
+#[test]
+fn direct_proxy_cli_does_not_validate_file_arguments_as_figma_refs() {
+    assert_proxy_cli_preserves_args_and_current_mirror(
+        json!({"nodeId": "1:1", "file": "not-a-figma-ref"}),
+        false,
+    );
+}
+
+#[test]
+fn socket_proxy_cli_preserves_structured_and_numeric_file_arguments() {
+    for file in [json!({"path": "synthetic-file"}), json!(42)] {
+        assert_proxy_cli_preserves_args_and_current_mirror(
+            json!({"nodeId": "1:1", "file": file}),
+            true,
+        );
+    }
 }
 
 /// Both files contain 1:1, so a successful read must also prove which

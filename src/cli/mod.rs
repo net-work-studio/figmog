@@ -620,9 +620,9 @@ fn requested_file(args: &Value) -> Option<String> {
 }
 
 /// Inject `.figmog/current`'s key as the routed `file` argument, when one
-/// is established and neither an explicit `file` nor a node URL selects
-/// a file (review C1): without this, a socket-routed call carries no `file` at
-/// all, so serve answers from *its own* default session
+/// is established, no explicit non-null `file` was supplied, and no node
+/// URL selects a file (review C1): without this, a socket-routed call
+/// carries no `file` at all, so serve answers from *its own* default session
 /// (`SessionManager::effective_default_key`) — which can silently diverge
 /// from the mirror `.figmog/current` (and thus direct mode) actually
 /// targets, or, in the zero-startup-file quick-start shape, doesn't exist
@@ -644,9 +644,14 @@ fn requested_file(args: &Value) -> Option<String> {
 /// fails direct, breaking the very byte-compatibility this routing exists
 /// to preserve (see `dispatch::cmd_as_tool_call`'s caller).
 fn with_current_file(mut args: Value) -> Result<Value, String> {
-    let has_file = requested_file(&args).is_some();
+    // Upstream schemas are passed through verbatim: a non-string `file`
+    // may be meaningful to the desktop tool, even though it cannot select
+    // a local mirror. Preserve it independently of URL inference.
+    let has_file = args.get("file").is_some_and(|value| !value.is_null());
+    let url_file = crate::dispatch::infer_file_from_node_ref(&args);
     if let Some(obj) = args.as_object_mut()
         && !has_file
+        && url_file.is_none()
         && let Some(key) = read_current_key()?
     {
         obj.insert("file".to_string(), json!(key));
@@ -804,12 +809,17 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
         });
     }
 
-    // A call's explicit file wins over URL inference; current is only a
-    // fallback. Reuse the read command's tool arguments so `id`, `under`,
-    // and `target` follow the same URL inference as the socket/server path.
-    // `figmog_open` keeps its separate file-to-open semantics.
+    // A per-file local call's explicit file wins over URL inference;
+    // current is only a fallback. Desktop calls keep the current mirror
+    // regardless of their arguments, since they cannot select the
+    // desktop's open file. Reuse the read command's tool arguments so
+    // `id`, `under`, and `target` follow the socket/server URL inference.
+    // `figmog_open` and `figmog_files` keep their management semantics.
     let file = match &cli.cmd {
-        Cmd::Call { tool, args, .. } if tool != "figmog_open" => {
+        Cmd::Call { tool, args, .. }
+            if crate::proxy::is_local_tool(tool)
+                && !matches!(tool.as_str(), "figmog_open" | "figmog_files") =>
+        {
             requested_file(&call::parse_args(args.as_deref())?)
         }
         cmd => cmd_as_tool_call(cmd).and_then(|(_, args)| requested_file(&args)),
@@ -1116,7 +1126,15 @@ mod tests {
     fn with_current_file_never_overrides_an_explicit_non_null_file() {
         // No filesystem dependency either way: an explicit `file` short-
         // circuits before `read_current_key` is ever consulted.
-        let args = with_current_file(json!({"id": "1:1", "file": "explicitkey12345678"})).unwrap();
-        assert_eq!(args["file"], json!("explicitkey12345678"));
+        for file in [
+            json!("explicitkey12345678"),
+            json!({"path": "synthetic-file"}),
+            json!(42),
+            json!(false),
+            json!([]),
+        ] {
+            let args = json!({"id": "1:1", "file": file});
+            assert_eq!(with_current_file(args.clone()).unwrap(), args);
+        }
     }
 }
