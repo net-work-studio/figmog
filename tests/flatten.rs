@@ -3,7 +3,7 @@
 mod common;
 
 use figmog::flatten::flatten_file;
-use figmog::model::{ComponentRec, Id, Rec};
+use figmog::model::{ComponentRec, Id, NodeRec, Rec};
 
 fn node(recs: &[(Id, Rec)], id: &str) -> figmog::model::NodeRec {
     recs.iter()
@@ -90,6 +90,81 @@ fn raw_is_canonical_and_childless() {
     assert_eq!(raw["name"], "Hero");
     // canonical: re-serializing the parsed value reproduces the string
     assert_eq!(serde_json::to_string(&raw).unwrap(), hero.raw);
+}
+
+#[test]
+fn nested_nodes_preserve_childless_record_bytes() {
+    let response = serde_json::json!({
+        "name": "Nested", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
+        "document": {
+            "id": "doc", "type": "DOCUMENT", "children": [{
+                "id": "page", "type": "CANVAS", "children": [{
+                    "id": "frame", "type": "FRAME", "paddingLeft": 12,
+                    "boundVariables": {"paddingLeft": {"type": "VARIABLE_ALIAS", "id": "var:frame"}},
+                    "custom": {"children": [{"value": null}], "enabled": false},
+                    "children": [
+                        {"name": "No id", "children": [{"id": "skipped"}]},
+                        {"id": "leaf", "type": "FRAME", "fills": [{
+                            "color": {"r": 0.5},
+                            "boundVariables": {"color": {"type": "VARIABLE_ALIAS", "id": "var:leaf"}}
+                        }], "children": []}
+                    ]
+                }]
+            }]
+        }
+    });
+    // Literal childless JSON and metadata specify the stored records without
+    // reproducing the flattening algorithm. Only the top-level children field
+    // is stripped; a same-named field in custom data must survive unchanged.
+    let expected = [
+        (
+            "doc", "DOCUMENT", None, 0, "doc",
+            r#"{"id":"doc","type":"DOCUMENT"}"#,
+            vec![],
+        ),
+        (
+            "page", "CANVAS", Some("doc"), 0, "page",
+            r#"{"id":"page","type":"CANVAS"}"#,
+            vec![],
+        ),
+        (
+            "frame", "FRAME", Some("page"), 0, "page",
+            r#"{"boundVariables":{"paddingLeft":{"id":"var:frame","type":"VARIABLE_ALIAS"}},"custom":{"children":[{"value":null}],"enabled":false},"id":"frame","paddingLeft":12,"type":"FRAME"}"#,
+            vec![("/paddingLeft".to_string(), "var:frame".to_string())],
+        ),
+        (
+            "leaf", "FRAME", Some("frame"), 1, "page",
+            r#"{"fills":[{"boundVariables":{"color":{"id":"var:leaf","type":"VARIABLE_ALIAS"}},"color":{"r":0.5}}],"id":"leaf","type":"FRAME"}"#,
+            vec![("/fills/0/color".to_string(), "var:leaf".to_string())],
+        ),
+    ]
+    .map(|(id, node_type, parent_id, child_index, page_id, raw, bound_variables)| {
+        (
+            Id::Node(id.to_string()),
+            Rec::Node(NodeRec {
+                id: id.to_string(),
+                parent_id: parent_id.map(str::to_string),
+                child_index,
+                page_id: page_id.to_string(),
+                node_type: node_type.to_string(),
+                name: String::new(),
+                visible: true,
+                text: None,
+                component_id: None,
+                component_properties: vec![],
+                property_definitions: None,
+                style_refs: vec![],
+                bound_variables,
+                abs_bounds: None,
+                raw: raw.to_string(),
+            }),
+        )
+    });
+    let out = flatten_file(&response).unwrap();
+    assert_eq!(
+        postcard::to_allocvec(&out.recs).unwrap(),
+        postcard::to_allocvec(expected.as_slice()).unwrap(),
+    );
 }
 
 #[test]
