@@ -884,8 +884,9 @@ const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Q
 /// reaches fold, which may write journal data while opening the store.
 /// `open` receives the verified absolute path and must use it for the store.
 /// Unsafe ancestor ownership or write permissions fail before the callback.
-/// The returned handle also holds a sibling `.figmog-lock` file for its
+/// The returned handle also holds an external per-user lock file for its
 /// entire lifetime, so `pull --fresh` cannot unlink a live writer's store.
+/// Ordinary opens need no write access to the store's parent directory.
 ///
 /// `open_store!` (via `fold::stream::Stream::new`) panics rather than
 /// returning a `Result` when the underlying store can't be opened — most

@@ -208,15 +208,24 @@ bundled into `pull --fresh`'s whole-store wipe too.
 
 **Fresh replacement:** file and optional variables responses are validated
 before opening or resetting the mirror. Every direct CLI and server-session
-store handle holds a persistent sibling lock (`db.figmog-lock` for a
-directory named `db`) until the store closes. A fresh pull first opens the
-existing store, checking fjall's own writer lock too, then keeps the sibling
+store handle holds a persistent external lock until the store closes. Locks
+live in `/tmp/figmog-locks-<effective-uid>/`, protected with mode 0700 and the
+same ownership, ancestor, and symlink checks as mirrors. Each filename is
+the FNV-1a 64 hash of the verified absolute store path's raw Unix bytes, plus
+`.lock`. The location is independent of `HOME` and `TMPDIR`; aliases of a
+store resolve to the same lock. Hash collisions only serialize unrelated
+stores. Ordinary opens, pulls, and server sessions need no write access to
+the database's parent and no administrator-provisioned sibling file. Fresh
+replacement still requires parent write access, checked before deletion so
+an unwritable parent does not leave the writable database emptied. A fresh
+pull first opens the existing store, checking fjall's own writer lock too,
+then keeps the external
 lock while closing, deleting, and rebuilding the database directory. A
 running serve therefore makes a valid fresh pull fail with a clean ownership
 error; invalid input leaves the existing mirror untouched. Deletion errors
-are reported. The sibling lock file is never deleted during normal operation:
-its stable inode coordinates replacement, and its OS lock releases when the
-handle closes or the process exits. This does not promise recovery from an
+are reported. External lock files are never deleted during normal operation:
+their stable inodes coordinate replacement, and their OS locks release when
+the handles close or processes exit. This does not promise recovery from an
 unopenable/corrupt store or rollback after filesystem failures during reset.
 
 ## 6. `figmog serve`: multi-file sessions, watch, MCP

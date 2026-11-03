@@ -218,3 +218,98 @@ fn serve_without_a_socket_also_protects_an_explicit_store() {
     assert_eq!(mode(&db), 0o700);
     assert!(!work.path().join(".figmog").exists());
 }
+
+#[test]
+fn existing_store_under_non_writable_parent_needs_no_sibling_lock_provisioning() {
+    use std::os::unix::fs::{MetadataExt, chown};
+    use std::os::unix::process::CommandExt;
+
+    // A private temp directory belonging to a root test runner can otherwise
+    // hide the fixture from the unprivileged child before it reaches figmog.
+    let work = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let parent = work.path().join("installed");
+    let db = parent.join("db");
+    pull(work.path(), &["--db", db.to_str().unwrap()]);
+    let sibling = parent.join("db.figmog-lock");
+    if sibling.exists() {
+        std::fs::remove_file(&sibling).unwrap();
+    }
+
+    // Seed as an older binary would, without provisioning a sibling lock.
+    // Also support root CI runners: test the actual DAC failure as uid 65534.
+    // SAFETY: geteuid/getegid have no preconditions or side effects.
+    let (uid, gid) = unsafe {
+        if libc::geteuid() == 0 {
+            (65534, 65534)
+        } else {
+            (libc::geteuid(), libc::getegid())
+        }
+    };
+    fn own_tree(path: &Path, uid: u32, gid: u32) {
+        chown(path, Some(uid), Some(gid)).unwrap();
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                own_tree(&entry.unwrap().path(), uid, gid);
+            }
+        }
+    }
+    std::fs::write(db.join("sentinel"), "preserve on rejected reset").unwrap();
+    own_tree(&db, uid, gid);
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Restore permissions even if a regression assertion unwinds.
+    struct RestoreParent<'a>(&'a Path);
+    impl Drop for RestoreParent<'_> {
+        fn drop(&mut self) {
+            std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let _restore = RestoreParent(&parent);
+
+    // Avoid requiring traversal through a root-owned build directory when
+    // dropping privileges in CI. All input and executable fixtures are local.
+    let binary = work.path().join("figmog");
+    std::fs::copy(assert_cmd::cargo::cargo_bin!("figmog"), &binary).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(&binary)
+            .uid(uid)
+            .gid(gid)
+            .env("FIGMA_TOKEN", "")
+            .args(args)
+            .arg("--db")
+            .arg(&db)
+            .current_dir(work.path())
+            .output()
+            .unwrap()
+    };
+    assert_ne!(uid, 0, "the permission regression must run unprivileged");
+    let status = run(&["status", "--no-socket"]);
+    assert!(status.status.success(), "{status:?}");
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["name"], "Synthetic");
+    let output = run(&["pull", "--from-file", "fixture.json"]);
+    assert!(output.status.success(), "{output:?}");
+    let output = run(&["serve", "--no-socket", "--no-watch", "--no-upstream"]);
+    assert!(output.status.success(), "{output:?}");
+    let output = run(&["pull", "--fresh", "--from-file", "fixture.json"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("checking reset parent")
+    );
+    assert_eq!(
+        std::fs::read_to_string(db.join("sentinel")).unwrap(),
+        "preserve on rejected reset"
+    );
+    let output = run(&["status", "--no-socket"]);
+    assert!(output.status.success(), "{output:?}");
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["name"], "Synthetic");
+    assert!(!sibling.exists());
+    assert_eq!(mode(&parent), 0o555);
+    assert_eq!(std::fs::metadata(&db).unwrap().uid(), uid);
+}

@@ -286,7 +286,6 @@ mod tests {
         let error = apply_pull(&db, &file, Some(&invalid_vars), true, false).unwrap_err();
         assert!(error.to_string().contains("variableCollections"));
         assert!(!db.path.exists(), "invalid data must not create a store");
-        assert!(!dir.path().join("db.figmog-lock").exists());
 
         apply_pull(&db, &file, None, false, true).unwrap();
         let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();

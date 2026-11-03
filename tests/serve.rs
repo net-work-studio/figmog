@@ -531,7 +531,7 @@ fn fresh_pull_preserves_a_store_owned_by_serve() {
     drop(stdin);
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 
-    // The persistent sidecar must release ownership when serve exits.
+    // The persistent external lock must release ownership when serve exits.
     std::fs::write(&input, common::fixture_other().to_string()).unwrap();
     common::command()
         .args(["pull", "--fresh", "--from-file"])
