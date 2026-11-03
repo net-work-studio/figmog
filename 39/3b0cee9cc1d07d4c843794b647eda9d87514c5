@@ -13,6 +13,7 @@ tests/serve.rs
   s_f6d5557475eaae::t_4f151bdf82f364 1383-1398,1417,1420
 docs/SPEC.md
   s_f6d5557475eaae::t_59e9f09367667f 601-605
+  s_f6d5557475eaae::t_90a43a930f5e14 600
 src/cli/mod.rs
   s_f6d5557475eaae::t_3ee12f7e9d7c6f 381-383,623-624
   s_f6d5557475eaae::t_632f3b78229477 648-652
