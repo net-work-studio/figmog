@@ -1,0 +1,45 @@
+docs/SPEC.md
+  s_351bdf39e4ec7c::t_18f321ef7e7814 66,134,257
+  s_351bdf39e4ec7c::t_9e256285d7107a 18,108,133,183,256,399,419-444,495
+  s_351bdf39e4ec7c::t_c4f34acfe4789b 135-136,258-259
+src/cli/mod.rs
+  s_351bdf39e4ec7c::t_9e256285d7107a 6,77
+src/upstream.rs
+  s_351bdf39e4ec7c::t_9e256285d7107a 4-6,9
+src/cache.rs
+  s_351bdf39e4ec7c::t_9e256285d7107a 1,3-7
+src/mcp.rs
+  s_351bdf39e4ec7c::t_9e256285d7107a 10-13,254
+tests/serve.rs
+  s_351bdf39e4ec7c::t_9e256285d7107a 310-311,541,543-544,595-600,604-630,677-681,685,702,704-705,747-758,766-832
+  s_351bdf39e4ec7c::t_28d9e0fef2b1b6 833
+src/cli/call.rs
+  s_351bdf39e4ec7c::t_8f9d25ddfade55 126
+  s_351bdf39e4ec7c::t_c9609789002cfa 1,81,90,137
+src/proxy.rs
+  s_351bdf39e4ec7c::t_c9609789002cfa 1-3,16-17,70-74,76-78,84,195-211,215,218,223,225-235,242
+src/sessions.rs
+  s_351bdf39e4ec7c::t_c9609789002cfa 4,23-26,68-70
+src/cli/socket.rs
+  s_351bdf39e4ec7c::t_c9609789002cfa 80,300
+src/serve.rs
+  s_351bdf39e4ec7c::t_c9609789002cfa 18-20,22-26,451,1017-1018,1022
+README.md
+  s_351bdf39e4ec7c::t_9e256285d7107a 203-204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1d87bded4f509d220a20d13190cf4cd16a046aae",
+  "prompts": {},
+  "sessions": {
+    "s_351bdf39e4ec7c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a38c-fe23-79f0-a970-18a1b1bbf840",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
