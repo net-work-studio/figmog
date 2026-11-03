@@ -1,10 +1,8 @@
 //! Multi-file serve (spec §14): each mirrored Figma file is a [`FileSession`]
 //! — its own store, opened at its own `open_store!` call site, with
 //! everything that touches it captured in boxed closures (`dispatch`,
-//! `pull`, `watermark`, `proxy_cache` — four, not three; see
-//! [`FileSession`]'s own doc comment for why a fourth closure was
-//! necessary beyond spec §14's literal three). This generalizes the
-//! single-store logic `serve.rs` used to inline directly: the store's
+//! `pull`, `proxy_cache`, `images`). This generalizes the single-store
+//! logic `serve.rs` used to inline directly: the store's
 //! pipeline type contains fn items and can't be named (see the doc
 //! comment on `store.rs`'s `open_store!` macro and the identical note in
 //! `cli::dispatch`), so a session's closures share the one open handle via
@@ -70,13 +68,12 @@ type DispatchFn = Box<dyn FnMut(&str, &Value) -> Result<ToolOutput, String>>;
 /// user-facing override of their own and so just let the mirror's already-
 /// stored setting (if any) keep driving the request — see [`do_pull`].
 type PullFn = Box<dyn FnMut(bool) -> Result<PullOutcome, PullError>>;
-type WatermarkFn = Box<dyn FnMut() -> Option<String>>;
 type ProxyCacheFn = Box<
     dyn FnMut(&mut crate::upstream::HttpUpstream, &str, &Value) -> Result<(Value, bool), String>,
 >;
 /// `figmog_images` (v0.0.2 spec §5): `(ids, format, scale) ->` every
-/// requested render/fill, cache-first. A fifth closure beyond `dispatch`/
-/// `pull`/`watermark`/`proxy_cache`, for the same structural reason as
+/// requested render/fill, cache-first. A fourth closure beyond `dispatch`/
+/// `pull`/`proxy_cache`, for the same structural reason as
 /// `proxy_cache` — it needs this session's own store (for caching) *and*
 /// the network (for misses), so it can't be answered by `dispatch`
 /// (read-only) or folded into `pull` (a different fetch/cache shape
@@ -91,11 +88,10 @@ type ImagesFn =
 /// and [`SessionManager::resolve`]'s auto-open) and returns the *typed*
 /// [`PullError`] on failure — not a plain string — so every call site can
 /// apply the same Retry-After-aware backoff `cli::pull_failure_wait`
-/// gives the CLI's own `pull`/`watch` commands (see [`do_pull`], the
-/// shared helper every one of those call sites goes through); `watermark`
-/// reads the stored `FileMeta.last_modified`, used to (re)seed `watcher`
-/// after every successful pull. `mirrored`: whether this session has ever
-/// completed a successful pull — `false` right after a *failed* auto-open
+/// gives the CLI's own `pull` command (see [`do_pull`], the
+/// shared helper every one of those call sites goes through).
+/// `mirrored`: whether this session has ever completed a successful pull
+/// — `false` right after a *failed* auto-open
 /// (a session that pushed into `SessionManager::sessions` before its pull
 /// could succeed must not be treated as "already mirrored" forever, or a
 /// transient failure would silently poison the key into permanent empty
@@ -104,23 +100,21 @@ type ImagesFn =
 /// loop can drive them directly, exactly as the old single-session loop
 /// drove its own local variables.
 ///
-/// `proxy_cache` is a fourth closure beyond spec §14's literal list,
-/// needed for the same structural reason as the other three: a proxied
-/// (upstream, non-`figmog_*`) call's version-keyed cache lives in *this*
+/// `proxy_cache` is another closure for the same structural reason: a
+/// proxied (upstream, non-`figmog_*`) call's version-keyed cache lives in *this*
 /// session's own `proxy_cache` table (spec §12/§14: "each session's store
 /// carries its own `proxy_cache`"), and the store can only ever be touched
 /// from behind one of these closures. `serve.rs` calls it only for the
 /// *default* session — see its own doc comment for why proxied calls
 /// route through the default rather than any per-call `file` argument.
 ///
-/// `images` (v0.0.2 spec §5) is a fifth — see [`ImagesFn`]'s own doc
+/// `images` (v0.0.2 spec §5) is a fourth — see [`ImagesFn`]'s own doc
 /// comment.
 pub(crate) struct FileSession {
     pub(crate) key: String,
     pub(crate) name: String,
     pub(crate) dispatch: DispatchFn,
     pub(crate) pull: PullFn,
-    pub(crate) watermark: WatermarkFn,
     pub(crate) proxy_cache: ProxyCacheFn,
     pub(crate) images: ImagesFn,
     pub(crate) watcher: Watcher,
@@ -129,14 +123,13 @@ pub(crate) struct FileSession {
 }
 
 impl FileSession {
-    /// Reseed `watcher`/`backoff`/`mirrored` after a successful pull from
-    /// any call site (startup, `figmog_sync`, `figmog_open`, a watch
+    /// Acknowledge pending metadata and reset backoff after a successful
+    /// pull from any call site (startup, `figmog_sync`, `figmog_open`, a watch
     /// tick, auto-open) — the same bookkeeping every one of those paths
     /// used to repeat inline.
     pub(crate) fn note_pull_success(&mut self, outcome: &PullOutcome) {
         self.name = outcome.name.clone();
-        let seen = (self.watermark)();
-        self.watcher = Watcher::new(seen);
+        self.watcher.note_pull_success();
         self.backoff = BACKOFF_START;
         self.mirrored = true;
     }
@@ -144,11 +137,10 @@ impl FileSession {
 
 /// Run `session.pull()` and apply the same failure-backoff discipline
 /// `cli::pull_failure_wait` gives (Retry-After honored for a rate limit,
-/// exponential otherwise, capped): on success, reseed the session via
-/// [`FileSession::note_pull_success`]; on failure, reset `watcher` to the
-/// last successfully-synced watermark (so the same change is re-detected
-/// next time) and advance
-/// `backoff`, returning the resulting wait alongside the stringified
+/// exponential otherwise, capped): on success, acknowledge the pending
+/// metadata via [`FileSession::note_pull_success`]; on failure, leave
+/// the change pending for retry and advance `backoff`, returning the
+/// resulting wait alongside the stringified
 /// error so every call site (watch tick, `figmog_sync`, `figmog_open`,
 /// `SessionManager::resolve`'s auto-open) can push its own `next_deadline`
 /// out by the same amount — spec §14 "backoff discipline per session".
@@ -166,7 +158,6 @@ pub(crate) fn do_pull(
             Ok(outcome)
         }
         Err(e) => {
-            session.watcher = Watcher::new((session.watermark)());
             let wait = pull_failure_wait(&e, &mut session.backoff, interval);
             Err((e.to_string(), wait))
         }
@@ -210,7 +201,19 @@ pub(crate) fn open_session_at(
     api_token: Option<&str>,
     pull_now: bool,
 ) -> Result<FileSession, String> {
-    let token = api_token.map(str::to_string);
+    let api = api_token.map(|token| Rc::new(UreqApi::new(token.to_string())) as Rc<dyn FigmaApi>);
+    open_session_with_api(path, key, network_key, api, pull_now)
+}
+
+/// Shared construction with the REST boundary supplied explicitly, so
+/// session bookkeeping and real store syncs can be exercised offline.
+pub(crate) fn open_session_with_api(
+    path: PathBuf,
+    key: String,
+    network_key: Option<&str>,
+    api: Option<Rc<dyn FigmaApi>>,
+    pull_now: bool,
+) -> Result<FileSession, String> {
     let network_key = network_key.map(str::to_string);
     let st = Rc::new(RefCell::new(open_store_checked(&path, |path| {
         crate::open_store!(path)
@@ -225,13 +228,13 @@ pub(crate) fn open_session_at(
     let pull_closure = {
         let st = st.clone();
         let network_key = network_key.clone();
-        let token = token.clone();
+        let api = api.clone();
         move |geometry_override: bool| -> Result<PullOutcome, PullError> {
             let key = network_key.clone().ok_or_else(|| {
                 PullError::from("no file key: pass a file key or figma.com URL".to_string())
             })?;
-            let token = token
-                .clone()
+            let api = api
+                .as_ref()
                 .ok_or_else(|| PullError::from(crate::auth::missing_token("network pulls")))?;
             // Sticky vector geometry (spec §4): what this pull requests
             // combines its own override (`figmog_open`'s `geometry` arg,
@@ -243,7 +246,6 @@ pub(crate) fn open_session_at(
                 .borrow()
                 .rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config));
             let request_geometry = store::effective_geometry(geometry_override, stored_geometry);
-            let api = UreqApi::new(token);
             let resp = api.file(&key, request_geometry)?;
             // Opportunistic Enterprise variables sync (spec §12): `Ok(None)`
             // on non-Enterprise plans is not an error — v1 behavior
@@ -309,9 +311,6 @@ pub(crate) fn open_session_at(
         .borrow()
         .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.name.clone()))
         .unwrap_or_else(|| key.clone());
-    let seen = st
-        .borrow()
-        .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.last_modified.clone()));
 
     let dispatch: DispatchFn = {
         let st = st.clone();
@@ -332,15 +331,6 @@ pub(crate) fn open_session_at(
     };
 
     let pull: PullFn = Box::new(pull_closure);
-
-    let watermark: WatermarkFn = {
-        let st = st.clone();
-        Box::new(move || {
-            st.borrow().rtx(|(_, _, _, _, _, _, meta, _, _, _)| {
-                meta.get(&0).map(|m| m.last_modified.clone())
-            })
-        })
-    };
 
     let proxy_cache: ProxyCacheFn = {
         let st = st.clone();
@@ -366,13 +356,13 @@ pub(crate) fn open_session_at(
     // this session's own concrete `open_store!` handle — see
     // `images.rs`'s own doc comment for why that split exists at all) then
     // `resolve` (network + cache-write) dance, with the session's api
-    // token and network key exactly like `pull_closure` above. `api: None`
+    // API and network key exactly like `pull_closure` above. `api: None`
     // when no token was configured at all — `resolve` itself still serves
     // every cache hit for free in that case (see its own doc comment).
     let images: ImagesFn = {
         let st = st.clone();
         let network_key = network_key.clone();
-        let token = token.clone();
+        let api = api.clone();
         Box::new(move |ids: &[String], format: &str, scale: Option<f64>| {
             let key = network_key
                 .clone()
@@ -383,12 +373,11 @@ pub(crate) fn open_session_at(
             let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images)| {
                 crate::images::scan(&nodes, &meta, &images, &node_ids, format, scale_m)
             });
-            let api = token.clone().map(UreqApi::new);
             let download = crate::api::download_bytes;
             Ok(crate::images::resolve(
                 &mut st,
                 scanned,
-                api.as_ref().map(|a| a as &dyn crate::api::FigmaApi),
+                api.as_deref(),
                 &download,
                 &key,
                 &node_ids,
@@ -403,10 +392,9 @@ pub(crate) fn open_session_at(
         name,
         dispatch,
         pull,
-        watermark,
         proxy_cache,
         images,
-        watcher: Watcher::new(seen),
+        watcher: Watcher::new(None),
         backoff: BACKOFF_START,
         mirrored: meta_present,
     })
@@ -568,7 +556,271 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::ApiError;
+    use crate::api::{ApiError, FileMetaResp};
+    use crate::watch::Tick;
+    use std::cell::Cell;
+
+    const FULL_TIMESTAMP: &str = "2026-01-01T12:00:00Z";
+    const META_TIMESTAMP: &str = "2026-01-01T12:00:00.123Z";
+
+    /// Synthetic REST boundary; sessions still flatten and sync a real store.
+    struct ScriptedApi {
+        metadata: RefCell<String>,
+        file_calls: Cell<usize>,
+        version: Cell<u32>,
+        fail_next: RefCell<Option<ApiError>>,
+        edit_during_fetch: RefCell<Option<&'static str>>,
+    }
+
+    impl ScriptedApi {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                metadata: RefCell::new(META_TIMESTAMP.into()),
+                file_calls: Cell::new(0),
+                version: Cell::new(1),
+                fail_next: RefCell::new(None),
+                edit_during_fetch: RefCell::new(None),
+            })
+        }
+
+        fn edit(&self, timestamp: &str) {
+            *self.metadata.borrow_mut() = timestamp.into();
+            self.version.set(self.version.get() + 1);
+        }
+    }
+
+    impl FigmaApi for ScriptedApi {
+        fn file_meta(&self, _key: &str) -> Result<FileMetaResp, ApiError> {
+            Ok(FileMetaResp {
+                name: "Synthetic".into(),
+                last_touched_at: self.metadata.borrow().clone(),
+            })
+        }
+
+        fn file(&self, _key: &str, _geometry: bool) -> Result<Value, ApiError> {
+            self.file_calls.set(self.file_calls.get() + 1);
+            if let Some(error) = self.fail_next.borrow_mut().take() {
+                return Err(error);
+            }
+            let version = self.version.get().to_string();
+            if let Some(timestamp) = self.edit_during_fetch.borrow_mut().take() {
+                self.edit(timestamp);
+            }
+            Ok(json!({
+                "name": "Synthetic", "version": version, "lastModified": FULL_TIMESTAMP,
+                "document": {"id": "0:0", "name": "Synthetic", "type": "DOCUMENT"}
+            }))
+        }
+    }
+
+    #[test]
+    fn unchanged_session_converges_despite_different_endpoint_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = ScriptedApi::new();
+        let mut session = open_session_with_api(
+            dir.path().join("db"),
+            "ABC123".into(),
+            Some("ABC123"),
+            Some(api.clone()),
+            true,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Changed
+        ));
+        do_pull(&mut session, Duration::from_secs(10), false).unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                session.watcher.tick(&*api, "ABC123"),
+                Tick::Unchanged
+            ));
+        }
+        assert_eq!(
+            api.file_calls.get(),
+            2,
+            "startup plus one reconciliation pull"
+        );
+    }
+
+    #[test]
+    fn failed_watch_pulls_retry_with_backoff_then_converge() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = ScriptedApi::new();
+        let mut session = open_session_with_api(
+            dir.path().join("db"),
+            "ABC123".into(),
+            Some("ABC123"),
+            Some(api.clone()),
+            true,
+        )
+        .unwrap();
+        let interval = Duration::from_secs(1);
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Changed
+        ));
+        do_pull(&mut session, interval, false).unwrap();
+
+        api.edit("2026-01-01T12:00:00.456Z");
+        for (error, seconds) in [
+            (ApiError::Network("down".into()), 5),
+            (ApiError::Network("down".into()), 10),
+            (
+                ApiError::RateLimited {
+                    retry_after: Duration::from_secs(90),
+                },
+                90,
+            ),
+        ] {
+            *api.fail_next.borrow_mut() = Some(error);
+            assert!(matches!(
+                session.watcher.tick(&*api, "ABC123"),
+                Tick::Changed
+            ));
+            let (_, wait) = do_pull(&mut session, interval, false).unwrap_err();
+            assert_eq!(wait, Duration::from_secs(seconds));
+        }
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Changed
+        ));
+        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "2");
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Unchanged
+        ));
+
+        api.edit("2026-01-01T12:00:00.789Z");
+        *api.fail_next.borrow_mut() = Some(ApiError::Network("down again".into()));
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Changed
+        ));
+        let (_, wait) = do_pull(&mut session, interval, false).unwrap_err();
+        assert_eq!(wait, Duration::from_secs(5), "success resets pull backoff");
+    }
+
+    #[test]
+    fn edits_during_watch_and_explicit_sync_are_pulled_on_the_next_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = ScriptedApi::new();
+        let mut session = open_session_with_api(
+            dir.path().join("db"),
+            "ABC123".into(),
+            Some("ABC123"),
+            Some(api.clone()),
+            true,
+        )
+        .unwrap();
+        let interval = Duration::from_secs(1);
+
+        // The watch pull can only certify the metadata polled before its
+        // fetch; an edit during that fetch belongs to the next pull.
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Changed
+        ));
+        *api.edit_during_fetch.borrow_mut() = Some("2026-01-01T12:00:00.456Z");
+        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "1");
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Changed
+        ));
+        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "2");
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Unchanged
+        ));
+
+        // An explicit sync without a pending observation retains the
+        // previous watermark, including across multiple explicit pulls.
+        for _ in 0..2 {
+            do_pull(&mut session, interval, false).unwrap();
+            assert!(matches!(
+                session.watcher.tick(&*api, "ABC123"),
+                Tick::Unchanged
+            ));
+        }
+        *api.edit_during_fetch.borrow_mut() = Some("2026-01-01T12:00:00.789Z");
+        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "2");
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Changed
+        ));
+        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "3");
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Unchanged
+        ));
+    }
+
+    #[test]
+    fn reopened_mirror_and_first_explicit_pull_need_metadata_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let api = ScriptedApi::new();
+        // Even matching raw strings from different endpoints aren't a
+        // persisted metadata acknowledgment when the session reopens.
+        *api.metadata.borrow_mut() = FULL_TIMESTAMP.into();
+        let session = open_session_with_api(
+            path.clone(),
+            "ABC123".into(),
+            Some("ABC123"),
+            Some(api.clone()),
+            true,
+        )
+        .unwrap();
+        drop(session);
+        let mut session = open_session_with_api(
+            path,
+            "ABC123".into(),
+            Some("ABC123"),
+            Some(api.clone()),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Changed
+        ));
+        do_pull(&mut session, Duration::from_secs(1), false).unwrap();
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Unchanged
+        ));
+
+        let mut session = open_session_with_api(
+            dir.path().join("new"),
+            "ABC123".into(),
+            Some("ABC123"),
+            Some(api.clone()),
+            false,
+        )
+        .unwrap();
+        *api.edit_during_fetch.borrow_mut() = Some(META_TIMESTAMP);
+        assert_eq!(
+            do_pull(&mut session, Duration::from_secs(1), false)
+                .unwrap()
+                .version,
+            "1"
+        );
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Changed
+        ));
+        assert_eq!(
+            do_pull(&mut session, Duration::from_secs(1), false)
+                .unwrap()
+                .version,
+            "2"
+        );
+        assert!(matches!(
+            session.watcher.tick(&*api, "ABC123"),
+            Tick::Unchanged
+        ));
+    }
 
     /// A scripted stand-in for a [`FileSession`] built without ever
     /// touching a real store — proves [`SessionManager`]'s routing/dedupe
@@ -594,7 +846,6 @@ mod tests {
         mirrored: bool,
         script: impl Fn(u32) -> Result<PullOutcome, PullError> + 'static,
     ) -> FileSession {
-        let watermark: WatermarkFn = Box::new(|| Some("t".to_string()));
         let pull: PullFn = {
             let pull_calls = pull_calls.clone();
             Box::new(move |_geometry: bool| {
@@ -608,7 +859,6 @@ mod tests {
             name: "Scripted".to_string(),
             dispatch: Box::new(|_name, _args| Ok(ToolOutput::Json(json!({})))),
             pull,
-            watermark,
             proxy_cache: Box::new(|_upstream, name, _args| {
                 Err(format!(
                     "scripted session has no store to proxy through: {name}"
@@ -908,7 +1158,6 @@ mod tests {
             name: "Scripted".to_string(),
             dispatch: Box::new(|_name, _args| Ok(ToolOutput::Json(json!({})))),
             pull,
-            watermark: Box::new(|| Some("t".to_string())),
             proxy_cache: Box::new(|_upstream, name, _args| {
                 Err(format!(
                     "scripted session has no store to proxy through: {name}"
