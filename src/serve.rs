@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::api::UreqApi;
+use crate::api::{FigmaApi, UreqApi};
 use crate::dispatch;
 use crate::ident::parse_file_ref;
 use crate::mcp::{self, FnHandler, ToolOutput};
@@ -510,7 +510,7 @@ pub(crate) fn run_serve(
         });
     }
 
-    let (mut manager, track_current) = build_sessions(
+    let (manager, track_current) = build_sessions(
         db_override,
         &files,
         no_watch,
@@ -523,7 +523,7 @@ pub(crate) fn run_serve(
     // desktop server at startup means local-only tools for the process's
     // whole life (build design §12). Global, not per-session (see this
     // module's doc comment).
-    let mut upstream: Option<HttpUpstream> = if no_upstream {
+    let upstream: Option<HttpUpstream> = if no_upstream {
         None
     } else {
         let mut client = HttpUpstream::new(upstream_url);
@@ -543,14 +543,6 @@ pub(crate) fn run_serve(
         "unreachable"
     };
 
-    let (tools, dropped) = match &upstream {
-        Some(u) => proxy::merge_registry(dispatch::tool_registry(), u.tools()),
-        None => (dispatch::tool_registry(), Vec::new()),
-    };
-    for name in &dropped {
-        eprintln!("figmog: dropping upstream tool named like a local tool: {name}");
-    }
-
     eprintln!(
         "{} serving {} file(s) (watch {}, upstream {upstream_status}, socket {})",
         mcp::SERVER_NAME,
@@ -558,6 +550,42 @@ pub(crate) fn run_serve(
         if no_watch { "off" } else { "on" },
         if no_socket { "off" } else { "on" }
     );
+
+    let watch_api = token.map(UreqApi::new);
+    serve_loop(
+        manager,
+        upstream,
+        upstream_status,
+        no_watch,
+        track_current,
+        interval_dur,
+        rx,
+        registry,
+        watch_api.as_ref().map(|api| api as &dyn FigmaApi),
+    )
+}
+
+/// Dispatch and polling after startup. The HTTP boundary is injected so
+/// stalled-peer recovery can exercise this same loop with a local peer.
+#[allow(clippy::too_many_arguments)]
+fn serve_loop(
+    mut manager: SessionManager,
+    mut upstream: Option<HttpUpstream>,
+    upstream_status: &'static str,
+    no_watch: bool,
+    track_current: bool,
+    interval_dur: Duration,
+    rx: mpsc::Receiver<Incoming>,
+    registry: ConnRegistry,
+    watch_api: Option<&dyn FigmaApi>,
+) -> Result<(), String> {
+    let (tools, dropped) = match &upstream {
+        Some(u) => proxy::merge_registry(dispatch::tool_registry(), u.tools()),
+        None => (dispatch::tool_registry(), Vec::new()),
+    };
+    for name in &dropped {
+        eprintln!("figmog: dropping upstream tool named like a local tool: {name}");
+    }
 
     let mut next_session_idx: usize = 0;
     let mut next_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
@@ -591,6 +619,7 @@ pub(crate) fn run_serve(
                 &mut next_session_idx,
                 interval_dur,
                 track_current,
+                watch_api,
             );
             continue;
         };
@@ -774,6 +803,7 @@ fn watch_tick(
     next_idx: &mut usize,
     interval: Duration,
     track_current: bool,
+    api: Option<&dyn FigmaApi>,
 ) -> Instant {
     if manager.sessions.is_empty() {
         return Instant::now() + interval;
@@ -784,7 +814,7 @@ fn watch_tick(
     // `mirrored: false`, rather than evicting it — no idle eviction, spec
     // §14 non-goal; a later `resolve()` retries it). Either way, without a
     // token there's nothing safe to poll this tick.
-    let Some(token) = manager.token.clone() else {
+    let Some(api) = api else {
         return Instant::now() + interval;
     };
 
@@ -793,11 +823,10 @@ fn watch_tick(
     *next_idx = (*next_idx + 1) % n;
     let deadline = tick_deadline(interval, n);
 
-    let api = UreqApi::new(token);
     let session = &mut manager.sessions[idx];
     let key = session.key.clone();
 
-    match session.watcher.tick(&api, &key) {
+    match session.watcher.tick(api, &key) {
         Tick::Unchanged => Instant::now() + deadline,
         Tick::Wait { after } => Instant::now() + after,
         // A background watch tick carries no user-facing geometry flag
@@ -1020,8 +1049,95 @@ fn handle_tool_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::test_http::{Peer, RESPONSE_BOUND, Reply, TEST_TIMEOUT};
     use crate::mcp::ToolDef;
     use crate::upstream::FakeUpstream;
+
+    #[test]
+    fn serve_answers_local_requests_and_resumes_polling_after_http_timeout() {
+        let peer = Peer::new(vec![
+            Reply::Stall(""),
+            Reply::Complete(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"file\":{\"name\":\"Fixture\",\"last_touched_at\":\"t\"}}",
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let url = peer.url.clone();
+        let (tx, rx) = mpsc::channel();
+        let (client, socket) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(RESPONSE_BOUND)).unwrap();
+        socket.set_write_timeout(Some(RESPONSE_BOUND)).unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut session =
+                sessions::open_session_at(db.clone(), "ABC123".into(), None, None, false).unwrap();
+            session.watcher = crate::watch::Watcher::new(Some("t".into()));
+            let manager = SessionManager {
+                sessions: vec![session],
+                root: db,
+                token: Some("synthetic-token".into()),
+                default_key: Some("ABC123".into()),
+            };
+            let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+            registry.lock().unwrap().insert(1, socket);
+            let api =
+                UreqApi::with_base_url("synthetic-token".into(), url).with_timeout(TEST_TIMEOUT);
+            serve_loop(
+                manager,
+                None,
+                "disabled",
+                false,
+                false,
+                Duration::from_secs(2),
+                rx,
+                registry,
+                Some(&api),
+            )
+            .unwrap();
+        });
+
+        // Queue a local request while the first meta poll is blocked on
+        // headers. Its response must arrive before the peer closes (4s).
+        let first = peer.requests.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(first.starts_with("GET /v1/files/ABC123/meta "));
+        let first_poll = Instant::now();
+        let mut reader = BufReader::new(client);
+        let request = |id| {
+            Incoming::Socket(
+                1,
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "figmog_files", "arguments": {}}
+                })
+                .to_string(),
+            )
+        };
+        tx.send(request(1)).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], json!(1));
+        assert_eq!(response["result"]["isError"], json!(false));
+        let files: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(files[0]["key"], json!("ABC123"));
+        assert!(first_poll.elapsed() < RESPONSE_BOUND);
+
+        // The ordinary five-second failure backoff expires, and a new
+        // HTTP poll succeeds. The same loop still answers local calls.
+        let next = peer.requests.recv_timeout(Duration::from_secs(8)).unwrap();
+        assert!(next.starts_with("GET /v1/files/ABC123/meta "));
+        assert!(first_poll.elapsed() >= Duration::from_secs(5));
+        tx.send(request(2)).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], json!(2));
+        assert_eq!(response["result"]["isError"], json!(false));
+        tx.send(Incoming::StdinClosed).unwrap();
+        worker.join().unwrap();
+    }
 
     fn local_registry() -> Vec<ToolDef> {
         dispatch::tool_registry()

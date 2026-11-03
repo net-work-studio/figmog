@@ -5,6 +5,14 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+#[cfg(test)]
+pub(crate) mod test_http;
+
+// Large file/image transfers get two minutes, including headers, redirects,
+// and body reads. ureq keeps this absolute deadline on its response reader,
+// so activity (including a slow trickle) cannot restart the budget.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Errors surfaced by [`FigmaApi`] implementations.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -107,12 +115,10 @@ pub(crate) fn parse_meta_response(v: &Value) -> Result<FileMetaResp, ApiError> {
 
 /// `GET /v1/files/:key` request path, with `?geometry=paths` appended when
 /// `geometry` (v0.0.2 spec §4). Split out from [`UreqApi::file`] as a pure
-/// function so the query-parameter construction is unit-testable without a
-/// live HTTP call — `UreqApi::with_base_url` has no fixture server to
-/// assert against in this crate's test suite, so this is the seam that
-/// proves the request shape (spec §4's stickiness tests lean on this for
-/// the "what would this pull have asked for" half; the from-file path
-/// never issues the request at all).
+/// function so query-parameter construction can be checked without an
+/// HTTP request (spec §4's stickiness tests lean on this for the "what
+/// would this pull have asked for" half; the from-file path never issues
+/// the request at all).
 pub(crate) fn file_url(key: &str, geometry: bool) -> String {
     if geometry {
         format!("/v1/files/{key}?geometry=paths")
@@ -163,6 +169,7 @@ pub(crate) fn error_from_status(status: u16, retry_after: Option<&str>, msg: Str
 pub struct UreqApi {
     token: String,
     base_url: String,
+    request_timeout: Duration,
 }
 
 impl UreqApi {
@@ -173,13 +180,33 @@ impl UreqApi {
     }
     /// `base_url` override for tests / proxies.
     pub fn with_base_url(token: String, base_url: String) -> Self {
-        UreqApi { token, base_url }
+        UreqApi {
+            token,
+            base_url,
+            request_timeout: HTTP_REQUEST_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     fn get_json(&self, path: &str) -> Result<Value, ApiError> {
         let url = format!("{}{}", self.base_url, path);
-        match ureq::get(&url).set("X-Figma-Token", &self.token).call() {
-            Ok(resp) => resp.into_json().map_err(|e| ApiError::Parse(e.to_string())),
+        match ureq::get(&url)
+            .timeout(self.request_timeout)
+            .set("X-Figma-Token", &self.token)
+            .call()
+        {
+            Ok(resp) => resp.into_json().map_err(|e| {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    ApiError::Network(e.to_string())
+                } else {
+                    ApiError::Parse(e.to_string())
+                }
+            }),
             Err(ureq::Error::Status(status, resp)) => {
                 let retry = resp.header("Retry-After").map(str::to_string);
                 let msg = resp.into_string().unwrap_or_default();
@@ -229,7 +256,11 @@ impl FigmaApi for UreqApi {
 /// `&dyn Fn(&str) -> Result<Vec<u8>, ApiError>`, injectable by tests
 /// without a `FigmaApi` implementor standing in for a plain HTTP GET.
 pub fn download_bytes(url: &str) -> Result<Vec<u8>, ApiError> {
-    match ureq::get(url).call() {
+    download_bytes_with_timeout(url, HTTP_REQUEST_TIMEOUT)
+}
+
+fn download_bytes_with_timeout(url: &str, timeout: Duration) -> Result<Vec<u8>, ApiError> {
+    match ureq::get(url).timeout(timeout).call() {
         Ok(resp) => {
             let mut buf = Vec::new();
             use std::io::Read;
@@ -260,6 +291,177 @@ fn variables_local_is_gated(e: &ApiError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_http::{Peer, RESPONSE_BOUND, Reply, TEST_TIMEOUT};
+
+    #[test]
+    fn rest_withheld_headers_time_out() {
+        let peer = Peer::new(vec![Reply::Stall("")]);
+        let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+            .with_timeout(TEST_TIMEOUT);
+        let start = std::time::Instant::now();
+        let result = api.file("ABC123", false);
+        assert!(
+            start.elapsed() < RESPONSE_BOUND,
+            "stalled headers exceeded budget"
+        );
+        assert!(matches!(result, Err(ApiError::Network(_))), "{result:?}");
+    }
+
+    #[test]
+    fn rest_stalled_success_body_is_a_network_error() {
+        let peer = Peer::new(vec![Reply::Stall(
+            "HTTP/1.1 200 OK\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n{",
+        )]);
+        let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+            .with_timeout(TEST_TIMEOUT);
+        let start = std::time::Instant::now();
+        let result = api.file("ABC123", false);
+        assert!(
+            start.elapsed() < RESPONSE_BOUND,
+            "stalled body exceeded budget"
+        );
+        assert!(matches!(result, Err(ApiError::Network(_))), "{result:?}");
+    }
+
+    #[test]
+    fn image_stalled_body_times_out() {
+        let peer = Peer::new(vec![Reply::Stall(
+            "HTTP/1.1 200 OK\r\nContent-Length: 10000\r\nConnection: close\r\n\r\nPNG",
+        )]);
+        let start = std::time::Instant::now();
+        let result = download_bytes_with_timeout(&peer.url, TEST_TIMEOUT);
+        assert!(
+            start.elapsed() < RESPONSE_BOUND,
+            "image body exceeded budget"
+        );
+        assert!(matches!(result, Err(ApiError::Network(_))), "{result:?}");
+    }
+
+    #[test]
+    fn image_withheld_headers_time_out() {
+        let peer = Peer::new(vec![Reply::Stall("")]);
+        let start = std::time::Instant::now();
+        let result = download_bytes_with_timeout(&peer.url, TEST_TIMEOUT);
+        assert!(start.elapsed() < RESPONSE_BOUND);
+        assert!(matches!(result, Err(ApiError::Network(_))), "{result:?}");
+    }
+
+    #[test]
+    fn slow_trickles_cannot_renew_rest_or_image_deadlines() {
+        for download in [false, true] {
+            let peer = Peer::new(vec![Reply::Trickle(
+                "HTTP/1.1 200 OK\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
+            )]);
+            let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+                .with_timeout(TEST_TIMEOUT);
+            let start = std::time::Instant::now();
+            let result = if download {
+                download_bytes_with_timeout(&peer.url, TEST_TIMEOUT).map(|_| ())
+            } else {
+                api.file("ABC123", false).map(|_| ())
+            };
+            assert!(
+                start.elapsed() < RESPONSE_BOUND,
+                "trickle renewed the budget"
+            );
+            assert!(matches!(result, Err(ApiError::Network(_))), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn stalled_error_bodies_preserve_status_and_retry_after() {
+        for download in [false, true] {
+            for (response, status) in [
+                (
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 17\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
+                    429,
+                ),
+                (
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
+                    403,
+                ),
+                (
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
+                    500,
+                ),
+            ] {
+                let peer = Peer::new(vec![Reply::Stall(response)]);
+                let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+                    .with_timeout(TEST_TIMEOUT);
+                let start = std::time::Instant::now();
+                let err = if download {
+                    download_bytes_with_timeout(&peer.url, TEST_TIMEOUT).unwrap_err()
+                } else {
+                    api.file("ABC123", false).unwrap_err()
+                };
+                assert!(
+                    start.elapsed() < RESPONSE_BOUND,
+                    "error body exceeded budget"
+                );
+                match status {
+                    429 => assert!(matches!(err, ApiError::RateLimited { retry_after }
+                        if retry_after == Duration::from_secs(17))),
+                    403 => assert!(matches!(err, ApiError::Auth)),
+                    500 => assert!(matches!(err, ApiError::Http { status: 500, .. })),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trickling_error_bodies_also_keep_the_overall_deadline() {
+        for download in [false, true] {
+            let peer = Peer::new(vec![Reply::Trickle(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 19\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
+            )]);
+            let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+                .with_timeout(TEST_TIMEOUT);
+            let start = std::time::Instant::now();
+            let err = if download {
+                download_bytes_with_timeout(&peer.url, TEST_TIMEOUT).unwrap_err()
+            } else {
+                api.file("ABC123", false).unwrap_err()
+            };
+            assert!(start.elapsed() < RESPONSE_BOUND);
+            assert!(matches!(err, ApiError::RateLimited { retry_after }
+                if retry_after == Duration::from_secs(19)));
+        }
+    }
+
+    #[test]
+    fn completed_responses_keep_json_bytes_and_auth_behavior() {
+        let peer = Peer::new(vec![Reply::Complete(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"file\":{\"name\":\"Fixture\",\"last_touched_at\":\"t\"}}",
+        )]);
+        let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+            .with_timeout(TEST_TIMEOUT);
+        assert_eq!(api.file_meta("ABC123").unwrap().name, "Fixture");
+        let request = peer.requests.recv_timeout(RESPONSE_BOUND).unwrap();
+        assert!(request.starts_with("GET /v1/files/ABC123/meta "));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-figma-token: synthetic-token")
+        );
+
+        let peer = Peer::new(vec![Reply::Complete(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nPNG",
+        )]);
+        assert_eq!(download_bytes(&peer.url).unwrap(), b"PNG");
+        let request = peer.requests.recv_timeout(RESPONSE_BOUND).unwrap();
+        assert!(!request.to_ascii_lowercase().contains("x-figma-token"));
+    }
+
+    #[test]
+    fn malformed_json_stays_a_parse_error() {
+        let peer = Peer::new(vec![Reply::Complete(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nnot json",
+        )]);
+        let api = UreqApi::with_base_url("synthetic-token".into(), peer.url.clone())
+            .with_timeout(TEST_TIMEOUT);
+        assert!(matches!(api.file("ABC123", false), Err(ApiError::Parse(_))));
+    }
 
     #[test]
     fn parses_meta_envelope() {
