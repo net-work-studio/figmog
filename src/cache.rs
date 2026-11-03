@@ -1,11 +1,10 @@
-//! Version-keyed proxy response cache (spec §12).
+//! Legacy version-keyed proxy response cache, retained for store compatibility.
 //!
-//! An upstream `get_*`/`list_*` call whose args carry an explicit node id
-//! is cacheable: key it by `hash(tool, canonical args)`, tag the row with
-//! the file version it was fetched at, and only serve it back while that
-//! version is still current. `store::stale_cache_ids` /
-//! `store::evict_stale_cache` handle eviction when the version moves on;
-//! this module owns key hashing and the read/write helpers.
+//! Desktop calls no longer use these helpers: a mirror's version cannot prove
+//! the upstream's active file identity or freshness. The frozen record/sink
+//! layout and eviction helpers still support stores containing older rows.
+//! Any future caller must establish authoritative upstream context before
+//! using cached responses; matching a mirror version alone is insufficient.
 
 use fold::pipeline::terminal::TableReader;
 use fold::pipeline::{Keyed, Push};

@@ -3,7 +3,7 @@
 //!
 //! Split into `pull` (pull/do_pull/`PullError`/`.figmog/current` helpers),
 //! `read` (the read-only query commands), and `call` (`tools`/`call`/
-//! `import-variables`, the cached-proxy CLI parity surface). This module
+//! `import-variables`, the desktop-proxy CLI parity surface). This module
 //! keeps the clap types, top-level dispatch, `run`, and the store-opening/
 //! JSON-writing helpers every submodule shares.
 
@@ -74,7 +74,7 @@ enum Cmd {
     },
     /// MCP stdio server: `figmog_*` tools over the local mirror, with the
     /// sync loop built in (one process owns the store), plus (unless
-    /// `--no-upstream`) a cached proxy to Figma's native desktop MCP
+    /// `--no-upstream`) an uncached proxy to Figma's native desktop MCP
     /// server — figmog is the only Figma MCP an agent needs to connect.
     Serve {
         /// File keys or figma.com URLs to mirror at startup — zero or

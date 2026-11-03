@@ -1,13 +1,12 @@
 //! Client for Figma's native desktop MCP server (streamable HTTP).
 //!
-//! This is figmog's half of the "cached proxy" design in build design §12:
 //! figmog probes the local Figma desktop app's Dev Mode MCP server
-//! (`http://127.0.0.1:3845/mcp` by default) at startup, forwards calls it
-//! doesn't handle itself, and — per §12's cache rules, implemented
-//! elsewhere — caches `get_*`/`list_*` responses keyed by file version.
+//! (`http://127.0.0.1:3845/mcp` by default) at startup and forwards calls
+//! it doesn't handle itself. Desktop responses are not cached: this interface
+//! provides no authoritative active-file identity or freshness information.
 //! This module owns only the wire protocol: MCP's `initialize` handshake,
 //! `tools/list`, and `tools/call`, all as JSON-RPC 2.0 frames POSTed to one
-//! URL. Registry merge, routing, and caching are Task 8's job (`serve.rs`).
+//! URL. Registry merge and routing live in `proxy.rs` and `serve.rs`.
 //!
 //! [`UpstreamMcp`] is the seam: [`HttpUpstream`] is the real client, and
 //! [`FakeUpstream`] is a scripted, `#[cfg(test)]`-only double this crate's

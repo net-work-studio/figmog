@@ -1,7 +1,7 @@
 //! Multi-file serve (spec §14): each mirrored Figma file is a [`FileSession`]
 //! — its own store, opened at its own `open_store!` call site, with
 //! everything that touches it captured in boxed closures (`dispatch`,
-//! `pull`, `proxy_cache`, `images`). This generalizes the single-store
+//! `pull`, `images`). This generalizes the single-store
 //! logic `serve.rs` used to inline directly: the store's
 //! pipeline type contains fn items and can't be named (see the doc
 //! comment on `store.rs`'s `open_store!` macro and the identical note in
@@ -20,13 +20,10 @@
 //! later auto-open (or two) never silently becomes "the default" the way
 //! plain first-in-`Vec` order would.
 //!
-//! **Proxied (upstream) tools stay outside this module entirely** — spec
-//! §14's documented caveat is that the desktop server has no concept of
-//! "which file", so the `file` argument only ever routes figmog's own
-//! local tools. `serve.rs` still owns the single, global upstream
-//! connection and decides for itself which session's `proxy_cache` a
-//! proxied call reads/writes through (see its own doc comment for that
-//! choice).
+//! **Proxied (upstream) tools stay outside this module entirely.** The
+//! desktop's active file/revision cannot be established from a mirror, so
+//! `serve.rs` forwards through the single global upstream connection without
+//! consulting any session's `proxy_cache` table.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -68,16 +65,9 @@ type DispatchFn = Box<dyn FnMut(&str, &Value) -> Result<ToolOutput, String>>;
 /// user-facing override of their own and so just let the mirror's already-
 /// stored setting (if any) keep driving the request — see [`do_pull`].
 type PullFn = Box<dyn FnMut(bool) -> Result<PullOutcome, PullError>>;
-type ProxyCacheFn = Box<
-    dyn FnMut(&mut crate::upstream::HttpUpstream, &str, &Value) -> Result<(Value, bool), String>,
->;
-/// `figmog_images` (v0.0.2 spec §5): `(ids, format, scale) ->` every
-/// requested render/fill, cache-first. A fourth closure beyond `dispatch`/
-/// `pull`/`proxy_cache`, for the same structural reason as
-/// `proxy_cache` — it needs this session's own store (for caching) *and*
-/// the network (for misses), so it can't be answered by `dispatch`
-/// (read-only) or folded into `pull` (a different fetch/cache shape
-/// entirely, and images is never automatic — see this type's own callers).
+/// `figmog_images`: `(ids, format, scale) ->` every requested render/fill,
+/// cache-first. It needs this session's store and the network, independently
+/// of read-only `dispatch` and the fetch/sync cycle in `pull`.
 type ImagesFn =
     Box<dyn FnMut(&[String], &str, Option<f64>) -> Result<Vec<crate::images::ImageItem>, String>>;
 
@@ -99,23 +89,11 @@ type ImagesFn =
 /// plain per-session state (not closures) so `serve.rs`'s round-robin tick
 /// loop can drive them directly, exactly as the old single-session loop
 /// drove its own local variables.
-///
-/// `proxy_cache` is another closure for the same structural reason: a
-/// proxied (upstream, non-`figmog_*`) call's version-keyed cache lives in *this*
-/// session's own `proxy_cache` table (spec §12/§14: "each session's store
-/// carries its own `proxy_cache`"), and the store can only ever be touched
-/// from behind one of these closures. `serve.rs` calls it only for the
-/// *default* session — see its own doc comment for why proxied calls
-/// route through the default rather than any per-call `file` argument.
-///
-/// `images` (v0.0.2 spec §5) is a fourth — see [`ImagesFn`]'s own doc
-/// comment.
 pub(crate) struct FileSession {
     pub(crate) key: String,
     pub(crate) name: String,
     pub(crate) dispatch: DispatchFn,
     pub(crate) pull: PullFn,
-    pub(crate) proxy_cache: ProxyCacheFn,
     pub(crate) images: ImagesFn,
     pub(crate) watcher: Watcher,
     pub(crate) backoff: Duration,
@@ -332,26 +310,6 @@ pub(crate) fn open_session_with_api(
 
     let pull: PullFn = Box::new(pull_closure);
 
-    let proxy_cache: ProxyCacheFn = {
-        let st = st.clone();
-        Box::new(move |upstream, name, args| {
-            let args_canonical = crate::proxy::canonical_args(args)?;
-            let version_and_hit = if crate::proxy::is_cacheable(name, args) {
-                st.borrow().rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
-                    let version = meta.get(&0).map(|m| m.version.clone());
-                    let hit = version
-                        .as_ref()
-                        .and_then(|v| crate::cache::lookup(&cache, name, &args_canonical, v));
-                    (version, hit)
-                })
-            } else {
-                (None, None)
-            };
-            let mut st = st.borrow_mut();
-            crate::proxy::proxy_call(&mut st, upstream, name, args, version_and_hit)
-        })
-    };
-
     // `figmog_images` (v0.0.2 spec §5): the two-step `scan` (read-only,
     // this session's own concrete `open_store!` handle — see
     // `images.rs`'s own doc comment for why that split exists at all) then
@@ -392,7 +350,6 @@ pub(crate) fn open_session_with_api(
         name,
         dispatch,
         pull,
-        proxy_cache,
         images,
         watcher: Watcher::new(None),
         backoff: BACKOFF_START,
@@ -859,11 +816,6 @@ mod tests {
             name: "Scripted".to_string(),
             dispatch: Box::new(|_name, _args| Ok(ToolOutput::Json(json!({})))),
             pull,
-            proxy_cache: Box::new(|_upstream, name, _args| {
-                Err(format!(
-                    "scripted session has no store to proxy through: {name}"
-                ))
-            }),
             images: Box::new(|_ids, _format, _scale| {
                 Err("scripted session has no store for images".to_string())
             }),
@@ -1158,11 +1110,6 @@ mod tests {
             name: "Scripted".to_string(),
             dispatch: Box::new(|_name, _args| Ok(ToolOutput::Json(json!({})))),
             pull,
-            proxy_cache: Box::new(|_upstream, name, _args| {
-                Err(format!(
-                    "scripted session has no store to proxy through: {name}"
-                ))
-            }),
             images: Box::new(|_ids, _format, _scale| {
                 Err("scripted session has no store for images".to_string())
             }),

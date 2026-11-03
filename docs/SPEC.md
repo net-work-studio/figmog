@@ -15,7 +15,7 @@ records in an embedded store (via `fold`'s `KeyedStream`); every read
 after that — search, tree walks, component/style/variable/structural
 queries — answers from local storage in milliseconds, at zero Figma API
 cost. `figmog serve` runs the same engine as a long-lived MCP stdio
-server with its own poll loop, plus a cached proxy to Figma's native
+server with its own poll loop, plus a desktop proxy to Figma's native
 desktop Dev Mode MCP server, so it can be the *only* Figma MCP an agent
 needs to connect. `serve` additionally listens on a unix-socket control
 plane (§6a), so CLI reads answer from the running server instead of
@@ -63,7 +63,7 @@ Two commands spend Figma's API budget deliberately and explicitly: `pull`
                                               │  serve.rs / sessions.rs   │
                                               │  MCP stdio loop, one       │
                                               │  FileSession per mirror,   │
-                                              │  poll loop, cached proxy   │
+                                              │  poll loop, desktop proxy  │
                                               │  to Figma desktop MCP      │
                                               └─────────────────────────┘
 ```
@@ -105,7 +105,7 @@ matching [`Rec`](../src/model.rs) variant:
 | `Variable(String)` | `VariableRec` | Enterprise auto-sync or `import-variables` |
 | `VariableCollection(String)` | `VariableCollectionRec` | same as above |
 | `Meta` | `FileMeta` | one row: name, version, last_modified, synced_at_unix_ms |
-| `ProxyCache(String)` | `ProxyCacheRec` | cached proxied-tool responses (§8) |
+| `ProxyCache(String)` | `ProxyCacheRec` | legacy proxied-tool responses (§8) |
 | `MirrorConfig` | `MirrorConfigRec` | one row: this mirror's sticky pull settings (§14) |
 | `ImageBlob(String)` | `ImageBlobRec` | cached render and fill bytes (§15) |
 
@@ -130,9 +130,10 @@ and style-value derivation).
 
 `ProxyCacheRec` (§8): `key_hash` (= the `Id::ProxyCache` key), `tool`,
 `args_canonical`, `file_version`, and `content` (canonical JSON of the
-upstream result). A hit requires `tool`/`args_canonical` to match the
-*request*, not just the key hash — FNV-1a 64 is non-cryptographic and
-collidable, and tool arguments are agent-authored strings, so the key
+upstream result), retained for on-disk compatibility. Desktop calls no
+longer read or write these rows (§8). The legacy lookup helper requires
+`tool`/`args_canonical` to match the *request*, not just the key hash —
+FNV-1a 64 is non-cryptographic and collidable, and tool arguments are agent-authored strings, so the key
 hash alone is not trusted (see `cache::lookup`).
 
 `MirrorConfigRec` (§14): `geometry: bool`, one row per mirror. An absent
@@ -179,7 +180,7 @@ is a breaking store-format change:
 | `variables` | Table | variable id | `vars` |
 | `variable_collections` | Table | collection id | `vars` |
 | `meta` | Table | `0u8` (not `()` — postcard-encodes to zero bytes, and the store forbids empty keys) | `status`, version comparisons |
-| `proxy_cache` | Table | cache key hash | proxied-tool caching (§8) |
+| `proxy_cache` | Table | cache key hash | legacy proxied-tool cache (§8) |
 | `mirror_config` | Table | `0u8` (one row, like `meta`) | sticky pull settings (§14) |
 | `images` | Table | image cache key hash | render/fill byte caching (§15) |
 
@@ -252,10 +253,10 @@ failures during reset.
 One `figmog serve` process owns every mirrored file's store via a
 [`SessionManager`](../src/sessions.rs): one `FileSession` per mirrored
 file, each with its own `open_store!` handle and its own `proxy_cache`
-table. A session's store can only be touched from behind one of four
-boxed closures (`dispatch`, `pull`, `proxy_cache`, `images`) — the
-store's pipeline type contains fn items and can't be named, so this is
-the only way several independently-boxed `FnMut`s can share the one open,
+table, retained for on-disk compatibility. A session's store can only be
+touched from behind one of three boxed closures (`dispatch`, `pull`,
+`images`) — the store's pipeline type contains fn items and can't be
+named, so this is the only way several independently-boxed `FnMut`s can share the one open,
 unnameable handle (via `Rc<RefCell<_>>`).
 
 **Startup:** `figmog serve [FILE]...` takes zero or more file
@@ -395,7 +396,7 @@ resolved `raw` JSON (`vars::style_value_from_consumer`: `/style` for
 TEXT, `/fills` for FILL, `/effects` for EFFECT, `/layoutGrids` for GRID).
 A style with no current consumers has no derivable value.
 
-## 8. The cached proxy
+## 8. The desktop proxy
 
 Unless `--no-upstream`, `figmog serve` (and CLI parity via `figmog
 tools`/`figmog call`, §10) probes Figma's native desktop app's Dev Mode
@@ -415,40 +416,32 @@ prefix — or with another upstream tool already accepted in the same
 merge; this can't happen from figmog's own registry, but a live desktop
 server's tool list is outside figmog's control.
 
-**Cacheable rule:** a proxied call is cached iff its name starts
-`get_`/`list_` **and** its arguments carry an explicit node id under
-`nodeId`, `node_id`, or `id` as a string (`proxy::is_cacheable`).
-Selection-based calls (no explicit node id) are always forwarded live and
-never touch the cache. A cache hit requires the stored row's `tool` and
-`args_canonical` to match the request *and* `file_version` to equal the
-mirror's current version (§3, §5). **Desktop-proxy caveat:** the desktop
-server has no concept of "which file" — it always answers for whatever
-file is open in the Figma app, independent of any mirror figmog manages.
-A `file` argument sent on a proxied call is simply ignored; in
-multi-file `serve`, the version-keyed cache for a proxied call always
-routes through the *default* session (or forwards uncached if none is
-mirrored yet) rather than guessing which mirror a `nodeId` belongs to.
+**Desktop context and caching:** the desktop answers for the file active
+in Figma, independently of every mirror figmog manages. Its MCP interface
+does not supply authoritative file identity and revision for a call, so
+all proxied calls forward **uncached**, including `get_*`/`list_*` calls
+with explicit node ids. A node id can occur in multiple files; a caller's
+`file` argument or the default mirror's version cannot establish which
+file/revision the desktop will answer from. Switching files or editing the
+active file must therefore reach upstream even if the mirror is unchanged.
+This applies equally to stdio, socket-routed CLI calls, direct `figmog call`,
+and servers with no mirrors. Arguments and results (including tool-level
+`isError: true` results) pass through verbatim.
 
-**Cache-write failures never fail the call:** an upstream response that
-already succeeded must still reach the client even if writing it to
-`proxy_cache` didn't work (its only realistic failure mode is a
-serialization error on `content` — practically unreachable for a real
-`serde_json::Value`, since the crate's public API can't even construct a
-non-finite float). `proxy::proxy_call` logs such a failure to stderr and
-returns the successful result regardless; the next identical call simply
-misses the cache and re-fetches. A tool-level failure (`isError: true`)
-is never cached at all, regardless of whether the write would have
-succeeded — it still passes through to the client verbatim so the next
-identical call gets a fresh attempt.
+Legacy `proxy_cache` rows are never served or populated by desktop calls.
+The record layout, enum variants, sink name, and eviction helpers remain
+for on-disk compatibility; ordinary version-change eviction and
+`pull --fresh` can still remove old rows. Any future proxy caching must
+first establish authoritative upstream file identity **and** freshness;
+routing to a mirror alone is insufficient. `figmog tools` reports
+`cacheable: false` for desktop tools on both direct and socket paths.
 
-**Rate budget:** only `figmog_sync` (a forced pull) and a proxied,
-native-named call that actually reaches the desktop server spend Figma's
-API/rate budget — a cache hit doesn't, and every `figmog_*` read tool is
-always free. A successful proxied call to a tool that isn't
-`get_*`/`list_*` (a likely write) schedules an immediate meta-poll rather
-than waiting for the next `--interval` tick, so the mirror catches up
-promptly (skipped under `--no-watch`, which has no poll loop to
-schedule). `pull --fresh` wipes the store *and* the proxy response cache.
+**Rate budget:** native-named calls reach the desktop server every time;
+`figmog_*` read tools continue to answer locally at zero API cost. A
+successful proxied call to a tool that isn't `get_*`/`list_*` (a likely
+write) schedules an immediate meta-poll rather than waiting for the next
+`--interval` tick, so the mirror catches up promptly (skipped under
+`--no-watch`, which has no poll loop to schedule).
 
 ## 9. Variables
 
@@ -499,7 +492,7 @@ The CLI is split by concern: `src/cli/mod.rs` (clap types, top-level
 dispatch, `run`, the shared store-opening/JSON-writing helpers),
 `src/cli/pull.rs` (`pull`, the typed `PullError`, `.figmog/current`),
 `src/cli/read.rs` (the 17 read-only query commands), `src/cli/call.rs`
-(`tools`, `call`, `import-variables` — the cached-proxy CLI parity
+(`tools`, `call`, `import-variables` — the desktop-proxy CLI parity
 surface, so every tool `figmog serve` would expose is reachable without
 an MCP client), `src/cli/images.rs` (`images`, §15), and
 `src/cli/socket.rs` (the client half of the control plane, §6a).

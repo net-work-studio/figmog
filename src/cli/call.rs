@@ -1,4 +1,4 @@
-//! Cached-proxy CLI parity: `figmog tools`, `figmog call`, and
+//! Desktop-proxy CLI parity: `figmog tools`, `figmog call`, and
 //! `figmog import-variables` — every tool `figmog serve` would expose,
 //! reachable without an MCP client.
 
@@ -78,7 +78,7 @@ pub(super) fn cmd_tools(upstream_url: String, no_upstream: bool) -> Result<(), S
             json!({
                 "name": t.name,
                 "source": if proxy::is_local_tool(t.name) { "local" } else { "upstream" },
-                "cacheable": proxy::tool_name_cache_capable(t.name),
+                "cacheable": false,
             })
         })
         .collect();
@@ -87,8 +87,7 @@ pub(super) fn cmd_tools(upstream_url: String, no_upstream: bool) -> Result<(), S
 
 /// `figmog call <tool> [--args json]`: invoke any tool by name through the
 /// same routing `figmog serve` uses — local `figmog_*` tools (including
-/// `figmog_sync`) and, when attached, the upstream proxy with the same
-/// cacheable-rule lookup/store.
+/// `figmog_sync`) and, when attached, the same uncached desktop proxy.
 pub(super) fn cmd_call(
     db: &Db,
     tool: String,
@@ -124,7 +123,7 @@ pub(super) fn cmd_call(
     }
 
     let (mut upstream, upstream_status) = attach_upstream(upstream_url, no_upstream);
-    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
 
     let result: Result<Value, String> = if proxy::is_local_tool(&tool) {
         match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, r)) {
@@ -135,19 +134,7 @@ pub(super) fn cmd_call(
         let up = upstream
             .as_mut()
             .ok_or_else(|| format!("upstream not attached: {tool}"))?;
-        let args_canonical = proxy::canonical_args(&args)?;
-        let version_and_hit = if proxy::is_cacheable(&tool, &args) {
-            st.rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
-                let version = meta.get(&0).map(|m| m.version.clone());
-                let hit = version
-                    .as_ref()
-                    .and_then(|v| crate::cache::lookup(&cache, &tool, &args_canonical, v));
-                (version, hit)
-            })
-        } else {
-            (None, None)
-        };
-        proxy::proxy_call(&mut st, up, &tool, &args, version_and_hit).map(|(value, trigger_poll)| {
+        proxy::proxy_call(up, &tool, &args).map(|(value, trigger_poll)| {
             if trigger_poll {
                 eprintln!(
                     "figmog: {tool} may have changed the file — run `figmog pull` (or `figmog serve`, which polls automatically) to refresh the mirror"
