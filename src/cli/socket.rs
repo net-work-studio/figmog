@@ -77,7 +77,7 @@ pub(super) fn tools_rows(tools: &[Value]) -> Value {
             json!({
                 "name": name,
                 "source": if crate::proxy::is_local_tool(name) { "local" } else { "upstream" },
-                "cacheable": crate::proxy::tool_name_cache_capable(name),
+                "cacheable": false,
             })
         })
         .collect();
@@ -297,7 +297,7 @@ mod tests {
         );
         assert_eq!(
             rows[1],
-            json!({"name": "get_code", "source": "upstream", "cacheable": true})
+            json!({"name": "get_code", "source": "upstream", "cacheable": false})
         );
         assert_eq!(
             rows[2],

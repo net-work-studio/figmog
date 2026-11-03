@@ -306,13 +306,9 @@ fn serve_e2e_initialize_tools_list_and_tool_calls() {
         .as_str()
         .expect("instructions is a string");
     assert!(!instructions.is_empty());
-    // v3 steering text (build design §12/§11 point 3): figmog is now the
-    // only Figma MCP an agent connects to — a cached proxy in front of
-    // Figma's native capabilities — which supersedes the v2 "second,
-    // separate server" text this assertion used to pin.
     assert!(
-        instructions.contains("cached proxy"),
-        "instructions should mention the cached proxy: {instructions}"
+        instructions.contains("forwarded uncached"),
+        "instructions should describe live desktop forwarding: {instructions}"
     );
 
     // notifications/initialized: no `id`, so no response frame is expected
@@ -542,15 +538,10 @@ fn fresh_pull_preserves_a_store_owned_by_serve() {
         .success();
 }
 
-// ---- cached-proxy e2e: figmog serve against an in-process HTTP fake ----
+// ---- desktop-proxy e2e: figmog against an in-process HTTP fake ----
 //
-// Minimal hand-rolled HTTP/1.1 server (std `TcpListener`, no new deps) that
-// answers exactly the handshake + one `tools/call` `HttpUpstream::initialize`
-// and a proxied call make: `initialize`, `notifications/initialized`,
-// `tools/list`, then one `tools/call`. Mirrors `upstream.rs`'s own
-// in-process fake (same wire mechanics), recreated here because that one
-// lives in a `#[cfg(test)]` module private to the lib crate and isn't
-// reachable from this integration-test binary.
+// Scripted desktop responses model active-file switches and revisions without
+// deriving fixtures from real files or exposing context to the proxy.
 
 fn read_request(stream: &mut TcpStream) -> String {
     let mut header_bytes = Vec::new();
@@ -601,20 +592,42 @@ fn request_id(body: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// Spawn a fake upstream MCP server answering exactly 4 requests: the
-/// `HttpUpstream::initialize` handshake (`initialize`,
-/// `notifications/initialized`, `tools/list` — advertising one tool,
-/// `get_code`), then one `tools/call` returning canned content. Returns
-/// its address and a join handle; the test drives exactly one real
-/// `tools/call` through the child, so a second, cache-served call never
-/// reaches this server — proven by the fake never accepting a 5th
-/// connection (the accept loop simply ends).
-fn spawn_fake_upstream() -> (String, std::thread::JoinHandle<()>) {
+/// Serve scripted calls, either on one persistent serve connection or with
+/// a fresh handshake for each direct CLI invocation. All accepts are bounded.
+fn spawn_fake_upstream(
+    results: Vec<Value>,
+    handshake_each_call: bool,
+) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let handle = std::thread::spawn(move || {
-        for i in 0..4u32 {
-            let (mut stream, _) = listener.accept().expect("accept");
+        listener.set_nonblocking(true).unwrap();
+        let requests = if handshake_each_call {
+            results.len() * 4
+        } else {
+            3 + results.len()
+        };
+        let mut results = results.into_iter();
+        for request in 0..requests {
+            let i = if handshake_each_call {
+                request % 4
+            } else {
+                request
+            };
+            let deadline = Instant::now() + TIMEOUT;
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "upstream request {request} never arrived"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("set_read_timeout");
@@ -661,11 +674,15 @@ fn spawn_fake_upstream() -> (String, std::thread::JoinHandle<()>) {
                         &resp,
                     );
                 }
-                3 => {
+                _ => {
+                    let call: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(call["method"], "tools/call");
+                    assert_eq!(call["params"]["name"], "get_code");
+                    assert_eq!(call["params"]["arguments"], json!({"nodeId": "1:2"}));
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": request_id(&body),
-                        "result": {"content": [{"type": "text", "text": "CODE_HERE"}], "isError": false},
+                        "result": results.next().expect("scripted result"),
                     })
                     .to_string();
                     write_response(
@@ -675,7 +692,6 @@ fn spawn_fake_upstream() -> (String, std::thread::JoinHandle<()>) {
                         &resp,
                     );
                 }
-                _ => unreachable!(),
             }
         }
     });
@@ -683,9 +699,10 @@ fn spawn_fake_upstream() -> (String, std::thread::JoinHandle<()>) {
 }
 
 #[test]
-fn serve_e2e_proxied_tool_lists_round_trips_and_second_call_is_cache_served() {
+fn serve_desktop_proxy_observes_file_switches_and_edits_with_unchanged_mirror() {
     let (_dir, db) = common::fixture_db();
-    let (fake_addr, fake_handle) = spawn_fake_upstream();
+    let results = desktop_results();
+    let (fake_addr, fake_handle) = spawn_fake_upstream(results.clone(), false);
     let (mut guard, mut stdin, rx) = spawn_serve_with_args(&db, &["--upstream", &fake_addr]);
 
     send(
@@ -727,28 +744,18 @@ fn serve_e2e_proxied_tool_lists_round_trips_and_second_call_is_cache_served() {
     assert_eq!(resp["result"]["isError"], json!(false));
     assert_eq!(result_json(&resp)["upstream"], json!("connected"));
 
-    // -- first get_code call with an explicit nodeId: round-trips the
-    // fake's canned content verbatim (the proxied result is a complete MCP
-    // `CallToolResult` already — figmog emits it as-is, NOT re-wrapped in
-    // another text content block, so native output formats like an image
-    // block survive unmangled) and is cacheable (get_* + string nodeId). --
-    let resp = call(&mut stdin, &rx, 4, "get_code", json!({"nodeId": "1:2"}));
-    assert_eq!(
-        resp["result"],
-        json!({"content": [{"type": "text", "text": "CODE_HERE"}], "isError": false})
-    );
-
-    // -- second identical call: served from the version-keyed cache — the
-    // fake upstream server only ever accepts 4 connections total (the
-    // handshake's 3 plus this test's one real `tools/call`), so if this
-    // call reached the network the fake's accept loop would still be
-    // blocked waiting for a 5th connection and `fake_handle.join()` below
-    // would hang past the test harness's own timeout.
-    let resp2 = call(&mut stdin, &rx, 5, "get_code", json!({"nodeId": "1:2"}));
-    assert_eq!(
-        resp2["result"], resp["result"],
-        "second identical call should be served byte-identically from cache"
-    );
+    // Mirror A stays at version 100 throughout. Desktop switches B -> C,
+    // then C is edited. Identical tool arguments must reach upstream each time.
+    for (i, expected) in results.iter().enumerate() {
+        let response = call(
+            &mut stdin,
+            &rx,
+            4 + i as i64,
+            "get_code",
+            json!({"nodeId": "1:2"}),
+        );
+        assert_eq!(&response["result"], expected, "desktop context change {i}");
+    }
 
     drop(stdin);
     let status = wait_with_timeout(&mut guard.0, TIMEOUT);
@@ -756,7 +763,74 @@ fn serve_e2e_proxied_tool_lists_round_trips_and_second_call_is_cache_served() {
 
     fake_handle
         .join()
-        .expect("fake upstream server thread should finish after exactly 4 requests");
+        .expect("every scripted desktop call should reach upstream");
+    let st = figmog::open_store!(&db);
+    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
+        assert_eq!(meta.get(&0).unwrap().version, "100");
+        assert!(
+            cache.iter().next().is_none(),
+            "unknown desktop context must not populate the cache"
+        );
+    });
+}
+
+fn desktop_results() -> Vec<Value> {
+    [
+        "file B revision 1",
+        "file C revision 1",
+        "file C revision 2",
+    ]
+    .into_iter()
+    .map(|text| json!({"content": [{"type": "text", "text": text}], "isError": false}))
+    .collect()
+}
+
+#[test]
+fn direct_cli_desktop_proxy_ignores_legacy_cache_and_observes_context_changes() {
+    let (_dir, db) = common::fixture_db();
+    let legacy =
+        json!({"content": [{"type": "text", "text": "legacy wrong file"}], "isError": false});
+    let args = r#"{"nodeId":"1:2"}"#;
+    {
+        let mut st = figmog::open_store!(&db);
+        figmog::cache::store(&mut st, "get_code", args, "100", &legacy).unwrap();
+    }
+    let results = desktop_results();
+    let (fake_addr, fake_handle) = spawn_fake_upstream(results.clone(), true);
+    let work = tempfile::tempdir().unwrap();
+    for expected in results {
+        let output = common::command()
+            .current_dir(work.path())
+            .args([
+                "call",
+                "get_code",
+                "--args",
+                args,
+                "--db",
+                db.to_str().unwrap(),
+                "--upstream",
+                &fake_addr,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result, expected,
+            "legacy or prior desktop responses must never be reused"
+        );
+    }
+    fake_handle
+        .join()
+        .expect("every direct call should reach upstream");
+    let st = figmog::open_store!(&db);
+    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
+        assert_eq!(meta.get(&0).unwrap().version, "100");
+        assert_eq!(
+            figmog::cache::lookup(&cache, "get_code", args, "100"),
+            Some(legacy)
+        );
+    });
 }
 
 // ---- multi-file serve e2e (spec §14) ----

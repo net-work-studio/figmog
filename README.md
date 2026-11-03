@@ -200,8 +200,8 @@ Figma's plugin console on any plan. See `docs/SPEC.md` §9.
 `figmog_sync`, `figmog_images`, and the two mirror-management tools. Unless
 `--no-upstream`, it also proxies Figma's desktop Dev Mode MCP server (paid
 Dev or Full seat, desktop app running), merging those tools into the same
-list and caching `get_*`/`list_*` responses by file version. Every name and
-argument shape is in `docs/SPEC.md` §6 and §8. `figmog tools` prints the
+list. Desktop calls forward uncached because the active file and revision
+cannot be verified against a local mirror. Every name and argument shape is in `docs/SPEC.md` §6 and §8. `figmog tools` prints the
 merged list, and `figmog call <tool>` invokes any of them from a shell.
 
 ## The benchmark run

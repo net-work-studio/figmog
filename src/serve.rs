@@ -15,21 +15,15 @@
 //! given at startup, or whichever got mirrored first if none were. Two
 //! new tools, `figmog_open` (mirror a file now) and `figmog_files` (list
 //! every mirror), aren't per-file operations and so don't take `file`.
-//! Each session owns its own store — and its own `proxy_cache` table
-//! (spec §12) — opened at its own concrete `open_store!` call site inside
-//! `sessions::open_session`; see that module's doc comment for why the
-//! store can only ever be touched from behind one of a session's boxed
-//! closures, and why that module carries a fourth (`proxy_cache`) closure
-//! beyond spec §14's literal three.
+//! Each session owns its own store, opened at a concrete `open_store!` call
+//! site inside `sessions::open_session`. Store access is captured by boxed
+//! closures; desktop proxy calls are independent of those stores.
 //!
-//! **Cache-routing choice for proxied calls (documented per spec §14's
-//! caveat):** the desktop upstream has no notion of "which file" — a
-//! proxied `get_*`/`list_*` call's `nodeId` could belong to any mirrored
-//! file, or none of them. Rather than guess or refuse to cache, proxied
-//! calls' version-keyed cache always routes through the **default**
-//! session (the same one a `file`-less local tool call would answer
-//! from) when at least one file is mirrored; with zero files mirrored,
-//! the call is simply forwarded uncached (see [`handle_tool_call`]).
+//! **Desktop context:** the upstream answers for the file active in Figma,
+//! independently of the mirrors. It supplies no authoritative file/revision
+//! context, so proxied calls always forward uncached, even with an explicit
+//! node id or `file` argument. A mirror's version cannot validate a response
+//! from an unrelated desktop file (see [`proxy::proxy_call`]).
 //!
 //! **v3 (build design §12):** unless `--no-upstream`, figmog also probes
 //! Figma's native desktop MCP server at startup and becomes the *only*
@@ -454,7 +448,7 @@ fn tick_deadline(interval: Duration, session_count: usize) -> Duration {
 /// `files` (zero or more, `--figmog-root`-rooted) are each mirrored at
 /// startup (pulled if their store is empty and `!no_watch`), the first
 /// one becoming the default. Unless `no_upstream`, also attaches Figma's
-/// native desktop MCP server at `upstream_url` as a cached proxy (build
+/// native desktop MCP server at `upstream_url` as an uncached proxy (build
 /// design §12); a failed probe degrades to local-only tools with one
 /// stderr line, never a hard error.
 #[allow(clippy::too_many_arguments)]
@@ -1020,22 +1014,12 @@ fn handle_tool_call(
         return Ok(result);
     }
 
-    // Proxied (upstream) call: `file` carries no meaning here (spec §14's
-    // documented caveat — the desktop server has no concept of "which
-    // file"; a client sending it anyway is simply ignored, same as any
-    // other argument the upstream tool doesn't itself define). Route the
-    // version-keyed cache through the default session when one exists;
-    // zero files mirrored yet means forward uncached rather than fail.
+    // Desktop context is independent of every mirror. Never route its
+    // responses through a session's version-keyed cache.
     let up = upstream
         .as_mut()
         .ok_or_else(|| format!("upstream not attached: {name}"))?;
-    let (value, trigger_poll) = match manager.sessions.first_mut() {
-        Some(session) => (session.proxy_cache)(up, name, args)?,
-        None => {
-            let result = up.call(name, args).map_err(|e| e.to_string())?;
-            (result, false)
-        }
-    };
+    let (value, trigger_poll) = proxy::proxy_call(up, name, args)?;
     if trigger_poll && !no_watch {
         *next_deadline = Instant::now();
     }
