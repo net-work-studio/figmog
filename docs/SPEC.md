@@ -253,7 +253,7 @@ One `figmog serve` process owns every mirrored file's store via a
 [`SessionManager`](../src/sessions.rs): one `FileSession` per mirrored
 file, each with its own `open_store!` handle and its own `proxy_cache`
 table. A session's store can only be touched from behind one of four
-boxed closures (`dispatch`, `pull`, `watermark`, `proxy_cache`) — the
+boxed closures (`dispatch`, `pull`, `proxy_cache`, `images`) — the
 store's pipeline type contains fn items and can't be named, so this is
 the only way several independently-boxed `FnMut`s can share the one open,
 unnameable handle (via `Rc<RefCell<_>>`).
@@ -283,11 +283,35 @@ count grows. `--interval` is clamped to a one-day maximum before it's
 ever added to an `Instant`, so a huge or typo'd value can't overflow-panic.
 On `Tick::Changed`, the session is pulled inline
 (fetch → flatten → sync → evict stale cache rows on a version change);
-on failure, the session's watcher resets to its last known-good watermark
-and its backoff advances (Retry-After honored for a rate limit,
+on failure, the change stays pending and its backoff advances
+(Retry-After honored for a rate limit,
 exponential otherwise, capped at 5 minutes) — every pull call site
 (watch tick, `figmog_sync`, `figmog_open`, an auto-open inside
 `resolve`) shares this one backoff discipline (`sessions::do_pull`).
+
+**Watch watermarks:** each session keeps a successfully synchronized
+metadata `last_touched_at` and a separate pending observation in memory.
+A changed poll records the pending timestamp; only a successful pull
+acknowledges it. Repeated polls, metadata errors, and failed pulls do not
+acknowledge a pending change. A successful pull never replaces this
+metadata watermark with full-file `lastModified`, since the endpoints
+can report different timestamps for unchanged content. Comparison keeps
+the complete strings, including fractional seconds, so distinct edits
+within one second still trigger pulls.
+
+Every newly opened session (including a reopened on-disk mirror or an
+immediate startup pull) starts with an unknown metadata watermark: it is
+not persisted in `FileMeta` or any other record. Its first successful
+metadata poll therefore triggers one reconciliation pull. Thereafter an
+unchanged session needs no more Tier-1 fetches. Explicit `figmog_open`,
+`figmog_sync`, and auto-open pulls use the same success/failure bookkeeping:
+when an observation is pending, success acknowledges that pre-fetch
+timestamp; otherwise success retains the previous watermark, possibly
+unknown. A subsequent poll may require one reconciliation pull if an
+explicit sync fetched a change that had not yet been polled. No metadata
+request after a fetch certifies the fetched content: an edit racing any
+pull remains detectable by the next poll, even if it happened within the
+same second. This needs no extra metadata requests or on-disk schema changes.
 
 **`file`-argument routing (spec-frozen tool surface, v4):** every local
 tool's JSON schema gains an optional `file` property (URL or bare key).
