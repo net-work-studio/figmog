@@ -1788,6 +1788,72 @@ fn wedged_socket_client_does_not_freeze_stdio() {
     assert!(status.success(), "figmog serve exited with {status:?}");
 }
 
+/// Explicit null is equality; an omitted equality only tests existence.
+/// Exercise both CLI routes and raw MCP against the same synthetic rows.
+#[test]
+fn where_null_equality_is_preserved_across_direct_socket_and_mcp() {
+    const KEY: &str = "figmogwherenullkey01";
+    let mut fixture = common::fixture_v1();
+    let hero = &mut fixture["document"]["children"][0]["children"][0];
+    hero["queryValue"] = Value::Null;
+    hero["children"][0]["queryValue"] = json!("VERTICAL");
+    hero["children"][1]["queryValue"] = json!(32);
+    // All other nodes omit queryValue, so existence must exclude them.
+    let dir = default_root_fixture(KEY, fixture);
+    let cases = [
+        (Some("null"), vec!["1:1"]),
+        (None, vec!["1:1", "1:2", "1:3"]),
+        (Some("VERTICAL"), vec!["1:2"]),
+        (Some("32"), vec!["1:3"]),
+    ];
+    let run = |equals: Option<&str>, direct: bool| {
+        let mut cmd = common::command();
+        cmd.args(["where", "--pointer", "/queryValue"])
+            .current_dir(dir.path());
+        if let Some(equals) = equals {
+            cmd.args(["--equals", equals]);
+        }
+        if direct {
+            cmd.arg("--no-socket");
+        }
+        cmd.assert().success().get_output().stdout.clone()
+    };
+    // Capture direct results before serve locks this same mirror.
+    let direct: Vec<_> = cases.iter().map(|(equals, _)| run(*equals, true)).collect();
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    for ((equals, expected_ids), direct) in cases.iter().zip(&direct) {
+        let direct_json: Value = serde_json::from_slice(direct).unwrap();
+        let ids: Vec<_> = direct_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(&ids, expected_ids, "direct --equals {equals:?}");
+
+        let socket = run(*equals, false);
+        let mut args = json!({"pointer": "/queryValue"});
+        if let Some(equals) = equals {
+            args["equals"] = serde_json::from_str(equals).unwrap_or_else(|_| json!(equals));
+        }
+        let resp = call(&mut stdin, &rx, 2, "figmog_where", args);
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let socket_json: Value = serde_json::from_slice(&socket).unwrap();
+        let mcp_json = result_json(&resp);
+        assert_eq!(
+            (&socket_json, &mcp_json),
+            (&direct_json, &direct_json),
+            "socket and MCP must match direct --equals {equals:?}"
+        );
+        assert_eq!(&socket, direct, "CLI output must be byte-identical");
+    }
+
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
 /// m6: a handful of read commands (deliberately including `where
 /// --pointer` with no `--equals` — C2's exact regression shape — and
 /// `status` — m1's) run once direct (before serve ever starts, so the

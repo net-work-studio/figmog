@@ -599,10 +599,12 @@ name and argument object `dispatch::dispatch_read_tool` expects, so the
 JSON on stdout is byte-identical to the direct-open answer, and a
 serve-side failure surfaces as the standard `{"error": ...}` exit 1.
 Unreachable ⇒ the store is opened directly. `--db` bypasses the socket
-entirely, since it names a store rather than a root. Null-valued optional
-arguments are stripped from a mapped command's arguments, so an omitted
-flag stays omitted rather than arriving as an explicit `null` (`figmog
-call`'s own `--args` payload is passed through untouched). A routed
+entirely, since it names a store rather than a root. Absent optional
+flags are omitted from a mapped command's arguments. For `where`, an
+omitted `--equals` tests pointer existence, while explicit `--equals null`
+matches only present null values; the matching MCP tool distinguishes an
+absent `equals` key from `"equals": null` the same way (`figmog call`'s own
+`--args` payload is passed through untouched). A routed
 command also carries the mirror `.figmog/current` resolves to as its
 `file` argument, so it answers for the same file the direct path would;
 `figmog call figmog_open` is the exception, since there `file` names the
