@@ -1,0 +1,23 @@
+tests/flatten.rs
+  s_68c5fc63d8ab38::t_8262cc7e7dfd60 6,95-165,167
+  s_68c5fc63d8ab38::t_a9f684d464269c 166
+  s_68c5fc63d8ab38::t_32a4e2ca70cdfc 168-169
+src/flatten.rs
+  s_68c5fc63d8ab38::t_23fb4c364b2177 125-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d9e2a5c74a7197285c8fbbfaffb7c5eae4781213",
+  "prompts": {},
+  "sessions": {
+    "s_68c5fc63d8ab38": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a227-df65-7f72-b9a4-619f0ec82204",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
