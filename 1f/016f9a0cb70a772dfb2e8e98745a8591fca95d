@@ -1,0 +1,45 @@
+src/cli/call.rs
+  s_f6d5557475eaae::t_59e9f09367667f 99,158-163
+  s_351bdf39e4ec7c::t_6f04adafd3899b 164-165
+src/ident.rs
+  s_f6d5557475eaae::t_59e9f09367667f 65-67
+tests/serve.rs
+  s_f6d5557475eaae::t_632f3b78229477 1299-1300
+  s_f6d5557475eaae::t_3ee12f7e9d7c6f 1301-1303,1306,1344-1345,1350-1352,1360,1367-1371,1379,1386-1388,1400-1411,1420,1428-1430,1447
+  s_f6d5557475eaae::t_24a50b5840868b 1335-1340
+  s_f6d5557475eaae::t_994f0a5510ede4 1325-1328
+  s_f6d5557475eaae::t_5f44f7990e315b 1277-1298,1304-1305,1307-1308,1329-1334,1341-1342,1347-1349,1393-1399,1431-1439,1448-1451
+  s_f6d5557475eaae::t_d454b1f052f038 1353-1359,1361-1366,1372-1378,1380-1385,1389-1392,1412-1419,1421-1427,1440-1446
+  s_f6d5557475eaae::t_4f151bdf82f364 1309-1324,1343,1346
+docs/SPEC.md
+  s_f6d5557475eaae::t_59e9f09367667f 605-610
+src/cli/mod.rs
+  s_f6d5557475eaae::t_3ee12f7e9d7c6f 381-383,623-624
+  s_f6d5557475eaae::t_632f3b78229477 648-652
+  s_f6d5557475eaae::t_748c20613d090d 830-832
+  s_f6d5557475eaae::t_59e9f09367667f 379-380,612-621,647,819-829,833-834
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1f016f9a0cb70a772dfb2e8e98745a8591fca95d",
+  "prompts": {},
+  "sessions": {
+    "s_351bdf39e4ec7c": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a38c-fe23-79f0-a970-18a1b1bbf840",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    },
+    "s_f6d5557475eaae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a38c-572c-7503-b5d4-0c78e4217d1e",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
