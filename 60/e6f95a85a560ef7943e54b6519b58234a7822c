@@ -1,0 +1,36 @@
+src/cli/store_lock.rs
+  s_e10e12a9661c03::t_1d5ed0dcf0ec83 139-145,173-175,184-188,211-218,220-224,238-243,245-250,344-347
+  s_e10e12a9661c03::t_db98a468642e97 1,8-9,12-15,24,56,59-85,88-89,105-107,114,136,263,265,269,271-272,289,291,295,334-343
+  s_e10e12a9661c03::t_469371a800f3ad 138,146-172,176-183,189-210,219,225-237,244,251-256
+  s_e10e12a9661c03::t_f643af1ba383c0 137
+src/cli/pull.rs
+  s_e10e12a9661c03::t_db98a468642e97 150
+tests/serve.rs
+  s_e10e12a9661c03::t_ceaa6b1535feec 534
+src/cli/mod.rs
+  s_e10e12a9661c03::t_db98a468642e97 887,889
+tests/cli.rs
+  s_e10e12a9661c03::t_1d5ed0dcf0ec83 317
+tests/permissions.rs
+  s_e10e12a9661c03::t_ceaa6b1535feec 267
+  s_e10e12a9661c03::t_db98a468642e97 278-279,308-311
+  s_e10e12a9661c03::t_1d5ed0dcf0ec83 238-247,312-314,317-318
+docs/SPEC.md
+  s_e10e12a9661c03::t_4003d2ad9edd56 211-229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "60e6f95a85a560ef7943e54b6519b58234a7822c",
+  "prompts": {},
+  "sessions": {
+    "s_e10e12a9661c03": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19dd0-1937-7142-b4c6-55b411b7211c",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
