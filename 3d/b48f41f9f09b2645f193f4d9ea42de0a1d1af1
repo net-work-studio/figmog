@@ -8,6 +8,7 @@ src/api.rs
   s_f10395619e391b::t_a1c59cece7939d 8-9,210,212-225,231,234,237,250,253
 src/cli/socket.rs
   s_f10395619e391b::t_ffce9a483b65d4 187,203,207-212,236,239
+  s_f10395619e391b::t_c852dba13cab5e 217,229
 src/mcp.rs
   s_f10395619e391b::t_e016748b29eeb9 144-149,209,211,215
 src/api/deep_tests.rs
