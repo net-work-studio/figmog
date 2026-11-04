@@ -95,12 +95,7 @@ pub(super) fn cmd_call(
     upstream_url: String,
     no_upstream: bool,
 ) -> Result<(), String> {
-    let args: Value = match args {
-        Some(raw) => {
-            serde_json::from_str(&raw).map_err(|e| format!("--args: invalid JSON: {e}"))?
-        }
-        None => json!({}),
-    };
+    let args = parse_args(args.as_deref())?;
 
     // `figmog_sync` delegates entirely to `do_pull`, which opens its own
     // `open_store!` handle at `db.path`. fjall allows only one open handle
@@ -145,6 +140,14 @@ pub(super) fn cmd_call(
     };
 
     print_call_result(result)
+}
+
+/// Parse call arguments identically for mirror selection and dispatch.
+pub(super) fn parse_args(raw: Option<&str>) -> Result<Value, String> {
+    match raw {
+        Some(raw) => serde_json::from_str(raw).map_err(|e| format!("--args: invalid JSON: {e}")),
+        None => Ok(json!({})),
+    }
 }
 
 /// Shared `figmog call` output: pretty-printed JSON on success; on failure,

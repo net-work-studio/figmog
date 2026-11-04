@@ -598,6 +598,14 @@ fn spawn_fake_upstream(
     results: Vec<Value>,
     handshake_each_call: bool,
 ) -> (String, std::thread::JoinHandle<()>) {
+    spawn_fake_upstream_with_args(results, handshake_each_call, json!({"nodeId": "1:2"}))
+}
+
+fn spawn_fake_upstream_with_args(
+    results: Vec<Value>,
+    handshake_each_call: bool,
+    expected_args: Value,
+) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let handle = std::thread::spawn(move || {
@@ -678,7 +686,7 @@ fn spawn_fake_upstream(
                     let call: Value = serde_json::from_str(&body).unwrap();
                     assert_eq!(call["method"], "tools/call");
                     assert_eq!(call["params"]["name"], "get_code");
-                    assert_eq!(call["params"]["arguments"], json!({"nodeId": "1:2"}));
+                    assert_eq!(call["params"]["arguments"], expected_args);
                     let resp = json!({
                         "jsonrpc": "2.0",
                         "id": request_id(&body),
@@ -1346,6 +1354,267 @@ fn default_root_fixture_multi(entries: &[(&str, Value)], current: &str) -> tempf
     }
     std::fs::write(figmog_dir.join("current"), current).unwrap();
     dir
+}
+
+const ROUTING_A: &str = "figmogroutingaaa11";
+const ROUTING_B: &str = "figmogroutingbbb22";
+
+fn routing_fixture() -> tempfile::TempDir {
+    default_root_fixture_multi(
+        &[
+            (ROUTING_A, common::fixture_v1()),
+            (ROUTING_B, common::fixture_other()),
+        ],
+        ROUTING_A,
+    )
+}
+
+fn assert_proxy_cli_preserves_args_and_current_mirror(args: Value, socket: bool) {
+    let dir = routing_fixture();
+    let result =
+        json!({"content": [{"type": "text", "text": r#"{"code":"CODE_HERE"}"#}], "isError": false});
+    let (address, upstream) = spawn_fake_upstream_with_args(vec![result], false, args.clone());
+    let server = if socket {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("figmog"));
+        command
+            .args([
+                "serve",
+                "--no-watch",
+                "--upstream",
+                &address,
+                ROUTING_A,
+                ROUTING_B,
+            ])
+            .current_dir(dir.path())
+            .env("FIGMA_TOKEN", "");
+        let (guard, mut stdin, rx) = spawn_child(command);
+        handshake(&mut stdin, &rx);
+        Some((guard, stdin))
+    } else {
+        None
+    };
+    // Holding B's store makes an accidental direct-mode selection of B
+    // fail on its writer lock. A desktop argument must not select B.
+    let other_db = dir.path().join(".figmog").join(ROUTING_B).join("db");
+    let other_store = (!socket).then(|| figmog::open_store!(&other_db));
+    let mut command = common::command();
+    command
+        .args(["call", "get_code", "--args", &args.to_string()])
+        .current_dir(dir.path());
+    if !socket {
+        command.args(["--no-socket", "--upstream", &address]);
+    }
+    let output = command.assert().success();
+    let mut value: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    if !socket {
+        value = serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap();
+    }
+    assert_eq!(value["code"], "CODE_HERE");
+    upstream.join().unwrap();
+    if let Some((mut guard, stdin)) = server {
+        drop(stdin);
+        assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    }
+    drop(other_store);
+
+    // Desktop calls remain uncached, regardless of their file arguments.
+    for key in [ROUTING_A, ROUTING_B] {
+        let db = dir.path().join(".figmog").join(key).join("db");
+        let store = figmog::open_store!(&db);
+        store.rtx(|(_, _, _, _, _, _, _, cache, _, _)| {
+            assert!(cache.iter().next().is_none(), "desktop cache for {key}");
+        });
+    }
+}
+
+#[test]
+fn direct_proxy_cli_ignores_file_and_node_url_mirror_hints() {
+    for args in [
+        json!({"nodeId": "1:1", "file": ROUTING_B}),
+        json!({"id": format!("https://www.figma.com/design/{ROUTING_B}/Fixture?node-id=1-1")}),
+    ] {
+        assert_proxy_cli_preserves_args_and_current_mirror(args, false);
+    }
+}
+
+#[test]
+fn direct_proxy_cli_does_not_validate_file_arguments_as_figma_refs() {
+    assert_proxy_cli_preserves_args_and_current_mirror(
+        json!({"nodeId": "1:1", "file": "not-a-figma-ref"}),
+        false,
+    );
+}
+
+#[test]
+fn socket_proxy_cli_preserves_structured_and_numeric_file_arguments() {
+    for file in [json!({"path": "synthetic-file"}), json!(42)] {
+        assert_proxy_cli_preserves_args_and_current_mirror(
+            json!({"nodeId": "1:1", "file": file}),
+            true,
+        );
+    }
+}
+
+/// Both files contain 1:1, so a successful read must also prove which
+/// file answered. Run the same expectations against each CLI transport.
+fn assert_cli_file_routing(cwd: &std::path::Path, flags: &[&str]) {
+    let url = format!("https://www.figma.com/design/{ROUTING_B}/Fixture?node-id=1-1");
+    let node_args = json!({"id": url}).to_string();
+    let null_file_args = json!({"id": url, "file": null}).to_string();
+    let explicit_args = json!({"file": ROUTING_B}).to_string();
+    let explicit_url_args = json!({"file": url}).to_string();
+    let conflicting_args = json!({"file": ROUTING_A, "id": url}).to_string();
+    let current_url = format!("https://www.figma.com/design/{ROUTING_A}/Fixture?node-id=1-1");
+    let explicit_b_args = json!({"file": ROUTING_B, "id": current_url}).to_string();
+    let scoped_args = json!({"under": url, "type": "TEXT"}).to_string();
+    let target_url = format!("https://www.figma.com/file/{ROUTING_B}/Fixture?node-id=2-2");
+    let target_args = json!({"target": target_url}).to_string();
+    let cases: &[(&[&str], &str)] = &[
+        (&["get", &url], "Banner"),
+        (&["tree", &url], "Banner"),
+        (&["dump", &url, "--depth", "0"], "Banner"),
+        (&["call", "figmog_node", "--args", &node_args], "Banner"),
+        (
+            &["call", "figmog_node", "--args", &null_file_args],
+            "Banner",
+        ),
+        (
+            &["call", "figmog_status", "--args", &explicit_args],
+            "OtherFixture",
+        ),
+        (
+            &["call", "figmog_status", "--args", &explicit_url_args],
+            "OtherFixture",
+        ),
+        (
+            &["call", "figmog_node", "--args", &conflicting_args],
+            "Hero",
+        ),
+        (
+            &["call", "figmog_node", "--args", &explicit_b_args],
+            "Banner",
+        ),
+        (&["get", "1:1"], "Hero"),
+        (&["status"], "Fixture"),
+        (&["call", "figmog_status"], "Fixture"),
+    ];
+    let mut failures = Vec::new();
+    for (args, expected) in cases {
+        let mut command = common::command();
+        command.args(flags).args(*args).current_dir(cwd);
+        if args[0] == "call" {
+            command.arg("--no-upstream");
+        }
+        let out = command.output().unwrap();
+        let value = serde_json::from_slice::<Value>(&out.stdout).unwrap_or(Value::Null);
+        if !out.status.success() || value["name"] != *expected {
+            failures.push(format!(
+                "{flags:?} {args:?}: expected {expected}, got {value}; stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    for args in [
+        vec!["find", "--type", "TEXT", "--under", &url],
+        vec![
+            "call",
+            "figmog_find",
+            "--args",
+            &scoped_args,
+            "--no-upstream",
+        ],
+    ] {
+        let out = common::command()
+            .args(flags)
+            .args(&args)
+            .current_dir(cwd)
+            .assert()
+            .success();
+        let value: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(value[0]["name"], "Banner", "{flags:?} {args:?}: {value}");
+    }
+    for args in [
+        vec!["instances", &target_url],
+        vec![
+            "call",
+            "figmog_instances",
+            "--args",
+            &target_args,
+            "--no-upstream",
+        ],
+    ] {
+        let out = common::command()
+            .args(flags)
+            .args(&args)
+            .current_dir(cwd)
+            .assert()
+            .success();
+        let value: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(value, json!([]), "{flags:?} {args:?}: {value}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(cwd.join(".figmog/current")).unwrap(),
+        ROUTING_A
+    );
+}
+
+#[test]
+fn direct_cli_file_routing_prefers_explicit_file_then_url_then_current() {
+    let dir = routing_fixture();
+    assert_cli_file_routing(dir.path(), &["--no-socket"]);
+    assert_cli_file_routing(dir.path(), &[]);
+}
+
+#[test]
+fn direct_cli_file_routing_honors_db_over_explicit_file_and_url() {
+    let dir = routing_fixture();
+    let db = dir.path().join(".figmog").join(ROUTING_A).join("db");
+    let url = format!("https://www.figma.com/design/{ROUTING_B}/Fixture?node-id=1-1");
+    let args = json!({"file": ROUTING_B, "id": url}).to_string();
+    // A corrupt current must not interfere with an explicit store path.
+    std::fs::write(dir.path().join(".figmog/current"), "invalid").unwrap();
+    for (args, expected) in [
+        (vec!["get", &url], "Hero"),
+        (
+            vec!["call", "figmog_node", "--args", &args, "--no-upstream"],
+            "Hero",
+        ),
+        (
+            vec!["call", "figmog_status", "--args", &args, "--no-upstream"],
+            "Fixture",
+        ),
+    ] {
+        let out = common::command()
+            .args(&args)
+            .arg("--db")
+            .arg(&db)
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        let value: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(value["name"], expected, "{args:?}: {value}");
+    }
+}
+
+#[test]
+fn socket_cli_file_routing_prefers_explicit_file_then_url_then_current() {
+    let dir = routing_fixture();
+    let (mut guard, mut stdin, rx) =
+        spawn_default_root_serve_keys(dir.path(), &[ROUTING_A, ROUTING_B], &[]);
+    handshake(&mut stdin, &rx);
+    assert_cli_file_routing(dir.path(), &[]);
+    let out = common::command()
+        .args(["call", "figmog_open"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .code(1);
+    let error: Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
+    assert_eq!(error["error"], "missing required field: file");
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
 
 /// Spawn `figmog serve --no-watch --no-upstream <keys...>` against the

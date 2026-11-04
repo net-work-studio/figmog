@@ -62,9 +62,9 @@ pub fn parse_node_ref(input: &str) -> Option<(Option<String>, String)> {
 /// URL with no `node-id=`): falls back to the raw input, same as
 /// [`normalize_node_id`] would do with any unrecognized shape. The file
 /// key half is discarded — every `query::*` call site this feeds already
-/// operates against one already-resolved store; only `figmog serve`'s
-/// multi-file session routing (`serve.rs`) needs the file key, and calls
-/// [`parse_node_ref`] directly for that.
+/// operates against one already-resolved store. CLI mirror selection and
+/// `figmog serve`'s session routing use [`parse_node_ref`] through the
+/// shared node-reference file inference before opening that store.
 pub fn normalize_node_ref(input: &str) -> String {
     parse_node_ref(input)
         .map(|(_, id)| id)
