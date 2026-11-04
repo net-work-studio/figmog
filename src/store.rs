@@ -336,12 +336,26 @@ pub fn collect_variable_ids<R: fold::stream::Readable>(
 // numbers) is untouched by this feature. Callers run a version-changing
 // pull, then `stale_cache_ids` + `evict_stale_cache` in a follow-up step.
 
+// Test-only observation of the performance contract: retaining cache rows
+// alone cannot distinguish skipping a scan from scanning without eviction.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STALE_SCAN_COUNTS: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
 /// `ProxyCache` rows whose `file_version` no longer matches
 /// `current_version` — the sweep set for [`evict_stale_cache`].
 pub fn stale_cache_ids<R: fold::stream::Readable>(
     cache: &fold::pipeline::terminal::TableReader<'_, R, String, ProxyCacheRec>,
     current_version: &str,
 ) -> Vec<Id> {
+    #[cfg(test)]
+    STALE_SCAN_COUNTS.with(|counts| {
+        let (cache, images) = counts.get();
+        counts.set((cache + 1, images));
+    });
     cache
         .iter()
         .filter(|(_, rec)| rec.file_version != current_version)
@@ -358,6 +372,11 @@ pub fn stale_image_ids<R: fold::stream::Readable>(
     images: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImageBlobRec>,
     current_version: &str,
 ) -> Vec<Id> {
+    #[cfg(test)]
+    STALE_SCAN_COUNTS.with(|counts| {
+        let (cache, images) = counts.get();
+        counts.set((cache, images + 1));
+    });
     images
         .iter()
         .filter(|(_, rec)| rec.file_version != current_version)
