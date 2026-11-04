@@ -1795,22 +1795,10 @@ fn no_socket_flag_forces_the_old_lock_error() {
     assert!(status.success(), "figmog serve exited with {status:?}");
 }
 
-/// F2 regression: `figmog images` used to socket-route even when `--db`
-/// was given — `cmd_images` gated its socket attempt on `--no-socket`
-/// alone, unlike every other routed command's `cli.db.is_none()` gate
-/// (spec §10: "When neither `--no-socket` nor `--db` is given..."). With
-/// `--db <path>`, `resolve_db` yields `key: None`; before the fix, the
-/// routed call still reached the *running* serve, which would answer
-/// against its own default mirror (`KEY`, not `other_db` at all) —
-/// `fetch_direct`'s own `db.key` check would never even run. After the
-/// fix, `--db` bypasses the socket exactly like `--no-socket` does: the
-/// call goes straight to `fetch_direct`, whose first step needs a
-/// resolved file key and fails immediately with the generic
-/// `{"error": ...}` shape on stderr, before any manifest is built or the
-/// network is touched — the observable proof this test pins, since a
-/// socket-routed answer would instead be a manifest-shaped JSON *array*
-/// on stdout (see the `images_no_token_error_path_is_manifest_shaped_json_exit_1`
-/// CLI test).
+/// An explicit store must bypass the running server. Its cache misses
+/// report missing file identity; routing to the server's known file would
+/// instead report missing credentials. Without --db, the current mirror
+/// still routes over the socket and avoids the server-held store lock.
 #[test]
 fn images_with_db_flag_bypasses_the_socket_even_when_serve_is_reachable() {
     const KEY: &str = "figmogsocketkeyfff666";
@@ -1845,25 +1833,23 @@ fn images_with_db_flag_bypasses_the_socket_even_when_serve_is_reachable() {
         .failure();
     let output = out.get_output();
     assert_eq!(output.status.code(), Some(1));
-    assert!(
-        output.stdout.is_empty(),
-        "direct-mode failure short-circuits before any manifest is printed: stdout {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let parsed: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|e| {
-        panic!(
-            "stderr must be exactly one JSON object (parse error: {e}); stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-    let err = parsed["error"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected an \"error\" string field, got: {parsed}"));
-    assert!(
-        err.contains("no file key"),
-        "expected the direct-mode 'no file key' error, proving --db bypassed \
-         the socket instead of getting KEY's default-mirror manifest back: {err}"
-    );
+    assert!(output.stderr.is_empty());
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed.as_array().unwrap().len(), 1);
+    let err = parsed[0]["error"].as_str().unwrap();
+    assert!(err.contains("without a file key"), "{err}");
+    assert!(!err.contains("FIGMA_TOKEN"), "{err}");
+
+    let routed = common::command()
+        .current_dir(dir.path())
+        .args(["images", "1:1"])
+        .assert()
+        .failure()
+        .code(1);
+    assert!(routed.get_output().stderr.is_empty());
+    let parsed: Value = serde_json::from_slice(&routed.get_output().stdout).unwrap();
+    let err = parsed[0]["error"].as_str().unwrap();
+    assert!(err.contains("FIGMA_TOKEN"), "{err}");
 
     // serve is still alive and untouched by this call.
     let resp = call(&mut stdin, &rx, 2, "figmog_status", json!({}));

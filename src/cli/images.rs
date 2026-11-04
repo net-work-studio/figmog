@@ -9,11 +9,12 @@
 //! lock" for free, because this command writes too). Socket reachable ⇒
 //! route through the very `figmog_images` tool `figmog serve` itself
 //! exposes (spec: "the tool path must exist anyway" — serve owns the
-//! caching); unreachable, `--no-socket`, or `--db` ⇒ direct network +
-//! direct store open, exactly like `pull` (spec §10: `--db` names a store
+//! caching); unreachable or `--no-socket` ⇒ direct network + store open.
+//! `--db` opens the explicit store for cache extraction only: its records
+//! do not establish the file key needed for downloads. `--db` names a store
 //! rather than a root, so it bypasses the socket entirely, same as every
 //! other routed command — see `cli::dispatch`'s own `cli.db.is_none()`
-//! gate).
+//! gate.
 //!
 //! **Manifest shape**, identical on both paths:
 //! `[{id|ref, kind, format, bytes, cached, path?, error?}]` — `bytes` is
@@ -119,17 +120,18 @@ fn fetch_direct(
     format: &str,
     scale: Option<f64>,
 ) -> Result<Vec<Fetched>, String> {
-    let key = db
-        .key
-        .clone()
-        .ok_or_else(|| "no file key: pass a file key or figma.com URL".to_string())?;
     let node_ids = images::normalize_ids(ids);
     let scale_m = images::scale_milli(scale);
     let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
     let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images_table)| {
         images::scan(&nodes, &meta, &images_table, &node_ids, format, scale_m)
     });
-    let token = crate::auth::token()?;
+    // An explicit store has no network identity. Cache extraction needs
+    // neither that identity nor credentials, even for a mixed hit/miss batch.
+    let token = match db.key {
+        Some(_) => crate::auth::token()?,
+        None => None,
+    };
     let api = token.map(UreqApi::new);
     let download = crate::api::download_bytes;
     let items = images::resolve(
@@ -137,7 +139,7 @@ fn fetch_direct(
         scanned,
         api.as_ref().map(|a| a as &dyn FigmaApi),
         &download,
-        &key,
+        db.key.as_deref(),
         &node_ids,
         format,
         scale,

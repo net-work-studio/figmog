@@ -749,6 +749,15 @@ equal the mirror's current version, so a repeat request against an
 unedited file spends nothing. Rows tagged with an older version are
 evicted by the same version-change pass that evicts `proxy_cache` (§5).
 
+**Explicit stores.** `figmog --db <store> images <node-id>...` exports
+matching cached renders and fills without a token or file key. The store
+does not record its Figma file key, and neither `.figmog/current`, the
+store's path nor a node URL supplies that identity for an explicit store.
+Each cache miss reports an actionable file-identity error in the manifest;
+cache hits still write successfully. Fetching missing images requires
+`figmog pull <file-key-or-url>` followed by `figmog images <node-id>...`
+without `--db`.
+
 **Output.** The CLI writes each item into `--out` (default
 `./figmog-images/`) and prints a manifest of
 `[{id|ref, kind, format, bytes, cached, path?, error?}]`, where `bytes`
@@ -770,4 +779,5 @@ back: exit 0 if at least one item succeeded, else 1.
 rows, so unlike a read command it cannot open a store `serve` holds. With
 the socket reachable it routes through serve's own `figmog_images` tool
 (serve owns the caching); with `--no-socket` or no server listening it
-fetches and writes directly, like `pull`.
+fetches and writes directly, like `pull`. `--db` always bypasses the socket
+and opens the explicit store, including for cached-image extraction.

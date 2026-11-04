@@ -178,6 +178,13 @@ again for an unedited file spends nothing. Nothing in figmog fetches images
 on its own, because Figma's images endpoints are its most rate-limited. See
 `docs/SPEC.md` §15.
 
+`figmog --db <store> images <node-id>...` exports matching cached renders
+and fills offline. The store does not record its Figma file key, so cache
+misses produce per-item errors. To fetch missing images, run
+`figmog pull <file-key-or-url>`, then `figmog images <node-id>...` without
+`--db`. A node URL in the images arguments selects a node within the chosen
+store; it does not supply the store's file identity.
+
 ### Freshness is polling, not push
 
 `figmog serve` polls the cheap Tier-3 meta endpoint every `--interval`

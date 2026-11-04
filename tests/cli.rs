@@ -1602,6 +1602,196 @@ fn page_argument_accepts_a_full_figma_url() {
 // prove the CLI's offline-reachable surface — no serve running, no
 // FIGMA_TOKEN, socket routing never engaged.
 
+#[test]
+fn images_with_db_exports_cached_bytes_without_a_file_key_or_token() {
+    use figmog::model::{Id, ImageBlobRec, Rec};
+
+    let (dir, db) = fixture_db();
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"1\" height=\"1\"/></svg>";
+    let key = figmog::images::image_key("render", "1:2", "svg", 1000);
+    {
+        let mut st = figmog::open_store!(&db);
+        st.wtx(|tx| {
+            tx.upsert(
+                &Id::ImageBlob(key.clone()),
+                &Rec::ImageBlob(ImageBlobRec {
+                    key_hash: key.clone(),
+                    kind: "render".into(),
+                    subject: "1:2".into(),
+                    format: "svg".into(),
+                    scale_milli: 1000,
+                    file_version: "100".into(),
+                    bytes: svg.to_vec(),
+                }),
+            );
+        });
+    }
+    let out_dir = dir.path().join("exported");
+    let out = common::command()
+        .current_dir(dir.path())
+        .args(["--db", &db, "images", "1:2", "--format", "svg", "--out"])
+        .arg(&out_dir)
+        .assert()
+        .success();
+    let manifest: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        manifest,
+        serde_json::json!([{
+            "id": "1:2", "kind": "render", "format": "svg",
+            "bytes": svg.len(), "cached": true,
+            "path": out_dir.join("render-1-2.svg").display().to_string(),
+        }])
+    );
+    assert_eq!(std::fs::read(out_dir.join("render-1-2.svg")).unwrap(), svg);
+    assert!(out.get_output().stderr.is_empty());
+    assert!(!dir.path().join(".figmog/current").exists());
+}
+
+#[test]
+fn images_with_db_exports_hits_and_reports_render_and_fill_misses() {
+    use figmog::model::{Id, ImageBlobRec, Rec};
+    use serde_json::json;
+
+    let (dir, db) = fixture_db();
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"1\"/></svg>";
+    {
+        let mut st = figmog::open_store!(&db);
+        let Some(Rec::Node(mut node)) = st.get(&Id::Node("1:2".into())) else {
+            panic!("fixture node missing");
+        };
+        let mut raw: serde_json::Value = serde_json::from_str(&node.raw).unwrap();
+        raw["fills"] = json!([
+            {"type": "IMAGE", "imageRef": "missing-fill"},
+            {"type": "IMAGE", "imageRef": "cached-fill"},
+        ]);
+        node.raw = raw.to_string();
+        st.wtx(|tx| {
+            tx.upsert(&Id::Node(node.id.clone()), &Rec::Node(node.clone()));
+            for (kind, subject, version, scale) in [
+                ("render", "1:2", "100", 2000),
+                ("render", "1:3", "99", 2000),
+                ("fill", "cached-fill", "100", 1000),
+            ] {
+                let format = if kind == "render" { "svg" } else { "" };
+                let key = figmog::images::image_key(kind, subject, format, scale);
+                tx.upsert(
+                    &Id::ImageBlob(key.clone()),
+                    &Rec::ImageBlob(ImageBlobRec {
+                        key_hash: key,
+                        kind: kind.into(),
+                        subject: subject.into(),
+                        format: "svg".into(),
+                        scale_milli: scale,
+                        file_version: version.into(),
+                        bytes: svg.to_vec(),
+                    }),
+                );
+            }
+        });
+    }
+    let out_dir = dir.path().join("mixed");
+    let out = common::command()
+        .current_dir(dir.path())
+        .args([
+            "--db", &db, "images", "1:3", "1-2", "1:2", "--format", "svg", "--scale", "2", "--out",
+        ])
+        .arg(&out_dir)
+        .assert()
+        .success();
+    let manifest: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let rows = manifest.as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["id"], "1:3");
+    assert_eq!(rows[1]["id"], "1:2");
+    assert_eq!(rows[2]["ref"], "cached-fill");
+    assert_eq!(rows[3]["ref"], "missing-fill");
+    for row in [&rows[0], &rows[3]] {
+        assert_eq!(row["cached"], false);
+        assert_eq!(row["bytes"], 0);
+        assert!(row["error"].as_str().unwrap().contains("without --db"));
+        assert!(row.get("path").is_none());
+    }
+    for (row, filename) in [
+        (&rows[1], "render-1-2.svg"),
+        (&rows[2], "fill-cached-fill.svg"),
+    ] {
+        assert_eq!(row["cached"], true);
+        assert!(row.get("error").is_none());
+        assert_eq!(std::fs::read(out_dir.join(filename)).unwrap(), svg);
+    }
+    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 2);
+    assert!(out.get_output().stderr.is_empty());
+}
+
+#[test]
+fn images_help_explains_explicit_store_cache_extraction() {
+    let out = common::command()
+        .args(["images", "--help"])
+        .assert()
+        .success();
+    let help = String::from_utf8_lossy(&out.get_output().stdout);
+    for explanation in [
+        "--db",
+        "cached images only",
+        "file key",
+        "figmog pull",
+        "without --db",
+    ] {
+        assert!(
+            help.contains(explanation),
+            "missing {explanation:?}: {help}"
+        );
+    }
+}
+
+#[test]
+fn images_with_db_cache_miss_explains_the_missing_file_identity() {
+    let (dir, db) = fixture_db();
+    // Neither the current mirror nor a pasted node URL identifies an
+    // arbitrary explicit store. A token cannot supply that identity either.
+    std::fs::create_dir(dir.path().join(".figmog")).unwrap();
+    std::fs::write(dir.path().join(".figmog/current"), "othercurrentkey123").unwrap();
+    let out = common::command()
+        .current_dir(dir.path())
+        .env("FIGMA_TOKEN", "synthetic-token")
+        .args([
+            "--db",
+            &db,
+            "images",
+            "https://www.figma.com/design/otherurlkey123/Fixture?node-id=1-2",
+        ])
+        .assert()
+        .failure()
+        .code(1);
+    let manifest: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(manifest.as_array().unwrap().len(), 1);
+    let row = &manifest[0];
+    assert_eq!(row["id"], "1:2");
+    assert_eq!(row["cached"], false);
+    assert_eq!(row["bytes"], 0);
+    assert!(row.get("path").is_none());
+    let error = row["error"].as_str().unwrap();
+    for explanation in [
+        "--db",
+        "file key",
+        "figmog pull",
+        "figmog images",
+        "without --db",
+    ] {
+        assert!(
+            error.contains(explanation),
+            "missing {explanation:?}: {error}"
+        );
+    }
+    assert!(out.get_output().stderr.is_empty());
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("figmog-images"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
 /// A mirror is established (`pull --from-file`, no network), but no
 /// FIGMA_TOKEN is set and no serve is running: every requested id is a
 /// cache miss, so `figmog images` must still print a manifest-shaped JSON
