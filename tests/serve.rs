@@ -974,9 +974,9 @@ fn serve_e2e_multi_file_routes_by_file_arg_and_first_startup_key_is_default() {
     assert_eq!(result_json(&resp)["name"], json!("OtherFixture"));
 
     // -- figmog_open {file: "garbagekey1234567890"}: a brand-new key
-    // auto-opens (no pull yet — see sessions::SessionManager::open), then
-    // figmog_open's own pull fails cleanly because FIGMA_TOKEN is scrubbed
-    // from this child's environment (spawn_serve_multifile). --
+    // opens a session and acknowledges a background job. Its eventual
+    // credential failure is reported through status/files instead of
+    // delaying this acknowledgement (spawn_serve_multifile is offline). --
     let resp = call(
         &mut stdin,
         &rx,
@@ -984,7 +984,8 @@ fn serve_e2e_multi_file_routes_by_file_arg_and_first_startup_key_is_default() {
         "figmog_open",
         json!({"file": "garbagekey1234567890"}),
     );
-    assert_eq!(resp["result"]["isError"], json!(true));
+    assert_eq!(resp["result"]["isError"], json!(false));
+    assert_eq!(result_json(&resp)["accepted"], true);
 
     drop(stdin);
     let status = wait_with_timeout(&mut guard.0, TIMEOUT);
@@ -1217,18 +1218,12 @@ fn serve_e2e_db_override_with_no_file_figmog_sync_errors_no_file_key() {
     );
 
     let resp = call(&mut stdin, &rx, 2, "figmog_sync", json!({}));
-    assert_eq!(resp["result"]["isError"], json!(true));
-    let text = resp["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        text.contains("no file key"),
-        "expected the no-file-key message, got: {text}"
-    );
-    assert!(
-        !text.to_lowercase().contains("panic"),
-        "must not panic: {text}"
-    );
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(result_json(&resp)["accepted"], true);
+    let status = wait_for_pull(&mut stdin, &rx, json!({}), "failed");
+    let text = status["pull"]["job"]["error"].as_str().unwrap();
+    assert!(text.contains("no file key"), "{status}");
+    assert!(!text.to_lowercase().contains("panic"), "{status}");
 
     drop(stdin);
     let status = wait_with_timeout(&mut guard.0, TIMEOUT);
@@ -1730,36 +1725,18 @@ fn socket_call_figmog_sync_reaches_the_owning_process_not_a_local_lock_error() {
         .args(["call", "figmog_sync"])
         .current_dir(dir.path())
         .assert()
-        .failure();
-    let output = out.get_output();
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "expected a clean exit-1 JSON error, not a lock panic; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let parsed: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|e| {
-        panic!(
-            "stderr must be exactly one JSON object (parse error: {e}); stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-    let err = parsed["error"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected an \"error\" string field, got: {parsed}"));
+        .success();
+    let accepted: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(accepted["accepted"], true);
+    let status = wait_for_pull(&mut stdin, &rx, json!({}), "failed");
+    let error = status["pull"]["job"]["error"].as_str().unwrap();
     assert!(
-        err.contains("FIGMA_TOKEN is empty")
-            && err.contains("unset FIGMA_TOKEN to use saved credentials"),
-        "expected serve's own sync error, got: {err}"
+        error.contains("FIGMA_TOKEN is empty")
+            && error.contains("unset FIGMA_TOKEN to use saved credentials"),
+        "{status}"
     );
-    assert!(
-        !err.to_lowercase().contains("locked"),
-        "must not be a local store-lock error: {err}"
-    );
-
-    // serve is still alive and answering after that error.
-    let resp = call(&mut stdin, &rx, 2, "figmog_status", json!({}));
-    assert_eq!(resp["result"]["isError"], json!(false), "resp: {resp:#?}");
+    assert!(!error.to_lowercase().contains("locked"), "{status}");
+    assert_eq!(status["ready"], true, "the prior mirror remains available");
 
     drop(stdin);
     let status = wait_with_timeout(&mut guard.0, TIMEOUT);
@@ -2192,10 +2169,14 @@ fn where_null_equality_is_preserved_across_direct_socket_and_mcp() {
 #[test]
 fn socket_routed_reads_are_byte_identical_to_direct_mode() {
     const KEY: &str = "figmogsockparitykey01";
-    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let mut fixture = common::fixture_v1();
+    fixture["document"]["children"][0]["children"][0]["ready"] = json!(false);
+    fixture["document"]["children"][0]["children"][0]["pull"] = json!({"custom": true});
+    let dir = default_root_fixture(KEY, fixture);
 
     let commands: &[&[&str]] = &[
         &["status"],
+        &["get", "1:1"],
         &["pages"],
         &["tree"],
         &["find", "--type", "TEXT"],
@@ -2233,4 +2214,19 @@ fn socket_routed_reads_are_byte_identical_to_direct_mode() {
     drop(stdin);
     let status = wait_with_timeout(&mut guard.0, TIMEOUT);
     assert!(status.success(), "figmog serve exited with {status:?}");
+}
+
+/// Observe completion through the same MCP interface clients use.
+fn wait_for_pull(stdin: &mut ChildStdin, rx: &Receiver<String>, args: Value, state: &str) -> Value {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let response = call(stdin, rx, 99, "figmog_status", args.clone());
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let status = result_json(&response);
+        if status["pull"]["job"]["state"] == state {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "waiting for {state}: {status}");
+        std::thread::yield_now();
+    }
 }

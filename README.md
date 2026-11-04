@@ -140,13 +140,18 @@ there first and answer from the running server's live view; with no server
 listening they open the store directly. `--no-socket` forces direct mode on
 both sides. `pull` is a writer and always opens the store itself, so while a
 server runs its error points at `figmog call figmog_sync`, which reaches the
-process that owns the store. See `docs/SPEC.md` §6 and §10.
+process that owns the store. Open/sync on the server acknowledge a background
+job immediately; check `figmog call figmog_status` (or `figmog_files`) for
+`ready`, job state, last successful version/churn, and errors. Reads continue
+using the last completed mirror while a pull runs. Direct sync without a
+running server remains synchronous. See `docs/SPEC.md` §6 and §10.
 
 ### One process, many files
 
 `figmog serve [FILE]...` takes zero or more file URLs or keys. Every
 `figmog_*` tool has an optional `file` argument, and a file referenced for
-the first time gets mirrored then (one Tier-1 pull). Starting with zero files
+the first time queues a pull. Until it completes, data reads report not-ready;
+status and files stay available. Starting with zero files
 needs no token up front. `figmog_open` and `figmog_files` manage the set. See
 `docs/SPEC.md` §6.
 

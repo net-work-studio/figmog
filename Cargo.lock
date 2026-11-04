@@ -666,11 +666,13 @@ version = "0.0.3"
 dependencies = [
  "assert_cmd",
  "clap",
+ "fjall",
  "fold",
  "keyring",
  "libc",
  "postcard",
  "rpassword",
+ "self_cell",
  "serde",
  "serde_json",
  "tempfile",
