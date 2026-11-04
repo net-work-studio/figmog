@@ -1,0 +1,44 @@
+src/serve/async_tests.rs
+  s_956c385c239ad1::t_1c55dacae39e5e 357-360
+  s_956c385c239ad1::t_a31f3194cbf58e 323-332,347-356,361-370,378-380
+  s_956c385c239ad1::t_24b94d02cbabf3 333-346,371-377
+  s_e7ff9442708a9b::t_a3692615dff65b 322
+tests/cli.rs
+  s_956c385c239ad1::t_8bd7c869d1f5f2 293-378
+src/flatten.rs
+  s_956c385c239ad1::t_ea1496f08862aa 32-33,36-37,50,112,117-120,122-129,133-134,136-138,144,146,191-198,201
+  s_956c385c239ad1::t_0b0090343748f9 186-189
+docs/SPEC.md
+  s_956c385c239ad1::t_e9fd0a1d9654b9 229-238
+tests/flatten.rs
+  s_956c385c239ad1::t_ea1496f08862aa 135
+  s_956c385c239ad1::t_1c55dacae39e5e 248-250
+  s_956c385c239ad1::t_b48b8b0e3fa788 179-214
+  s_956c385c239ad1::t_8bd7c869d1f5f2 257-280
+  s_956c385c239ad1::t_2fc69807180fe6 215,217-247,251-256
+  s_956c385c239ad1::t_07e34fa4f3c198 216
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ad576a7760fa44bc7e30153375cde57d6e389bcc",
+  "prompts": {},
+  "sessions": {
+    "s_956c385c239ad1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a7f3-6a40-75a1-8cfa-0ac7255815c6",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    },
+    "s_e7ff9442708a9b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a7f3-9d14-7a90-8628-75efc3bb5e2b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
