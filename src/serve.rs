@@ -546,6 +546,7 @@ pub(crate) fn run_serve(
     );
 
     let watch_api = token.map(UreqApi::new);
+    let first_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
     serve_loop(
         manager,
         upstream,
@@ -553,6 +554,7 @@ pub(crate) fn run_serve(
         no_watch,
         track_current,
         interval_dur,
+        first_deadline,
         rx,
         registry,
         watch_api.as_ref().map(|api| api as &dyn FigmaApi),
@@ -561,6 +563,8 @@ pub(crate) fn run_serve(
 
 /// Dispatch and polling after startup. The HTTP boundary is injected so
 /// stalled-peer recovery can exercise this same loop with a local peer.
+/// The first deadline is supplied so queued traffic can be tested with
+/// an already-overdue poll, without sleeping.
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(
     mut manager: SessionManager,
@@ -569,6 +573,7 @@ fn serve_loop(
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
+    mut next_deadline: Instant,
     rx: mpsc::Receiver<Incoming>,
     registry: ConnRegistry,
     watch_api: Option<&dyn FigmaApi>,
@@ -582,32 +587,11 @@ fn serve_loop(
     }
 
     let mut next_session_idx: usize = 0;
-    let mut next_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
 
     loop {
-        let incoming = if no_watch {
-            // No ticking to do, so a disconnect (all senders dropped — in
-            // practice unreachable once the socket is on, since the
-            // acceptor thread holds its own `tx` clone forever, but still
-            // handled) is the only other thing `recv` can report besides a
-            // message — exit clean rather than falling into the
-            // (watch-only) timeout branch below.
-            match rx.recv() {
-                Ok(msg) => Some(msg),
-                Err(mpsc::RecvError) => return Ok(()),
-            }
-        } else {
-            let wait = next_deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(wait) {
-                Ok(msg) => Some(msg),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            }
-        };
-
-        let Some(msg) = incoming else {
-            // Timeout with watch enabled: round-robin one session's meta
-            // poll, pulling inline on change (spec §14).
+        // A queued message wins over recv_timeout even with a zero wait.
+        // Service an overdue poll first so a busy queue cannot starve it.
+        if !no_watch && Instant::now() >= next_deadline {
             next_deadline = watch_tick(
                 &mut manager,
                 &mut next_session_idx,
@@ -615,7 +599,28 @@ fn serve_loop(
                 track_current,
                 watch_api,
             );
-            continue;
+        }
+
+        // Attempt a receive even when the poll returned a zero retry
+        // delay, so queued requests also keep making progress.
+        let msg = if no_watch {
+            // No ticking to do, so a disconnect (all senders dropped — in
+            // practice unreachable once the socket is on, since the
+            // acceptor thread holds its own `tx` clone forever, but still
+            // handled) is the only other thing `recv` can report besides a
+            // message — exit clean rather than falling into the
+            // (watch-only) timeout branch below.
+            match rx.recv() {
+                Ok(msg) => msg,
+                Err(mpsc::RecvError) => return Ok(()),
+            }
+        } else {
+            let wait = next_deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(wait) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
         };
 
         let line = match msg {
@@ -1037,6 +1042,201 @@ mod tests {
     use crate::mcp::ToolDef;
     use crate::upstream::FakeUpstream;
 
+    /// Every receive has a message ready, including the final EOF sentinel:
+    /// an overdue poll cannot rely on a gap in the request queue to run.
+    fn serve_queued_requests(
+        manager: SessionManager,
+        api: &dyn FigmaApi,
+        no_watch: bool,
+        tool: &str,
+    ) -> Vec<Value> {
+        let (tx, rx) = mpsc::channel();
+        let (client, socket) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(RESPONSE_BOUND)).unwrap();
+        socket.set_write_timeout(Some(RESPONSE_BOUND)).unwrap();
+        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+        registry.lock().unwrap().insert(1, socket);
+        for id in 1..=8 {
+            tx.send(Incoming::Stdio(
+                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
+            ))
+            .unwrap();
+            tx.send(Incoming::Socket(
+                1,
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": tool, "arguments": {}}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        }
+        tx.send(Incoming::StdinClosed).unwrap();
+
+        serve_loop(
+            manager,
+            None,
+            "disabled",
+            no_watch,
+            false,
+            Duration::from_secs(10),
+            Instant::now() - Duration::from_secs(1),
+            rx,
+            registry,
+            Some(api),
+        )
+        .unwrap();
+
+        let mut reader = BufReader::new(client);
+        (1..=8)
+            .map(|id| {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let response: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(response["id"], id);
+                assert_eq!(response["result"]["isError"], false);
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn serve_refreshes_an_overdue_mirror_before_answering_queued_reads() {
+        use crate::api::{ApiError, FileMetaResp};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct VersionedApi(Cell<&'static str>);
+        impl FigmaApi for VersionedApi {
+            fn file_meta(&self, _key: &str) -> Result<FileMetaResp, ApiError> {
+                Ok(FileMetaResp {
+                    name: "Synthetic".into(),
+                    last_touched_at: self.0.get().into(),
+                })
+            }
+
+            fn file(&self, _key: &str, _geometry: bool) -> Result<Value, ApiError> {
+                Ok(json!({
+                    "name": "Synthetic", "version": self.0.get(), "lastModified": "t",
+                    "document": {"id": "0:0", "name": "Synthetic", "type": "DOCUMENT"}
+                }))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let api = Rc::new(VersionedApi(Cell::new("1")));
+        let session = sessions::open_session_with_api(
+            dir.path().join("db"),
+            "ABC123".into(),
+            Some("ABC123"),
+            Some(api.clone()),
+            true,
+        )
+        .unwrap();
+        let manager = SessionManager {
+            sessions: vec![session],
+            root: dir.path().to_path_buf(),
+            token: None,
+            default_key: Some("ABC123".into()),
+        };
+        api.0.set("2");
+
+        let responses = serve_queued_requests(manager, &*api, false, "figmog_status");
+        for response in responses {
+            assert_eq!(
+                response["version"], "2",
+                "queued reads must see the refresh"
+            );
+        }
+    }
+
+    struct RateLimitedApi {
+        polls: std::cell::RefCell<Vec<String>>,
+        waits: std::cell::RefCell<std::collections::VecDeque<Duration>>,
+    }
+
+    impl FigmaApi for RateLimitedApi {
+        fn file_meta(&self, key: &str) -> Result<crate::api::FileMetaResp, crate::api::ApiError> {
+            self.polls.borrow_mut().push(key.to_string());
+            let retry_after = self
+                .waits
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected metadata poll");
+            Err(crate::api::ApiError::RateLimited { retry_after })
+        }
+
+        fn file(&self, _key: &str, _geometry: bool) -> Result<Value, crate::api::ApiError> {
+            Ok(json!({
+                "name": "Synthetic", "version": "1", "lastModified": "t",
+                "document": {"id": "0:0", "name": "Synthetic", "type": "DOCUMENT"}
+            }))
+        }
+    }
+
+    fn mirrored_test_sessions(root: &Path, api: std::rc::Rc<dyn FigmaApi>) -> SessionManager {
+        let sessions = ["ABC123", "DEF456"]
+            .into_iter()
+            .map(|key| {
+                sessions::open_session_with_api(
+                    root.join(key),
+                    key.into(),
+                    Some(key),
+                    Some(api.clone()),
+                    true,
+                )
+                .unwrap()
+            })
+            .collect();
+        SessionManager {
+            sessions,
+            root: root.to_path_buf(),
+            token: None,
+            default_key: Some("ABC123".into()),
+        }
+    }
+
+    #[test]
+    fn serve_round_robins_due_polls_and_honors_retry_after_with_queued_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = std::rc::Rc::new(RateLimitedApi {
+            polls: Default::default(),
+            // Two immediately due retries, then a future deadline: both
+            // polling and request handling must progress through the queue.
+            waits: std::cell::RefCell::new(
+                [Duration::ZERO, Duration::ZERO, Duration::from_secs(3600)].into(),
+            ),
+        });
+        let manager = mirrored_test_sessions(dir.path(), api.clone());
+
+        let responses = serve_queued_requests(manager, &*api, false, "figmog_files");
+
+        assert_eq!(*api.polls.borrow(), ["ABC123", "DEF456", "ABC123"]);
+        for response in responses {
+            assert_eq!(response[0]["key"], "ABC123");
+            assert_eq!(response[1]["key"], "DEF456");
+        }
+    }
+
+    #[test]
+    fn serve_no_watch_answers_queued_requests_without_polling_an_overdue_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = std::rc::Rc::new(RateLimitedApi {
+            polls: Default::default(),
+            waits: Default::default(),
+        });
+        let manager = mirrored_test_sessions(dir.path(), api.clone());
+
+        let responses = serve_queued_requests(manager, &*api, true, "figmog_files");
+
+        assert!(api.polls.borrow().is_empty());
+        for response in responses {
+            assert_eq!(response[0]["version"], "1");
+            assert_eq!(response[1]["version"], "1");
+        }
+    }
+
     #[test]
     fn watch_tick_reconciles_once_despite_different_endpoint_timestamps() {
         use crate::api::{ApiError, FileMetaResp};
@@ -1191,6 +1391,7 @@ mod tests {
                 false,
                 false,
                 Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(2),
                 rx,
                 registry,
                 Some(&api),

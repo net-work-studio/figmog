@@ -272,7 +272,10 @@ default at all, and an omitted `file` then errors, naming
 **Reader loop:** a background thread turns stdin lines into an `mpsc`
 channel; the main loop answers `mcp::handle_message` between poll ticks,
 using `rx.recv_timeout` against the next scheduled deadline (or plain
-`recv` under `--no-watch`, which has no ticking at all). Stdout writes
+`recv` under `--no-watch`, which has no ticking at all). Before each
+receive, the watch-enabled loop services an overdue poll even when
+requests remain queued. It then attempts a receive, so an immediately
+due retry also lets queued requests progress. Stdout writes
 are manual (`writeln!` + flush, not `println!`), so a reader that
 vanishes mid-write (client exited) is a clean exit 0, not a panic.
 
