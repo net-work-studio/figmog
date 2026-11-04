@@ -86,8 +86,8 @@ pub(super) fn tools_rows(tools: &[Value]) -> Value {
 
 /// Like [`try_call`], but for `figmog_images` specifically (v0.0.2 spec
 /// §5): returns the raw MCP `result` object (`{"content": [...],
-/// "isError": ...}`) rather than [`interpret_call_response`]'s unwrapped
-/// domain `Value`. `figmog_images`'s content mixes a text manifest block
+/// "isError": ...}`) rather than the unwrapped domain `Value` of other
+/// local tools. `figmog_images`'s content mixes a text manifest block
 /// with per-item payload blocks — `image` (base64, raster formats) or
 /// `text` (raw markup, SVG — see `images::to_mcp_content`'s own doc
 /// comment) — `interpret_call_response`'s "parse `content[0]`'s text as
@@ -124,7 +124,7 @@ fn call_over(stream: UnixStream, tool: &str, args: Value) -> Result<Value, Strin
             "params": {"name": tool, "arguments": args},
         }),
     )?;
-    interpret_call_response(resp)
+    interpret_call_response(tool, resp)
 }
 
 fn tools_list_over(stream: UnixStream) -> Result<Vec<Value>, String> {
@@ -197,12 +197,16 @@ fn protocol_error_message(err: &Value) -> String {
 /// Pure translation of one `tools/call` JSON-RPC response into the plain
 /// `Result<Value, String>` shape every CLI command already produces —
 /// split from [`call_over`]'s I/O so it's unit-testable directly against
-/// hand-built response `Value`s.
-fn interpret_call_response(resp: Value) -> Result<Value, String> {
+/// hand-built response `Value`s. Only local single-JSON tools are
+/// unwrapped; desktop results and `figmog_images` retain their MCP envelope.
+fn interpret_call_response(tool: &str, resp: Value) -> Result<Value, String> {
     if let Some(err) = resp.get("error") {
         return Err(protocol_error_message(err));
     }
     let result = resp.get("result").cloned().unwrap_or(Value::Null);
+    if !crate::proxy::is_local_tool(tool) {
+        return Ok(result);
+    }
     let is_error = result
         .get("isError")
         .and_then(Value::as_bool)
@@ -212,19 +216,17 @@ fn interpret_call_response(resp: Value) -> Result<Value, String> {
     if is_error {
         return Err(text.unwrap_or_else(|| "unknown error from serve".to_string()));
     }
+    if tool == "figmog_images" {
+        return Ok(result);
+    }
 
     match text {
-        // Every local `figmog_*` tool — the only kind this CLI ever calls
-        // over the socket — answers as `ToolOutput::Json`, i.e. one text
-        // content block holding figmog's own JSON (see `mcp::ToolOutput`'s
-        // doc comment); parse it back out rather than handing the caller a
-        // JSON *string* nested inside the MCP envelope.
+        // Local single-JSON tools answer as `ToolOutput::Json`, i.e. one
+        // text block holding figmog's own JSON (see `mcp::ToolOutput`).
+        // Parse it back out for the CLI's established local read shape.
         Some(t) => serde_json::from_str(&t)
             .map_err(|e| format!("serve returned non-JSON tool content: {e}")),
-        // No text content at all: a `Raw` (proxied, non-`figmog_*`) result.
-        // `figmog call` can legitimately name a proxied tool, so this is a
-        // real path, not defensive dead code — pass the whole result
-        // through unchanged, same as direct mode's own proxy_call return.
+        // Preserve the existing fallback for a local result without text.
         None => Ok(result),
     }
 }
@@ -240,7 +242,10 @@ mod tests {
             "id": 1,
             "result": {"content": [{"type": "text", "text": "{\"ok\":true}"}], "isError": false},
         });
-        assert_eq!(interpret_call_response(resp).unwrap(), json!({"ok": true}));
+        assert_eq!(
+            interpret_call_response("figmog_status", resp).unwrap(),
+            json!({"ok": true})
+        );
     }
 
     #[test]
@@ -251,7 +256,7 @@ mod tests {
             "result": {"content": [{"type": "text", "text": "no node 99:99 in the mirror"}], "isError": true},
         });
         assert_eq!(
-            interpret_call_response(resp).unwrap_err(),
+            interpret_call_response("figmog_get", resp).unwrap_err(),
             "no node 99:99 in the mirror"
         );
     }
@@ -264,7 +269,7 @@ mod tests {
             "error": {"code": -32601, "message": "method not found"},
         });
         assert_eq!(
-            interpret_call_response(resp).unwrap_err(),
+            interpret_call_response("get_code", resp).unwrap_err(),
             "method not found"
         );
     }
@@ -279,7 +284,10 @@ mod tests {
             "isError": false,
         });
         let resp = json!({"jsonrpc": "2.0", "id": 1, "result": raw_result});
-        assert_eq!(interpret_call_response(resp).unwrap(), raw_result);
+        assert_eq!(
+            interpret_call_response("get_screenshot", resp).unwrap(),
+            raw_result
+        );
     }
 
     #[test]

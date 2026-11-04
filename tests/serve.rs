@@ -841,6 +841,89 @@ fn direct_cli_desktop_proxy_ignores_legacy_cache_and_observes_context_changes() 
     });
 }
 
+#[test]
+fn desktop_proxy_cli_results_are_verbatim_and_byte_identical_across_transports() {
+    const KEY: &str = "figmogproxyresult001";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let args = json!({"nodeId": "1:2", "file": KEY});
+    let results = vec![
+        json!({
+            "content": [
+                {"type": "text", "text": "<Frame>synthetic code</Frame>"},
+                {"type": "text", "text": "const label = 'Synthetic';\n"},
+            ],
+            "isError": false,
+        }),
+        json!({
+            "content": [
+                {"type": "text", "text": " { \"code\" : \"synthetic\" }\n"},
+                {"type": "image", "data": "YQ==", "mimeType": "image/png"},
+                {"type": "resource", "resource": {
+                    "uri": "synthetic:///code", "mimeType": "text/plain", "text": "Synthetic resource",
+                }},
+            ],
+            "structuredContent": {"code": "synthetic", "nodes": ["1:2"]},
+            "isError": false,
+            "_meta": {"synthetic": true},
+        }),
+        json!({
+            "content": [
+                {"type": "text", "text": "Synthetic tool failure"},
+                {"type": "text", "text": "Additional error details"},
+            ],
+            "structuredContent": {"reason": "synthetic"},
+            "isError": true,
+        }),
+        json!({
+            "content": [
+                {"type": "image", "data": "YQ==", "mimeType": "image/png"},
+                {"type": "resource_link", "uri": "synthetic:///code", "name": "Code"},
+            ],
+        }),
+        json!({"content": [], "structuredContent": {"code": "synthetic"}}),
+    ];
+    let run = |flags: &[&str]| {
+        common::command()
+            .current_dir(dir.path())
+            .args(["call", "get_code", "--args", &args.to_string()])
+            .args(flags)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+
+    let (address, upstream) = spawn_fake_upstream_with_args(results.clone(), true, args.clone());
+    let direct: Vec<Vec<u8>> = results
+        .iter()
+        .map(|expected| {
+            let stdout = run(&["--no-socket", "--upstream", &address]);
+            let result: Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(&result, expected);
+            stdout
+        })
+        .collect();
+    upstream.join().unwrap();
+
+    let (address, upstream) = spawn_fake_upstream_with_args(results.clone(), false, args.clone());
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("figmog"));
+    command
+        .args(["serve", "--no-watch", "--upstream", &address, KEY])
+        .current_dir(dir.path());
+    let (mut guard, mut stdin, rx) = spawn_child(command);
+    handshake(&mut stdin, &rx);
+    for (expected, direct_stdout) in results.iter().zip(&direct) {
+        let stdout = run(&[]);
+        let result: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(&result, expected);
+        assert_eq!(&stdout, direct_stdout);
+    }
+    upstream.join().unwrap();
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
 // ---- multi-file serve e2e (spec §14) ----
 //
 // Two pre-built stores under a temp `--figmog-root` (built via `pull
@@ -1368,7 +1451,8 @@ fn assert_proxy_cli_preserves_args_and_current_mirror(args: Value, socket: bool)
     let dir = routing_fixture();
     let result =
         json!({"content": [{"type": "text", "text": r#"{"code":"CODE_HERE"}"#}], "isError": false});
-    let (address, upstream) = spawn_fake_upstream_with_args(vec![result], false, args.clone());
+    let (address, upstream) =
+        spawn_fake_upstream_with_args(vec![result.clone()], false, args.clone());
     let server = if socket {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin!("figmog"));
         command
@@ -1400,11 +1484,8 @@ fn assert_proxy_cli_preserves_args_and_current_mirror(args: Value, socket: bool)
         command.args(["--no-socket", "--upstream", &address]);
     }
     let output = command.assert().success();
-    let mut value: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
-    if !socket {
-        value = serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap();
-    }
-    assert_eq!(value["code"], "CODE_HERE");
+    let value: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(value, result);
     upstream.join().unwrap();
     if let Some((mut guard, stdin)) = server {
         drop(stdin);
@@ -1600,14 +1681,19 @@ fn socket_cli_file_routing_prefers_explicit_file_then_url_then_current() {
         spawn_default_root_serve_keys(dir.path(), &[ROUTING_A, ROUTING_B], &[]);
     handshake(&mut stdin, &rx);
     assert_cli_file_routing(dir.path(), &[]);
-    let out = common::command()
-        .args(["call", "figmog_open"])
-        .current_dir(dir.path())
-        .assert()
-        .failure()
-        .code(1);
-    let error: Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
-    assert_eq!(error["error"], "missing required field: file");
+    for (tool, expected) in [
+        ("figmog_open", "missing required field: file"),
+        ("figmog_images", "missing required field: ids"),
+    ] {
+        let out = common::command()
+            .args(["call", tool])
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .code(1);
+        let error: Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
+        assert_eq!(error["error"], expected);
+    }
     drop(stdin);
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
