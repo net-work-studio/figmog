@@ -1523,6 +1523,78 @@ fn search_under_ranks_the_full_corpus_before_truncating_to_limit() {
 // ---- v0.0.2 §6: --resolve-vars ----
 
 #[test]
+fn escaped_binding_pointers_resolve_observed_values_and_annotations() {
+    use serde_json::{Value, json};
+
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    let alias = json!({"type": "VARIABLE_ALIAS", "id": "VariableID:300"});
+    let mut fixture = common::fixture_v1();
+    let instance = &mut fixture["document"]["children"][0]["children"][0]["children"][1];
+    instance["componentProperties"] = json!({
+        "Label/Title#1:2": {"type": "TEXT", "value": "Hello", "boundVariables": {"value": alias}},
+        "Label~1/Title#1:2": {"type": "TEXT", "value": "Hello", "boundVariables": {"value": alias}}
+    });
+    instance["custom"] = json!({
+        "values": [{"a/~": "Hello"}],
+        "boundVariables": {"values": [{"a/~": alias}]}
+    });
+    std::fs::write(&response, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    let db = dir.path().join("db").display().to_string();
+    let run = |args: &[&str]| -> Value {
+        let out = common::command()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice(&out.get_output().stdout).unwrap()
+    };
+    run(&["pull", "--from-file", response.to_str().unwrap()]);
+
+    let pointers = [
+        "/componentProperties/Label~01~1Title#1:2/value",
+        "/componentProperties/Label~1Title#1:2/value",
+        "/custom/values/0/a~1~0",
+    ];
+    let vars = run(&["vars", "VariableID:300"]);
+    assert_eq!(vars[0]["source"], "inferred");
+    assert_eq!(vars[0]["observed"], json!(["\"Hello\""]));
+    assert_eq!(
+        vars[0]["sites"],
+        json!([
+            ["1:3", pointers[0]],
+            ["1:3", pointers[1]],
+            ["1:3", pointers[2]],
+        ])
+    );
+
+    let export = dir.path().join("vars.json");
+    let variables = json!({
+        "variables": {
+            "VariableID:300": {"name": "label/title", "resolvedType": "STRING",
+                "variableCollectionId": "collection:labels", "valuesByMode": {"mode:default": "Hello"}}
+        },
+        "variableCollections": {
+            "collection:labels": {"name": "Labels", "defaultModeId": "mode:default",
+                "modes": [{"modeId": "mode:default", "name": "default"}]}
+        }
+    });
+    std::fs::write(&export, serde_json::to_vec(&variables).unwrap()).unwrap();
+    run(&["import-variables", export.to_str().unwrap()]);
+
+    let node = run(&["get", "1:3", "--resolve-vars"]);
+    let annotations = node["resolved_variables"].as_array().unwrap();
+    assert_eq!(annotations.len(), pointers.len());
+    for (annotation, pointer) in annotations.iter().zip(pointers) {
+        assert_eq!(annotation["pointer"], pointer);
+        assert_eq!(annotation["variable_id"], "VariableID:300");
+        assert_eq!(annotation["variable_name"], "label/title");
+        assert_eq!(annotation["values_by_mode"], json!({"default": "Hello"}));
+        assert_eq!(node.pointer(pointer), Some(&json!("Hello")));
+    }
+}
+
+#[test]
 fn resolve_vars_marks_bindings_unresolved_with_no_variables_table() {
     let (_dir, db) = fixture_db();
 

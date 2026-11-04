@@ -227,6 +227,10 @@ fn scan_bound_variables(node_raw: &Value) -> Vec<(String, String)> {
     out
 }
 
+fn escape_json_pointer_component(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
 fn scan_bv(v: &Value, path: &str, out: &mut Vec<(String, String)>) {
     match v {
         Value::Object(map) => {
@@ -234,7 +238,8 @@ fn scan_bv(v: &Value, path: &str, out: &mut Vec<(String, String)>) {
                 if k == "boundVariables" {
                     collect_aliases(child, path, out);
                 } else {
-                    scan_bv(child, &format!("{path}/{k}"), out);
+                    let key = escape_json_pointer_component(k);
+                    scan_bv(child, &format!("{path}/{key}"), out);
                 }
             }
         }
@@ -258,7 +263,8 @@ fn collect_aliases(v: &Value, prop_path: &str, out: &mut Vec<(String, String)>) 
                 return;
             }
             for (k, child) in map {
-                collect_aliases(child, &format!("{prop_path}/{k}"), out);
+                let key = escape_json_pointer_component(k);
+                collect_aliases(child, &format!("{prop_path}/{key}"), out);
             }
         }
         Value::Array(items) => {

@@ -167,6 +167,93 @@ fn nested_nodes_preserve_childless_record_bytes() {
 }
 
 #[test]
+fn binding_pointers_escape_object_keys_outside_bound_variables() {
+    use serde_json::json;
+
+    for (key, pointer) in [
+        (
+            "Label/Title#1:2",
+            "/componentProperties/Label~1Title#1:2/value",
+        ),
+        ("Label~Title", "/componentProperties/Label~0Title/value"),
+        ("~/", "/componentProperties/~0~1/value"),
+        ("/~", "/componentProperties/~1~0/value"),
+        ("~1", "/componentProperties/~01/value"),
+        ("~0", "/componentProperties/~00/value"),
+    ] {
+        let response = json!({
+            "name": "Escaped bindings", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
+            "document": {
+                "id": "doc", "type": "DOCUMENT", "children": [{
+                    "id": "instance", "type": "INSTANCE",
+                    "componentProperties": {
+                        (key): {
+                            "value": "Hello",
+                            "boundVariables": {"value": {"type": "VARIABLE_ALIAS", "id": "var:label"}}
+                        }
+                    }
+                }]
+            }
+        });
+        let out = flatten_file(&response).unwrap();
+        let instance = node(&out.recs, "instance");
+        assert_eq!(
+            instance.bound_variables,
+            vec![(pointer.to_string(), "var:label".to_string())],
+            "key: {key}"
+        );
+        let raw: serde_json::Value = serde_json::from_str(&instance.raw).unwrap();
+        assert_eq!(raw.pointer(pointer), Some(&json!("Hello")), "key: {key}");
+    }
+}
+
+#[test]
+fn binding_pointers_escape_nested_alias_keys_and_preserve_array_indices() {
+    use serde_json::json;
+
+    for (key, pointer) in [
+        ("a/b", "/custom/nested~1aliases/1/a~1b"),
+        ("a~b", "/custom/nested~1aliases/1/a~0b"),
+        ("~/", "/custom/nested~1aliases/1/~0~1"),
+        ("/~", "/custom/nested~1aliases/1/~1~0"),
+        ("~1", "/custom/nested~1aliases/1/~01"),
+        ("~0", "/custom/nested~1aliases/1/~00"),
+    ] {
+        let response = json!({
+            "name": "Nested aliases", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
+            "document": {
+                "id": "doc", "type": "DOCUMENT",
+                "custom": {
+                    "nested/aliases": [10, {(key): "Hello"}],
+                    "boundVariables": {
+                        "nested/aliases": [
+                            {"type": "VARIABLE_ALIAS", "id": "var:number"},
+                            {(key): {"type": "VARIABLE_ALIAS", "id": "var:label"}}
+                        ]
+                    }
+                }
+            }
+        });
+        let out = flatten_file(&response).unwrap();
+        let doc = node(&out.recs, "doc");
+        assert_eq!(
+            doc.bound_variables,
+            vec![
+                (
+                    "/custom/nested~1aliases/0".to_string(),
+                    "var:number".to_string()
+                ),
+                (pointer.to_string(), "var:label".to_string()),
+            ],
+            "key: {key}"
+        );
+        let raw: serde_json::Value = serde_json::from_str(&doc.raw).unwrap();
+        assert_eq!(raw.pointer("/custom/nested~1aliases/0"), Some(&json!(10)));
+        assert_eq!(raw.pointer(pointer), Some(&json!("Hello")), "key: {key}");
+    }
+}
+
+#[test]
 fn deterministic_bytes() {
     let a = flatten_file(&common::fixture_v1()).unwrap();
     let b = flatten_file(&common::fixture_v1()).unwrap();
