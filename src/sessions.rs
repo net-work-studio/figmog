@@ -611,34 +611,29 @@ pub(crate) fn open_session_with_hooks(
                     scale,
                     reply,
                 } => {
-                    let result = (|| {
-                        let key = network_key.as_deref().ok_or_else(|| {
-                            "no file key: pass a file key or figma.com URL".to_string()
-                        })?;
-                        let node_ids = crate::images::normalize_ids(&ids);
-                        let scanned =
-                            st.rtx(|(_, ((nodes, ..), _, _, _, _, _, meta, _, _, images))| {
-                                crate::images::scan(
-                                    &nodes,
-                                    &meta,
-                                    &images,
-                                    &node_ids,
-                                    &format,
-                                    crate::images::scale_milli(scale),
-                                )
-                            });
-                        Ok(crate::images::resolve(
-                            &mut st,
-                            scanned,
-                            api.as_deref().map(|a| a as &dyn FigmaApi),
-                            &crate::api::download_bytes,
-                            Some(key),
-                            &node_ids,
-                            &format,
-                            scale,
-                        ))
-                    })();
-                    let _ = reply.send(result);
+                    let node_ids = crate::images::normalize_ids(&ids);
+                    let scanned =
+                        st.rtx(|(_, ((nodes, ..), _, _, _, _, _, meta, _, _, images))| {
+                            crate::images::scan(
+                                &nodes,
+                                &meta,
+                                &images,
+                                &node_ids,
+                                &format,
+                                crate::images::scale_milli(scale),
+                            )
+                        });
+                    let items = crate::images::resolve(
+                        &mut st,
+                        scanned,
+                        api.as_deref().map(|a| a as &dyn FigmaApi),
+                        &crate::api::download_bytes,
+                        network_key.as_deref(),
+                        &node_ids,
+                        &format,
+                        scale,
+                    );
+                    let _ = reply.send(Ok(items));
                 }
             }
         }

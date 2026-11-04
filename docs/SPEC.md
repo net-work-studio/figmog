@@ -869,6 +869,12 @@ cache hits still write successfully. Fetching missing images requires
 `figmog pull <file-key-or-url>` followed by `figmog images <node-id>...`
 without `--db`.
 
+`figmog serve --db <store> --no-watch` without a file positional supports
+the same offline cache extraction through `figmog_images`. Matching renders
+and fills retain their inline content alongside per-item missing-identity
+errors for cache misses. Busy and not-ready sessions still reject image
+requests before scanning the cache (§6).
+
 **Output.** The CLI writes each item into `--out` (default
 `./figmog-images/`) and prints a manifest of
 `[{id|ref, kind, format, bytes, cached, path?, error?}]`, where `bytes`
