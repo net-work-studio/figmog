@@ -822,6 +822,18 @@ impl Harness {
             std::thread::yield_now();
         }
     }
+
+    fn finish_pull_at(&mut self, now: Instant) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.manager.sessions[0].maintain_at(now);
+            if self.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] == "succeeded" {
+                return;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
 }
 
 #[test]
@@ -1165,6 +1177,147 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
 }
 
 mod watch_and_cache;
+
+#[test]
+fn successful_explicit_sync_preserves_metadata_retry_and_normal_round() {
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    *h.api.metadata_error.lock().unwrap() =
+        Some(ApiError::Network("temporary metadata failure".into()));
+    let base = Instant::now() + Duration::from_secs(60);
+    let interval = Duration::from_secs(3600);
+    let mut watch = WatchScheduler::new(base);
+    watch.service_at(&mut h.manager, interval, base);
+    h.wait_for_metadata_at(base);
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base);
+    assert_eq!(
+        watch.next_deadline(&h.manager),
+        base + Duration::from_secs(5)
+    );
+
+    h.manager.sessions[0].request_pull(false, interval);
+    h.wait_for_event_at(base + Duration::from_secs(1), "fetch");
+    h.release.send(()).unwrap();
+    h.finish_pull_at(base + Duration::from_secs(1));
+    assert_eq!(
+        watch.next_deadline(&h.manager),
+        base + Duration::from_secs(5),
+        "a successful sync must not cancel outstanding metadata recovery"
+    );
+
+    // An edit after the explicit fetch must still be detected at recovery.
+    *h.api.metadata.lock().unwrap() = "after-sync".into();
+    watch.service_at(&mut h.manager, interval, base + Duration::from_secs(4));
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        false
+    );
+    *h.api.metadata_error.lock().unwrap() =
+        Some(ApiError::Network("second metadata failure".into()));
+    watch.service_at(&mut h.manager, interval, base + Duration::from_secs(5));
+    h.wait_for_metadata_at(base + Duration::from_secs(5));
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + Duration::from_secs(5));
+    assert_eq!(
+        watch.next_deadline(&h.manager),
+        base + Duration::from_secs(15),
+        "pull success must not reset consecutive metadata failures' backoff"
+    );
+    watch.service_at(&mut h.manager, interval, base + Duration::from_secs(15));
+    h.wait_for_metadata_at(base + Duration::from_secs(15));
+    h.release.send(()).unwrap();
+    h.wait_for_event_at(base + Duration::from_secs(15), "fetch");
+    h.release.send(()).unwrap();
+    h.finish_pull_at(base + Duration::from_secs(15));
+    assert_eq!(
+        watch.next_deadline(&h.manager),
+        base + interval,
+        "recovery must clear its retry without postponing the normal round"
+    );
+    watch.service_at(&mut h.manager, interval, base + interval);
+    h.wait_for_metadata_at(base + interval);
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + interval);
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn successful_explicit_sync_preserves_metadata_retry_after_and_expedited_reconciliation() {
+    for (seconds, sync_finished, expedited) in [(90, 1, true), (90, 91, false), (7200, 1, true)] {
+        let mut h = Harness::new();
+        h.mirror_from_watch();
+        h.api.block_meta.store(true, Ordering::Relaxed);
+        *h.api.metadata_error.lock().unwrap() = Some(ApiError::RateLimited {
+            retry_after: Duration::from_secs(seconds),
+        });
+        let base = Instant::now() + Duration::from_secs(60);
+        let interval = Duration::from_secs(3600);
+        let mut watch = WatchScheduler::new(base);
+        watch.service_at(&mut h.manager, interval, base);
+        h.wait_for_metadata_at(base);
+        h.release.send(()).unwrap();
+        h.finish_poll_at(base);
+
+        h.manager.sessions[0].request_pull(false, interval);
+        h.wait_for_event_at(base + Duration::from_secs(1), "fetch");
+        if expedited {
+            h.desktop_write(false);
+        }
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(sync_finished));
+        assert_eq!(
+            h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+            false,
+            "metadata recovery must remain serialized behind the sync"
+        );
+        h.release.send(()).unwrap();
+        h.finish_pull_at(base + Duration::from_secs(sync_finished));
+
+        if seconds > 3600 {
+            watch.service_at(&mut h.manager, interval, base + interval);
+            assert_eq!(
+                h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+                false,
+                "a normal round must not bypass metadata Retry-After"
+            );
+        }
+        assert_eq!(
+            watch.next_deadline(&h.manager),
+            base + Duration::from_secs(seconds.max(sync_finished)),
+            "sync success must preserve even an overdue metadata retry"
+        );
+        if sync_finished < seconds {
+            let before = base + Duration::from_secs(seconds - 1);
+            h.manager.sessions[0].maintain_at(before);
+            watch.service_at(&mut h.manager, interval, before);
+            assert_eq!(
+                h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+                false,
+                "expedited reconciliation must honor metadata Retry-After"
+            );
+        }
+
+        *h.api.metadata.lock().unwrap() = "after-sync".into();
+        *h.api.response.lock().unwrap() = Ok(fixture("3"));
+        let recovery = base + Duration::from_secs(seconds.max(sync_finished));
+        if !expedited {
+            watch.service_at(&mut h.manager, interval, recovery);
+        }
+        h.wait_for_metadata_at(recovery);
+        h.release.send(()).unwrap();
+        h.wait_for_event_at(recovery, "fetch");
+        h.release.send(()).unwrap();
+        h.finish_pull_at(recovery);
+        assert_eq!(h.manager.sessions[0].status().unwrap()["version"], "3");
+        h.manager.sessions[0].maintain_at(recovery + Duration::from_secs(1));
+        assert!(matches!(
+            h.entered.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(h.api.calls.load(Ordering::Relaxed), 3);
+    }
+}
 
 #[test]
 fn ordinary_metadata_failure_retries_at_backoff_before_next_hourly_round() {

@@ -121,7 +121,8 @@ pub(crate) struct FileSession {
     backoff: Duration,
     retry_at: Instant,
     next_poll: Instant,
-    poll_retry_at: Instant,
+    poll_retry_at: Option<Instant>,
+    // Watch recovery for pull failures; metadata recovery is independent.
     watch_retry_at: Option<Instant>,
     expedited_poll: bool,
     interval: Duration,
@@ -286,9 +287,8 @@ impl FileSession {
                         // latency must not make the next round ineligible.
                         Tick::Unchanged => {}
                         Tick::Wait { after } => {
-                            self.poll_retry_at = now + after;
-                            self.next_poll = self.poll_retry_at;
-                            self.watch_retry_at = Some(self.poll_retry_at);
+                            self.next_poll = now + after;
+                            self.poll_retry_at = Some(self.next_poll);
                             // A failed expedited observation still needs
                             // reconciliation once its retry delay expires.
                             self.expedited_poll |= expedited;
@@ -354,12 +354,11 @@ impl FileSession {
         {
             return None;
         }
-        self.watch_retry_at.map(|retry| {
-            retry
-                .max(self.retry_at)
-                .max(self.poll_retry_at)
-                .max(self.next_poll)
-        })
+        self.watch_retry_at
+            .into_iter()
+            .chain(self.poll_retry_at)
+            .max()
+            .map(|retry| retry.max(self.retry_at).max(self.next_poll))
     }
 
     /// Extra retry work must not push an already scheduled normal visit
@@ -377,7 +376,7 @@ impl FileSession {
         if !self.busy
             && (self.expedited_poll || now >= self.next_poll)
             && now >= self.retry_at
-            && now >= self.poll_retry_at
+            && self.poll_retry_at.is_none_or(|retry| now >= retry)
             && self
                 .job
                 .as_ref()
@@ -390,6 +389,7 @@ impl FileSession {
                 .send(Command::Poll { expedited })
                 .unwrap();
             self.next_poll = now + interval;
+            self.poll_retry_at = None;
             self.watch_retry_at = None;
             self.busy = true;
             self.polling = true;
@@ -661,7 +661,7 @@ pub(crate) fn open_session_with_hooks(
         backoff: BACKOFF_START,
         retry_at: Instant::now(),
         next_poll: Instant::now(),
-        poll_retry_at: Instant::now(),
+        poll_retry_at: None,
         watch_retry_at: None,
         expedited_poll: false,
         interval: Duration::from_secs(10),

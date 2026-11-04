@@ -392,7 +392,9 @@ Ordinary poll eligibility is anchored to metadata request dispatch, matching
 the global round-robin clock. An unchanged completion or successful pull
 publication does not move it later and accidentally skip the next round.
 Metadata retry deadlines and pull retry deadlines remain separate from this
-ordinary cadence; neither can be bypassed by an expedited request.
+ordinary cadence; neither can be bypassed by an expedited request. A
+successful pull does not cancel outstanding metadata recovery or reset its
+exponential backoff.
 
 **Watch watermarks:** each session keeps a successfully synchronized
 metadata `last_touched_at` and a separate pending observation in memory.
