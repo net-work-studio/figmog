@@ -46,7 +46,8 @@ pub enum ToolOutput {
 }
 
 /// Executes a `tools/call`. `Ok(output)` becomes the success result per
-/// [`ToolOutput`]'s two shapes; `Err(msg)` becomes `isError` text content.
+/// [`ToolOutput`]'s two shapes; `Err(msg)` becomes `isError` text content
+/// on stdio or a JSON-RPC error on the socket control plane.
 pub trait ToolHandler {
     fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String>;
 }
@@ -73,6 +74,31 @@ pub fn handle_message(
     tools: &[ToolDef],
     handler: &mut dyn ToolHandler,
 ) -> Option<Value> {
+    handle_message_with_tool_errors(raw, tools, handler, ToolErrorMode::McpContent)
+}
+
+/// Handle a control-plane request. Serve-generated tool failures use a
+/// JSON-RPC error so CLI clients can distinguish them from genuine upstream
+/// `CallToolResult`s, whose tool-level `isError` belongs to the desktop.
+pub(crate) fn handle_socket_message(
+    raw: &str,
+    tools: &[ToolDef],
+    handler: &mut dyn ToolHandler,
+) -> Option<Value> {
+    handle_message_with_tool_errors(raw, tools, handler, ToolErrorMode::JsonRpc)
+}
+
+enum ToolErrorMode {
+    McpContent,
+    JsonRpc,
+}
+
+fn handle_message_with_tool_errors(
+    raw: &str,
+    tools: &[ToolDef],
+    handler: &mut dyn ToolHandler,
+    tool_errors: ToolErrorMode,
+) -> Option<Value> {
     let msg: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
@@ -98,7 +124,19 @@ pub fn handle_message(
         "initialize" => Some(initialize_result(&params)),
         "ping" => Some(json!({})),
         "tools/list" => Some(tools_list_result(tools)),
-        "tools/call" => Some(tools_call_result(&params, tools, handler)),
+        "tools/call" => match tools_call_result(&params, tools, handler) {
+            Ok(result) => Some(result),
+            Err(message) => match tool_errors {
+                ToolErrorMode::McpContent => Some(error_content(&message)),
+                ToolErrorMode::JsonRpc => {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32000, "message": message},
+                    }));
+                }
+            },
+        },
         _ => None,
     };
 
@@ -150,19 +188,23 @@ fn tools_list_result(tools: &[ToolDef]) -> Value {
     json!({"tools": list})
 }
 
-fn tools_call_result(params: &Value, tools: &[ToolDef], handler: &mut dyn ToolHandler) -> Value {
+fn tools_call_result(
+    params: &Value,
+    tools: &[ToolDef],
+    handler: &mut dyn ToolHandler,
+) -> Result<Value, String> {
     let name = match params.get("name").and_then(Value::as_str) {
         Some(name) => name,
-        None => return error_content("missing required field: name"),
+        None => return Err("missing required field: name".to_string()),
     };
 
     if !tools.iter().any(|t| t.name == name) {
-        return error_content(&format!("unknown tool: {name}"));
+        return Err(format!("unknown tool: {name}"));
     }
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    match handler.call(name, &args) {
-        Ok(ToolOutput::Json(v)) => {
+    Ok(match handler.call(name, &args)? {
+        ToolOutput::Json(v) => {
             let mut result = json!({
                 "content": [{"type": "text", "text": serde_json::to_string(&v).unwrap()}],
                 "isError": false,
@@ -172,9 +214,8 @@ fn tools_call_result(params: &Value, tools: &[ToolDef], handler: &mut dyn ToolHa
             }
             result
         }
-        Ok(ToolOutput::Raw(v)) => v,
-        Err(msg) => error_content(&msg),
-    }
+        ToolOutput::Raw(v) => v,
+    })
 }
 
 fn error_content(msg: &str) -> Value {
