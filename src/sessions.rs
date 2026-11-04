@@ -246,23 +246,27 @@ pub(crate) fn open_session_with_api(
                 );
                 prior.extend(stored_var_ids);
             }
+            let prior_version =
+                st.rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.version.clone()));
             let churn = store::sync(&mut st, &prior, &flattened, now_ms());
 
             // Cache eviction lives here rather than folded into `sync`
             // (store.rs's own note): a version-changing pull sweeps stale
             // `proxy_cache` rows (and, v0.0.2 spec §5, stale `images` rows
-            // the same way); computing `stale` against the version just
-            // synced makes this a no-op whenever the version didn't
-            // actually move, with no separate "did it change" check needed.
+            // the same way). Match CLI pulls: skip both scans when the
+            // stored version is unchanged, avoiding decoding cached image
+            // bytes. An absent prior version still triggers eviction.
             let version = flattened.file.version.clone();
-            let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
-                let mut stale = store::stale_cache_ids(&cache, &version);
-                stale.extend(store::stale_image_ids(&images, &version));
-                stale
-            });
-            if !stale.is_empty() {
-                stale.sort();
-                store::evict_stale_cache(&mut st, &stale);
+            if prior_version.as_deref() != Some(version.as_str()) {
+                let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
+                    let mut stale = store::stale_cache_ids(&cache, &version);
+                    stale.extend(store::stale_image_ids(&images, &version));
+                    stale
+                });
+                if !stale.is_empty() {
+                    stale.sort();
+                    store::evict_stale_cache(&mut st, &stale);
+                }
             }
 
             // Persist the (possibly just-turned-on) geometry flag so the
@@ -567,6 +571,131 @@ mod tests {
                 "name": "Synthetic", "version": version, "lastModified": FULL_TIMESTAMP,
                 "document": {"id": "0:0", "name": "Synthetic", "type": "DOCUMENT"}
             }))
+        }
+    }
+
+    /// Synthetic legacy proxy rows and 1 MiB render/fill blobs, including
+    /// both matching and mismatched versions independently of stored meta.
+    fn seed_session_cache(path: &Path, prior_version: Option<&str>) {
+        use crate::model::{FileMeta, ImageBlobRec, Rec};
+
+        let mut st = crate::open_store!(path);
+        if let Some(version) = prior_version {
+            st.wtx(|tx| {
+                tx.upsert(
+                    &Id::Meta,
+                    &Rec::Meta(FileMeta {
+                        name: "Synthetic".into(),
+                        version: version.into(),
+                        last_modified: FULL_TIMESTAMP.into(),
+                        synced_at_unix_ms: 0,
+                    }),
+                );
+            });
+        }
+        for version in ["0", "1"] {
+            crate::cache::store(&mut st, "get_code", version, version, &json!([])).unwrap();
+            for kind in ["render", "fill"] {
+                let subject = format!("synthetic-{kind}-{version}");
+                let key = crate::images::image_key(kind, &subject, "png", 1000);
+                let rec = ImageBlobRec {
+                    key_hash: key.clone(),
+                    kind: kind.into(),
+                    subject,
+                    format: "png".into(),
+                    scale_milli: 1000,
+                    file_version: version.into(),
+                    bytes: vec![42; 1024 * 1024],
+                };
+                st.wtx(|tx| {
+                    tx.upsert(&Id::ImageBlob(key.clone()), &Rec::ImageBlob(rec.clone()));
+                });
+            }
+        }
+    }
+
+    fn session_cache_rows(path: &Path) -> Vec<crate::model::Rec> {
+        use crate::model::Rec;
+
+        let st = crate::open_store!(path);
+        st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
+            cache
+                .iter()
+                .map(|(_, rec)| Rec::ProxyCache(rec))
+                .chain(images.iter().map(|(_, rec)| Rec::ImageBlob(rec)))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn same_version_session_pulls_skip_cache_scans_with_large_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        seed_session_cache(&path, Some("1"));
+        let expected = session_cache_rows(&path);
+        let api = ScriptedApi::new();
+        let scans_before = store::STALE_SCAN_COUNTS.get();
+
+        // Startup and repeated explicit pulls use the persisted version,
+        // including after reopening a mirror from an earlier session.
+        let mut session = open_session_with_api(
+            path.clone(),
+            "ABC123".into(),
+            Some("ABC123"),
+            Some(api.clone()),
+            true,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                do_pull(&mut session, Duration::from_secs(1), false)
+                    .unwrap()
+                    .version,
+                "1"
+            );
+        }
+        assert_eq!(api.file_calls.get(), 3);
+        assert_eq!(store::STALE_SCAN_COUNTS.get(), scans_before);
+        drop(session);
+        assert_eq!(session_cache_rows(&path), expected);
+    }
+
+    #[test]
+    fn initial_and_version_changing_session_pulls_evict_only_mismatched_cache_rows() {
+        use crate::model::Rec;
+
+        for prior_version in [None, Some("0")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            seed_session_cache(&path, prior_version);
+            let expected: Vec<_> = session_cache_rows(&path)
+                .into_iter()
+                .filter(|rec| match rec {
+                    Rec::ProxyCache(rec) => rec.file_version == "1",
+                    Rec::ImageBlob(rec) => rec.file_version == "1",
+                    _ => unreachable!(),
+                })
+                .collect();
+            assert_eq!(expected.len(), 3, "one proxy row, one render, one fill");
+            let scans_before = store::STALE_SCAN_COUNTS.get();
+            let mut session = open_session_with_api(
+                path.clone(),
+                "ABC123".into(),
+                Some("ABC123"),
+                Some(ScriptedApi::new()),
+                false,
+            )
+            .unwrap();
+
+            let outcome = do_pull(&mut session, Duration::from_secs(1), false).unwrap();
+            assert_eq!(outcome.version, "1");
+            assert_eq!(
+                store::STALE_SCAN_COUNTS.get(),
+                (scans_before.0 + 1, scans_before.1 + 1),
+                "initial and version-changing pulls must scan both tables"
+            );
+            drop(session);
+            assert_eq!(session_cache_rows(&path), expected);
         }
     }
 
