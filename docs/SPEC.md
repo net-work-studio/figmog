@@ -701,20 +701,21 @@ argument `file` first (key or Figma URL), then the file inferred from a
 node URL in `id`, `under`, or `target`, then `.figmog/current`.
 An explicit `--db` takes precedence
 over all of these. Current is injected as a routed `file` argument only
-when no explicit non-null `file` was supplied and no node URL selects a
-file; `figmog call figmog_open` is the exception, since there `file` names the
-file to open rather than a routing target. A routed `figmog_status`
-result drops the server-only `upstream`, `ready` and `pull` fields, keeping
-ordinary CLI output byte-identical for an existing mirror. Before a first
-successful mirror, plain `figmog status` returns a clear not-ready error;
+for per-file local tools, when no explicit non-null `file` was supplied
+and no node URL selects a file. `figmog_open` and `figmog_files` keep
+their management semantics: `file` names the file to open for the former,
+and the latter lists all sessions without a routing target. A routed
+`figmog_status` result drops the server-only `upstream`, `ready` and `pull`
+fields, keeping ordinary CLI output byte-identical for an existing mirror.
+Before a first successful mirror, plain `figmog status` returns a clear not-ready error;
 `figmog call figmog_status` exposes the full lifecycle instead.
 
 Desktop-proxy calls do not interpret `file` or node URLs as mirror
 selectors (§8): direct mode opens the current mirror (or an explicit
 `--db`), while serve forwards desktop calls without resolving a mirror.
-Both paths forward uncached. Explicit
-non-null `file` values, including objects and numbers, pass through to
-upstream unchanged.
+Both paths forward uncached and preserve desktop arguments exactly,
+including an absent `file` or explicit null, string, number, or object.
+Socket routing never injects `.figmog/current` into desktop arguments.
 
 `pull` is a writer and always opens the store directly. While `serve`
 holds that store, `pull`'s lock error additionally says "or ask the

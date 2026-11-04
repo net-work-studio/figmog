@@ -381,14 +381,12 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         } = &cli.cmd
         {
             let parsed_args = call::parse_args(args.as_deref())?;
-            // Use current only after explicit file and URL inference,
-            // exactly like direct mode's `resolve_db` — except
-            // `figmog_open`, whose `file` argument means "the file to
-            // open", not a routing hint (see `with_current_file`).
-            let parsed_args = if tool == "figmog_open" {
-                parsed_args
-            } else {
+            // Only per-file local tools use mirror routing. Desktop
+            // arguments and management calls pass through unchanged.
+            let parsed_args = if is_per_file_local_tool(tool) {
                 with_current_file(parsed_args)?
+            } else {
+                parsed_args
             };
             if let Some(result) = socket::try_call(root, tool, parsed_args) {
                 note_ignored_upstream_flags(upstream, *no_upstream);
@@ -632,11 +630,18 @@ fn requested_file(args: &Value) -> Option<String> {
         .or_else(|| crate::dispatch::infer_file_from_node_ref(args))
 }
 
-/// Inject `.figmog/current`'s key as the routed `file` argument, when one
-/// is established, no explicit non-null `file` was supplied, and no node
-/// URL selects a file (review C1): without this, a socket-routed call
-/// carries no `file` at all, so serve answers from *its own* default session
-/// (`SessionManager::effective_default_key`) — which can silently diverge
+/// Management tools don't target an existing mirror, and desktop tools
+/// use the desktop's own context rather than local mirror routing.
+fn is_per_file_local_tool(tool: &str) -> bool {
+    crate::proxy::is_local_tool(tool) && !matches!(tool, "figmog_open" | "figmog_files")
+}
+
+/// For per-file local tools, inject `.figmog/current`'s key as the routed
+/// `file` argument when one is established, no explicit non-null `file`
+/// was supplied, and no node URL selects a file (review C1): without this,
+/// a socket-routed call carries no `file` at all, so serve answers from
+/// *its own* default session (`SessionManager::effective_default_key`) —
+/// which can silently diverge
 /// from the mirror `.figmog/current` (and thus direct mode) actually
 /// targets, or, in the zero-startup-file quick-start shape, doesn't exist
 /// at all (serve has no sessions yet), producing a hard "no default
@@ -649,17 +654,17 @@ fn requested_file(args: &Value) -> Option<String> {
 /// `mirrored: meta_present`). `.figmog/current` unset ⇒ args unchanged,
 /// preserving today's serve-own-default behavior exactly.
 ///
-/// Never applied to `figmog_open`: unlike every other tool, `figmog_open`'s
-/// own `file` argument names the file *to open*, not a routing hint — it's
-/// required, and direct mode's own dispatch correctly rejects an omitted
-/// one; silently defaulting it here would let `figmog call figmog_open`
+/// Never applied to desktop tools or `figmog_files`, which have no mirror
+/// routing, nor to `figmog_open`: its own `file` argument names the file
+/// *to open*, not a routing hint — it's required, and direct mode's own
+/// dispatch correctly rejects an omitted one; silently defaulting it here
+/// would let `figmog call figmog_open`
 /// (no `--args`) succeed over the socket while the exact same invocation
 /// fails direct, breaking the very byte-compatibility this routing exists
 /// to preserve (see `dispatch::cmd_as_tool_call`'s caller).
 fn with_current_file(mut args: Value) -> Result<Value, String> {
-    // Upstream schemas are passed through verbatim: a non-string `file`
-    // may be meaningful to the desktop tool, even though it cannot select
-    // a local mirror. Preserve it independently of URL inference.
+    // Preserve explicit non-null values for the local tool's own argument
+    // handling, even when they cannot select a mirror.
     let has_file = args.get("file").is_some_and(|value| !value.is_null());
     let url_file = crate::dispatch::infer_file_from_node_ref(&args);
     if let Some(obj) = args.as_object_mut()
@@ -822,10 +827,7 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
     // `id`, `under`, and `target` follow the socket/server URL inference.
     // `figmog_open` and `figmog_files` keep their management semantics.
     let file = match &cli.cmd {
-        Cmd::Call { tool, args, .. }
-            if crate::proxy::is_local_tool(tool)
-                && !matches!(tool.as_str(), "figmog_open" | "figmog_files") =>
-        {
+        Cmd::Call { tool, args, .. } if is_per_file_local_tool(tool) => {
             requested_file(&call::parse_args(args.as_deref())?)
         }
         cmd => cmd_as_tool_call(cmd).and_then(|(_, args)| requested_file(&args)),
