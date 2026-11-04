@@ -32,7 +32,9 @@ enum Command {
     Pull {
         geometry: bool,
     },
-    Poll,
+    Poll {
+        expedited: bool,
+    },
     Images {
         ids: Vec<String>,
         format: String,
@@ -44,7 +46,7 @@ enum Command {
 enum Completion {
     Pull(Result<(PullOutcome, Arc<SessionView>), PullError>),
     Phase(PullPhase),
-    Poll(Tick),
+    Poll { tick: Tick, expedited: bool },
 }
 
 #[derive(Debug)]
@@ -119,6 +121,8 @@ pub(crate) struct FileSession {
     backoff: Duration,
     retry_at: Instant,
     next_poll: Instant,
+    poll_retry_at: Instant,
+    expedited_poll: bool,
     interval: Duration,
 }
 
@@ -229,7 +233,11 @@ impl FileSession {
     }
 
     fn start_if_ready(&mut self) {
-        if self.busy || Instant::now() < self.retry_at {
+        self.start_if_ready_at(Instant::now());
+    }
+
+    fn start_if_ready_at(&mut self, now: Instant) {
+        if self.busy || now < self.retry_at {
             return;
         }
         if let Some(job) = &mut self.job
@@ -251,6 +259,10 @@ impl FileSession {
     /// serially per file, so neither an old poll nor an old pull can
     /// overwrite a newer publication.
     pub(crate) fn maintain(&mut self) -> bool {
+        self.maintain_at(Instant::now())
+    }
+
+    pub(crate) fn maintain_at(&mut self, now: Instant) -> bool {
         let mut published = false;
         while let Ok(completion) = self.completions.try_recv() {
             if let Completion::Phase(phase) = completion {
@@ -262,14 +274,23 @@ impl FileSession {
             self.busy = false;
             match completion {
                 Completion::Phase(_) => unreachable!("handled above"),
-                Completion::Poll(tick) => {
+                Completion::Poll { tick, expedited } => {
                     self.polling = false;
                     match tick {
                         Tick::Changed => {
                             self.request_pull(false, self.interval);
                         }
-                        Tick::Unchanged => self.next_poll = Instant::now() + self.interval,
-                        Tick::Wait { after } => self.next_poll = Instant::now() + after,
+                        // Ordinary cadence is anchored to dispatch, just
+                        // like the global round-robin tick. Completion
+                        // latency must not make the next round ineligible.
+                        Tick::Unchanged => {}
+                        Tick::Wait { after } => {
+                            self.poll_retry_at = now + after;
+                            self.next_poll = self.poll_retry_at;
+                            // A failed expedited observation still needs
+                            // reconciliation once its retry delay expires.
+                            self.expedited_poll |= expedited;
+                        }
                     }
                 }
                 Completion::Pull(result) => {
@@ -283,15 +304,16 @@ impl FileSession {
                                 Some(json!({"job_id": job.id, "name": outcome.name,
                                 "version": outcome.version, "churn": outcome.churn}));
                             self.backoff = BACKOFF_START;
-                            self.retry_at = Instant::now();
-                            self.next_poll = Instant::now() + self.interval;
+                            self.retry_at = now;
+                            // Publishing a pull must not postpone the
+                            // next round beyond its last poll dispatch.
                             published = true;
                         }
                         Err(error) => {
                             let wait = pull_failure_wait(&error, &mut self.backoff, self.interval);
                             job.state = JobState::Failed;
                             job.error = Some(error.to_string());
-                            self.retry_at = Instant::now() + wait;
+                            self.retry_at = now + wait;
                             self.next_poll = self.retry_at;
                         }
                     }
@@ -303,21 +325,38 @@ impl FileSession {
                 }
             }
         }
-        self.start_if_ready();
+        self.start_if_ready_at(now);
+        if self.expedited_poll {
+            self.poll_at(self.interval, now);
+        }
         published
     }
 
-    pub(crate) fn poll(&mut self, interval: Duration) {
+    /// Desktop context cannot identify a mirror authoritatively. Its
+    /// write requests one coalesced observation per known session.
+    pub(crate) fn expedite_poll(&mut self, interval: Duration) {
+        self.interval = interval;
+        self.expedited_poll = true;
+    }
+
+    pub(crate) fn poll_at(&mut self, interval: Duration, now: Instant) {
         self.interval = interval;
         if !self.busy
-            && Instant::now() >= self.next_poll
-            && Instant::now() >= self.retry_at
+            && (self.expedited_poll || now >= self.next_poll)
+            && now >= self.retry_at
+            && now >= self.poll_retry_at
             && self
                 .job
                 .as_ref()
                 .is_none_or(|j| j.state != JobState::Queued)
         {
-            self.commands.as_ref().unwrap().send(Command::Poll).unwrap();
+            let expedited = std::mem::take(&mut self.expedited_poll);
+            self.commands
+                .as_ref()
+                .unwrap()
+                .send(Command::Poll { expedited })
+                .unwrap();
+            self.next_poll = now + interval;
             self.busy = true;
             self.polling = true;
         }
@@ -441,14 +480,14 @@ pub(crate) fn open_session_with_hooks(
         let mut watcher = Watcher::new(None);
         while let Ok(command) = work.recv() {
             match command {
-                Command::Poll => {
+                Command::Poll { expedited } => {
                     let tick = match (&api, &network_key) {
                         (Some(api), Some(key)) => watcher.tick(&**api, key),
                         _ => Tick::Wait {
                             after: Duration::from_secs(300),
                         },
                     };
-                    if done.send(Completion::Poll(tick)).is_err() {
+                    if done.send(Completion::Poll { tick, expedited }).is_err() {
                         break;
                     }
                 }
@@ -585,6 +624,8 @@ pub(crate) fn open_session_with_hooks(
         backoff: BACKOFF_START,
         retry_at: Instant::now(),
         next_poll: Instant::now(),
+        poll_retry_at: Instant::now(),
+        expedited_poll: false,
         interval: Duration::from_secs(10),
     })
 }
@@ -655,6 +696,12 @@ impl SessionManager {
             session.request_pull(false, interval);
         }
         Ok(session)
+    }
+
+    pub(crate) fn expedite_polls(&mut self, interval: Duration) {
+        for session in &mut self.sessions {
+            session.expedite_poll(interval);
+        }
     }
 
     pub(crate) fn list(&self) -> Value {

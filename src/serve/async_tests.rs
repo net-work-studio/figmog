@@ -17,6 +17,7 @@ struct Api {
     entered: mpsc::Sender<&'static str>,
     release: Arc<Mutex<mpsc::Receiver<()>>>,
     block_meta: AtomicBool,
+    metadata_error: Mutex<Option<ApiError>>,
 }
 
 impl FigmaApi for Api {
@@ -28,6 +29,9 @@ impl FigmaApi for Api {
                 .unwrap()
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap();
+        }
+        if let Some(error) = self.metadata_error.lock().unwrap().take() {
+            return Err(error);
         }
         Ok(FileMetaResp {
             name: "Synthetic".into(),
@@ -96,6 +100,7 @@ impl Harness {
             entered,
             release: gate,
             block_meta: AtomicBool::new(false),
+            metadata_error: Mutex::new(None),
         });
         let session = sessions::open_session_with_hooks(
             dir.path().join("ABC1234567890/db"),
@@ -128,7 +133,7 @@ impl Harness {
         for session in &mut self.manager.sessions {
             session.maintain();
         }
-        let mut upstream = None;
+        let mut upstream: Option<HttpUpstream> = None;
         let mut deadline = Instant::now();
         let mut handler = FnHandler(|name: &str, args: &Value| {
             handle_tool_call(
@@ -394,7 +399,7 @@ fn async_delayed_metadata_poll_keeps_reads_responsive_and_reconciles_once() {
     h.release.send(()).unwrap();
     h.wait_for("succeeded");
     h.api.block_meta.store(true, Ordering::Relaxed);
-    h.manager.sessions[0].poll(Duration::ZERO);
+    h.manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
     assert_eq!(
         h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
         "metadata"
@@ -417,7 +422,7 @@ fn async_delayed_metadata_poll_keeps_reads_responsive_and_reconciles_once() {
     *h.api.metadata.lock().unwrap() = "t2".into();
     h.release.send(()).unwrap();
     h.wait_for("succeeded");
-    h.manager.sessions[0].poll(Duration::ZERO);
+    h.manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.api.calls.load(Ordering::Relaxed) < 3 {
         h.value("figmog_status", json!({}));
@@ -428,7 +433,7 @@ fn async_delayed_metadata_poll_keeps_reads_responsive_and_reconciles_once() {
     h.release.send(()).unwrap();
     h.wait_for("succeeded");
     // No further edit: this poll must not create job 4.
-    h.manager.sessions[0].poll(Duration::ZERO);
+    h.manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let status = h.value("figmog_status", json!({}));
@@ -725,4 +730,376 @@ fn async_startup_queues_missing_mirror_without_waiting_for_its_pull() {
     h.release.send(()).unwrap();
     assert_eq!(h.wait_for("succeeded")["version"], "1");
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 1);
+}
+
+impl Harness {
+    /// Prime a real watch observation and its pull, making later polls
+    /// unchanged without assuming full-file and metadata timestamps agree.
+    fn mirror_from_watch(&mut self) {
+        self.manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.api.calls.load(Ordering::Relaxed) == 0 {
+            self.manager.sessions[0].maintain();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            self.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "fetch"
+        );
+        self.release.send(()).unwrap();
+        self.wait_for("succeeded");
+    }
+
+    fn finish_poll_at(&mut self, now: Instant) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.manager.sessions[0].maintain_at(now);
+            if self.manager.sessions[0].status().unwrap()["pull"]["polling"] == false {
+                return;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[test]
+fn watch_cadence_does_not_skip_rounds_after_delayed_unchanged_metadata() {
+    for seconds in [2, 10] {
+        let mut h = Harness::new();
+        h.mirror_from_watch();
+        h.api.block_meta.store(true, Ordering::Relaxed);
+        let interval = Duration::from_secs(seconds);
+        let mut due = Instant::now() + Duration::from_secs(60);
+        let mut cursor = 0;
+        for round in 0..3 {
+            let next = watch_tick_at(&mut h.manager, &mut cursor, interval, due);
+            assert_eq!(
+                h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+                true,
+                "round {round} at configured {seconds}s cadence was skipped"
+            );
+            assert_eq!(
+                h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+                "metadata"
+            );
+            h.release.send(()).unwrap();
+            h.finish_poll_at(due + Duration::from_millis(100));
+            due = next;
+        }
+        assert_eq!(
+            h.api.calls.load(Ordering::Relaxed),
+            1,
+            "unchanged polls must not pull"
+        );
+    }
+}
+
+impl Harness {
+    fn desktop_write(&mut self, no_watch: bool) {
+        let mut desktop = crate::upstream::FakeUpstream::new(vec![json!({
+            "name":"set_node_name", "inputSchema":{"type":"object"}
+        })]);
+        desktop.push_result(Ok(json!({"content":[], "isError":false})));
+        let (tools, _) = proxy::merge_registry(dispatch::tool_registry(), desktop.tools());
+        let mut upstream = Some(desktop);
+        let mut deadline = Instant::now() + Duration::from_secs(3600);
+        let mut handler = FnHandler(|name: &str, args: &Value| {
+            handle_tool_call(
+                &mut self.manager,
+                &mut upstream,
+                "connected",
+                no_watch,
+                Duration::from_secs(3600),
+                &mut deadline,
+                name,
+                args,
+            )
+        });
+        let response = mcp::handle_message(
+            &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"set_node_name", "arguments":{}}})
+            .to_string(),
+            &tools,
+            &mut handler,
+        )
+        .unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+    }
+
+    fn wait_for_metadata_at(&mut self, now: Instant) {
+        self.wait_for_event_at(now, "metadata");
+    }
+
+    fn wait_for_event_at(&mut self, now: Instant, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.manager.sessions[0].maintain_at(now);
+            if let Ok(event) = self.entered.try_recv() {
+                assert_eq!(event, expected);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {expected} request never started"
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[test]
+fn desktop_write_expedites_recent_poll_and_retains_writes_during_poll() {
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    let hour = Duration::from_secs(3600);
+    let base = Instant::now() + Duration::from_secs(60);
+    h.manager.sessions[0].poll_at(hour, base);
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + Duration::from_millis(100));
+
+    h.desktop_write(false);
+    watch_tick_at(
+        &mut h.manager,
+        &mut 0,
+        hour,
+        base + Duration::from_millis(200),
+    );
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        true,
+        "a desktop write must bypass the ordinary one-hour deadline"
+    );
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    // Writes after an observation starts cannot be certified by that
+    // observation. They must coalesce into one additional poll.
+    h.desktop_write(false);
+    h.desktop_write(false);
+    h.release.send(()).unwrap();
+    h.wait_for_metadata_at(base + Duration::from_millis(300));
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + Duration::from_millis(400));
+    assert!(matches!(
+        h.entered.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 1);
+
+    h.desktop_write(true);
+    h.manager.sessions[0].maintain_at(base + Duration::from_secs(1));
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        false,
+        "--no-watch must not schedule desktop-write polling"
+    );
+}
+
+#[test]
+fn desktop_write_during_pull_is_polled_immediately_after_publication() {
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    let base = Instant::now() + Duration::from_secs(60);
+    h.manager.sessions[0].poll_at(Duration::from_secs(3600), base);
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + Duration::from_millis(100));
+    h.manager.sessions[0].request_pull(false, Duration::from_secs(3600));
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "fetch"
+    );
+    h.desktop_write(false);
+    h.manager.sessions[0].maintain_at(base + Duration::from_millis(200));
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        false
+    );
+    h.release.send(()).unwrap();
+    h.wait_for_metadata_at(base + Duration::from_millis(300));
+    assert_eq!(h.manager.sessions[0].status().unwrap()["version"], "2");
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + Duration::from_millis(400));
+}
+
+#[test]
+fn expedited_poll_retries_honor_metadata_retry_after_and_network_backoff() {
+    for (error, seconds) in [
+        (
+            ApiError::RateLimited {
+                retry_after: Duration::from_secs(90),
+            },
+            90,
+        ),
+        (ApiError::Network("synthetic offline peer".into()), 5),
+    ] {
+        let mut h = Harness::new();
+        h.mirror_from_watch();
+        h.api.block_meta.store(true, Ordering::Relaxed);
+        *h.api.metadata_error.lock().unwrap() = Some(error);
+        let base = Instant::now() + Duration::from_secs(60);
+        h.desktop_write(false);
+        h.manager.sessions[0].maintain_at(base);
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "metadata"
+        );
+        h.release.send(()).unwrap();
+        h.finish_poll_at(base);
+        // Rate limits also survive another mutation; a network failure
+        // retries the original expedited request without another write.
+        if seconds == 90 {
+            h.desktop_write(false);
+        }
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(seconds - 1));
+        assert_eq!(
+            h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+            false
+        );
+        assert!(matches!(
+            h.entered.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        h.wait_for_metadata_at(base + Duration::from_secs(seconds));
+        h.release.send(()).unwrap();
+        h.finish_poll_at(base + Duration::from_secs(seconds));
+    }
+}
+
+#[test]
+fn expedited_poll_preserves_pull_retry_after() {
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    *h.api.response.lock().unwrap() = Err(ApiError::RateLimited {
+        retry_after: Duration::from_secs(90),
+    });
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    let base = Instant::now() + Duration::from_secs(60);
+    h.manager.sessions[0].request_pull(false, Duration::from_secs(3600));
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "fetch"
+    );
+    h.release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] != "failed" {
+        h.manager.sessions[0].maintain_at(base);
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    h.desktop_write(false);
+    // Pull rate limits retain the existing max(interval, Retry-After)
+    // cooldown, even when an expedited metadata request is pending.
+    h.manager.sessions[0].maintain_at(base + Duration::from_secs(3599));
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        false
+    );
+    h.wait_for_metadata_at(base + Duration::from_secs(3600));
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + Duration::from_secs(3600));
+}
+
+#[test]
+fn images_retry_a_failed_first_mirror_coalescing_and_honoring_backoff() {
+    for retry_after in [Duration::ZERO, Duration::from_secs(90)] {
+        let mut h = Harness::new();
+        *h.api.response.lock().unwrap() = Err(ApiError::RateLimited { retry_after });
+        let args = json!({"file":"ABC1234567890", "ids":["0:0"]});
+        let first = h.call("figmog_images", args.clone());
+        assert_eq!(first["result"]["isError"], true);
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "fetch"
+        );
+        h.release.send(()).unwrap();
+        let failed = h.wait_for("failed");
+        assert_eq!(failed["pull"]["job"]["id"], 1);
+        assert_eq!(
+            h.value("figmog_files", json!({}))[0]["pull"]["job"]["state"],
+            "failed",
+            "inspection must not implicitly retry"
+        );
+
+        assert_eq!(
+            h.call("figmog_images", args.clone())["result"]["isError"],
+            true
+        );
+        let retry = h.value("figmog_status", json!({}));
+        assert_eq!(
+            retry["pull"]["job"]["id"], 2,
+            "another image request must retry the failed mirror"
+        );
+        let expected = if retry_after.is_zero() {
+            "running"
+        } else {
+            "queued"
+        };
+        assert_eq!(retry["pull"]["job"]["state"], expected);
+        assert_eq!(h.call("figmog_images", args)["result"]["isError"], true);
+        assert_eq!(
+            h.value("figmog_status", json!({}))["pull"]["job"]["id"],
+            2,
+            "duplicate retries coalesce"
+        );
+        if retry_after.is_zero() {
+            assert_eq!(
+                h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+                "fetch"
+            );
+            h.release.send(()).unwrap();
+            assert_eq!(h.wait_for("succeeded")["ready"], true);
+        } else {
+            assert!(matches!(
+                h.entered.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+    }
+}
+
+#[test]
+fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    let interval = Duration::from_secs(2);
+    let mut due = Instant::now() + Duration::from_secs(60);
+    let mut cursor = 0;
+    for round in 0..3 {
+        *h.api.metadata.lock().unwrap() = format!("edit-{round}");
+        let next = watch_tick_at(&mut h.manager, &mut cursor, interval, due);
+        assert_eq!(
+            h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+            true,
+            "round {round} after publishing a watched change was skipped"
+        );
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "metadata"
+        );
+        h.release.send(()).unwrap();
+        h.wait_for_event_at(due + Duration::from_millis(100), "fetch");
+        h.release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] != "succeeded" {
+            h.manager.sessions[0].maintain_at(due + Duration::from_millis(200));
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        due = next;
+    }
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 4);
 }

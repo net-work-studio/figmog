@@ -785,14 +785,23 @@ fn add_startup_files(
 
 /// Schedule at most one due metadata poll; the session worker performs it.
 fn watch_tick(manager: &mut SessionManager, next_idx: &mut usize, interval: Duration) -> Instant {
+    watch_tick_at(manager, next_idx, interval, Instant::now())
+}
+
+fn watch_tick_at(
+    manager: &mut SessionManager,
+    next_idx: &mut usize,
+    interval: Duration,
+    now: Instant,
+) -> Instant {
     if manager.sessions.is_empty() {
-        return Instant::now() + interval;
+        return now + interval;
     }
     let count = manager.sessions.len();
     let idx = *next_idx % count;
     *next_idx = (*next_idx + 1) % count;
-    manager.sessions[idx].poll(interval);
-    Instant::now() + tick_deadline(interval, count)
+    manager.sessions[idx].poll_at(interval, now);
+    now + tick_deadline(interval, count)
 }
 
 /// Refresh `.figmog/current` to `key` — only when `track` (the no-`--db`-
@@ -814,9 +823,9 @@ fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
 /// Open/sync and implicit first reads schedule workers; they never perform
 /// a pull on the request thread. Status and files report job completion.
 #[allow(clippy::too_many_arguments)]
-fn handle_tool_call(
+fn handle_tool_call<U: UpstreamMcp>(
     manager: &mut SessionManager,
-    upstream: &mut Option<HttpUpstream>,
+    upstream: &mut Option<U>,
     upstream_status: &'static str,
     no_watch: bool,
     interval: Duration,
@@ -857,20 +866,6 @@ fn handle_tool_call(
 
     if proxy::is_local_tool(name) {
         let session = manager.resolve(file_arg.as_deref(), interval)?;
-        if name == "figmog_images" {
-            // v0.0.2 spec §5: never automatic, and this is the only place
-            // that reaches `FileSession::images` — no other call site
-            // wires it in. Images scan this session's cache and spend
-            // Figma API budget on misses; a pull failure has no
-            // analog here (images doesn't pull the file), so unlike
-            // `figmog_sync`/`figmog_open` this never touches
-            // `next_deadline`.
-            let ids = dispatch::require_str_array(args, "ids")?;
-            let format = args.get("format").and_then(Value::as_str).unwrap_or("png");
-            let scale = dispatch::arg_f64(args, "scale");
-            let items = session.images(&ids, format, scale)?;
-            return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
-        }
 
         if name == "figmog_sync" {
             return Ok(ToolOutput::Json(session.request_pull(false, interval)));
@@ -884,6 +879,17 @@ fn handle_tool_call(
         if !session.mirrored {
             session.request_pull(false, interval);
         }
+        if name == "figmog_images" {
+            // Failed first mirrors share the data-read retry path above.
+            // Once ready, image fetching retains its own synchronous
+            // networking/cache contract, separate from pull scheduling.
+            let ids = dispatch::require_str_array(args, "ids")?;
+            let format = args.get("format").and_then(Value::as_str).unwrap_or("png");
+            let scale = dispatch::arg_f64(args, "scale");
+            let items = session.images(&ids, format, scale)?;
+            return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
+        }
+
         let result = session.dispatch(name, &call_args).map_err(|msg| {
             // spec §2b: note an explicit-file/URL-file disagreement on a
             // failed call (almost always "no node ... in the mirror" —
@@ -918,6 +924,7 @@ fn handle_tool_call(
         .ok_or_else(|| format!("upstream not attached: {name}"))?;
     let (value, trigger_poll) = proxy::proxy_call(up, name, args)?;
     if trigger_poll && !no_watch {
+        manager.expedite_polls(interval);
         *next_deadline = Instant::now();
     }
     // A proxied result is already a complete MCP `CallToolResult` from the
@@ -997,11 +1004,11 @@ mod tests {
         assert_eq!(manager.list()[0]["version"], "1");
         // Poll again with a zero per-file wait. Differing endpoint
         // timestamps must still require only the first reconciliation.
-        manager.sessions[0].poll(Duration::ZERO);
+        manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
         let deadline = Instant::now() + Duration::from_secs(5);
         while api.meta_calls.load(Ordering::Relaxed) < 2 {
             manager.sessions[0].maintain();
-            manager.sessions[0].poll(Duration::ZERO);
+            manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }

@@ -308,7 +308,7 @@ are detected by the next metadata poll; repeated syncs during a running job
 do not create an unbounded backlog. Each file's pull retries honor
 Retry-After or exponential backoff, including explicit requests made during
 the wait; other files continue independently. A failed first mirror can be
-retried by open/sync, another data read, or watch reconciliation. Status/files
+retried by open/sync, another data read (including `figmog_images`), or watch reconciliation. Status/files
 do not erase terminal errors by implicitly retrying them.
 
 Polls and pulls execute serially on the file's worker. No poll observed after
@@ -368,6 +368,11 @@ to a one-day maximum. On `Tick::Changed`, completion queues a pull through
 the same lifecycle as explicit open/sync. Failure leaves the observation
 pending for retry; Retry-After or exponential backoff (capped at 5 minutes)
 is per file.
+Ordinary poll eligibility is anchored to metadata request dispatch, matching
+the global round-robin clock. An unchanged completion or successful pull
+publication does not move it later and accidentally skip the next round.
+Metadata retry deadlines and pull retry deadlines remain separate from this
+ordinary cadence; neither can be bypassed by an expedited request.
 
 **Watch watermarks:** each session keeps a successfully synchronized
 metadata `last_touched_at` and a separate pending observation in memory.
@@ -516,9 +521,15 @@ routing to a mirror alone is insufficient. `figmog tools` reports
 **Rate budget:** native-named calls reach the desktop server every time;
 `figmog_*` read tools continue to answer locally at zero API cost. A
 successful proxied call to a tool that isn't `get_*`/`list_*` (a likely
-write) schedules an immediate meta-poll rather than waiting for the next
-`--interval` tick, so the mirror catches up promptly (skipped under
-`--no-watch`, which has no poll loop to schedule).
+write) records an expedited meta-poll for each known session rather than
+waiting for the next `--interval` tick: the desktop supplies no authoritative
+active-file identity with which to select a single mirror. Repeated writes
+coalesce per file. A request made during a pull or poll remains pending
+until the worker is idle; a write after a metadata request started requires
+another observation. Expedited polls bypass the ordinary interval, retain
+their pending refresh after a transient failure, and honor both metadata
+and pull Retry-After/backoff deadlines. They are skipped under `--no-watch`.
+The ordinary round-robin rate bound excludes these write-triggered polls.
 
 ## 9. Variables
 
