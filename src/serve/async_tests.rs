@@ -775,7 +775,7 @@ fn watch_cadence_does_not_skip_rounds_after_delayed_unchanged_metadata() {
         let mut due = Instant::now() + Duration::from_secs(60);
         let mut cursor = 0;
         for round in 0..3 {
-            let next = watch_tick_at(&mut h.manager, &mut cursor, interval, due);
+            let (next, _) = watch_tick_at(&mut h.manager, &mut cursor, interval, due);
             assert_eq!(
                 h.manager.sessions[0].status().unwrap()["pull"]["polling"],
                 true,
@@ -1081,7 +1081,7 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
     let mut cursor = 0;
     for round in 0..3 {
         *h.api.metadata.lock().unwrap() = format!("edit-{round}");
-        let next = watch_tick_at(&mut h.manager, &mut cursor, interval, due);
+        let (next, _) = watch_tick_at(&mut h.manager, &mut cursor, interval, due);
         assert_eq!(
             h.manager.sessions[0].status().unwrap()["pull"]["polling"],
             true,
@@ -1106,3 +1106,279 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
 }
 
 mod watch_and_cache;
+
+#[test]
+fn ordinary_metadata_failure_retries_at_backoff_before_next_hourly_round() {
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    *h.api.metadata.lock().unwrap() = "t2".into();
+    *h.api.metadata_error.lock().unwrap() =
+        Some(ApiError::Network("temporary metadata failure".into()));
+    let base = Instant::now() + Duration::from_secs(60);
+    let mut watch = WatchScheduler::new(base);
+    watch.service_at(&mut h.manager, Duration::from_secs(3600), base);
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base);
+    assert_eq!(
+        watch.next_deadline(&h.manager),
+        base + Duration::from_secs(5),
+        "the server must wake for the failed file's backoff, not its hourly round"
+    );
+    watch.service_at(
+        &mut h.manager,
+        Duration::from_secs(3600),
+        base + Duration::from_secs(4),
+    );
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        false
+    );
+    *h.api.metadata_error.lock().unwrap() =
+        Some(ApiError::Network("second metadata failure".into()));
+    watch.service_at(
+        &mut h.manager,
+        Duration::from_secs(3600),
+        base + Duration::from_secs(5),
+    );
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        true
+    );
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + Duration::from_secs(5));
+    assert_eq!(
+        watch.next_deadline(&h.manager),
+        base + Duration::from_secs(15),
+        "a second failure must retain the ten-second exponential retry"
+    );
+    watch.service_at(
+        &mut h.manager,
+        Duration::from_secs(3600),
+        base + Duration::from_secs(14),
+    );
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        false
+    );
+    watch.service_at(
+        &mut h.manager,
+        Duration::from_secs(3600),
+        base + Duration::from_secs(15),
+    );
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.release.send(()).unwrap();
+    h.wait_for_event_at(base + Duration::from_secs(15), "fetch");
+    h.release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.manager.sessions[0].status().unwrap()["version"] != "2" {
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(15));
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    watch.service_at(
+        &mut h.manager,
+        Duration::from_secs(3600),
+        base + Duration::from_secs(3600),
+    );
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        true,
+        "retry recovery must not postpone the next normal round by another hour"
+    );
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + Duration::from_secs(3600));
+}
+
+#[test]
+fn ordinary_watch_pull_failure_retries_at_backoff_before_next_hourly_round() {
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    *h.api.metadata.lock().unwrap() = "t2".into();
+    *h.api.response.lock().unwrap() = Err(ApiError::Network("temporary pull failure".into()));
+    let base = Instant::now() + Duration::from_secs(60);
+    let mut watch = WatchScheduler::new(base);
+    watch.service_at(&mut h.manager, Duration::from_secs(3600), base);
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.release.send(()).unwrap();
+    h.wait_for_event_at(base, "fetch");
+    h.release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] != "failed" {
+        h.manager.sessions[0].maintain_at(base);
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(h.manager.sessions[0].status().unwrap()["version"], "1");
+    assert_eq!(
+        watch.next_deadline(&h.manager),
+        base + Duration::from_secs(5),
+        "a failed watched pull must not wait for the next hourly round"
+    );
+    watch.service_at(
+        &mut h.manager,
+        Duration::from_secs(3600),
+        base + Duration::from_secs(4),
+    );
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        false
+    );
+    watch.service_at(
+        &mut h.manager,
+        Duration::from_secs(3600),
+        base + Duration::from_secs(5),
+    );
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.release.send(()).unwrap();
+    h.wait_for_event_at(base + Duration::from_secs(5), "fetch");
+    h.release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.manager.sessions[0].status().unwrap()["version"] != "2" {
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(5));
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn ordinary_retries_share_rate_limit_and_do_not_starve_normal_rounds() {
+    let mut first = Harness::new();
+    first.mirror_from_watch();
+    let mut second = Harness::new();
+    second.mirror_from_watch();
+    let mut other = second.manager.sessions.pop().unwrap();
+    other.key = "OTHER123456789".into();
+    first.manager.sessions.push(other);
+    first.api.block_meta.store(true, Ordering::Relaxed);
+    second.api.block_meta.store(true, Ordering::Relaxed);
+    let base = Instant::now() + Duration::from_secs(60);
+    let interval = Duration::from_secs(2);
+    let mut watch = WatchScheduler::new(base);
+    // Normal A, retry A, normal B, retry A: both queues progress even
+    // when the configured normal cadence uses every available rate slot.
+    for (seconds, index) in [(0, 0), (2, 0), (4, 1), (6, 0)] {
+        if index == 0 {
+            *first.api.metadata_error.lock().unwrap() = Some(ApiError::RateLimited {
+                retry_after: Duration::ZERO,
+            });
+        }
+        let now = base + Duration::from_secs(seconds);
+        watch.service_at(&mut first.manager, interval, now);
+        assert_eq!(
+            first.manager.sessions[index].status().unwrap()["pull"]["polling"],
+            true
+        );
+        let (entered, release) = if index == 0 {
+            (&first.entered, &first.release)
+        } else {
+            (&second.entered, &second.release)
+        };
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "metadata"
+        );
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while first.manager.sessions[index].status().unwrap()["pull"]["polling"] == true {
+            first.manager.sessions[index].maintain_at(now);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        watch.service_at(&mut first.manager, interval, now + Duration::from_secs(1));
+        assert!(
+            first
+                .manager
+                .sessions
+                .iter()
+                .all(|session| session.status().unwrap()["pull"]["polling"] == false),
+            "ordinary retries must preserve the two-second global polling bound"
+        );
+        assert!(matches!(
+            first.entered.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            second.entered.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+    assert_eq!(first.api.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(second.api.calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn ordinary_metadata_retries_preserve_retry_after_before_and_after_normal_round() {
+    for seconds in [90, 7200] {
+        let mut h = Harness::new();
+        h.mirror_from_watch();
+        h.api.block_meta.store(true, Ordering::Relaxed);
+        *h.api.metadata_error.lock().unwrap() = Some(ApiError::RateLimited {
+            retry_after: Duration::from_secs(seconds),
+        });
+        let base = Instant::now() + Duration::from_secs(60);
+        let mut watch = WatchScheduler::new(base);
+        let interval = Duration::from_secs(3600);
+        watch.service_at(&mut h.manager, interval, base);
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "metadata"
+        );
+        h.release.send(()).unwrap();
+        h.finish_poll_at(base);
+        if seconds > 3600 {
+            watch.service_at(&mut h.manager, interval, base + Duration::from_secs(3600));
+            assert_eq!(
+                h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+                false,
+                "normal rounds cannot bypass a longer Retry-After"
+            );
+        }
+        assert_eq!(
+            watch.next_deadline(&h.manager),
+            base + Duration::from_secs(seconds)
+        );
+        watch.service_at(
+            &mut h.manager,
+            interval,
+            base + Duration::from_secs(seconds - 1),
+        );
+        assert_eq!(
+            h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+            false
+        );
+        watch.service_at(
+            &mut h.manager,
+            interval,
+            base + Duration::from_secs(seconds),
+        );
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "metadata"
+        );
+        h.release.send(()).unwrap();
+        h.finish_poll_at(base + Duration::from_secs(seconds));
+    }
+}

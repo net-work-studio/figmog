@@ -361,16 +361,23 @@ outside this pull-scheduling change. When a file's worker is occupied by a
 pull or metadata poll, `figmog_images` returns a prompt busy error (including
 for cache hits), rather than waiting behind that operation.
 
-**Watch/poll loop:** round-robins at most one due session's Tier-3 metadata
-poll per tick; the per-tick deadline is `max(--interval / session_count, 2s)`,
-so total scheduled polls stay bounded (≤ 30 requests/min). The session's
+**Watch/poll loop:** normal rounds visit one session every
+`max(--interval / session_count, 2s)`. Ordinary polls and retries share a
+two-second global dispatch floor (≤ 30 requests/min). The session's
 worker performs the blocking HTTP call. Busy files are skipped, and each
 file retains its own retry/poll deadline, so a delayed poll or rate-limited
 file never pauses other files' reads or polling. `--interval` is clamped
 to a one-day maximum. On `Tick::Changed`, completion queues a pull through
 the same lifecycle as explicit open/sync. Failure leaves the observation
 pending for retry; Retry-After or exponential backoff (capped at 5 minutes)
-is per file.
+is per file. Outstanding metadata and pull failures wake the scheduler at
+their per-file retry deadline, independently of the next normal round.
+When normal and retry work are both due, they alternate so neither starves.
+Busy workers and explicitly queued pulls remain serialized. A recovery
+poll does not postpone its next normal visit, and a retry can also satisfy
+the same file's already-due normal visit. `--no-watch` disables automatic
+ordinary retries, while explicit and expedited requests retain their
+existing behavior.
 Ordinary poll eligibility is anchored to metadata request dispatch, matching
 the global round-robin clock. An unchanged completion or successful pull
 publication does not move it later and accidentally skip the next round.

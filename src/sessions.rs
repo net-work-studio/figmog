@@ -122,6 +122,7 @@ pub(crate) struct FileSession {
     retry_at: Instant,
     next_poll: Instant,
     poll_retry_at: Instant,
+    watch_retry_at: Option<Instant>,
     expedited_poll: bool,
     interval: Duration,
 }
@@ -287,6 +288,7 @@ impl FileSession {
                         Tick::Wait { after } => {
                             self.poll_retry_at = now + after;
                             self.next_poll = self.poll_retry_at;
+                            self.watch_retry_at = Some(self.poll_retry_at);
                             // A failed expedited observation still needs
                             // reconciliation once its retry delay expires.
                             self.expedited_poll |= expedited;
@@ -305,6 +307,7 @@ impl FileSession {
                                 "version": outcome.version, "churn": outcome.churn}));
                             self.backoff = BACKOFF_START;
                             self.retry_at = now;
+                            self.watch_retry_at = None;
                             // Publishing a pull must not postpone the
                             // next round beyond its last poll dispatch.
                             published = true;
@@ -315,6 +318,7 @@ impl FileSession {
                             job.error = Some(error.to_string());
                             self.retry_at = now + wait;
                             self.next_poll = self.retry_at;
+                            self.watch_retry_at = Some(self.retry_at);
                         }
                     }
                     job.phase = None;
@@ -339,7 +343,36 @@ impl FileSession {
         self.expedited_poll = true;
     }
 
-    pub(crate) fn poll_at(&mut self, interval: Duration, now: Instant) {
+    /// Retry work is independent of the ordinary round, but unavailable
+    /// workers and explicitly queued pulls must keep their serialization.
+    pub(crate) fn watch_retry_deadline(&self) -> Option<Instant> {
+        if self.busy
+            || self
+                .job
+                .as_ref()
+                .is_some_and(|job| job.state == JobState::Queued)
+        {
+            return None;
+        }
+        self.watch_retry_at.map(|retry| {
+            retry
+                .max(self.retry_at)
+                .max(self.poll_retry_at)
+                .max(self.next_poll)
+        })
+    }
+
+    /// Extra retry work must not push an already scheduled normal visit
+    /// past its eligibility boundary. The scheduler still rate-limits it.
+    pub(crate) fn retry_poll_at(&mut self, interval: Duration, now: Instant) -> bool {
+        if self.poll_at(interval, now) {
+            self.next_poll = now;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn poll_at(&mut self, interval: Duration, now: Instant) -> bool {
         self.interval = interval;
         if !self.busy
             && (self.expedited_poll || now >= self.next_poll)
@@ -357,9 +390,12 @@ impl FileSession {
                 .send(Command::Poll { expedited })
                 .unwrap();
             self.next_poll = now + interval;
+            self.watch_retry_at = None;
             self.busy = true;
             self.polling = true;
+            return true;
         }
+        false
     }
 
     pub(crate) fn images(
@@ -626,6 +662,7 @@ pub(crate) fn open_session_with_hooks(
         retry_at: Instant::now(),
         next_poll: Instant::now(),
         poll_retry_at: Instant::now(),
+        watch_retry_at: None,
         expedited_poll: false,
         interval: Duration::from_secs(10),
     })

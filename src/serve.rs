@@ -590,7 +590,7 @@ fn serve_loop_with_output(
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
-    mut next_deadline: Instant,
+    first_deadline: Instant,
     rx: mpsc::Receiver<Incoming>,
     registry: ConnRegistry,
     mut write_stdio: impl FnMut(&Value) -> bool,
@@ -603,7 +603,7 @@ fn serve_loop_with_output(
         eprintln!("figmog: dropping upstream tool named like a local tool: {name}");
     }
 
-    let mut next_session_idx: usize = 0;
+    let mut watch = WatchScheduler::new(first_deadline);
 
     loop {
         // Completions and due watch work run even under continuous traffic.
@@ -617,13 +617,15 @@ fn serve_loop_with_output(
         for key in published {
             refresh_current(&manager, track_current, &key);
         }
-        if !no_watch && Instant::now() >= next_deadline {
-            next_deadline = watch_tick(&mut manager, &mut next_session_idx, interval_dur);
+        if !no_watch {
+            watch.service_at(&mut manager, interval_dur, Instant::now());
         }
         let wait = Duration::from_millis(20).min(if no_watch {
             Duration::from_millis(20)
         } else {
-            next_deadline.saturating_duration_since(Instant::now())
+            watch
+                .next_deadline(&manager)
+                .saturating_duration_since(Instant::now())
         });
         let msg = match rx.recv_timeout(wait) {
             Ok(msg) => msg,
@@ -643,7 +645,7 @@ fn serve_loop_with_output(
                             upstream_status,
                             no_watch,
                             interval_dur,
-                            &mut next_deadline,
+                            &mut watch.next_round,
                             name,
                             args,
                         )
@@ -662,7 +664,7 @@ fn serve_loop_with_output(
                 upstream_status,
                 no_watch,
                 interval_dur,
-                &mut next_deadline,
+                &mut watch.next_round,
                 name,
                 args,
             )
@@ -785,25 +787,106 @@ fn add_startup_files(
     Ok(())
 }
 
-/// Schedule at most one due metadata poll; the session worker performs it.
-fn watch_tick(manager: &mut SessionManager, next_idx: &mut usize, interval: Duration) -> Instant {
-    watch_tick_at(manager, next_idx, interval, Instant::now())
+/// Normal rounds and per-file retries share a rate-limited dispatch slot.
+/// Alternating when both are due keeps either queue from starving the other.
+struct WatchScheduler {
+    next_round: Instant,
+    round_cursor: usize,
+    retry_cursor: usize,
+    next_slot: Option<Instant>,
+    retry_first: bool,
 }
 
+impl WatchScheduler {
+    fn new(first_deadline: Instant) -> Self {
+        Self {
+            next_round: first_deadline,
+            round_cursor: 0,
+            retry_cursor: 0,
+            next_slot: None,
+            retry_first: true,
+        }
+    }
+
+    fn next_deadline(&self, manager: &SessionManager) -> Instant {
+        let retry = manager
+            .sessions
+            .iter()
+            .filter_map(|session| session.watch_retry_deadline())
+            .min();
+        let due = retry.map_or(self.next_round, |retry| retry.min(self.next_round));
+        self.next_slot.map_or(due, |slot| due.max(slot))
+    }
+
+    fn dispatch_retry(
+        &mut self,
+        manager: &mut SessionManager,
+        index: usize,
+        interval: Duration,
+        now: Instant,
+    ) {
+        if manager.sessions[index].retry_poll_at(interval, now) {
+            let count = manager.sessions.len();
+            // One request can satisfy a retry and the same file's due
+            // normal visit; avoid issuing another poll two seconds later.
+            if now >= self.next_round && index == self.round_cursor % count {
+                self.round_cursor = (index + 1) % count;
+                self.next_round = now + tick_deadline(interval, count);
+            }
+            self.retry_cursor = (index + 1) % count;
+            self.retry_first = false;
+            self.next_slot = Some(now + MIN_TICK_DEADLINE);
+        }
+    }
+
+    fn service_at(&mut self, manager: &mut SessionManager, interval: Duration, now: Instant) {
+        if self.next_slot.is_some_and(|slot| now < slot) {
+            return;
+        }
+        let retry = (0..manager.sessions.len())
+            .map(|offset| (self.retry_cursor + offset) % manager.sessions.len())
+            .find(|&index| {
+                manager.sessions[index]
+                    .watch_retry_deadline()
+                    .is_some_and(|due| due <= now)
+            });
+        let round_due = now >= self.next_round;
+        if let Some(index) = retry
+            && (!round_due || self.retry_first)
+        {
+            self.dispatch_retry(manager, index, interval, now);
+            return;
+        }
+        if round_due {
+            let (next, dispatched) = watch_tick_at(manager, &mut self.round_cursor, interval, now);
+            self.next_round = next;
+            if dispatched {
+                self.retry_first = true;
+                self.next_slot = Some(now + MIN_TICK_DEADLINE);
+                return;
+            }
+        }
+        if let Some(index) = retry {
+            self.dispatch_retry(manager, index, interval, now);
+        }
+    }
+}
+
+/// Schedule at most one due metadata poll; the session worker performs it.
 fn watch_tick_at(
     manager: &mut SessionManager,
     next_idx: &mut usize,
     interval: Duration,
     now: Instant,
-) -> Instant {
+) -> (Instant, bool) {
     if manager.sessions.is_empty() {
-        return now + interval;
+        return (now + interval, false);
     }
     let count = manager.sessions.len();
     let idx = *next_idx % count;
     *next_idx = (*next_idx + 1) % count;
-    manager.sessions[idx].poll_at(interval, now);
-    now + tick_deadline(interval, count)
+    let dispatched = manager.sessions[idx].poll_at(interval, now);
+    (now + tick_deadline(interval, count), dispatched)
 }
 
 /// Refresh `.figmog/current` to `key` — only when `track` (the no-`--db`-
@@ -994,7 +1077,7 @@ mod tests {
         let mut next_idx = 0;
         let interval = Duration::ZERO;
 
-        watch_tick(&mut manager, &mut next_idx, interval);
+        watch_tick_at(&mut manager, &mut next_idx, interval, Instant::now());
         let deadline = Instant::now() + Duration::from_secs(5);
         while manager.list()[0]["pull"]["job"]["state"] != "succeeded" {
             manager.sessions[0].maintain();
