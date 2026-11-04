@@ -650,7 +650,7 @@ fn serve_loop_with_output(
                             args,
                         )
                     });
-                if let Some(resp) = mcp::handle_message(&l, &tools, &mut handler) {
+                if let Some(resp) = mcp::handle_socket_message(&l, &tools, &mut handler) {
                     write_socket_response(&registry, conn_id, &resp);
                 }
                 continue;

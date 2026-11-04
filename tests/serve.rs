@@ -606,6 +606,25 @@ fn spawn_fake_upstream_with_args(
     handshake_each_call: bool,
     expected_args: Value,
 ) -> (String, std::thread::JoinHandle<()>) {
+    spawn_scripted_upstream(
+        results.into_iter().map(DesktopReply::Result).collect(),
+        handshake_each_call,
+        expected_args,
+    )
+}
+
+#[derive(Clone)]
+enum DesktopReply {
+    Result(Value),
+    ProtocolError(&'static str),
+    Disconnect,
+}
+
+fn spawn_scripted_upstream(
+    results: Vec<DesktopReply>,
+    handshake_each_call: bool,
+    expected_args: Value,
+) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let handle = std::thread::spawn(move || {
@@ -687,17 +706,22 @@ fn spawn_fake_upstream_with_args(
                     assert_eq!(call["method"], "tools/call");
                     assert_eq!(call["params"]["name"], "get_code");
                     assert_eq!(call["params"]["arguments"], expected_args);
-                    let resp = json!({
+                    let mut resp = json!({
                         "jsonrpc": "2.0",
                         "id": request_id(&body),
-                        "result": results.next().expect("scripted result"),
-                    })
-                    .to_string();
+                    });
+                    match results.next().expect("scripted reply") {
+                        DesktopReply::Result(result) => resp["result"] = result,
+                        DesktopReply::ProtocolError(message) => {
+                            resp["error"] = json!({"code": -32603, "message": message});
+                        }
+                        DesktopReply::Disconnect => continue,
+                    }
                     write_response(
                         &mut stream,
                         "200 OK",
                         &[("Content-Type", "application/json")],
-                        &resp,
+                        &resp.to_string(),
                     );
                 }
             }
@@ -920,6 +944,87 @@ fn desktop_proxy_cli_results_are_verbatim_and_byte_identical_across_transports()
         assert_eq!(&stdout, direct_stdout);
     }
     upstream.join().unwrap();
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+fn assert_proxy_cli_forwarding_failure(reply: DesktopReply, message_prefix: &str) {
+    const KEY: &str = "figmogproxyfailure01";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let args = json!({"nodeId": "1:2", "file": KEY});
+    let (address, upstream) =
+        spawn_scripted_upstream(vec![reply.clone(), reply], true, args.clone());
+    let run = |flags: &[&str]| {
+        let output = common::command()
+            .current_dir(dir.path())
+            .args(["call", "get_code", "--args", &args.to_string()])
+            .args(flags)
+            .assert()
+            .failure()
+            .code(1)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(error["error"].as_str().unwrap().starts_with(message_prefix));
+        output
+    };
+    let direct = run(&["--no-socket", "--upstream", &address]);
+
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("figmog"));
+    command
+        .args(["serve", "--no-watch", "--upstream", &address, KEY])
+        .current_dir(dir.path());
+    let (mut guard, mut stdin, rx) = spawn_child(command);
+    handshake(&mut stdin, &rx);
+    let socket = run(&[]);
+    assert_eq!(socket.stderr, direct.stderr);
+    upstream.join().unwrap();
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+#[test]
+fn desktop_proxy_cli_protocol_errors_fail_on_both_transports() {
+    assert_proxy_cli_forwarding_failure(
+        DesktopReply::ProtocolError("Synthetic protocol failure"),
+        "upstream protocol error: Synthetic protocol failure",
+    );
+}
+
+#[test]
+fn desktop_proxy_cli_transport_errors_fail_on_both_transports() {
+    assert_proxy_cli_forwarding_failure(DesktopReply::Disconnect, "upstream unreachable:");
+}
+
+#[test]
+fn desktop_proxy_cli_unknown_and_unavailable_tools_fail_on_both_transports() {
+    const KEY: &str = "figmogproxyunknown01";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let run = |tool: &str, flags: &[&str]| {
+        let output = common::command()
+            .current_dir(dir.path())
+            .args(["call", tool])
+            .args(flags)
+            .assert()
+            .failure()
+            .code(1)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stderr).unwrap()
+    };
+    for tool in ["nonexistent", "get_code"] {
+        let error = run(tool, &["--no-socket", "--no-upstream"]);
+        assert_eq!(error["error"], format!("upstream not attached: {tool}"));
+    }
+
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+    for tool in ["nonexistent", "get_code"] {
+        let error = run(tool, &[]);
+        assert_eq!(error["error"], format!("unknown tool: {tool}"));
+    }
     drop(stdin);
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }

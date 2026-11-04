@@ -465,8 +465,8 @@ skips binding.
 
 Frames on the socket are the same newline-delimited JSON-RPC the stdio
 loop reads. `initialize` is optional for socket clients: `tools/call` is
-accepted directly, since `mcp::handle_message` treats every frame
-independently. An acceptor thread gives each connection its own reader
+accepted directly, since dispatch treats every frame independently.
+An acceptor thread gives each connection its own reader
 thread, which tags frames with a connection id and forwards them into the
 same `mpsc` channel stdin feeds; the connection's write half is
 registered before its reader starts, so a response always has somewhere
@@ -476,6 +476,13 @@ the registry rather than stalling the single-threaded loop; a vanished
 client is a silent no-op. The store stays single-threaded throughout:
 socket traffic interleaves with MCP frames and watch ticks like any other
 request.
+
+Socket `tools/call` registry and handler failures (including upstream
+protocol/transport failures) use a top-level JSON-RPC `error` with code
+`-32000`, so the CLI emits its standard stderr error and exits 1.
+Genuine upstream results remain verbatim `result` values, including
+tool-level `isError: true`; those are successful forwarding operations.
+Stdio retains MCP `isError` content for registry and handler failures.
 
 The CLI side of the plane is in §10.
 
