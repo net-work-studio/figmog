@@ -1,0 +1,35 @@
+src/sessions.rs
+  s_a8ef7678fc30dd::t_427a3e428b7d0d 365-374
+  s_a8ef7678fc30dd::t_5a9c54a1fe5f78 125,291,310,321,346-364,375,393,396,398,665
+src/serve.rs
+  s_a8ef7678fc30dd::t_427a3e428b7d0d 828-836
+  s_a8ef7678fc30dd::t_14acccd391cf2f 593,606,620-621,626-628,648,667,792-794,798-804,808-810,819-820,842,871-872,875,1080
+  s_a8ef7678fc30dd::t_5a9c54a1fe5f78 790-791,795-797,805-807,811-818,822-827,837-841,843-856,858-869,881,883,888-889
+  s_a8ef7678fc30dd::t_07f9295cb50314 821,857,870
+src/serve/async_tests.rs
+  s_a8ef7678fc30dd::t_cf4e1af724fd67 1190-1205
+  s_a8ef7678fc30dd::t_5a9c54a1fe5f78 778,1084
+  s_a8ef7678fc30dd::t_14acccd391cf2f 1109-1140,1143-1156,1183-1185,1187-1189,1206
+  s_a8ef7678fc30dd::t_329818041f89fe 1207-1264
+  s_a8ef7678fc30dd::t_7265aeaa94cc1e 1265-1384
+  s_a8ef7678fc30dd::t_345fbe5177a50c 1141-1142,1157-1182,1186
+docs/SPEC.md
+  s_a8ef7678fc30dd::t_82b535ac3b22ec 364-366,375
+  s_a8ef7678fc30dd::t_345fbe5177a50c 373-374,376-380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "96dd52d968a9c450b71caac3bc259004a5716d55",
+  "prompts": {},
+  "sessions": {
+    "s_a8ef7678fc30dd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a5df-89bf-7013-a20f-7c82648f763c",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
