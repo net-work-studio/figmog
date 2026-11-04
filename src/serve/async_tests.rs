@@ -320,6 +320,65 @@ fn async_failed_pull_retains_prior_mirror_and_can_be_retried() {
 }
 
 #[test]
+fn async_malformed_document_pull_preserves_the_readable_mirror() {
+    for document in [
+        json!(null),
+        json!({"id": "0:0", "type": "DOCUMENT", "children": [{
+            "id": "0:1", "type": "CANVAS", "children": null
+        }]}),
+        json!({"id": "0:0", "type": "DOCUMENT", "children": [{
+            "id": "0:1", "type": "CANVAS", "children": [{"type": "TEXT"}]
+        }]}),
+    ] {
+        let mut h = Harness::new();
+        let mut seed = fixture("1");
+        seed["document"]["children"] = json!([{
+            "id": "0:1", "type": "CANVAS", "name": "Page", "children": [{
+                "id": "1:1", "type": "TEXT", "characters": "Synthetic text"
+            }]
+        }]);
+        *h.api.response.lock().unwrap() = Ok(seed);
+        h.value("figmog_sync", json!({}));
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        h.release.send(()).unwrap();
+        let initial = h.wait_for("succeeded");
+        let tree = h.value("figmog_node", json!({"id": "0:0", "children": true}));
+
+        let mut response = fixture("2");
+        response["document"] = document;
+        *h.api.response.lock().unwrap() = Ok(response);
+        h.value("figmog_sync", json!({}));
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        h.release.send(()).unwrap();
+        let failed = h.wait_for("failed");
+        assert_eq!(failed["ready"], true);
+        assert_eq!(failed["version"], "1");
+        assert_eq!(failed["nodes"], 3);
+        assert_eq!(
+            failed["pull"]["last_success"],
+            initial["pull"]["last_success"]
+        );
+        assert!(
+            failed["pull"]["job"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("document")
+        );
+        assert_eq!(
+            h.value("figmog_node", json!({"id": "0:0", "children": true})),
+            tree
+        );
+        // Reopen the worker's store to prove the rejected pull never reached
+        // the persisted mirror, even if a previous published snapshot survived.
+        h.manager.sessions.clear();
+        let reopened = sessions::open_session(h._dir.path(), "ABC1234567890", None).unwrap();
+        let status = reopened.status().unwrap();
+        assert_eq!(status["version"], "1");
+        assert_eq!(status["nodes"], 3);
+    }
+}
+
+#[test]
 fn async_geometry_upgrade_queues_one_followup_and_survives_reopen() {
     let mut h = Harness::new();
     h.value("figmog_open", json!({"file":"ABC1234567890"}));

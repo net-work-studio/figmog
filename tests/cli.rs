@@ -291,6 +291,92 @@ fn pull_fresh_invalid_response_preserves_every_existing_store_file() {
 }
 
 #[test]
+fn malformed_document_pulls_preserve_seeded_mirrors() {
+    use serde_json::json;
+
+    for fresh in [false, true] {
+        let (dir, db) = fixture_db();
+        let db_path = std::path::Path::new(&db);
+        seed_fresh_reset_state(db_path);
+        let before = common::store_snapshot(db_path);
+        let read = |args: &[&str]| {
+            let out = common::command()
+                .args(args)
+                .args(["--db", &db])
+                .assert()
+                .success();
+            serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+        };
+        let status = read(&["status"]);
+        let tree = read(&["get", "0:0", "--children"]);
+        let input = dir.path().join("invalid.json");
+        for document in [
+            json!(null),
+            json!([]),
+            json!({"type": "DOCUMENT"}),
+            json!({"id": "0:0", "type": "CANVAS"}),
+            json!({"id": "0:0", "type": "DOCUMENT", "children": null}),
+            json!({"id": "0:0", "type": "DOCUMENT", "children": {}}),
+            json!({"id": "0:0", "type": "DOCUMENT", "children": [null]}),
+            json!({"id": "0:0", "type": "DOCUMENT", "children": [{
+                "id": "0:1", "type": "CANVAS", "children": [{
+                    "type": "FRAME", "children": [{"id": "1:2", "type": "TEXT"}]
+                }]
+            }]}),
+        ] {
+            let response = json!({
+                "name": "Invalid replacement", "version": "101",
+                "lastModified": "2026-08-02T00:00:00Z", "document": document
+            });
+            std::fs::write(&input, response.to_string()).unwrap();
+            let mut command = common::command();
+            command.args(["pull", "--from-file"]).arg(&input);
+            if fresh {
+                command.arg("--fresh");
+            }
+            let out = command.args(["--db", &db]).assert().failure().code(1);
+            assert!(out.get_output().stdout.is_empty());
+            let error: serde_json::Value =
+                serde_json::from_slice(&out.get_output().stderr).unwrap();
+            assert!(error["error"].as_str().unwrap().contains("document"));
+            assert_eq!(common::store_snapshot(db_path), before);
+            assert_eq!(read(&["status"]), status);
+            assert_eq!(read(&["get", "0:0", "--children"]), tree);
+        }
+    }
+}
+
+#[test]
+fn empty_document_pulls_can_sync_and_replace_seeded_mirrors() {
+    for fresh in [false, true] {
+        let (dir, db) = fixture_db();
+        let input = dir.path().join("empty.json");
+        std::fs::write(
+            &input,
+            serde_json::json!({
+                "name": "Empty", "version": "101", "lastModified": "2026-08-02T00:00:00Z",
+                "document": {"id": "0:0", "type": "DOCUMENT", "children": []}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut command = common::command();
+        command.args(["pull", "--from-file"]).arg(&input);
+        if fresh {
+            command.arg("--fresh");
+        }
+        command.args(["--db", &db]).assert().success();
+        let out = common::command()
+            .args(["status", "--db", &db])
+            .assert()
+            .success();
+        let status: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(status["nodes"], 1);
+        assert_eq!(status["version"], "101");
+    }
+}
+
+#[test]
 fn pull_fresh_resets_file_imports_config_and_same_version_caches() {
     let (dir, db) = fixture_db();
     let db_path = std::path::Path::new(&db);

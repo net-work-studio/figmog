@@ -226,6 +226,16 @@ the one `store::evict_stale_cache` function. This runs after every
 `pull`/`figmog_sync`/watch-tick pull that changes the version, and is
 bundled into `pull --fresh`'s whole-store wipe too.
 
+**Tree validation:** the shared flattener rejects document roots that are
+not objects with a non-empty string `id` and `type: "DOCUMENT"`. Every
+descendant must also be an object with non-empty string `id` and `type`
+fields; unknown descendant types remain supported. A node's `children`,
+when present, must be an array of valid nodes. Missing `children` and empty
+arrays are accepted, including on an empty DOCUMENT root. Invalid trees
+return an error with the node's location, before an ordinary CLI import,
+fresh replacement, or server pull can sync a partial tree or sweep existing
+subtrees. Other fields remain unknown-field-preserving.
+
 **Fresh replacement:** file and optional variables responses are validated
 before opening or resetting the mirror. Every direct CLI and server-session
 store handle holds a lock on the permanent `.figmog-lock` file inside the

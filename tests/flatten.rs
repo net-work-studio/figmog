@@ -103,7 +103,6 @@ fn nested_nodes_preserve_childless_record_bytes() {
                     "boundVariables": {"paddingLeft": {"type": "VARIABLE_ALIAS", "id": "var:frame"}},
                     "custom": {"children": [{"value": null}], "enabled": false},
                     "children": [
-                        {"name": "No id", "children": [{"id": "skipped"}]},
                         {"id": "leaf", "type": "FRAME", "fills": [{
                             "color": {"r": 0.5},
                             "boundVariables": {"color": {"type": "VARIABLE_ALIAS", "id": "var:leaf"}}
@@ -133,7 +132,7 @@ fn nested_nodes_preserve_childless_record_bytes() {
             vec![("/paddingLeft".to_string(), "var:frame".to_string())],
         ),
         (
-            "leaf", "FRAME", Some("frame"), 1, "page",
+            "leaf", "FRAME", Some("frame"), 0, "page",
             r#"{"fills":[{"boundVariables":{"color":{"id":"var:leaf","type":"VARIABLE_ALIAS"}},"color":{"r":0.5}}],"id":"leaf","type":"FRAME"}"#,
             vec![("/fills/0/color".to_string(), "var:leaf".to_string())],
         ),
@@ -177,7 +176,108 @@ fn deterministic_bytes() {
 
 #[test]
 fn missing_document_errors() {
-    assert!(flatten_file(&serde_json::json!({"name": "x"})).is_err());
+    let mut response = common::fixture_v1();
+    response.as_object_mut().unwrap().remove("document");
+    assert_eq!(
+        flatten_file(&response).unwrap_err().to_string(),
+        "missing field: document"
+    );
+}
+
+#[test]
+fn malformed_document_roots_are_rejected() {
+    use serde_json::json;
+
+    for document in [
+        json!(null),
+        json!(false),
+        json!(42),
+        json!("document"),
+        json!([]),
+        json!({}),
+        json!({"type": "DOCUMENT"}),
+        json!({"id": null, "type": "DOCUMENT"}),
+        json!({"id": 1, "type": "DOCUMENT"}),
+        json!({"id": "", "type": "DOCUMENT"}),
+        json!({"id": "0:0"}),
+        json!({"id": "0:0", "type": null}),
+        json!({"id": "0:0", "type": 1}),
+        json!({"id": "0:0", "type": ""}),
+        json!({"id": "0:0", "type": "CANVAS"}),
+    ] {
+        let mut response = common::fixture_v1();
+        response["document"] = document.clone();
+        let error = flatten_file(&response)
+            .expect_err(&format!("must reject document: {document}"))
+            .to_string();
+        assert!(error.contains("document"), "{error}");
+    }
+}
+
+#[test]
+fn malformed_children_are_rejected_at_any_depth() {
+    use serde_json::json;
+
+    for children in [json!(null), json!({}), json!("children"), json!(1)] {
+        for pointer in ["/document", "/document/children/0/children/0"] {
+            let mut response = common::fixture_v1();
+            response.pointer_mut(pointer).unwrap()["children"] = children.clone();
+            let error = flatten_file(&response).expect_err("children must be an array");
+            assert!(error.to_string().contains("children"), "{error}");
+        }
+    }
+
+    for child in [
+        json!(null),
+        json!(false),
+        json!(1),
+        json!("child"),
+        json!([]),
+        json!({"type": "FRAME", "children": [{"id": "1:2", "type": "TEXT"}]}),
+        json!({"id": 1, "type": "FRAME"}),
+        json!({"id": "", "type": "FRAME"}),
+        json!({"id": "1:1"}),
+        json!({"id": "1:1", "type": null}),
+        json!({"id": "1:1", "type": 1}),
+        json!({"id": "1:1", "type": ""}),
+    ] {
+        let mut response = common::fixture_v1();
+        response["document"]["children"][0]["children"][0] = child;
+        let error = flatten_file(&response).expect_err("must not skip malformed subtrees");
+        assert!(
+            error
+                .to_string()
+                .contains("document.children[0].children[0]"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn empty_documents_and_unknown_descendant_types_remain_valid() {
+    use serde_json::json;
+
+    let mut response = json!({
+        "name": "Empty", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
+        "document": {"id": "0:0", "type": "DOCUMENT"}
+    });
+    for children in [None, Some(json!([]))] {
+        if let Some(children) = children {
+            response["document"]["children"] = children;
+        }
+        let out = flatten_file(&response).unwrap();
+        assert_eq!(out.recs.len(), 1);
+        assert_eq!(node(&out.recs, "0:0").node_type, "DOCUMENT");
+    }
+
+    response["document"]["children"] = json!([{
+        "id": "0:1", "type": "CANVAS", "children": [{
+            "id": "1:1", "type": "FUTURE_NODE", "custom": {"children": null}
+        }]
+    }]);
+    let out = flatten_file(&response).unwrap();
+    assert_eq!(out.recs.len(), 3);
+    assert_eq!(node(&out.recs, "1:1").node_type, "FUTURE_NODE");
 }
 
 #[test]

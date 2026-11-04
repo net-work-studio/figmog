@@ -29,9 +29,12 @@ pub struct Flattened {
 pub enum FlattenError {
     #[error("missing field: {0}")]
     Missing(&'static str),
+    #[error("invalid node at {path}: {reason}")]
+    InvalidNode { path: String, reason: &'static str },
 }
 
-/// Flatten a full `GET /v1/files/:key` response.
+/// Flatten a full `GET /v1/files/:key` response, rejecting malformed trees
+/// before any caller can apply a partial record set to a mirror.
 pub fn flatten_file(resp: &Value) -> Result<Flattened, FlattenError> {
     let file = FileInfo {
         name: str_field(resp, "name").ok_or(FlattenError::Missing("name"))?,
@@ -44,7 +47,7 @@ pub fn flatten_file(resp: &Value) -> Result<Flattened, FlattenError> {
         .ok_or(FlattenError::Missing("document"))?;
 
     let mut recs = Vec::new();
-    walk(document, None, 0, None, &mut recs);
+    walk(document, "document", None, 0, None, &mut recs)?;
 
     // Borrowed, not cloned: every entry is read once here (a handful of
     // `str_field`/`get` lookups) and dropped, so there's no reason to clone
@@ -106,28 +109,41 @@ fn str_field(v: &Value, k: &str) -> Option<String> {
 /// pages — the record then carries the node's own id).
 fn walk(
     node: &Value,
+    path: &str,
     parent_id: Option<&str>,
     child_index: u32,
     page_id: Option<&str>,
     out: &mut Vec<(Id, Rec)>,
-) {
-    let Some(id) = node.get("id").and_then(Value::as_str) else {
-        return; // node without id: skip it and its subtree
+) -> Result<(), FlattenError> {
+    let invalid = |reason| FlattenError::InvalidNode {
+        path: path.to_string(),
+        reason,
     };
+    let object = node
+        .as_object()
+        .ok_or_else(|| invalid("expected an object"))?;
+    let id = node
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| invalid("expected a non-empty string id"))?;
     let node_type = node
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or("UNKNOWN")
+        .filter(|node_type| !node_type.is_empty())
+        .ok_or_else(|| invalid("expected a non-empty string type"))?
         .to_string();
+    if parent_id.is_none() && node_type != "DOCUMENT" {
+        return Err(invalid("root type must be DOCUMENT"));
+    }
     let own_page = matches!(node_type.as_str(), "DOCUMENT" | "CANVAS");
     let page = if own_page { id } else { page_id.unwrap_or(id) };
 
     // Filter before cloning: cloning the whole node would copy every
     // descendant subtree just to discard it, repeating that work per ancestor.
-    // An id-bearing node is necessarily an object; the map stays sorted.
+    // The validated object map stays sorted.
     let raw = Value::Object(
-        node.as_object()
-            .expect("node with an id is an object")
+        object
             .iter()
             .filter(|(key, _)| key.as_str() != "children")
             .map(|(key, value)| (key.clone(), value.clone()))
@@ -167,11 +183,22 @@ fn walk(
     };
     out.push((Id::Node(id.to_string()), Rec::Node(rec)));
 
-    if let Some(children) = node.get("children").and_then(Value::as_array) {
+    if let Some(children) = node.get("children") {
+        let children = children
+            .as_array()
+            .ok_or_else(|| invalid("children must be an array when present"))?;
         for (i, child) in children.iter().enumerate() {
-            walk(child, Some(id), i as u32, Some(page), out);
+            walk(
+                child,
+                &format!("{path}.children[{i}]"),
+                Some(id),
+                i as u32,
+                Some(page),
+                out,
+            )?;
         }
     }
+    Ok(())
 }
 
 /// Turn a JSON object into sorted (key, f(value)) pairs; absent/None entries drop.
