@@ -1,0 +1,50 @@
+docs/SPEC.md
+  s_3b59ac61ec5493::t_85a32d88ea03fa 715
+  s_3b59ac61ec5493::t_01f00f3a41fd98 704-714,716-717,734
+  s_3b59ac61ec5493::t_0cf5f54dbf3eea 804,823
+tests/common/mod.rs
+  s_3b59ac61ec5493::t_a699d6ef230c19 80-106
+tests/serve.rs
+  s_3b59ac61ec5493::t_100393419355d5 2589-2716
+tests/cli.rs
+  s_3b59ac61ec5493::t_4d798d31f894d6 629,631,635,637-644,646,648-652,664-665,669,671-672,677-678,680-713,719-720,727,732-740,744-760
+  s_3b59ac61ec5493::t_e35a71125182e7 658,661,714-718,721-726,728-731,741-743
+  s_3b59ac61ec5493::t_68ce4c10df3778 616
+  s_3b59ac61ec5493::t_bb4ef316d492d2 630,632-634,636,645,647,653-657,659-660,662-663,666-668,670,673-676,679
+README.md
+  s_3b59ac61ec5493::t_01f00f3a41fd98 162-164
+src/cli/read.rs
+  s_3b59ac61ec5493::t_68ce4c10df3778 249
+  s_3b59ac61ec5493::t_00c65c8d6d43be 246,250-251,253
+src/cli/mod.rs
+  s_3b59ac61ec5493::t_e35a71125182e7 596-602,797-803
+  s_3b59ac61ec5493::t_0e4e880882be3e 853
+  s_3b59ac61ec5493::t_00c65c8d6d43be 228,237-242,603-604,804-806
+  s_3b59ac61ec5493::t_68ce4c10df3778 234-236
+src/serve.rs
+  s_3b59ac61ec5493::t_0e4e880882be3e 938,996
+src/query.rs
+  s_3b59ac61ec5493::t_00c65c8d6d43be 920-926,929,933-934,943,945-958,976
+  s_3b59ac61ec5493::t_68ce4c10df3778 932,936-942,959-960
+src/dispatch.rs
+  s_3b59ac61ec5493::t_0e4e880882be3e 151,157,313-319
+  s_3b59ac61ec5493::t_4c3ae99058344c 309-312
+  s_3b59ac61ec5493::t_68ce4c10df3778 308,541,546
+  s_3b59ac61ec5493::t_00c65c8d6d43be 320,536,542-544
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "69eb4919b450e3869f832131e01a7e6492ca663f",
+  "prompts": {},
+  "sessions": {
+    "s_3b59ac61ec5493": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a8a4-b5ae-7de0-9413-10982c18c166",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
