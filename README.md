@@ -74,10 +74,14 @@ $ claude mcp list        # find its name; it is usually `figma`
 $ claude mcp remove figma
 ```
 
-Run one or the other, not both. figmog already forwards the official
-server's tools, with caching, whenever the Figma desktop app is running, so
-dropping the direct connection loses nothing. Keep both and the agent sees
-two overlapping Figma servers, then picks tools badly.
+Run one or the other, not both. figmog forwards the tools of Figma's
+**desktop** MCP server (uncached, verbatim) when the Figma desktop app is
+running with Dev Mode MCP enabled. Two limits: figmog checks for the
+desktop app only once, when `figmog serve` starts, so start the desktop
+app before your agent (or restart the agent after opening it); and only
+the desktop server's tools are forwarded — Figma's remote MCP server is
+not. Keep both connections and the agent sees two overlapping Figma
+servers, then picks tools badly.
 
 ### 4. Ask for something
 
