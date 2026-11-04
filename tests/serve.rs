@@ -1426,6 +1426,97 @@ fn serve_e2e_db_override_with_no_file_figmog_sync_errors_no_file_key() {
     assert!(status.success(), "figmog serve exited with {status:?}");
 }
 
+#[test]
+fn serve_e2e_db_images_preserve_cached_renders_and_fills_among_misses() {
+    use figmog::model::{Id, ImageBlobRec, Rec};
+
+    let (dir, db) = common::fixture_db();
+    {
+        let mut st = figmog::open_store!(&db);
+        let Some(Rec::Node(mut node)) = st.get(&Id::Node("1:2".into())) else {
+            panic!("fixture node missing");
+        };
+        let mut raw: Value = serde_json::from_str(&node.raw).unwrap();
+        raw["fills"] = json!([
+            {"type": "IMAGE", "imageRef": "missing-fill"},
+            {"type": "IMAGE", "imageRef": "cached-fill"},
+        ]);
+        node.raw = raw.to_string();
+        st.wtx(|tx| {
+            tx.upsert(&Id::Node(node.id.clone()), &Rec::Node(node.clone()));
+            for (kind, subject, version, scale, bytes) in [
+                ("render", "1:2", "100", 2000, b"render".as_slice()),
+                ("render", "1:3", "99", 2000, b"stale".as_slice()),
+                ("fill", "cached-fill", "100", 1000, b"fill".as_slice()),
+            ] {
+                let format = if kind == "render" { "png" } else { "" };
+                let key = figmog::images::image_key(kind, subject, format, scale);
+                tx.upsert(
+                    &Id::ImageBlob(key.clone()),
+                    &Rec::ImageBlob(ImageBlobRec {
+                        key_hash: key,
+                        kind: kind.into(),
+                        subject: subject.into(),
+                        format: "png".into(),
+                        scale_milli: scale,
+                        file_version: version.into(),
+                        bytes: bytes.to_vec(),
+                    }),
+                );
+            }
+        });
+    }
+    // A current-file hint and a node URL must not supply network identity
+    // to an explicit store. The child also has no token (spawn_child).
+    std::fs::create_dir_all(dir.path().join(".figmog")).unwrap();
+    std::fs::write(dir.path().join(".figmog/current"), KEY_A).unwrap();
+    let (mut guard, mut stdin, rx) = spawn_serve(&db);
+    handshake(&mut stdin, &rx);
+    let resp = call(
+        &mut stdin,
+        &rx,
+        2,
+        "figmog_images",
+        json!({
+            "ids": ["1:3", format!("https://www.figma.com/design/{KEY_A}/Fixture?node-id=1-2"), "1:2"],
+            "scale": 2,
+        }),
+    );
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let manifest = result_json(&resp);
+    let rows = manifest.as_array().unwrap();
+    assert_eq!(rows.len(), 4, "{manifest}");
+    assert_eq!(rows[0]["id"], "1:3");
+    assert_eq!(rows[3]["ref"], "missing-fill");
+    for row in [&rows[0], &rows[3]] {
+        assert_eq!(row["cached"], false);
+        assert_eq!(row["bytes"], 0);
+        let error = row["error"].as_str().unwrap();
+        assert!(error.contains("without a file key"), "{error}");
+        assert!(error.contains("figmog pull"), "{error}");
+        assert!(!error.contains("FIGMA_TOKEN"), "{error}");
+    }
+    assert_eq!(
+        rows[1],
+        json!({"id": "1:2", "kind": "render", "format": "png", "bytes": 6, "cached": true})
+    );
+    assert_eq!(
+        rows[2],
+        json!({"ref": "cached-fill", "kind": "fill", "format": "png", "bytes": 4, "cached": true})
+    );
+    assert_eq!(
+        &resp["result"]["content"].as_array().unwrap()[1..],
+        &[
+            json!({"type": "image", "id": "1:2", "mimeType": "image/png", "data": "cmVuZGVy"}),
+            json!({"type": "image", "ref": "cached-fill", "mimeType": "image/png", "data": "ZmlsbA=="}),
+        ],
+    );
+
+    drop(stdin);
+    let status = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(status.success(), "figmog serve exited with {status:?}");
+}
+
 /// Documents an accepted divergence (see this crate's README, "Multiple
 /// files" section, and `serve.rs::build_sessions`'s doc comment):
 /// `.figmog/current` is only refreshed by a startup pull that actually
