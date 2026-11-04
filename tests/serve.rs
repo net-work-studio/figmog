@@ -2476,6 +2476,116 @@ fn where_null_equality_is_preserved_across_direct_socket_and_mcp() {
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
 
+#[test]
+fn search_ties_are_deterministic_across_direct_socket_and_mcp_after_broad_queries() {
+    const KEY: &str = "figmogsearchtieskey01";
+    let mut nodes: Vec<Value> = (0..300)
+        .map(|i| {
+            json!({
+                "id": format!("1:{i}"), "type": "TEXT",
+                "name": if i < 12 { "target" } else { "padding" },
+            })
+        })
+        .collect();
+    let scoped: Vec<Value> = nodes.drain(4..12).collect();
+    nodes.push(json!({"id": "9:0", "type": "FRAME", "name": "Scope", "children": scoped}));
+    // A higher-scoring hit must precede the ties even though its ID sorts last.
+    nodes.push(json!({"id": "9:1", "type": "TEXT", "name": "target target target"}));
+    let fixture = json!({
+        "name": "Search ties", "version": "1", "lastModified": "2026-11-04T00:00:00Z",
+        "document": {
+            "id": "0:0", "type": "DOCUMENT", "name": "Document",
+            "children": [{"id": "0:1", "type": "CANVAS", "name": "Page", "children": nodes}],
+        },
+    });
+    let dir = default_root_fixture(KEY, fixture);
+    let cases = [
+        (0, None, vec![]),
+        (3, None, vec!["9:1", "1:0", "1:1"]),
+        (
+            20,
+            None,
+            vec![
+                "9:1", "1:0", "1:1", "1:10", "1:11", "1:2", "1:3", "1:4", "1:5", "1:6", "1:7",
+                "1:8", "1:9",
+            ],
+        ),
+        (3, Some("9:0"), vec!["1:10", "1:11", "1:4"]),
+        (
+            20,
+            Some("9:0"),
+            vec!["1:10", "1:11", "1:4", "1:5", "1:6", "1:7", "1:8", "1:9"],
+        ),
+        (3, Some("1:299"), vec![]),
+    ];
+    let run = |limit: usize, under: Option<&str>, direct: bool| {
+        let mut cmd = common::command();
+        cmd.args(["search", "target", "-n", &limit.to_string()])
+            .current_dir(dir.path());
+        if let Some(under) = under {
+            cmd.args(["--under", under]);
+        }
+        if direct {
+            cmd.arg("--no-socket");
+        }
+        cmd.assert().success().get_output().stdout.clone()
+    };
+    // Capture direct results before serve locks this same mirror.
+    let direct: Vec<_> = cases
+        .iter()
+        .map(|(limit, under, expected_ids)| {
+            let bytes = run(*limit, *under, true);
+            let rows: Value = serde_json::from_slice(&bytes).unwrap();
+            let ids: Vec<_> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(&ids, expected_ids, "limit {limit}, under {under:?}");
+            bytes
+        })
+        .collect();
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    for after_broad_query in [false, true] {
+        if after_broad_query {
+            let resp = call(
+                &mut stdin,
+                &rx,
+                2,
+                "figmog_search",
+                json!({"query": "target padding", "limit": 1000}),
+            );
+            assert_eq!(resp["result"]["isError"], false, "{resp}");
+            assert_eq!(result_json(&resp).as_array().unwrap().len(), 301);
+        }
+        for ((limit, under, _), direct) in cases.iter().zip(&direct) {
+            let socket = run(*limit, *under, false);
+            assert_eq!(
+                &socket, direct,
+                "socket output: limit {limit}, under {under:?}, after broad query {after_broad_query}"
+            );
+            let mut args = json!({"query": "target", "limit": limit});
+            if let Some(under) = under {
+                args["under"] = json!(under);
+            }
+            let resp = call(&mut stdin, &rx, 3, "figmog_search", args);
+            assert_eq!(resp["result"]["isError"], false, "{resp}");
+            let direct_json: Value = serde_json::from_slice(direct).unwrap();
+            assert_eq!(
+                result_json(&resp),
+                direct_json,
+                "MCP output: limit {limit}, under {under:?}, after broad query {after_broad_query}"
+            );
+        }
+    }
+
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
 /// m6: a handful of read commands (deliberately including `where
 /// --pointer` with no `--equals` — C2's exact regression shape — and
 /// `status` — m1's) run once direct (before serve ever starts, so the
