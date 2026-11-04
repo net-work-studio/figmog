@@ -609,6 +609,14 @@ fn spawn_fake_upstream_with_args(
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let handle = std::thread::spawn(move || {
+        // This synthetic desktop accepts only the scripted argument keys;
+        // the call assertion below also checks their exact values.
+        let properties: serde_json::Map<String, Value> = expected_args
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| (key.clone(), json!({})))
+            .collect();
         listener.set_nonblocking(true).unwrap();
         let requests = if handshake_each_call {
             results.len() * 4
@@ -670,7 +678,7 @@ fn spawn_fake_upstream_with_args(
                             {
                                 "name": "get_code",
                                 "description": "Returns code for a node",
-                                "inputSchema": {"type": "object", "properties": {"nodeId": {"type": "string"}}},
+                                "inputSchema": {"type": "object", "properties": properties, "additionalProperties": false},
                             },
                         ]},
                     })
@@ -1423,30 +1431,28 @@ fn assert_proxy_cli_preserves_args_and_current_mirror(args: Value, socket: bool)
 }
 
 #[test]
-fn direct_proxy_cli_ignores_file_and_node_url_mirror_hints() {
-    for args in [
-        json!({"nodeId": "1:1", "file": ROUTING_B}),
-        json!({"id": format!("https://www.figma.com/design/{ROUTING_B}/Fixture?node-id=1-1")}),
-    ] {
-        assert_proxy_cli_preserves_args_and_current_mirror(args, false);
+fn proxy_cli_preserves_desktop_arguments_across_direct_and_socket() {
+    for socket in [false, true] {
+        for args in [
+            json!({"nodeId": "1:2"}),
+            json!({"nodeId": "1:2", "file": null}),
+            json!({"nodeId": "1:2", "file": ROUTING_B}),
+            json!({"nodeId": "1:2", "file": "not-a-figma-ref"}),
+            json!({"nodeId": "1:2", "file": 42}),
+            json!({"nodeId": "1:2", "file": {"path": "synthetic-file"}}),
+        ] {
+            assert_proxy_cli_preserves_args_and_current_mirror(args, socket);
+        }
     }
 }
 
 #[test]
-fn direct_proxy_cli_does_not_validate_file_arguments_as_figma_refs() {
-    assert_proxy_cli_preserves_args_and_current_mirror(
-        json!({"nodeId": "1:1", "file": "not-a-figma-ref"}),
-        false,
-    );
-}
-
-#[test]
-fn socket_proxy_cli_preserves_structured_and_numeric_file_arguments() {
-    for file in [json!({"path": "synthetic-file"}), json!(42)] {
-        assert_proxy_cli_preserves_args_and_current_mirror(
-            json!({"nodeId": "1:1", "file": file}),
-            true,
-        );
+fn proxy_cli_does_not_infer_mirrors_from_desktop_node_urls() {
+    let url = format!("https://www.figma.com/design/{ROUTING_B}/Fixture?node-id=1-1");
+    for socket in [false, true] {
+        for key in ["id", "under", "target"] {
+            assert_proxy_cli_preserves_args_and_current_mirror(json!({(key): url}), socket);
+        }
     }
 }
 
@@ -1608,6 +1614,34 @@ fn socket_cli_file_routing_prefers_explicit_file_then_url_then_current() {
         .code(1);
     let error: Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
     assert_eq!(error["error"], "missing required field: file");
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+#[test]
+fn socket_management_calls_do_not_require_a_valid_current_mirror() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve_zero_files(dir.path(), &[]);
+    handshake(&mut stdin, &rx);
+    std::fs::write(dir.path().join(".figmog/current"), "invalid").unwrap();
+
+    let out = common::command()
+        .args(["call", "figmog_files"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let files: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(files, json!([]));
+
+    let out = common::command()
+        .args(["call", "figmog_open"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .code(1);
+    let error: Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
+    assert_eq!(error["error"], "missing required field: file");
+
     drop(stdin);
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
