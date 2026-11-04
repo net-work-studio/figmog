@@ -2586,6 +2586,134 @@ fn search_ties_are_deterministic_across_direct_socket_and_mcp_after_broad_querie
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
 
+#[test]
+fn at_is_scoped_and_bounded_across_direct_socket_and_mcp_requests() {
+    const KEY_A: &str = "figmogpointaaa001";
+    const KEY_B: &str = "figmogpointbbb002";
+    let mut other = common::fixture_other();
+    other["document"]["children"][0]["children"][0]["absoluteBoundingBox"] =
+        json!({"x": 0, "y": 0, "width": 20, "height": 20});
+    let dir = default_root_fixture_multi(&[(KEY_A, common::fixture_at()), (KEY_B, other)], KEY_A);
+    let page_url = format!("https://www.figma.com/design/{KEY_B}/Fixture?node-id=0-1");
+    let run = |args: &[&str]| {
+        let out = common::command()
+            .args(["at", "--x", "0", "--y", "0"])
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        out.get_output().stdout.clone()
+    };
+    // A page URL must select its own file, even when current names another.
+    let other_direct = run(&["--page", &page_url]);
+    let rows: Value = serde_json::from_slice(&other_direct).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["name"], "Banner");
+    let scope_args = ["--page", "0:1", "--under", "1:1", "--limit", "3"];
+    let scoped_direct = run(&scope_args);
+    let rows: Value = serde_json::from_slice(&scoped_direct).unwrap();
+    let ids: Vec<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["1:2", "1:3", "1:1"]);
+
+    let (mut guard, mut stdin, rx) =
+        spawn_default_root_serve_keys(dir.path(), &[KEY_A, KEY_B], &[]);
+    handshake(&mut stdin, &rx);
+    assert_eq!(run(&["--page", &page_url]), other_direct);
+    assert_eq!(run(&scope_args), scoped_direct);
+    send(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    );
+    let response = recv(&rx);
+    let schema = &response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "figmog_at")
+        .unwrap()["inputSchema"];
+    for required in ["x", "y", "page"] {
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(required))
+        );
+    }
+    assert_eq!(schema["properties"]["under"]["type"], "string");
+    assert_eq!(schema["properties"]["limit"]["type"], "integer");
+    assert_eq!(schema["properties"]["limit"]["minimum"], 0);
+    assert_eq!(schema["properties"]["limit"]["default"], 100);
+
+    let resp = call(
+        &mut stdin,
+        &rx,
+        3,
+        "figmog_at",
+        json!({"page": page_url, "x": 0, "y": 0}),
+    );
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        result_json(&resp),
+        serde_json::from_slice::<Value>(&other_direct).unwrap()
+    );
+    let resp = call(
+        &mut stdin,
+        &rx,
+        4,
+        "figmog_at",
+        json!({"page": "0:1", "x": 0, "y": 0, "under": "1:1", "limit": 3}),
+    );
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        result_json(&resp),
+        serde_json::from_slice::<Value>(&scoped_direct).unwrap()
+    );
+    let resp = call(
+        &mut stdin,
+        &rx,
+        5,
+        "figmog_at",
+        json!({"page": "0:1", "x": 0, "y": 0}),
+    );
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(result_json(&resp).as_array().unwrap().len(), 100);
+    for extra in [
+        json!({"limit": 0}),
+        json!({"page": "0:2", "under": "1:1"}),
+        json!({"under": "1:10"}),
+    ] {
+        let mut args = json!({"page": "0:1", "x": 0, "y": 0});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let resp = call(&mut stdin, &rx, 6, "figmog_at", args);
+        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(result_json(&resp), json!([]));
+    }
+    for args in [
+        json!({"x": 0, "y": 0}),
+        json!({"page": 1, "x": 0, "y": 0}),
+        json!({"page": "1:1", "x": 0, "y": 0}),
+        json!({"page": "99:99", "x": 0, "y": 0}),
+        json!({"page": "0:1", "x": 0, "y": 0, "under": "99:99"}),
+        json!({"page": "0:1", "x": 0, "y": 0, "under": 123}),
+        json!({"page": "0:1", "x": 0, "y": 0, "limit": -1}),
+        json!({"page": "0:1", "x": 0, "y": 0, "limit": 1.5}),
+        json!({"page": "0:1", "x": 0, "y": 0, "limit": "1"}),
+        json!({"page": "0:1", "x": 0, "y": 0, "limit": null}),
+    ] {
+        let resp = call(&mut stdin, &rx, 7, "figmog_at", args.clone());
+        assert_eq!(resp["result"]["isError"], true, "{args}: {resp}");
+    }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
 /// m6: a handful of read commands (deliberately including `where
 /// --pointer` with no `--equals` — C2's exact regression shape — and
 /// `status` — m1's) run once direct (before serve ever starts, so the

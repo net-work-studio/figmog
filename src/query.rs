@@ -917,15 +917,47 @@ pub fn where_<R: Readable>(
     Ok(Value::Array(arr))
 }
 
-/// Nodes whose `abs_bounds` contain `(x, y)`, sorted by area ascending
-/// (deepest/smallest first) then id. Rows `[{id, name, type, page_id, area}]`.
+/// Default output cap for point lookups, shared by the CLI and MCP.
+pub const DEFAULT_AT_LIMIT: usize = 100;
+
+/// Visible nodes on `page` whose `abs_bounds` contain `(x, y)`, optionally
+/// intersected with `under`'s subtree. Hidden branches are pruned from the
+/// page walk. Matches sort by area ascending then id before taking `limit`.
+/// Rows `[{id, name, type, page_id, area}]`.
 pub fn at<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     x: f64,
     y: f64,
+    page: String,
+    under: Option<String>,
+    limit: usize,
 ) -> Result<Value, String> {
+    let page = normalize_node_ref(&page);
+    let page_node = nodes
+        .get(&page)
+        .ok_or_else(|| format!("no node {page} in the mirror"))?;
+    if page_node.node_type != "CANVAS" {
+        return Err(format!("node {page} is not a page (CANVAS)"));
+    }
+    let scope = resolve_under(nodes, children, under)?;
     let mut rows: Vec<(f64, String, String, String, String)> = Vec::new();
-    for (_, n) in nodes.iter() {
+    let mut pending = vec![page.clone()];
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let Some(n) = nodes.get(&id) else {
+            continue;
+        };
+        if n.page_id != page || !n.visible {
+            continue;
+        }
+        pending.extend(children.get(&id).into_iter().map(|(_, child_id)| child_id));
+        if scope.as_ref().is_some_and(|ids| !ids.contains(&id)) {
+            continue;
+        }
         let Some([bx, by, w, h]) = n.abs_bounds else {
             continue;
         };
@@ -941,6 +973,7 @@ pub fn at<R: Readable>(
 
     let arr: Vec<Value> = rows
         .into_iter()
+        .take(limit)
         .map(|(area, id, name, node_type, page_id)| {
             json!({"id": id, "name": name, "type": node_type, "page_id": page_id, "area": area})
         })
