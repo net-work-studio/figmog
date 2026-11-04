@@ -11,7 +11,9 @@ use fold::stream::KeyedStream;
 use serde::Serialize;
 
 use crate::flatten::Flattened;
-use crate::model::{FileMeta, Id, ImageBlobRec, MirrorConfigRec, NodeRec, ProxyCacheRec, Rec};
+use crate::model::{
+    FileMeta, Id, ImageBlobRec, ImagePinRec, MirrorConfigRec, NodeRec, ProxyCacheRec, Rec,
+};
 
 // ---- pipeline branch functions (pure; fold requires determinism) ----
 
@@ -150,6 +152,15 @@ pub fn image_only(d: &Keyed<Id, Rec>) -> Option<Keyed<String, ImageBlobRec>> {
     }
 }
 
+/// Feeds the `image_pins` table: keep only `Rec::ImagePin` markers, keyed
+/// by the image key of the render row they mark (NWS-2960).
+pub fn image_pin_only(d: &Keyed<Id, Rec>) -> Option<Keyed<String, ImagePinRec>> {
+    match (&d.key, &d.val) {
+        (Id::ImagePin(k), Rec::ImagePin(r)) => Some(Keyed::new(k.clone(), r.clone())),
+        _ => None,
+    }
+}
+
 /// The full figmog pipeline. Sink names are frozen on-disk schema.
 #[macro_export]
 macro_rules! figmog_pipeline {
@@ -210,6 +221,10 @@ macro_rules! figmog_pipeline {
                 terminal::Table::new("mirror_config"),
             ),
             FilterMap::new($crate::store::image_only, terminal::Table::new("images")),
+            FilterMap::new(
+                $crate::store::image_pin_only,
+                terminal::Table::new("image_pins"),
+            ),
         )
     }};
 }
@@ -368,6 +383,10 @@ pub fn stale_cache_ids<R: fold::stream::Readable>(
 /// for the `images` table, joining the same post-pull eviction step (see
 /// this section's own note above — cache and image eviction are both
 /// version-triggered, not file-sweep-triggered).
+///
+/// Each stale key yields both its `ImageBlob` row and its `ImagePin`
+/// marker id (NWS-2960) so markers never outlive the row they mark;
+/// removing an absent marker (fill rows, legacy renders) is a no-op.
 pub fn stale_image_ids<R: fold::stream::Readable>(
     images: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImageBlobRec>,
     current_version: &str,
@@ -380,7 +399,7 @@ pub fn stale_image_ids<R: fold::stream::Readable>(
     images
         .iter()
         .filter(|(_, rec)| rec.file_version != current_version)
-        .map(|(k, _)| Id::ImageBlob(k))
+        .flat_map(|(k, _)| [Id::ImageBlob(k.clone()), Id::ImagePin(k)])
         .collect()
 }
 
@@ -392,7 +411,10 @@ pub fn stale_image_ids<R: fold::stream::Readable>(
 pub fn evict_stale_cache<P: Push<Keyed<Id, Rec>>>(st: &mut KeyedStream<Id, Rec, P>, stale: &[Id]) {
     st.wtx(|tx| {
         for id in stale {
-            debug_assert!(matches!(id, Id::ProxyCache(_) | Id::ImageBlob(_)));
+            debug_assert!(matches!(
+                id,
+                Id::ProxyCache(_) | Id::ImageBlob(_) | Id::ImagePin(_)
+            ));
             tx.remove(id);
         }
     });
@@ -470,11 +492,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut st = crate::open_store!(&dir.path().join("db"));
 
-        let absent = st.rtx(|(.., mirror_config, _)| read_geometry(&mirror_config));
+        let absent = st.rtx(|(.., mirror_config, _, _)| read_geometry(&mirror_config));
         assert!(!absent, "no row upserted yet ⇒ geometry defaults false");
 
         upsert_mirror_config(&mut st, true);
-        let now_true = st.rtx(|(.., mirror_config, _)| read_geometry(&mirror_config));
+        let now_true = st.rtx(|(.., mirror_config, _, _)| read_geometry(&mirror_config));
         assert!(now_true, "the upserted flag must be what a later read sees");
 
         // Sweep-exempt: `mirror_config` isn't among `collect_sweepable`'s
@@ -492,7 +514,7 @@ mod tests {
             collect_sweepable(&nodes, &components, &component_sets, &styles)
         });
         sync(&mut st, &prior, &flattened, 0);
-        let still_true = st.rtx(|(.., mirror_config, _)| read_geometry(&mirror_config));
+        let still_true = st.rtx(|(.., mirror_config, _, _)| read_geometry(&mirror_config));
         assert!(still_true, "mirror_config must survive an unrelated sweep");
     }
 }

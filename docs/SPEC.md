@@ -108,12 +108,13 @@ matching [`Rec`](../src/model.rs) variant:
 | `ProxyCache(String)` | `ProxyCacheRec` | legacy proxied-tool responses (§8) |
 | `MirrorConfig` | `MirrorConfigRec` | one row: this mirror's sticky pull settings (§14) |
 | `ImageBlob(String)` | `ImageBlobRec` | cached render and fill bytes (§15) |
+| `ImagePin(String)` | `ImagePinRec` | version-pin marker for one cached render row (§15) |
 
 `Id`/`Rec` are **append-only enums** — postcard encodes variant indices
 positionally, so inserting a new variant anywhere but the end would
-silently corrupt every existing on-disk store. `ImageBlob` is the most
-recent addition and sits last in both enums (`MirrorConfig` immediately
-before it); the next new record kind goes after `ImageBlob`, never
+silently corrupt every existing on-disk store. `ImagePin` is the most
+recent addition and sits last in both enums (`ImageBlob` immediately
+before it); the next new record kind goes after `ImagePin`, never
 between existing variants. The same rule is why a new setting arrives as
 a new record kind rather than a new field on an existing `Rec` struct:
 struct fields are positional too, so widening `FileMeta` would break
@@ -147,6 +148,14 @@ hash for a fill), `format`, `scale_milli` (requested scale × 1000, always
 `kind`/`subject`/`format`/`scale_milli` against the request rather than
 trusting the key hash, the same identity check `cache::lookup` makes for
 proxied responses.
+
+`ImagePinRec` (§15): `generation: u32` and `file_version`, keyed by the
+same image key as the render row it marks. A render row is a hit only
+with a marker whose `generation` equals `images::RENDER_PIN_GENERATION`
+(currently 1, meaning "requested with `version=<file_version>`") and
+whose `file_version` equals the row's. It is a separate record kind
+rather than a new `ImageBlobRec` field for the same reason as
+`MirrorConfig`. Fill rows carry no marker.
 
 **Determinism contract:** every map-shaped field is a sorted `Vec` of
 pairs; every canonical-JSON string comes from `serde_json` without
@@ -183,10 +192,12 @@ is a breaking store-format change:
 | `proxy_cache` | Table | cache key hash | legacy proxied-tool cache (§8) |
 | `mirror_config` | Table | `0u8` (one row, like `meta`) | sticky pull settings (§14) |
 | `images` | Table | image cache key hash | render/fill byte caching (§15) |
+| `image_pins` | Table | image cache key hash | render version-pin markers (§15) |
 
-`mirror_config` and `images` are appended at the pipeline root's tail, so
-the reader tuple grows at the end and older stores keep decoding. Both
-sit outside `collect_sweepable` (§5): a file sync never removes a config
+`mirror_config`, `images` and `image_pins` are appended at the pipeline
+root's tail, so the reader tuple grows at the end and older stores keep
+decoding (a store created before `image_pins` existed opens with that
+sink empty). All three sit outside `collect_sweepable` (§5): a file sync never removes a config
 row, and image rows are evicted by version instead.
 
 `bound_to`'s edges are deliberately not deduped before feeding the
@@ -221,7 +232,8 @@ Tier-1 fetch and nothing else downstream.
 `sync`'s sweep (its churn accounting stays untouched by this feature):
 after a sync whose file *version* actually moved, every `proxy_cache` row
 (`store::stale_cache_ids`) and every `images` row
-(`store::stale_image_ids`) tagged with the old version is removed through
+(`store::stale_image_ids`, which also yields each row's `image_pins`
+marker) tagged with the old version is removed through
 the one `store::evict_stale_cache` function. This runs after every
 `pull`/`figmog_sync`/watch-tick pull that changes the version, and is
 bundled into `pull --fresh`'s whole-store wipe too.
@@ -857,8 +869,13 @@ Figma's most rate-limited, so a fetch happens only when a person or an
 agent asks for one.
 
 **Two fetch kinds behind one command.** Renders come from `GET
-/v1/images/:key?ids=…&format=…&scale=…`, which returns per-node URLs that
-are then downloaded. Fills come from the `fills` of the requested nodes:
+/v1/images/:key?ids=…&format=…&scale=…&version=…`, which returns per-node
+URLs that are then downloaded. `version` is always the mirror's current
+`FileMeta.version` (percent-encoded), read once before the request and
+reused as the cached row's `file_version`, so a render matches the
+mirrored design even after the file is edited upstream, and a pull that
+lands mid-request can't relabel it. A node deleted upstream but still in
+the mirror renders from that version too. Fills come from the `fills` of the requested nodes:
 every `imageRef` hash found there is resolved through `GET
 /v1/files/:key/images` (fetched at most once per invocation) and
 downloaded. One invocation makes at most one call of each kind.
@@ -867,8 +884,15 @@ downloaded. One invocation makes at most one call of each kind.
 hash of kind, subject, format and scale (§3). A hit requires the stored
 row's identity fields to match the request and its `file_version` to
 equal the mirror's current version, so a repeat request against an
-unedited file spends nothing. Rows tagged with an older version are
-evicted by the same version-change pass that evicts `proxy_cache` (§5).
+unedited file spends nothing. A render hit additionally requires its
+`image_pins` marker (§3), written in the same transaction as the row.
+Renders saved by builds that requested them without `version` have no
+marker — their bytes may show a newer design than their label — so they
+read as misses and are refetched and overwritten. Fill rows need no
+marker: fills are addressed by content hash, and the fills endpoint
+takes no version. Rows tagged with an older version, and their markers,
+are evicted by the same version-change pass that evicts `proxy_cache`
+(§5).
 
 **Explicit stores.** `figmog --db <store> images <node-id>...` exports
 matching cached renders and fills without a token or file key. The store

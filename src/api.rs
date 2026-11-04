@@ -66,7 +66,8 @@ pub trait FigmaApi {
         let _ = key;
         Ok(None)
     }
-    /// `GET /v1/images/:key?ids=…&format=…[&scale=…]` (v0.0.2 spec §5) —
+    /// `GET /v1/images/:key?ids=…&format=…[&scale=…][&version=…]` (v0.0.2
+    /// spec §5) —
     /// node renders. Unlike `variables_local`'s "not on this plan, and
     /// that's fine" gating, an unimplemented render endpoint is a genuine
     /// capability gap for any caller that reaches it, so the default
@@ -75,14 +76,19 @@ pub trait FigmaApi {
     /// Script`) keep compiling without knowing renders exist at all, and
     /// `crate::images::fetch` surfaces this as a normal per-item manifest
     /// error rather than a panic if a caller ever did reach it.
+    ///
+    /// `version` pins the render to that file version (NWS-2960): callers
+    /// pass the mirrored `FileMeta::version` so the bytes match what the
+    /// cache row is labelled with, even if Figma has moved on since.
     fn images_render(
         &self,
         key: &str,
         ids: &[String],
         format: &str,
         scale: Option<f64>,
+        version: Option<&str>,
     ) -> Result<Value, ApiError> {
-        let _ = (key, ids, format, scale);
+        let _ = (key, ids, format, scale, version);
         Err(ApiError::Http {
             status: 501,
             msg: "images_render not implemented".into(),
@@ -131,21 +137,42 @@ pub(crate) fn file_url(key: &str, geometry: bool) -> String {
 }
 
 /// `GET /v1/images/:key` request path (v0.0.2 spec §5) — comma-joined
-/// `ids`, `format`, and `scale` when given. Split out as a pure function
-/// for the same reason as [`file_url`]: unit-testable request-shape
-/// coverage without a live HTTP call.
+/// `ids`, `format`, `scale` when given, and `version` when given
+/// (NWS-2960: pins the render to the mirrored file version; percent-encoded
+/// since it's an opaque upstream string). Split out as a pure function for
+/// the same reason as [`file_url`]: unit-testable request-shape coverage
+/// without a live HTTP call.
 pub(crate) fn images_render_url(
     key: &str,
     ids: &[String],
     format: &str,
     scale: Option<f64>,
+    version: Option<&str>,
 ) -> String {
     let ids_param = ids.join(",");
     let mut url = format!("/v1/images/{key}?ids={ids_param}&format={format}");
     if let Some(s) = scale {
         url.push_str(&format!("&scale={s}"));
     }
+    if let Some(v) = version {
+        url.push_str("&version=");
+        url.push_str(&encode_query_value(v));
+    }
     url
+}
+
+/// Percent-encode a query-parameter value: RFC 3986 unreserved bytes pass
+/// through, every other byte becomes `%XX` (uppercase hex).
+fn encode_query_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// `GET /v1/files/:key/images` request path (v0.0.2 spec §5) — the fill
@@ -240,8 +267,9 @@ impl FigmaApi for UreqApi {
         ids: &[String],
         format: &str,
         scale: Option<f64>,
+        version: Option<&str>,
     ) -> Result<Value, ApiError> {
-        self.get_json(&images_render_url(key, ids, format, scale))
+        self.get_json(&images_render_url(key, ids, format, scale, version))
     }
     fn file_image_fills(&self, key: &str) -> Result<Value, ApiError> {
         self.get_json(&file_image_fills_url(key))
@@ -736,7 +764,7 @@ mod tests {
     fn images_render_url_joins_ids_and_omits_scale_when_absent() {
         let ids = vec!["1:2".to_string(), "1:3".to_string()];
         assert_eq!(
-            images_render_url("ABC123", &ids, "png", None),
+            images_render_url("ABC123", &ids, "png", None, None),
             "/v1/images/ABC123?ids=1:2,1:3&format=png"
         );
     }
@@ -745,8 +773,23 @@ mod tests {
     fn images_render_url_appends_scale_when_given() {
         let ids = vec!["1:2".to_string()];
         assert_eq!(
-            images_render_url("ABC123", &ids, "svg", Some(2.0)),
+            images_render_url("ABC123", &ids, "svg", Some(2.0), None),
             "/v1/images/ABC123?ids=1:2&format=svg&scale=2"
+        );
+    }
+
+    /// NWS-2960: the render request carries the mirrored file version, so
+    /// Figma renders that version rather than the file's latest.
+    #[test]
+    fn images_render_url_carries_the_pinned_version() {
+        let ids = vec!["1:2".to_string()];
+        assert_eq!(
+            images_render_url("ABC123", &ids, "png", None, Some("1234567890")),
+            "/v1/images/ABC123?ids=1:2&format=png&version=1234567890"
+        );
+        assert_eq!(
+            images_render_url("ABC123", &ids, "png", Some(2.0), Some("v 1&x=2")),
+            "/v1/images/ABC123?ids=1:2&format=png&scale=2&version=v%201%26x%3D2"
         );
     }
 
@@ -762,7 +805,7 @@ mod tests {
     fn default_images_render_and_file_image_fills_are_errors() {
         assert!(
             NoVariablesOverride
-                .images_render("ABC", &[], "png", None)
+                .images_render("ABC", &[], "png", None, Some("1"))
                 .is_err()
         );
         assert!(NoVariablesOverride.file_image_fills("ABC").is_err());

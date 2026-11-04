@@ -40,7 +40,7 @@ fn seed_cache(path: &std::path::Path, prior_version: Option<&str>) {
 
 fn cache_rows(path: &std::path::Path) -> Vec<Rec> {
     let st = crate::open_store!(path);
-    st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
+    st.rtx(|(_, _, _, _, _, _, _, cache, _, images, _)| {
         cache
             .iter()
             .map(|(_, rec)| Rec::ProxyCache(rec))

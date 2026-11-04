@@ -442,7 +442,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
             match other {
                 Cmd::Status => st.rtx(
-                    |((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _, _)| {
+                    |((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _, _, _)| {
                         read::cmd_status(&nodes, &meta)
                     },
                 ),
@@ -547,7 +547,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                     read::cmd_uses(&nodes, &styled_by, &bound_to, id)
                 }),
                 Cmd::Vars { id } => st.rtx(
-                    |((nodes, ..), _, _, _, variables, variable_collections, _, _, _, _)| {
+                    |((nodes, ..), _, _, _, variables, variable_collections, _, _, _, _, _)| {
                         read::cmd_vars(&nodes, &variables, &variable_collections, id)
                     },
                 ),

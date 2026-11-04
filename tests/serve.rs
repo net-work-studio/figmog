@@ -805,7 +805,7 @@ fn serve_desktop_proxy_observes_file_switches_and_edits_with_unchanged_mirror() 
         .join()
         .expect("every scripted desktop call should reach upstream");
     let st = figmog::open_store!(&db);
-    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
+    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _, _)| {
         assert_eq!(meta.get(&0).unwrap().version, "100");
         assert!(
             cache.iter().next().is_none(),
@@ -864,7 +864,7 @@ fn direct_cli_desktop_proxy_ignores_legacy_cache_and_observes_context_changes() 
         .join()
         .expect("every direct call should reach upstream");
     let st = figmog::open_store!(&db);
-    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
+    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _, _)| {
         assert_eq!(meta.get(&0).unwrap().version, "100");
         assert_eq!(
             figmog::cache::lookup(&cache, "get_code", args, "100"),
@@ -1428,7 +1428,7 @@ fn serve_e2e_db_override_with_no_file_figmog_sync_errors_no_file_key() {
 
 #[test]
 fn serve_e2e_db_images_preserve_cached_renders_and_fills_among_misses() {
-    use figmog::model::{Id, ImageBlobRec, Rec};
+    use figmog::model::{Id, ImageBlobRec, ImagePinRec, Rec};
 
     let (dir, db) = common::fixture_db();
     {
@@ -1451,6 +1451,15 @@ fn serve_e2e_db_images_preserve_cached_renders_and_fills_among_misses() {
             ] {
                 let format = if kind == "render" { "png" } else { "" };
                 let key = figmog::images::image_key(kind, subject, format, scale);
+                if kind == "render" {
+                    tx.upsert(
+                        &Id::ImagePin(key.clone()),
+                        &Rec::ImagePin(ImagePinRec {
+                            generation: figmog::images::RENDER_PIN_GENERATION,
+                            file_version: version.into(),
+                        }),
+                    );
+                }
                 tx.upsert(
                     &Id::ImageBlob(key.clone()),
                     &Rec::ImageBlob(ImageBlobRec {
@@ -1701,7 +1710,7 @@ fn assert_proxy_cli_preserves_args_and_current_mirror(args: Value, socket: bool)
     for key in [ROUTING_A, ROUTING_B] {
         let db = dir.path().join(".figmog").join(key).join("db");
         let store = figmog::open_store!(&db);
-        store.rtx(|(_, _, _, _, _, _, _, cache, _, _)| {
+        store.rtx(|(_, _, _, _, _, _, _, cache, _, _, _)| {
             assert!(cache.iter().next().is_none(), "desktop cache for {key}");
         });
     }

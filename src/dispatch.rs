@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 use crate::mcp::ToolDef;
 use crate::model::{
-    ComponentRec, ComponentSetRec, FileMeta, ImageBlobRec, MirrorConfigRec, NodeRec, ProxyCacheRec,
-    StyleRec, VariableCollectionRec, VariableRec,
+    ComponentRec, ComponentSetRec, FileMeta, ImageBlobRec, ImagePinRec, MirrorConfigRec, NodeRec,
+    ProxyCacheRec, StyleRec, VariableCollectionRec, VariableRec,
 };
 use crate::query;
 
@@ -36,11 +36,11 @@ pub(crate) type NodeReaders<'a, R> = (
 );
 
 /// Read handles for the whole pipeline, in `figmog_pipeline!`'s top-level
-/// order — the exact tuple `st.rtx`'s closure receives. 10 elements: the
+/// order — the exact tuple `st.rtx`'s closure receives. 11 elements: the
 /// `nodes` branch bundle, then `components`, `component_sets`, `styles`,
 /// `variables`, `variable_collections`, `meta`, `proxy_cache`,
-/// `mirror_config` (v0.0.2 spec §4), `images` (v0.0.2 spec §5 — appended
-/// last, non-breaking).
+/// `mirror_config` (v0.0.2 spec §4), `images` (v0.0.2 spec §5),
+/// `image_pins` (NWS-2960 — appended last, non-breaking).
 pub(crate) type RootReaders<'a, R> = (
     NodeReaders<'a, R>,
     TableReader<'a, R, String, ComponentRec>,
@@ -52,6 +52,7 @@ pub(crate) type RootReaders<'a, R> = (
     TableReader<'a, R, String, ProxyCacheRec>,
     TableReader<'a, R, u8, MirrorConfigRec>,
     TableReader<'a, R, String, ImageBlobRec>,
+    TableReader<'a, R, String, ImagePinRec>,
 );
 
 // ---- arg extraction ----
@@ -187,6 +188,7 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         _cache,
         _mirror_config,
         _images,
+        _image_pins,
     ) = r;
 
     match name {

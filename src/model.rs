@@ -26,9 +26,14 @@ pub enum Id {
     MirrorConfig,
     /// Cached image bytes (render or fill, v0.0.2 spec §5), keyed by
     /// [`crate::images::image_key`]'s hash — same pattern as
-    /// [`Id::ProxyCache`]. APPEND ONLY — see that variant's note; this must
-    /// stay the last variant until the next one is appended after it.
+    /// [`Id::ProxyCache`]. APPEND ONLY — see that variant's note.
     ImageBlob(String),
+    /// Render cache-generation marker for the [`Id::ImageBlob`] row under
+    /// the same key (NWS-2960): present only for renders fetched with the
+    /// request pinned to the mirrored file version. APPEND ONLY — see
+    /// [`Id::ProxyCache`]'s note; this must stay the last variant until
+    /// the next one is appended after it.
+    ImagePin(String),
 }
 
 /// One mirrored record; variant always matches its [`Id`] variant.
@@ -47,6 +52,8 @@ pub enum Rec {
     MirrorConfig(MirrorConfigRec),
     /// See [`Id::ImageBlob`]. APPEND ONLY — see that variant's note.
     ImageBlob(ImageBlobRec),
+    /// See [`Id::ImagePin`]. APPEND ONLY — see [`Id::ProxyCache`]'s note.
+    ImagePin(ImagePinRec),
 }
 
 /// One node of the document tree (children stripped from `raw`).
@@ -212,6 +219,27 @@ pub struct ImageBlobRec {
     pub bytes: Vec<u8>,
 }
 
+/// Cache-generation marker for one render row in the `images` table
+/// (key [`Id::ImagePin`], identical to the [`Id::ImageBlob`] key it
+/// marks). Renders fetched before NWS-2960 were requested without a
+/// `version` parameter, so their bytes may show a newer design than the
+/// `file_version` they were stored under; only a render row with a
+/// matching marker (`generation == crate::images::RENDER_PIN_GENERATION`
+/// and the same `file_version`) is a cache hit. Fill rows need no marker:
+/// they are addressed by content hash, so their bytes can't differ by
+/// version.
+///
+/// A separate record kind rather than a new [`ImageBlobRec`] field, for
+/// the same reason as [`MirrorConfigRec`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImagePinRec {
+    /// Render-cache generation the marked row was fetched under.
+    pub generation: u32,
+    /// File version the render request was pinned to — always equal to
+    /// the marked row's own [`ImageBlobRec::file_version`] when written.
+    pub file_version: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,7 +307,8 @@ mod tests {
     /// Appending `MirrorConfig` *after* `ProxyCache` must not move that
     /// index (it would corrupt every existing cache row's discriminant on
     /// decode), and each new variant must land at the next free index (8
-    /// for `MirrorConfig`, 9 for the later-appended `ImageBlob`). A
+    /// for `MirrorConfig`, 9 for the later-appended `ImageBlob`, 10 for
+    /// `ImagePin`). A
     /// pre-change build isn't available to literally round-trip against,
     /// so this pins the concrete bytes instead — the same guarantee the
     /// append-only doc comments on `Id`/`Rec` assert, made checkable.
@@ -301,7 +330,21 @@ mod tests {
 
         let img = Rec::ImageBlob(sample_image_blob());
         let bytes = postcard::to_allocvec(&img).unwrap();
-        assert_eq!(bytes[0], 9, "ImageBlob is the newly appended variant");
+        assert_eq!(bytes[0], 9, "ImageBlob's variant index must not move");
+
+        let pin = Rec::ImagePin(ImagePinRec {
+            generation: 1,
+            file_version: "100".into(),
+        });
+        let bytes = postcard::to_allocvec(&pin).unwrap();
+        assert_eq!(bytes[0], 10, "ImagePin is the newly appended variant");
+        let back: Rec = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(pin, back);
+        assert_eq!(
+            postcard::to_allocvec(&Id::ImagePin("k".into())).unwrap()[0],
+            10,
+            "Id::ImagePin is the newly appended Id variant"
+        );
     }
 
     #[test]
