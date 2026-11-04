@@ -802,9 +802,10 @@ argument): one BFS over the `children` index from the scope root
 (inclusive, cycle-safe via a visited set) collects the descendant id set,
 and results are filtered against it. It composes with `page` by
 intersection. An unknown scope id gives the standard `no node ...` error.
-`search` ranks the whole corpus before truncating when a scope is active,
-so an in-scope hit can't be lost to an out-of-scope one taking its slot
-in the top-N.
+`search` orders all matching hits by score descending, then node ID
+ascending (lexicographic), before applying the result limit. Scoped calls
+filter before truncating, so an in-scope hit can't be lost to an
+out-of-scope one taking its slot in the top-N.
 
 **Resolved variables** (`query::resolved_variables`; `--resolve-vars` on
 `get`, `dump` and `styles --values`, plus the matching tool arguments): a

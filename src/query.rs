@@ -14,6 +14,9 @@ use crate::model::{
     ComponentRec, ComponentSetRec, FileMeta, NodeRec, StyleRec, VariableCollectionRec, VariableRec,
 };
 
+#[cfg(test)]
+mod tests;
+
 /// Read handle for the pipeline's `text` BM25 sink (its tokenizer type
 /// param makes the full type unwieldy at every call site).
 pub type TextReader<'tx, R> = Bm25Reader<'tx, R, String, fn(&str, &mut Vec<u8>)>;
@@ -427,14 +430,9 @@ pub fn find<R: Readable>(
 }
 
 /// BM25 search over layer names and text content, optionally scoped to
-/// `under`'s subtree (spec §3). Scoped calls rank the *entire* matching
-/// corpus before filtering: `Bm25Reader::search` already scores every
-/// matching document internally regardless of `limit` (its own `limit`
-/// only truncates the final sorted list), so passing an effectively
-/// unlimited `limit` here isn't a more expensive query — it just skips
-/// that final truncation until after the scope filter runs, so an
-/// out-of-scope top-k match can't crowd an in-scope one out of the
-/// response. Unscoped calls keep the direct top-`limit` path unchanged.
+/// `under`'s subtree (spec §3). Order all matches by score descending,
+/// then node ID ascending, before limiting results. Scoped calls filter
+/// before truncating so out-of-scope hits can't crowd out in-scope ones.
 pub fn search<R: Readable>(
     text: &TextReader<'_, R>,
     nodes: &TableReader<'_, R, String, NodeRec>,
@@ -444,9 +442,10 @@ pub fn search<R: Readable>(
     under: Option<String>,
 ) -> Result<Value, String> {
     let scope = resolve_under(nodes, children, under)?;
-    // BM25's own ranking order is deterministic; keep it (do not re-sort).
-    let search_limit = if scope.is_some() { usize::MAX } else { limit };
-    let hits = text.search(query, search_limit);
+    // Upstream score ties depend on reused thread-local scratch capacity.
+    // Fetch every match so ties crossing the cutoff are resolved here.
+    let mut hits = text.search(query, usize::MAX);
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.val.cmp(&b.val)));
     let rows: Vec<Value> = hits
         .iter()
         .filter(|hit| scope.as_ref().is_none_or(|s| s.contains(&hit.val)))
