@@ -55,6 +55,10 @@ pub const FILL: &str = "fill";
 /// (guaranteed-401) network attempt.
 const NO_TOKEN_MSG: &str = "FIGMA_TOKEN is unset or empty and no saved token is available — required for image downloads; an empty FIGMA_TOKEN disables saved credentials, so unset it to use saved credentials; run `figmog auth login` or set FIGMA_TOKEN";
 
+/// An explicit store can serve cached bytes, but its records do not
+/// establish the file key needed to fetch a miss safely.
+const NO_FILE_KEY_MSG: &str = "image is not cached for this request and file version; --db selects a store without a file key, so it cannot fetch missing images. Run `figmog pull <file-key-or-url>`, then `figmog images <node-id>...` without --db";
+
 /// Content blocks over roughly this many bytes are excluded from the MCP
 /// tool's inline content (spec §5's "1MB" cap) — 1 MiB exactly, matching
 /// the spec's own "1MB each" wording as closely as a byte count can.
@@ -281,14 +285,16 @@ pub fn scan<R: Readable>(
 /// and return every item in `node_ids`' request order followed by the
 /// scanned fill refs' sorted order. `api: None` means "no Figma API token
 /// available": cache hits still resolve fully; every miss gets a
-/// missing-credential error instead of a network attempt.
+/// missing-credential error instead of a network attempt. `file_key: None`
+/// allows cache extraction from an explicit store without a known file
+/// identity; misses report that missing identity, even if a token exists.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve<P: Push<Keyed<Id, Rec>>>(
     st: &mut KeyedStream<Id, Rec, P>,
     scanned: Scanned,
     api: Option<&dyn FigmaApi>,
     download: &dyn Fn(&str) -> Result<Vec<u8>, ApiError>,
-    file_key: &str,
+    file_key: Option<&str>,
     node_ids: &[String],
     format: &str,
     scale: Option<f64>,
@@ -300,6 +306,12 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
         mut fill_hits,
     } = scanned;
     let scale_m = scale_milli(scale);
+    let unavailable_reason = if file_key.is_none() {
+        NO_FILE_KEY_MSG
+    } else {
+        NO_TOKEN_MSG
+    };
+    let api = api.zip(file_key);
 
     let render_misses: Vec<String> = node_ids
         .iter()
@@ -310,10 +322,18 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
         match api {
             None => {
                 for id in &render_misses {
-                    render_hits.insert(id.clone(), no_token_item(RENDER, id, format));
+                    render_hits.insert(
+                        id.clone(),
+                        error_item(
+                            RENDER,
+                            id,
+                            format.to_string(),
+                            unavailable_reason.to_string(),
+                        ),
+                    );
                 }
             }
-            Some(api) => match api.images_render(file_key, &render_misses, format, scale) {
+            Some((api, key)) => match api.images_render(key, &render_misses, format, scale) {
                 Ok(resp) => {
                     let url_map = resp.get("images").and_then(Value::as_object);
                     for id in &render_misses {
@@ -368,10 +388,13 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
         match api {
             None => {
                 for r in &fill_misses {
-                    fill_hits.insert(r.clone(), no_token_item(FILL, r, ""));
+                    fill_hits.insert(
+                        r.clone(),
+                        error_item(FILL, r, String::new(), unavailable_reason.to_string()),
+                    );
                 }
             }
-            Some(api) => match api.file_image_fills(file_key) {
+            Some((api, key)) => match api.file_image_fills(key) {
                 Ok(resp) => {
                     // Figma's own response nests under `meta.images`; tolerate
                     // a bare `images` map too (this crate's own test fixtures
@@ -433,17 +456,6 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
         }
     }
     out
-}
-
-fn no_token_item(kind: &'static str, subject: &str, format: &str) -> ImageItem {
-    ImageItem {
-        subject: subject.to_string(),
-        kind,
-        format: format.to_string(),
-        bytes: Vec::new(),
-        cached: false,
-        error: Some(NO_TOKEN_MSG.to_string()),
-    }
 }
 
 fn error_item(kind: &'static str, subject: &str, format: String, error: String) -> ImageItem {
@@ -1145,7 +1157,14 @@ mod tests {
                 scan(&nodes, &meta, &images, $ids, $format, scale_milli($scale))
             });
             resolve(
-                &mut $st, scanned, $api, $download, "FILE", $ids, $format, $scale,
+                &mut $st,
+                scanned,
+                $api,
+                $download,
+                Some("FILE"),
+                $ids,
+                $format,
+                $scale,
             )
         }};
     }

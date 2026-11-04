@@ -232,9 +232,13 @@ enum Cmd {
         #[arg(long)]
         y: f64,
     },
-    /// Download node renders and/or fill images to --out, caching by file
-    /// version (spec §5). Never automatic — the images endpoints are
-    /// Figma's most rate-limited.
+    /// Download node renders and/or fill images to --out, caching by file version.
+    ///
+    /// With --db, export cached images only: stores do not record a file key.
+    /// To fetch misses, run `figmog pull <file-key-or-url>`, then
+    /// `figmog images <node-id>...` without --db. A node URL selects a node
+    /// within the chosen store, not the store's file identity.
+    /// Never automatic — the images endpoints are Figma's most rate-limited.
     Images {
         /// Node ids (or Figma URLs carrying node-id=) to render, and/or
         /// scan for fill imageRefs. At least one required.

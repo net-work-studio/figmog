@@ -337,7 +337,7 @@ pub(crate) fn open_session_with_api(
                 scanned,
                 api.as_deref(),
                 &download,
-                &key,
+                Some(&key),
                 &node_ids,
                 format,
                 scale,
