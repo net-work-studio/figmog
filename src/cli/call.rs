@@ -121,7 +121,7 @@ pub(super) fn cmd_call(
     let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
 
     let result: Result<Value, String> = if proxy::is_local_tool(&tool) {
-        match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, r)) {
+        match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, &r)) {
             Some(r) => r,
             None => Err(format!("unknown tool: {tool}")),
         }

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 /// Steering text carried verbatim in the `initialize` result. Local tools
 /// answer from mirrors; native tools forward live to desktop, whose active
 /// file/revision is independent of those mirrors. `file` routes local tools.
-const INSTRUCTIONS: &str = "figmog is your Figma server: a local, instant mirror of one Figma file plus a proxy to Figma's native capabilities. Call figmog for everything Figma-related. figmog_* tools answer from the local mirror at zero API cost; native-named tools (get_*, …) go live to Figma desktop and are forwarded uncached. Pass the Figma file URL as the `file` argument to figmog_* tools when you have one; figmog mirrors files on first reference.";
+const INSTRUCTIONS: &str = "figmog is your Figma server: a local, instant mirror of one Figma file plus a proxy to Figma's native capabilities. Call figmog for everything Figma-related. figmog_* tools answer from the local mirror at zero API cost; native-named tools (get_*, …) go live to Figma desktop and are forwarded uncached. Pass the Figma file URL as the `file` argument to figmog_* tools when you have one; figmog queues a background pull on first reference. Open/sync return a job acknowledgement; poll figmog_status or figmog_files for ready, progress, version/churn and errors.";
 
 /// The default MCP protocol version echoed when a client's `initialize`
 /// request omits `protocolVersion`.
@@ -136,11 +136,15 @@ fn tools_list_result(tools: &[ToolDef]) -> Value {
     let list: Vec<Value> = tools
         .iter()
         .map(|t| {
-            json!({
+            let mut tool = json!({
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": t.input_schema,
-            })
+            });
+            if let Some(schema) = crate::dispatch::output_schema(t.name) {
+                tool["outputSchema"] = schema;
+            }
+            tool
         })
         .collect();
     json!({"tools": list})
@@ -158,10 +162,16 @@ fn tools_call_result(params: &Value, tools: &[ToolDef], handler: &mut dyn ToolHa
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match handler.call(name, &args) {
-        Ok(ToolOutput::Json(v)) => json!({
-            "content": [{"type": "text", "text": serde_json::to_string(&v).unwrap()}],
-            "isError": false,
-        }),
+        Ok(ToolOutput::Json(v)) => {
+            let mut result = json!({
+                "content": [{"type": "text", "text": serde_json::to_string(&v).unwrap()}],
+                "isError": false,
+            });
+            if crate::dispatch::output_schema(name).is_some() {
+                result["structuredContent"] = v;
+            }
+            result
+        }
         Ok(ToolOutput::Raw(v)) => v,
         Err(msg) => error_content(&msg),
     }
@@ -251,7 +261,7 @@ mod tests {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "figmog", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "figmog is your Figma server: a local, instant mirror of one Figma file plus a proxy to Figma's native capabilities. Call figmog for everything Figma-related. figmog_* tools answer from the local mirror at zero API cost; native-named tools (get_*, …) go live to Figma desktop and are forwarded uncached. Pass the Figma file URL as the `file` argument to figmog_* tools when you have one; figmog mirrors files on first reference.",
+                    "instructions": "figmog is your Figma server: a local, instant mirror of one Figma file plus a proxy to Figma's native capabilities. Call figmog for everything Figma-related. figmog_* tools answer from the local mirror at zero API cost; native-named tools (get_*, …) go live to Figma desktop and are forwarded uncached. Pass the Figma file URL as the `file` argument to figmog_* tools when you have one; figmog queues a background pull on first reference. Open/sync return a job acknowledgement; poll figmog_status or figmog_files for ready, progress, version/churn and errors.",
                 },
             })
         );

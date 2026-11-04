@@ -1,36 +1,18 @@
-//! Multi-file serve (spec §14): each mirrored Figma file is a [`FileSession`]
-//! — its own store, opened at its own `open_store!` call site, with
-//! everything that touches it captured in boxed closures (`dispatch`,
-//! `pull`, `images`). This generalizes the single-store
-//! logic `serve.rs` used to inline directly: the store's
-//! pipeline type contains fn items and can't be named (see the doc
-//! comment on `store.rs`'s `open_store!` macro and the identical note in
-//! `cli::dispatch`), so a session's closures share the one open handle via
-//! `Rc<RefCell<_>>` — the only way several independently-boxed `FnMut`s
-//! can all reach the same unnameable, non-`Copy` value.
+//! Per-file background workers and routing for multi-file serve.
 //!
-//! [`SessionManager`] owns every open session, in open order, and
-//! implements the `file`-argument routing rule (spec §14): explicit
-//! `file` → that mirror, auto-opening (and spending exactly one Tier-1
-//! pull, with backoff/retry — see [`do_pull`]) if it's new *or was never
-//! successfully mirrored*; omitted → the first **startup** FILE if one
-//! was given, else the single mirrored file if exactly one exists, else
-//! an error naming `figmog_open`/`figmog_files`. `default_key` carries
-//! the startup-established default independently of open order, so a
-//! later auto-open (or two) never silently becomes "the default" the way
-//! plain first-in-`Vec` order would.
-//!
-//! **Proxied (upstream) tools stay outside this module entirely.** The
-//! desktop's active file/revision cannot be established from a mirror, so
-//! `serve.rs` forwards through the single global upstream connection without
-//! consulting any session's `proxy_cache` table.
+//! Each worker owns the only writer. Dispatch reads a separately pinned
+//! committed view, published only after fetch, flatten, sync and eviction
+//! finish. Workers also own watch watermarks, so a metadata observation
+//! cannot acknowledge a fetch that preceded it.
 
-use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
+use fold::pipeline::Push;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::api::{FigmaApi, UreqApi};
@@ -40,1216 +22,733 @@ use crate::flatten::flatten_file;
 use crate::ident::parse_file_ref;
 use crate::mcp::ToolOutput;
 use crate::model::Id;
+use crate::session_view::{SessionView, SharedPipeline};
 use crate::store::{self, Churn, collect_sweepable, collect_variable_ids};
-use crate::watch::{BACKOFF_START, Watcher};
+use crate::watch::{BACKOFF_START, Tick, Watcher};
 
-/// What one [`FileSession::pull`] call did: the sync churn plus the file's
-/// name/version as of that pull — `figmog_open`'s own result and
-/// `figmog_sync`'s churn value are both built from this.
-#[derive(Debug)]
-pub(crate) struct PullOutcome {
-    pub(crate) churn: Churn,
-    pub(crate) name: String,
-    pub(crate) version: String,
+type SessionApi = Arc<dyn FigmaApi + Send + Sync>;
+
+enum Command {
+    Pull {
+        geometry: bool,
+    },
+    Poll {
+        expedited: bool,
+    },
+    Images {
+        ids: Vec<String>,
+        format: String,
+        scale: Option<f64>,
+        reply: mpsc::SyncSender<Result<Vec<crate::images::ImageItem>, String>>,
+    },
 }
 
-// Named aliases for `FileSession`'s boxed-closure fields (clippy's
-// `type_complexity` lint, and plain readability): every one of these
-// exists only because the store's pipeline type contains fn items and
-// can't be named (this module's doc comment), so it can never appear in a
-// named struct field directly — only behind one of these closures.
-type DispatchFn = Box<dyn FnMut(&str, &Value) -> Result<ToolOutput, String>>;
-/// `bool` argument: this pull's own geometry override (spec §4) —
-/// `figmog_open`'s `geometry` arg, or `false` from every other call site
-/// (startup, watch tick, `figmog_sync`, auto-open), which don't carry a
-/// user-facing override of their own and so just let the mirror's already-
-/// stored setting (if any) keep driving the request — see [`do_pull`].
-type PullFn = Box<dyn FnMut(bool) -> Result<PullOutcome, PullError>>;
-/// `figmog_images`: `(ids, format, scale) ->` every requested render/fill,
-/// cache-first. It needs this session's store and the network, independently
-/// of read-only `dispatch` and the fetch/sync cycle in `pull`.
-type ImagesFn =
-    Box<dyn FnMut(&[String], &str, Option<f64>) -> Result<Vec<crate::images::ImageItem>, String>>;
+enum Completion {
+    Pull(Result<(PullOutcome, Arc<SessionView>), PullError>),
+    Phase(PullPhase),
+    Poll { tick: Tick, expedited: bool },
+}
 
-/// One mirrored Figma file. `dispatch` answers the 16 read-only
-/// `figmog_*` tools (everything [`dispatch::dispatch_read_tool`] knows);
-/// `pull` runs one Tier-1 fetch-flatten-sync-evict cycle (used by
-/// startup, `figmog_sync`, `figmog_open`, a watch tick's `Changed` branch,
-/// and [`SessionManager::resolve`]'s auto-open) and returns the *typed*
-/// [`PullError`] on failure — not a plain string — so every call site can
-/// apply the same Retry-After-aware backoff `cli::pull_failure_wait`
-/// gives the CLI's own `pull` command (see [`do_pull`], the
-/// shared helper every one of those call sites goes through).
-/// `mirrored`: whether this session has ever completed a successful pull
-/// — `false` right after a *failed* auto-open
-/// (a session that pushed into `SessionManager::sessions` before its pull
-/// could succeed must not be treated as "already mirrored" forever, or a
-/// transient failure would silently poison the key into permanent empty
-/// results — see [`SessionManager::resolve`]). `watcher`/`backoff` are
-/// plain per-session state (not closures) so `serve.rs`'s round-robin tick
-/// loop can drive them directly, exactly as the old single-session loop
-/// drove its own local variables.
+#[derive(Debug)]
+struct PullOutcome {
+    churn: Churn,
+    name: String,
+    version: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JobState {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PullPhase {
+    Fetching,
+    Flattening,
+    Applying,
+    Publishing,
+}
+
+impl PullPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetching => "fetching",
+            Self::Flattening => "flattening",
+            Self::Applying => "applying",
+            Self::Publishing => "publishing",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Job {
+    id: u64,
+    state: JobState,
+    geometry: bool,
+    error: Option<String>,
+    phase: Option<PullPhase>,
+}
+
+impl Job {
+    fn json(&self) -> Value {
+        json!({"id": self.id, "state": self.state, "geometry": self.geometry, "error": self.error, "phase": self.phase})
+    }
+}
+
+/// A session's control plane. No local read waits for the worker or locks
+/// its pipeline. Only image operations (outside the pull scheduling scope)
+/// synchronously await their worker reply.
 pub(crate) struct FileSession {
     pub(crate) key: String,
-    pub(crate) name: String,
-    pub(crate) dispatch: DispatchFn,
-    pub(crate) pull: PullFn,
-    pub(crate) images: ImagesFn,
-    pub(crate) watcher: Watcher,
-    pub(crate) backoff: Duration,
     pub(crate) mirrored: bool,
+    view: Arc<SessionView>,
+    commands: Option<mpsc::SyncSender<Command>>,
+    completions: mpsc::Receiver<Completion>,
+    worker: Option<JoinHandle<()>>,
+    busy: bool,
+    polling: bool,
+    job: Option<Job>,
+    queued: Option<Job>,
+    last_completed: Option<Value>,
+    last_success: Option<Value>,
+    next_job: u64,
+    geometry: bool,
+    backoff: Duration,
+    retry_at: Instant,
+    next_poll: Instant,
+    poll_retry_at: Instant,
+    watch_retry_at: Option<Instant>,
+    expedited_poll: bool,
+    interval: Duration,
+}
+
+impl Drop for FileSession {
+    fn drop(&mut self) {
+        // Graceful shutdown drains the one running command. A queued
+        // follow-up has not started and is discarded. Client disconnects
+        // never drop a session, so they do not cancel accepted work.
+        self.commands.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl FileSession {
-    /// Acknowledge pending metadata and reset backoff after a successful
-    /// pull from any call site (startup, `figmog_sync`, `figmog_open`, a watch
-    /// tick, auto-open) — the same bookkeeping every one of those paths
-    /// used to repeat inline.
-    pub(crate) fn note_pull_success(&mut self, outcome: &PullOutcome) {
-        self.name = outcome.name.clone();
-        self.watcher.note_pull_success();
-        self.backoff = BACKOFF_START;
-        self.mirrored = true;
+    pub(crate) fn lifecycle(&self) -> Value {
+        json!({
+            "job": self.job.as_ref().map(Job::json),
+            "queued": self.queued.as_ref().map(Job::json),
+            "last_completed": self.last_completed,
+            "last_success": self.last_success,
+            "polling": self.polling,
+        })
+    }
+
+    pub(crate) fn status(&self) -> Result<Value, String> {
+        let mut value = if self.mirrored {
+            match self.dispatch("figmog_status", &json!({}))? {
+                ToolOutput::Json(value) => value,
+                ToolOutput::Raw(_) => unreachable!("local read tools return JSON"),
+            }
+        } else {
+            json!({"name": null, "version": null, "last_modified": null,
+                "synced_at_unix_ms": null, "nodes": 0})
+        };
+        value["ready"] = json!(self.mirrored);
+        value["pull"] = self.lifecycle();
+        Ok(value)
+    }
+
+    pub(crate) fn dispatch(&self, name: &str, args: &Value) -> Result<ToolOutput, String> {
+        if !self.mirrored && name != "figmog_status" {
+            return Err(format!(
+                "mirror {} is not ready; inspect figmog_status or figmog_files for pull progress and errors",
+                self.key
+            ));
+        }
+        self.view.with_dependent(|_, readers| {
+            dispatch::dispatch_read_tool(name, args, "", readers)
+                .ok_or_else(|| format!("unknown tool: {name}"))?
+                .map(ToolOutput::Json)
+        })
+    }
+
+    fn new_job(&mut self) -> Job {
+        let job = Job {
+            id: self.next_job,
+            state: JobState::Queued,
+            geometry: self.geometry,
+            error: None,
+            phase: None,
+        };
+        self.next_job += 1;
+        job
+    }
+
+    /// Repeated requests share the active/queued job. The sole follow-up
+    /// case is a geometry upgrade that the running fetch cannot satisfy.
+    pub(crate) fn request_pull(&mut self, geometry: bool, interval: Duration) -> Value {
+        self.interval = interval;
+        self.geometry |= geometry;
+        if let Some(queued) = &mut self.queued {
+            queued.geometry |= self.geometry;
+            let id = queued.id;
+            return self.accepted(id);
+        }
+        if let Some(job) = &mut self.job
+            && matches!(job.state, JobState::Queued | JobState::Running)
+        {
+            if job.state == JobState::Queued {
+                job.geometry |= self.geometry;
+                let id = job.id;
+                return self.accepted(id);
+            }
+            if !self.geometry || job.geometry {
+                let id = job.id;
+                return self.accepted(id);
+            }
+            let queued = self.new_job();
+            let id = queued.id;
+            self.queued = Some(queued);
+            return self.accepted(id);
+        }
+        self.job = Some(self.new_job());
+        self.start_if_ready();
+        self.accepted(self.job.as_ref().unwrap().id)
+    }
+
+    fn accepted(&self, id: u64) -> Value {
+        let job = self
+            .queued
+            .as_ref()
+            .filter(|j| j.id == id)
+            .or_else(|| self.job.as_ref().filter(|j| j.id == id))
+            .unwrap();
+        json!({"accepted": true, "key": self.key, "job_id": id, "state": job.state})
+    }
+
+    fn start_if_ready(&mut self) {
+        self.start_if_ready_at(Instant::now());
+    }
+
+    fn start_if_ready_at(&mut self, now: Instant) {
+        if self.busy || now < self.retry_at {
+            return;
+        }
+        if let Some(job) = &mut self.job
+            && job.state == JobState::Queued
+        {
+            self.commands
+                .as_ref()
+                .unwrap()
+                .send(Command::Pull {
+                    geometry: job.geometry,
+                })
+                .unwrap();
+            job.state = JobState::Running;
+            self.busy = true;
+        }
+    }
+
+    /// Apply completions in dispatch order, exactly once. Workers run
+    /// serially per file, so neither an old poll nor an old pull can
+    /// overwrite a newer publication.
+    pub(crate) fn maintain(&mut self) -> bool {
+        self.maintain_at(Instant::now())
+    }
+
+    pub(crate) fn maintain_at(&mut self, now: Instant) -> bool {
+        let mut published = false;
+        while let Ok(completion) = self.completions.try_recv() {
+            if let Completion::Phase(phase) = completion {
+                if let Some(job) = &mut self.job {
+                    job.phase = Some(phase);
+                }
+                continue;
+            }
+            self.busy = false;
+            match completion {
+                Completion::Phase(_) => unreachable!("handled above"),
+                Completion::Poll { tick, expedited } => {
+                    self.polling = false;
+                    match tick {
+                        Tick::Changed => {
+                            self.request_pull(false, self.interval);
+                        }
+                        // Ordinary cadence is anchored to dispatch, just
+                        // like the global round-robin tick. Completion
+                        // latency must not make the next round ineligible.
+                        Tick::Unchanged => {}
+                        Tick::Wait { after } => {
+                            self.poll_retry_at = now + after;
+                            self.next_poll = self.poll_retry_at;
+                            self.watch_retry_at = Some(self.poll_retry_at);
+                            // A failed expedited observation still needs
+                            // reconciliation once its retry delay expires.
+                            self.expedited_poll |= expedited;
+                        }
+                    }
+                }
+                Completion::Pull(result) => {
+                    let job = self.job.as_mut().expect("pull has an accepted job");
+                    match result {
+                        Ok((outcome, view)) => {
+                            self.view = view;
+                            self.mirrored = true;
+                            job.state = JobState::Succeeded;
+                            self.last_success =
+                                Some(json!({"job_id": job.id, "name": outcome.name,
+                                "version": outcome.version, "churn": outcome.churn}));
+                            self.backoff = BACKOFF_START;
+                            self.retry_at = now;
+                            self.watch_retry_at = None;
+                            // Publishing a pull must not postpone the
+                            // next round beyond its last poll dispatch.
+                            published = true;
+                        }
+                        Err(error) => {
+                            let wait = pull_failure_wait(&error, &mut self.backoff, self.interval);
+                            job.state = JobState::Failed;
+                            job.error = Some(error.to_string());
+                            self.retry_at = now + wait;
+                            self.next_poll = self.retry_at;
+                            self.watch_retry_at = Some(self.retry_at);
+                        }
+                    }
+                    job.phase = None;
+                    self.last_completed = Some(job.json());
+                    if let Some(queued) = self.queued.take() {
+                        self.job = Some(queued);
+                    }
+                }
+            }
+        }
+        self.start_if_ready_at(now);
+        if self.expedited_poll {
+            self.poll_at(self.interval, now);
+        }
+        published
+    }
+
+    /// Desktop context cannot identify a mirror authoritatively. Its
+    /// write requests one coalesced observation per known session.
+    pub(crate) fn expedite_poll(&mut self, interval: Duration) {
+        self.interval = interval;
+        self.expedited_poll = true;
+    }
+
+    /// Retry work is independent of the ordinary round, but unavailable
+    /// workers and explicitly queued pulls must keep their serialization.
+    pub(crate) fn watch_retry_deadline(&self) -> Option<Instant> {
+        if self.busy
+            || self
+                .job
+                .as_ref()
+                .is_some_and(|job| job.state == JobState::Queued)
+        {
+            return None;
+        }
+        self.watch_retry_at.map(|retry| {
+            retry
+                .max(self.retry_at)
+                .max(self.poll_retry_at)
+                .max(self.next_poll)
+        })
+    }
+
+    /// Extra retry work must not push an already scheduled normal visit
+    /// past its eligibility boundary. The scheduler still rate-limits it.
+    pub(crate) fn retry_poll_at(&mut self, interval: Duration, now: Instant) -> bool {
+        if self.poll_at(interval, now) {
+            self.next_poll = now;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn poll_at(&mut self, interval: Duration, now: Instant) -> bool {
+        self.interval = interval;
+        if !self.busy
+            && (self.expedited_poll || now >= self.next_poll)
+            && now >= self.retry_at
+            && now >= self.poll_retry_at
+            && self
+                .job
+                .as_ref()
+                .is_none_or(|j| j.state != JobState::Queued)
+        {
+            let expedited = std::mem::take(&mut self.expedited_poll);
+            self.commands
+                .as_ref()
+                .unwrap()
+                .send(Command::Poll { expedited })
+                .unwrap();
+            self.next_poll = now + interval;
+            self.watch_retry_at = None;
+            self.busy = true;
+            self.polling = true;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn images(
+        &mut self,
+        ids: &[String],
+        format: &str,
+        scale: Option<f64>,
+    ) -> Result<Vec<crate::images::ImageItem>, String> {
+        if !self.mirrored {
+            return Err(format!(
+                "mirror {} is not ready; inspect figmog_status",
+                self.key
+            ));
+        }
+        // Never wait behind a pull/poll, even for an image cache hit.
+        // Cache-miss networking keeps its existing synchronous contract
+        // when the worker is idle, independently of pull scheduling.
+        if self.busy {
+            return Err(format!(
+                "mirror {} has a pull or metadata poll in progress; retry figmog_images after figmog_status reports it complete",
+                self.key
+            ));
+        }
+        let (reply, result) = mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .unwrap()
+            .send(Command::Images {
+                ids: ids.to_vec(),
+                format: format.to_string(),
+                scale,
+                reply,
+            })
+            .map_err(|e| e.to_string())?;
+        result.recv().map_err(|e| e.to_string())?
     }
 }
 
-/// Run `session.pull()` and apply the same failure-backoff discipline
-/// `cli::pull_failure_wait` gives (Retry-After honored for a rate limit,
-/// exponential otherwise, capped): on success, acknowledge the pending
-/// metadata via [`FileSession::note_pull_success`]; on failure, leave
-/// the change pending for retry and advance `backoff`, returning the
-/// resulting wait alongside the stringified
-/// error so every call site (watch tick, `figmog_sync`, `figmog_open`,
-/// `SessionManager::resolve`'s auto-open) can push its own `next_deadline`
-/// out by the same amount — spec §14 "backoff discipline per session".
-/// Every one of those call sites shares this single implementation so
-/// "same treatment" is structural, not a convention to keep in sync by
-/// hand.
-pub(crate) fn do_pull(
-    session: &mut FileSession,
-    interval: Duration,
-    geometry: bool,
-) -> Result<PullOutcome, (String, Duration)> {
-    match (session.pull)(geometry) {
-        Ok(outcome) => {
-            session.note_pull_success(&outcome);
-            Ok(outcome)
-        }
-        Err(e) => {
-            let wait = pull_failure_wait(&e, &mut session.backoff, interval);
-            Err((e.to_string(), wait))
-        }
-    }
-}
-
-/// Build a [`FileSession`] mirroring `key` under `root` (`root/<key>/db` —
-/// the per-key store layout every mirror has used since v1, see
-/// `cli::db_path_for`). Thin wrapper over [`open_session_at`] with
-/// `network_key = Some(key)` — every session built this way (startup
-/// files, auto-open) always has a real, parsed Figma key to pull with.
 pub(crate) fn open_session(
     root: &Path,
     key: &str,
     api_token: Option<&str>,
-    pull_now: bool,
 ) -> Result<FileSession, String> {
-    let path = root.join(key).join("db");
-    open_session_at(path, key.to_string(), Some(key), api_token, pull_now)
+    open_session_at(
+        root.join(key).join("db"),
+        key.to_string(),
+        Some(key),
+        api_token,
+    )
 }
 
-/// Like [`open_session`], but at an explicit store path rather than one
-/// derived from `root`/`key`, and with the Figma key used for *network*
-/// calls tracked separately from `key` (the session's display/dedupe
-/// identity). The CLI's legacy `--db <path>` escape hatch (`serve.rs`'s
-/// `run_serve`) needs both: it predates multi-file serve and its existing
-/// tests pin an explicit, arbitrary store directory (no `--figmog-root`
-/// layout involved), so `figmog serve --db <path>` keeps opening exactly
-/// that path as a single session, unchanged — and when no file ref was
-/// given alongside `--db` either, that session has no real Figma key at
-/// all. `network_key: None` is exactly that case: the built session still
-/// dedupes/displays under a path-derived sentinel `key`, but any attempt
-/// to pull it fails immediately with the same clean message pre-v4
-/// `figmog serve`/`do_pull` always gave ("no file key: pass a file key or
-/// figma.com URL") instead of trying — and failing confusingly — to fetch
-/// a "file" named after a filesystem path.
 pub(crate) fn open_session_at(
     path: PathBuf,
     key: String,
     network_key: Option<&str>,
     api_token: Option<&str>,
-    pull_now: bool,
 ) -> Result<FileSession, String> {
-    let api = api_token.map(|token| Rc::new(UreqApi::new(token.to_string())) as Rc<dyn FigmaApi>);
-    open_session_with_api(path, key, network_key, api, pull_now)
+    let api = api_token.map(|token| Arc::new(UreqApi::new(token.to_string())) as SessionApi);
+    open_session_with_api(path, key, network_key, api)
 }
 
-/// Shared construction with the REST boundary supplied explicitly, so
-/// session bookkeeping and real store syncs can be exercised offline.
+/// Injection at the REST boundary keeps real flattening, indexing and
+/// snapshot publication exercised by synthetic tests.
+#[cfg(test)]
+type PhaseHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[derive(Default)]
+pub(crate) struct WorkerHooks {
+    #[cfg(test)]
+    pub(crate) on_phase: Option<PhaseHook>,
+}
+
+impl WorkerHooks {
+    fn phase(&self, _phase: &str) {
+        #[cfg(test)]
+        if let Some(hook) = &self.on_phase {
+            hook(_phase);
+        }
+    }
+}
+
 pub(crate) fn open_session_with_api(
     path: PathBuf,
     key: String,
     network_key: Option<&str>,
-    api: Option<Rc<dyn FigmaApi>>,
-    pull_now: bool,
+    api: Option<SessionApi>,
+) -> Result<FileSession, String> {
+    open_session_with_hooks(path, key, network_key, api, WorkerHooks::default())
+}
+
+pub(crate) fn open_session_with_hooks(
+    path: PathBuf,
+    key: String,
+    network_key: Option<&str>,
+    api: Option<SessionApi>,
+    hooks: WorkerHooks,
 ) -> Result<FileSession, String> {
     let network_key = network_key.map(str::to_string);
-    let st = Rc::new(RefCell::new(open_store_checked(&path, |path| {
-        crate::open_store!(path)
-    })?));
-
-    // The pull-and-sync cycle (build design §12's do_pull-equivalent
-    // sequence): fetch, flatten, sync, evict stale cache rows on a version
-    // change. Defined once and reused for the immediate `pull_now` call
-    // below and — moved as-is — for the `pull` closure every other call
-    // site (`figmog_sync`, `figmog_open`, watch, auto-open) drives via
-    // [`do_pull`].
-    let pull_closure = {
-        let st = st.clone();
-        let network_key = network_key.clone();
-        let api = api.clone();
-        move |geometry_override: bool| -> Result<PullOutcome, PullError> {
-            let key = network_key.clone().ok_or_else(|| {
-                PullError::from("no file key: pass a file key or figma.com URL".to_string())
-            })?;
-            let api = api
-                .as_ref()
-                .ok_or_else(|| PullError::from(crate::auth::missing_token("network pulls")))?;
-            // Sticky vector geometry (spec §4): what this pull requests
-            // combines its own override (`figmog_open`'s `geometry` arg,
-            // or `false` from every other caller — see `PullFn`'s doc
-            // comment) with whatever's already stored, so a plain re-pull
-            // of a mirror that was ever opened with `--geometry`/
-            // `geometry: true` keeps asking for it.
-            let stored_geometry = st
-                .borrow()
-                .rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config));
-            let request_geometry = store::effective_geometry(geometry_override, stored_geometry);
-            let resp = api.file(&key, request_geometry)?;
-            // Opportunistic Enterprise variables sync (spec §12): `Ok(None)`
-            // on non-Enterprise plans is not an error — v1 behavior
-            // (import/inference, sweep-exempt) holds unchanged below.
-            let vars_resp = api.variables_local(&key)?;
-            let mut flattened = flatten_file(&resp).map_err(|e| e.to_string())?;
-
-            let mut st = st.borrow_mut();
-            let mut prior: BTreeSet<Id> =
-                st.rtx(|((nodes, ..), components, component_sets, styles, ..)| {
-                    collect_sweepable(&nodes, &components, &component_sets, &styles)
-                });
-            if let Some(v) = &vars_resp {
-                let var_recs = crate::vars::parse_variables_export(v).map_err(|e| e.to_string())?;
-                flattened.recs.extend(var_recs);
-                let stored_var_ids = st.rtx(
-                    |(_, _, _, _, variables, variable_collections, _, _, _, _)| {
-                        collect_variable_ids(&variables, &variable_collections)
-                    },
-                );
-                prior.extend(stored_var_ids);
-            }
-            let prior_version =
-                st.rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.version.clone()));
-            let churn = store::sync(&mut st, &prior, &flattened, now_ms());
-
-            // Cache eviction lives here rather than folded into `sync`
-            // (store.rs's own note): a version-changing pull sweeps stale
-            // `proxy_cache` rows (and, v0.0.2 spec §5, stale `images` rows
-            // the same way). Match CLI pulls: skip both scans when the
-            // stored version is unchanged, avoiding decoding cached image
-            // bytes. An absent prior version still triggers eviction.
-            let version = flattened.file.version.clone();
-            if prior_version.as_deref() != Some(version.as_str()) {
-                let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
-                    let mut stale = store::stale_cache_ids(&cache, &version);
-                    stale.extend(store::stale_image_ids(&images, &version));
-                    stale
-                });
-                if !stale.is_empty() {
-                    stale.sort();
-                    store::evict_stale_cache(&mut st, &stale);
-                }
-            }
-
-            // Persist the (possibly just-turned-on) geometry flag so the
-            // *next* pull's own peek above sees it, even if this call's
-            // override was the only reason it was requested this time.
-            store::upsert_mirror_config(&mut st, request_geometry);
-
-            Ok(PullOutcome {
-                churn,
-                name: flattened.file.name.clone(),
-                version,
-            })
-        }
-    };
-
-    if pull_now {
-        pull_closure(false).map_err(|e| e.to_string())?;
-    }
-
-    let meta_present = st
-        .borrow()
-        .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).is_some());
-    let name = st
-        .borrow()
-        .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.name.clone()))
-        .unwrap_or_else(|| key.clone());
-
-    let dispatch: DispatchFn = {
-        let st = st.clone();
-        Box::new(
-            move |name: &str, args: &Value| -> Result<ToolOutput, String> {
-                let st = st.borrow();
-                // `upstream_status` is a purely global concern (proxy routing
-                // never varies per file — see this module's doc comment), so
-                // it's spliced into a client-requested `figmog_status` result
-                // at the call site that actually knows it (`serve.rs`), not
-                // here. `""` is never observed by a real caller.
-                match st.rtx(|r| dispatch::dispatch_read_tool(name, args, "", r)) {
-                    Some(result) => result.map(ToolOutput::Json),
-                    None => Err(format!("unknown tool: {name}")),
-                }
-            },
+    let pipeline = Arc::new(Mutex::new(crate::figmog_pipeline!()));
+    let mut st = open_store_checked(&path, |path| {
+        fold::stream::KeyedStream::<Id, crate::model::Rec, _>::new(
+            path,
+            SharedPipeline(pipeline.clone()),
         )
+    })?;
+    let make_view = move |snapshot| {
+        Arc::new(SessionView::new(snapshot, |snapshot| {
+            pipeline.lock().unwrap().reader(snapshot)
+        }))
     };
-
-    let pull: PullFn = Box::new(pull_closure);
-
-    // `figmog_images` (v0.0.2 spec §5): the two-step `scan` (read-only,
-    // this session's own concrete `open_store!` handle — see
-    // `images.rs`'s own doc comment for why that split exists at all) then
-    // `resolve` (network + cache-write) dance, with the session's api
-    // API and network key exactly like `pull_closure` above. `api: None`
-    // when no token was configured at all — `resolve` itself still serves
-    // every cache hit for free in that case (see its own doc comment).
-    let images: ImagesFn = {
-        let st = st.clone();
-        let network_key = network_key.clone();
-        let api = api.clone();
-        Box::new(move |ids: &[String], format: &str, scale: Option<f64>| {
-            let key = network_key
-                .clone()
-                .ok_or_else(|| "no file key: pass a file key or figma.com URL".to_string())?;
-            let node_ids = crate::images::normalize_ids(ids);
-            let scale_m = crate::images::scale_milli(scale);
-            let mut st = st.borrow_mut();
-            let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images)| {
-                crate::images::scan(&nodes, &meta, &images, &node_ids, format, scale_m)
-            });
-            let download = crate::api::download_bytes;
-            Ok(crate::images::resolve(
-                &mut st,
-                scanned,
-                api.as_deref(),
-                &download,
-                Some(&key),
-                &node_ids,
-                format,
-                scale,
-            ))
-        })
-    };
-
+    let view = make_view(st.rtx(|(snapshot, _)| snapshot.clone()));
+    let mirrored =
+        view.with_dependent(|_, (_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).is_some());
+    let geometry = view.with_dependent(|_, (.., config, _)| store::read_geometry(config));
+    let (commands, work) = mpsc::sync_channel(1);
+    let (done, completions) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut watcher = Watcher::new(None);
+        while let Ok(command) = work.recv() {
+            match command {
+                Command::Poll { expedited } => {
+                    let tick = match (&api, &network_key) {
+                        (Some(api), Some(key)) => watcher.tick(&**api, key),
+                        _ => Tick::Wait {
+                            after: Duration::from_secs(300),
+                        },
+                    };
+                    if done.send(Completion::Poll { tick, expedited }).is_err() {
+                        break;
+                    }
+                }
+                Command::Pull { geometry } => {
+                    let phase = |name| {
+                        let _ = done.send(Completion::Phase(name));
+                        hooks.phase(name.as_str());
+                    };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let key = network_key.as_deref().ok_or_else(|| {
+                            PullError::from(
+                                "no file key: pass a file key or figma.com URL".to_string(),
+                            )
+                        })?;
+                        let api = api.as_ref().ok_or_else(|| {
+                            PullError::from(crate::auth::missing_token("network pulls"))
+                        })?;
+                        let stored = st.rtx(|(_, (.., config, _))| store::read_geometry(&config));
+                        let geometry = store::effective_geometry(geometry, stored);
+                        phase(PullPhase::Fetching);
+                        let response = api.file(key, geometry)?;
+                        let vars = api.variables_local(key)?;
+                        phase(PullPhase::Flattening);
+                        let mut flattened =
+                            flatten_file(&response).map_err(|e| PullError::from(e.to_string()))?;
+                        let mut prior: BTreeSet<Id> =
+                            st.rtx(|(_, ((nodes, ..), components, sets, styles, ..))| {
+                                collect_sweepable(&nodes, &components, &sets, &styles)
+                            });
+                        if let Some(vars) = vars {
+                            flattened.recs.extend(
+                                crate::vars::parse_variables_export(&vars)
+                                    .map_err(|e| PullError::from(e.to_string()))?,
+                            );
+                            prior.extend(st.rtx(|(_, (_, _, _, _, vars, collections, ..))| {
+                                collect_variable_ids(&vars, &collections)
+                            }));
+                        }
+                        phase(PullPhase::Applying);
+                        let prior_version = st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _))| {
+                            meta.get(&0).map(|meta| meta.version.clone())
+                        });
+                        let churn = store::sync(&mut st, &prior, &flattened, now_ms());
+                        let version = flattened.file.version.clone();
+                        // Match direct pulls: unchanged versions avoid decoding
+                        // potentially large image blobs merely to evict none.
+                        if prior_version.as_deref() != Some(version.as_str()) {
+                            let mut stale =
+                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images))| {
+                                    let mut ids = store::stale_cache_ids(&cache, &version);
+                                    ids.extend(store::stale_image_ids(&images, &version));
+                                    ids
+                                });
+                            if !stale.is_empty() {
+                                stale.sort();
+                                store::evict_stale_cache(&mut st, &stale);
+                            }
+                        }
+                        store::upsert_mirror_config(&mut st, geometry);
+                        phase(PullPhase::Publishing);
+                        let view = make_view(st.rtx(|(snapshot, _)| snapshot.clone()));
+                        watcher.note_pull_success();
+                        Ok((
+                            PullOutcome {
+                                churn,
+                                name: flattened.file.name,
+                                version,
+                            },
+                            view,
+                        ))
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(PullError::from(
+                            "pull worker panicked; retry the pull and inspect server stderr"
+                                .to_string(),
+                        ))
+                    });
+                    if done.send(Completion::Pull(result)).is_err() {
+                        break;
+                    }
+                }
+                Command::Images {
+                    ids,
+                    format,
+                    scale,
+                    reply,
+                } => {
+                    let result = (|| {
+                        let key = network_key.as_deref().ok_or_else(|| {
+                            "no file key: pass a file key or figma.com URL".to_string()
+                        })?;
+                        let node_ids = crate::images::normalize_ids(&ids);
+                        let scanned =
+                            st.rtx(|(_, ((nodes, ..), _, _, _, _, _, meta, _, _, images))| {
+                                crate::images::scan(
+                                    &nodes,
+                                    &meta,
+                                    &images,
+                                    &node_ids,
+                                    &format,
+                                    crate::images::scale_milli(scale),
+                                )
+                            });
+                        Ok(crate::images::resolve(
+                            &mut st,
+                            scanned,
+                            api.as_deref().map(|a| a as &dyn FigmaApi),
+                            &crate::api::download_bytes,
+                            Some(key),
+                            &node_ids,
+                            &format,
+                            scale,
+                        ))
+                    })();
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    });
     Ok(FileSession {
         key,
-        name,
-        dispatch,
-        pull,
-        images,
-        watcher: Watcher::new(None),
+        mirrored,
+        view,
+        commands: Some(commands),
+        completions,
+        worker: Some(worker),
+        busy: false,
+        polling: false,
+        job: None,
+        queued: None,
+        last_completed: None,
+        last_success: None,
+        next_job: 1,
+        geometry,
         backoff: BACKOFF_START,
-        mirrored: meta_present,
+        retry_at: Instant::now(),
+        next_poll: Instant::now(),
+        poll_retry_at: Instant::now(),
+        watch_retry_at: None,
+        expedited_poll: false,
+        interval: Duration::from_secs(10),
     })
 }
 
-/// Every mirrored file for one `figmog serve` process, in open order.
-/// `root`/`token` are what every auto-opened session is built with
-/// ([`open_session`]). `default_key`: the startup-established default (spec
-/// §14's "first startup FILE"), set once by `serve.rs`'s startup
-/// orchestration and never mutated by a later auto-open — see this
-/// module's doc comment and [`SessionManager::resolve`].
+/// Sessions remain in open order; startup selection is independent of it.
 pub(crate) struct SessionManager {
     pub(crate) sessions: Vec<FileSession>,
     pub(crate) root: PathBuf,
     pub(crate) token: Option<String>,
     pub(crate) default_key: Option<String>,
+    #[cfg(test)]
+    pub(crate) api: Option<SessionApi>,
 }
 
-/// A [`SessionManager::resolve`] failure: the message plus, when this was
-/// a failed *pull* (rather than a bad `file` argument or an unresolvable
-/// default), how long the caller should wait before this session's next
-/// watch tick (see [`do_pull`]) — `None` for every other kind of failure,
-/// which carries no backoff information to act on.
-#[derive(Debug)]
-pub(crate) struct ResolveError {
-    pub(crate) message: String,
-    pub(crate) retry_after: Option<Duration>,
-}
-
-impl From<String> for ResolveError {
-    fn from(message: String) -> Self {
-        ResolveError {
-            message,
-            retry_after: None,
-        }
-    }
-}
-
-/// The `file`-argument resolution error's shared text (spec §14: must name
-/// `figmog_open`/`figmog_files`).
 const NO_DEFAULT_FILE_MSG: &str = "no file specified and no default mirrored file — pass a `file` argument, mirror one with figmog_open, or see figmog_files for the current list";
 
 impl SessionManager {
-    /// Get-or-create the session for `file_ref` (URL or bare key),
-    /// deduped by key — never pulls: a freshly-created session is left
-    /// exactly as [`open_session`] built it (empty unless the caller asked
-    /// for `pull_now`). [`Self::resolve`]/`figmog_open` are what decide
-    /// whether — and how many times — to actually pull.
     pub(crate) fn open(&mut self, file_ref: &str) -> Result<&mut FileSession, String> {
         let key = parse_file_ref(file_ref)
             .ok_or_else(|| format!("not a Figma file key or URL: {file_ref}"))?;
         if let Some(pos) = self.sessions.iter().position(|s| s.key == key) {
             return Ok(&mut self.sessions[pos]);
         }
-        let session = open_session(&self.root, &key, self.token.as_deref(), false)?;
+        #[cfg(test)]
+        let session = match &self.api {
+            Some(api) => open_session_with_api(
+                self.root.join(&key).join("db"),
+                key.clone(),
+                Some(&key),
+                Some(api.clone()),
+            )?,
+            None => open_session(&self.root, &key, self.token.as_deref())?,
+        };
+        #[cfg(not(test))]
+        let session = open_session(&self.root, &key, self.token.as_deref())?;
         self.sessions.push(session);
-        Ok(self.sessions.last_mut().expect("just pushed"))
+        Ok(self.sessions.last_mut().unwrap())
     }
 
-    /// Spec §14's default-file rule, shared by [`Self::resolve`]'s omitted
-    /// branch and [`Self::list`]'s `default` flag: the startup-established
-    /// `default_key` if one was set, else the single mirrored file if
-    /// exactly one exists, else `None` (ambiguous or nothing mirrored yet).
     pub(crate) fn effective_default_key(&self) -> Option<String> {
-        if let Some(key) = &self.default_key {
-            return Some(key.clone());
-        }
-        match self.sessions.len() {
-            1 => Some(self.sessions[0].key.clone()),
-            _ => None,
-        }
+        self.default_key.clone().or_else(|| {
+            if self.sessions.len() == 1 {
+                Some(self.sessions[0].key.clone())
+            } else {
+                None
+            }
+        })
     }
 
-    /// Spec §14's `file`-argument resolution rule. Explicit `file`: that
-    /// mirror, auto-opening it if unknown *or opened-but-never-
-    /// successfully-mirrored* (a session whose first pull failed is
-    /// retried here rather than served empty forever — see
-    /// [`FileSession::mirrored`]), spending exactly one Tier-1 pull via
-    /// [`do_pull`] (whose typed failure carries the retry-after wait the
-    /// caller should push its own scheduling out by). Omitted:
-    /// [`Self::effective_default_key`]'s session, or [`NO_DEFAULT_FILE_MSG`].
-    /// Returns, alongside the session, the [`PullOutcome`] of a pull this
-    /// call itself just performed (`None` if it didn't need to) — so a
-    /// caller like `figmog_sync` can skip its own redundant pull.
     pub(crate) fn resolve(
         &mut self,
-        file_arg: Option<&str>,
+        file: Option<&str>,
         interval: Duration,
-    ) -> Result<(&mut FileSession, Option<PullOutcome>), ResolveError> {
-        match file_arg {
-            Some(f) => {
-                let session = self.open(f)?;
-                if session.mirrored {
-                    Ok((session, None))
-                } else {
-                    // No user-facing geometry override reaches an implicit
-                    // auto-open (only `figmog_open` carries one) — this
-                    // just lets the mirror's stored setting, if any, drive
-                    // the request (spec §4).
-                    match do_pull(session, interval, false) {
-                        Ok(outcome) => Ok((session, Some(outcome))),
-                        Err((message, wait)) => Err(ResolveError {
-                            message,
-                            retry_after: Some(wait),
-                        }),
-                    }
-                }
-            }
-            None => {
-                let key = self
-                    .effective_default_key()
-                    .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?;
-                let pos = self
-                    .sessions
-                    .iter()
-                    .position(|s| s.key == key)
-                    .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?;
-                Ok((&mut self.sessions[pos], None))
-            }
-        }
-    }
-
-    /// `figmog_files`: every mirrored file, in open order, as `{key,
-    /// name, version, nodes, last_synced, default}` — `default` per
-    /// [`Self::effective_default_key`], not merely index 0 (spec §14: two
-    /// auto-opened mirrors with no startup default have *no* default at
-    /// all). Deterministic — plain `Vec` order, no `HashMap` involved.
-    pub(crate) fn list(&mut self) -> Value {
-        let default_key = self.effective_default_key();
-        let rows: Vec<Value> = self
-            .sessions
-            .iter_mut()
-            .map(|s| {
-                let status = (s.dispatch)("figmog_status", &json!({})).ok();
-                let (name, version, nodes, last_synced) = match status {
-                    Some(ToolOutput::Json(v)) => (
-                        v["name"].clone(),
-                        v["version"].clone(),
-                        v["nodes"].clone(),
-                        v["synced_at_unix_ms"].clone(),
-                    ),
-                    _ => (Value::Null, Value::Null, Value::Null, Value::Null),
-                };
-                let is_default = default_key.as_deref() == Some(s.key.as_str());
-                json!({
-                    "key": s.key,
-                    "name": name,
-                    "version": version,
-                    "nodes": nodes,
-                    "last_synced": last_synced,
-                    "default": is_default,
-                })
-            })
-            .collect();
-        json!(rows)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::api::{ApiError, FileMetaResp};
-    use crate::watch::Tick;
-    use std::cell::Cell;
-
-    const FULL_TIMESTAMP: &str = "2026-01-01T12:00:00Z";
-    const META_TIMESTAMP: &str = "2026-01-01T12:00:00.123Z";
-
-    /// Synthetic REST boundary; sessions still flatten and sync a real store.
-    struct ScriptedApi {
-        metadata: RefCell<String>,
-        file_calls: Cell<usize>,
-        version: Cell<u32>,
-        fail_next: RefCell<Option<ApiError>>,
-        edit_during_fetch: RefCell<Option<&'static str>>,
-    }
-
-    impl ScriptedApi {
-        fn new() -> Rc<Self> {
-            Rc::new(Self {
-                metadata: RefCell::new(META_TIMESTAMP.into()),
-                file_calls: Cell::new(0),
-                version: Cell::new(1),
-                fail_next: RefCell::new(None),
-                edit_during_fetch: RefCell::new(None),
-            })
-        }
-
-        fn edit(&self, timestamp: &str) {
-            *self.metadata.borrow_mut() = timestamp.into();
-            self.version.set(self.version.get() + 1);
-        }
-    }
-
-    impl FigmaApi for ScriptedApi {
-        fn file_meta(&self, _key: &str) -> Result<FileMetaResp, ApiError> {
-            Ok(FileMetaResp {
-                name: "Synthetic".into(),
-                last_touched_at: self.metadata.borrow().clone(),
-            })
-        }
-
-        fn file(&self, _key: &str, _geometry: bool) -> Result<Value, ApiError> {
-            self.file_calls.set(self.file_calls.get() + 1);
-            if let Some(error) = self.fail_next.borrow_mut().take() {
-                return Err(error);
-            }
-            let version = self.version.get().to_string();
-            if let Some(timestamp) = self.edit_during_fetch.borrow_mut().take() {
-                self.edit(timestamp);
-            }
-            Ok(json!({
-                "name": "Synthetic", "version": version, "lastModified": FULL_TIMESTAMP,
-                "document": {"id": "0:0", "name": "Synthetic", "type": "DOCUMENT"}
-            }))
-        }
-    }
-
-    /// Synthetic legacy proxy rows and 1 MiB render/fill blobs, including
-    /// both matching and mismatched versions independently of stored meta.
-    fn seed_session_cache(path: &Path, prior_version: Option<&str>) {
-        use crate::model::{FileMeta, ImageBlobRec, Rec};
-
-        let mut st = crate::open_store!(path);
-        if let Some(version) = prior_version {
-            st.wtx(|tx| {
-                tx.upsert(
-                    &Id::Meta,
-                    &Rec::Meta(FileMeta {
-                        name: "Synthetic".into(),
-                        version: version.into(),
-                        last_modified: FULL_TIMESTAMP.into(),
-                        synced_at_unix_ms: 0,
-                    }),
-                );
-            });
-        }
-        for version in ["0", "1"] {
-            crate::cache::store(&mut st, "get_code", version, version, &json!([])).unwrap();
-            for kind in ["render", "fill"] {
-                let subject = format!("synthetic-{kind}-{version}");
-                let key = crate::images::image_key(kind, &subject, "png", 1000);
-                let rec = ImageBlobRec {
-                    key_hash: key.clone(),
-                    kind: kind.into(),
-                    subject,
-                    format: "png".into(),
-                    scale_milli: 1000,
-                    file_version: version.into(),
-                    bytes: vec![42; 1024 * 1024],
-                };
-                st.wtx(|tx| {
-                    tx.upsert(&Id::ImageBlob(key.clone()), &Rec::ImageBlob(rec.clone()));
-                });
-            }
-        }
-    }
-
-    fn session_cache_rows(path: &Path) -> Vec<crate::model::Rec> {
-        use crate::model::Rec;
-
-        let st = crate::open_store!(path);
-        st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
-            cache
-                .iter()
-                .map(|(_, rec)| Rec::ProxyCache(rec))
-                .chain(images.iter().map(|(_, rec)| Rec::ImageBlob(rec)))
-                .collect()
-        })
-    }
-
-    #[test]
-    fn same_version_session_pulls_skip_cache_scans_with_large_images() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db");
-        seed_session_cache(&path, Some("1"));
-        let expected = session_cache_rows(&path);
-        let api = ScriptedApi::new();
-        let scans_before = store::STALE_SCAN_COUNTS.get();
-
-        // Startup and repeated explicit pulls use the persisted version,
-        // including after reopening a mirror from an earlier session.
-        let mut session = open_session_with_api(
-            path.clone(),
-            "ABC123".into(),
-            Some("ABC123"),
-            Some(api.clone()),
-            true,
-        )
-        .unwrap();
-        for _ in 0..2 {
-            assert_eq!(
-                do_pull(&mut session, Duration::from_secs(1), false)
-                    .unwrap()
-                    .version,
-                "1"
-            );
-        }
-        assert_eq!(api.file_calls.get(), 3);
-        assert_eq!(store::STALE_SCAN_COUNTS.get(), scans_before);
-        drop(session);
-        assert_eq!(session_cache_rows(&path), expected);
-    }
-
-    #[test]
-    fn initial_and_version_changing_session_pulls_evict_only_mismatched_cache_rows() {
-        use crate::model::Rec;
-
-        for prior_version in [None, Some("0")] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("db");
-            seed_session_cache(&path, prior_version);
-            let expected: Vec<_> = session_cache_rows(&path)
-                .into_iter()
-                .filter(|rec| match rec {
-                    Rec::ProxyCache(rec) => rec.file_version == "1",
-                    Rec::ImageBlob(rec) => rec.file_version == "1",
-                    _ => unreachable!(),
-                })
-                .collect();
-            assert_eq!(expected.len(), 3, "one proxy row, one render, one fill");
-            let scans_before = store::STALE_SCAN_COUNTS.get();
-            let mut session = open_session_with_api(
-                path.clone(),
-                "ABC123".into(),
-                Some("ABC123"),
-                Some(ScriptedApi::new()),
-                false,
-            )
-            .unwrap();
-
-            let outcome = do_pull(&mut session, Duration::from_secs(1), false).unwrap();
-            assert_eq!(outcome.version, "1");
-            assert_eq!(
-                store::STALE_SCAN_COUNTS.get(),
-                (scans_before.0 + 1, scans_before.1 + 1),
-                "initial and version-changing pulls must scan both tables"
-            );
-            drop(session);
-            assert_eq!(session_cache_rows(&path), expected);
-        }
-    }
-
-    #[test]
-    fn unchanged_session_converges_despite_different_endpoint_timestamps() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = ScriptedApi::new();
-        let mut session = open_session_with_api(
-            dir.path().join("db"),
-            "ABC123".into(),
-            Some("ABC123"),
-            Some(api.clone()),
-            true,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Changed
-        ));
-        do_pull(&mut session, Duration::from_secs(10), false).unwrap();
-        for _ in 0..3 {
-            assert!(matches!(
-                session.watcher.tick(&*api, "ABC123"),
-                Tick::Unchanged
-            ));
-        }
-        assert_eq!(
-            api.file_calls.get(),
-            2,
-            "startup plus one reconciliation pull"
-        );
-    }
-
-    #[test]
-    fn failed_watch_pulls_retry_with_backoff_then_converge() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = ScriptedApi::new();
-        let mut session = open_session_with_api(
-            dir.path().join("db"),
-            "ABC123".into(),
-            Some("ABC123"),
-            Some(api.clone()),
-            true,
-        )
-        .unwrap();
-        let interval = Duration::from_secs(1);
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Changed
-        ));
-        do_pull(&mut session, interval, false).unwrap();
-
-        api.edit("2026-01-01T12:00:00.456Z");
-        for (error, seconds) in [
-            (ApiError::Network("down".into()), 5),
-            (ApiError::Network("down".into()), 10),
-            (
-                ApiError::RateLimited {
-                    retry_after: Duration::from_secs(90),
-                },
-                90,
-            ),
-        ] {
-            *api.fail_next.borrow_mut() = Some(error);
-            assert!(matches!(
-                session.watcher.tick(&*api, "ABC123"),
-                Tick::Changed
-            ));
-            let (_, wait) = do_pull(&mut session, interval, false).unwrap_err();
-            assert_eq!(wait, Duration::from_secs(seconds));
-        }
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Changed
-        ));
-        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "2");
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Unchanged
-        ));
-
-        api.edit("2026-01-01T12:00:00.789Z");
-        *api.fail_next.borrow_mut() = Some(ApiError::Network("down again".into()));
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Changed
-        ));
-        let (_, wait) = do_pull(&mut session, interval, false).unwrap_err();
-        assert_eq!(wait, Duration::from_secs(5), "success resets pull backoff");
-    }
-
-    #[test]
-    fn edits_during_watch_and_explicit_sync_are_pulled_on_the_next_poll() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = ScriptedApi::new();
-        let mut session = open_session_with_api(
-            dir.path().join("db"),
-            "ABC123".into(),
-            Some("ABC123"),
-            Some(api.clone()),
-            true,
-        )
-        .unwrap();
-        let interval = Duration::from_secs(1);
-
-        // The watch pull can only certify the metadata polled before its
-        // fetch; an edit during that fetch belongs to the next pull.
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Changed
-        ));
-        *api.edit_during_fetch.borrow_mut() = Some("2026-01-01T12:00:00.456Z");
-        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "1");
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Changed
-        ));
-        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "2");
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Unchanged
-        ));
-
-        // An explicit sync without a pending observation retains the
-        // previous watermark, including across multiple explicit pulls.
-        for _ in 0..2 {
-            do_pull(&mut session, interval, false).unwrap();
-            assert!(matches!(
-                session.watcher.tick(&*api, "ABC123"),
-                Tick::Unchanged
-            ));
-        }
-        *api.edit_during_fetch.borrow_mut() = Some("2026-01-01T12:00:00.789Z");
-        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "2");
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Changed
-        ));
-        assert_eq!(do_pull(&mut session, interval, false).unwrap().version, "3");
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Unchanged
-        ));
-    }
-
-    #[test]
-    fn reopened_mirror_and_first_explicit_pull_need_metadata_reconciliation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db");
-        let api = ScriptedApi::new();
-        // Even matching raw strings from different endpoints aren't a
-        // persisted metadata acknowledgment when the session reopens.
-        *api.metadata.borrow_mut() = FULL_TIMESTAMP.into();
-        let session = open_session_with_api(
-            path.clone(),
-            "ABC123".into(),
-            Some("ABC123"),
-            Some(api.clone()),
-            true,
-        )
-        .unwrap();
-        drop(session);
-        let mut session = open_session_with_api(
-            path,
-            "ABC123".into(),
-            Some("ABC123"),
-            Some(api.clone()),
-            false,
-        )
-        .unwrap();
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Changed
-        ));
-        do_pull(&mut session, Duration::from_secs(1), false).unwrap();
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Unchanged
-        ));
-
-        let mut session = open_session_with_api(
-            dir.path().join("new"),
-            "ABC123".into(),
-            Some("ABC123"),
-            Some(api.clone()),
-            false,
-        )
-        .unwrap();
-        *api.edit_during_fetch.borrow_mut() = Some(META_TIMESTAMP);
-        assert_eq!(
-            do_pull(&mut session, Duration::from_secs(1), false)
-                .unwrap()
-                .version,
-            "1"
-        );
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Changed
-        ));
-        assert_eq!(
-            do_pull(&mut session, Duration::from_secs(1), false)
-                .unwrap()
-                .version,
-            "2"
-        );
-        assert!(matches!(
-            session.watcher.tick(&*api, "ABC123"),
-            Tick::Unchanged
-        ));
-    }
-
-    /// A scripted stand-in for a [`FileSession`] built without ever
-    /// touching a real store — proves [`SessionManager`]'s routing/dedupe
-    /// logic in isolation, per the brief's Step 1. `mirrored` matches what
-    /// a real session freshly opened without a `pull_now` would have.
-    fn scripted_session(key: &str, pull_calls: Rc<RefCell<u32>>) -> FileSession {
-        scripted_session_with(key, pull_calls, false, |_| {
-            Ok(PullOutcome {
-                churn: Churn::default(),
-                name: "Scripted".to_string(),
-                version: "1".to_string(),
-            })
-        })
-    }
-
-    /// Like [`scripted_session`], but the caller controls `mirrored` at
-    /// construction and scripts the pull outcome per call (`call_index`
-    /// starting at 0) — used for the retry-after-failure and typed-error
-    /// regression tests below.
-    fn scripted_session_with(
-        key: &str,
-        pull_calls: Rc<RefCell<u32>>,
-        mirrored: bool,
-        script: impl Fn(u32) -> Result<PullOutcome, PullError> + 'static,
-    ) -> FileSession {
-        let pull: PullFn = {
-            let pull_calls = pull_calls.clone();
-            Box::new(move |_geometry: bool| {
-                let call_index = *pull_calls.borrow();
-                *pull_calls.borrow_mut() += 1;
-                script(call_index)
-            })
+    ) -> Result<&mut FileSession, String> {
+        let key = file
+            .map(str::to_string)
+            .or_else(|| self.effective_default_key())
+            .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?;
+        let session = if file.is_some() {
+            self.open(&key)?
+        } else {
+            self.sessions
+                .iter_mut()
+                .find(|s| s.key == key)
+                .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?
         };
-        FileSession {
-            key: key.to_string(),
-            name: "Scripted".to_string(),
-            dispatch: Box::new(|_name, _args| Ok(ToolOutput::Json(json!({})))),
-            pull,
-            images: Box::new(|_ids, _format, _scale| {
-                Err("scripted session has no store for images".to_string())
-            }),
-            watcher: Watcher::new(None),
-            backoff: BACKOFF_START,
-            mirrored,
+        if !session.mirrored && session.job.is_none() {
+            session.request_pull(false, interval);
+        }
+        Ok(session)
+    }
+
+    pub(crate) fn expedite_polls(&mut self, interval: Duration) {
+        for session in &mut self.sessions {
+            session.expedite_poll(interval);
         }
     }
 
-    fn empty_manager() -> SessionManager {
-        SessionManager {
-            sessions: Vec::new(),
-            root: PathBuf::from("/nonexistent"),
-            token: None,
-            default_key: None,
-        }
-    }
-
-    #[test]
-    fn resolve_omitted_with_no_sessions_names_figmog_open_and_figmog_files() {
-        let mut mgr = empty_manager();
-        let err = mgr
-            .resolve(None, Duration::from_secs(10))
-            .map(|_| ())
-            .unwrap_err();
-        assert!(err.message.contains("figmog_open"), "{}", err.message);
-        assert!(err.message.contains("figmog_files"), "{}", err.message);
-    }
-
-    #[test]
-    fn resolve_omitted_errors_when_two_mirrors_were_auto_opened_with_no_startup_default() {
-        // C1 regression: zero-file startup (no `default_key` ever set),
-        // then two files get auto-opened via explicit-`file` tool calls —
-        // an omitted `file` after that must still error naming
-        // figmog_open/figmog_files, NOT silently fall back to whichever
-        // was opened first.
-        let mut mgr = empty_manager();
-        let calls = Rc::new(RefCell::new(0));
-        mgr.sessions
-            .push(scripted_session("keyA1234567890", calls.clone()));
-        mgr.sessions
-            .push(scripted_session("keyB1234567890", calls.clone()));
-        assert_eq!(mgr.default_key, None);
-        let err = mgr
-            .resolve(None, Duration::from_secs(10))
-            .map(|_| ())
-            .unwrap_err();
-        assert!(err.message.contains("figmog_open"), "{}", err.message);
-        assert!(err.message.contains("figmog_files"), "{}", err.message);
-    }
-
-    #[test]
-    fn resolve_omitted_returns_the_startup_default_even_out_of_open_order() {
-        let mut mgr = empty_manager();
-        let calls = Rc::new(RefCell::new(0));
-        mgr.sessions
-            .push(scripted_session("keyA1234567890", calls.clone()));
-        mgr.sessions
-            .push(scripted_session("keyB1234567890", calls.clone()));
-        // B was opened second but is the startup-established default —
-        // resolve(None) must follow `default_key`, not `sessions[0]`.
-        mgr.default_key = Some("keyB1234567890".to_string());
-        let (session, outcome) = mgr.resolve(None, Duration::from_secs(10)).unwrap();
-        assert_eq!(session.key, "keyB1234567890");
-        assert!(outcome.is_none());
-    }
-
-    #[test]
-    fn resolve_omitted_returns_the_single_mirrored_file_with_no_startup_default() {
-        let mut mgr = empty_manager();
-        let calls = Rc::new(RefCell::new(0));
-        mgr.sessions
-            .push(scripted_session("keyA1234567890", calls.clone()));
-        let (session, _) = mgr.resolve(None, Duration::from_secs(10)).unwrap();
-        assert_eq!(session.key, "keyA1234567890");
-    }
-
-    #[test]
-    fn resolve_explicit_known_mirrored_key_never_pulls() {
-        let mut mgr = empty_manager();
-        let calls = Rc::new(RefCell::new(0));
-        mgr.sessions.push(scripted_session_with(
-            "flAtUnMfzvA5daBSTFQK35",
-            calls.clone(),
-            true,
-            |_| unreachable!("must not pull an already-mirrored session"),
-        ));
-        let (session, outcome) = mgr
-            .resolve(Some("flAtUnMfzvA5daBSTFQK35"), Duration::from_secs(10))
-            .unwrap();
-        assert_eq!(session.key, "flAtUnMfzvA5daBSTFQK35");
-        assert!(outcome.is_none());
-        assert_eq!(
-            *calls.borrow(),
-            0,
-            "an already-mirrored session must not be re-pulled"
-        );
-    }
-
-    #[test]
-    fn resolve_explicit_unknown_key_dedupes_by_key_from_a_url_and_pulls_once() {
-        let mut mgr = empty_manager();
-        let calls = Rc::new(RefCell::new(0));
-        mgr.sessions.push(scripted_session_with(
-            "flAtUnMfzvA5daBSTFQK35",
-            calls.clone(),
-            false,
-            |_| {
-                Ok(PullOutcome {
-                    churn: Churn::default(),
-                    name: "F".to_string(),
-                    version: "1".to_string(),
-                })
-            },
-        ));
-        // A full figma.com URL for the same key resolves to the existing
-        // session rather than creating a second one (dedupe by parsed
-        // key), and pulls it exactly once since it wasn't mirrored yet.
-        let (session, outcome) = mgr
-            .resolve(
-                Some("https://www.figma.com/design/flAtUnMfzvA5daBSTFQK35/whatever"),
-                Duration::from_secs(10),
-            )
-            .unwrap();
-        assert_eq!(session.key, "flAtUnMfzvA5daBSTFQK35");
-        assert!(session.mirrored);
-        assert!(outcome.is_some());
-        assert_eq!(mgr.sessions.len(), 1);
-        assert_eq!(*calls.borrow(), 1);
-    }
-
-    #[test]
-    fn resolve_rejects_garbage_file_ref() {
-        let mut mgr = empty_manager();
-        let err = mgr
-            .resolve(Some("not a key!"), Duration::from_secs(10))
-            .map(|_| ())
-            .unwrap_err();
-        assert!(
-            err.message.contains("not a Figma file key or URL"),
-            "{}",
-            err.message
-        );
-        assert!(err.retry_after.is_none());
-    }
-
-    #[test]
-    fn open_dedupes_repeated_calls_for_the_same_key() {
-        let mut mgr = empty_manager();
-        let calls = Rc::new(RefCell::new(0));
-        mgr.sessions
-            .push(scripted_session("keyA1234567890", calls.clone()));
-        mgr.open("keyA1234567890").unwrap();
-        mgr.open("keyA1234567890").unwrap();
-        assert_eq!(mgr.sessions.len(), 1);
-    }
-
-    #[test]
-    fn list_marks_default_via_effective_default_key_not_vec_order() {
-        let mut mgr = empty_manager();
-        let calls = Rc::new(RefCell::new(0));
-        mgr.sessions
-            .push(scripted_session("keyA1234567890", calls.clone()));
-        mgr.sessions
-            .push(scripted_session("keyB1234567890", calls.clone()));
-        mgr.default_key = Some("keyB1234567890".to_string());
-        let list = mgr.list();
-        let rows = list.as_array().unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0]["key"], json!("keyA1234567890"));
-        assert_eq!(rows[0]["default"], json!(false));
-        assert_eq!(rows[1]["key"], json!("keyB1234567890"));
-        assert_eq!(rows[1]["default"], json!(true));
-    }
-
-    #[test]
-    fn list_marks_no_default_when_two_mirrors_and_no_startup_default() {
-        let mut mgr = empty_manager();
-        let calls = Rc::new(RefCell::new(0));
-        mgr.sessions
-            .push(scripted_session("keyA1234567890", calls.clone()));
-        mgr.sessions
-            .push(scripted_session("keyB1234567890", calls.clone()));
-        let list = mgr.list();
-        let rows = list.as_array().unwrap();
-        assert!(rows.iter().all(|r| r["default"] == json!(false)));
-    }
-
-    #[test]
-    fn resolve_retries_the_pull_for_a_session_whose_first_pull_failed() {
-        // I3 regression: `open()` pushes the session before any pull can
-        // succeed or fail — a failed auto-open must not poison the key
-        // into permanent empty results. `mirrored` starts `false` (as a
-        // real failed-open session would), and the scripted pull fails on
-        // the first call, succeeds on the second.
-        let mut mgr = empty_manager();
-        let calls = Rc::new(RefCell::new(0));
-        mgr.sessions.push(scripted_session_with(
-            "keyA1234567890",
-            calls.clone(),
-            false,
-            |call_index| {
-                if call_index == 0 {
-                    Err(PullError::from("network down".to_string()))
-                } else {
-                    Ok(PullOutcome {
-                        churn: Churn::default(),
-                        name: "Recovered".to_string(),
-                        version: "2".to_string(),
-                    })
-                }
-            },
-        ));
-
-        let err = mgr
-            .resolve(Some("keyA1234567890"), Duration::from_secs(10))
-            .map(|_| ())
-            .unwrap_err();
-        assert!(!err.message.is_empty());
-        assert!(err.retry_after.is_some());
-        assert_eq!(
-            mgr.sessions.len(),
-            1,
-            "the poisoned session is kept, not evicted"
-        );
-        assert!(!mgr.sessions[0].mirrored);
-
-        // A second resolve for the same key retries the pull (not treated
-        // as already-mirrored) and this time succeeds.
-        let (session, outcome) = mgr
-            .resolve(Some("keyA1234567890"), Duration::from_secs(10))
-            .unwrap();
-        assert!(session.mirrored);
-        assert_eq!(outcome.unwrap().name, "Recovered");
-        assert_eq!(*calls.borrow(), 2);
-    }
-
-    #[test]
-    fn typed_pull_error_survives_the_closure_boundary_for_rate_limit_backoff() {
-        // C2 regression: a `PullError::Api(RateLimited { .. })` returned
-        // from the boxed `pull` closure must still be *typed* by the time
-        // `do_pull` sees it — not degraded to a plain string — so
-        // `pull_failure_wait` can honor `Retry-After` instead of falling
-        // back to plain exponential backoff.
-        let mut backoff = BACKOFF_START;
-        let mut session =
-            scripted_session_with("keyA1234567890", Rc::new(RefCell::new(0)), false, |_| {
-                Err(PullError::Api(ApiError::RateLimited {
-                    retry_after: Duration::from_secs(90),
-                }))
-            });
-        session.backoff = backoff;
-
-        let (message, wait) = do_pull(&mut session, Duration::from_secs(10), false).unwrap_err();
-        assert!(message.contains("retry after"), "{message}");
-        // `pull_failure_wait` honors Retry-After for a rate limit
-        // regardless of the configured interval, and does NOT touch the
-        // exponential-backoff budget — proving the typed variant, not a
-        // stringly-typed fallback, reached `pull_failure_wait`.
-        assert_eq!(wait, Duration::from_secs(90));
-        assert_eq!(session.backoff, BACKOFF_START);
-        let _ = &mut backoff;
-    }
-
-    // ---- sticky vector geometry (v0.0.2 spec §4) ----
-
-    /// [`do_pull`]'s `geometry` argument must reach the session's own
-    /// `pull` closure unchanged — the plumbing every re-pull call site
-    /// (`figmog_open`'s explicit arg, or `false` from every other caller:
-    /// startup, watch tick, `figmog_sync`, auto-open) relies on. The
-    /// closure's own decision to union this with the stored flag
-    /// (`store::effective_geometry`) is proven separately and purely at
-    /// the store/api layer — this test only proves the *argument*
-    /// threading, at the one layer (`FileSession`/`SessionManager`) that
-    /// can't be exercised without a real store or network.
-    #[test]
-    fn do_pull_forwards_its_geometry_argument_to_the_session_pull_closure() {
-        let seen: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
-        let pull: PullFn = {
-            let seen = seen.clone();
-            Box::new(move |geometry: bool| {
-                seen.borrow_mut().push(geometry);
-                Ok(PullOutcome {
-                    churn: Churn::default(),
-                    name: "Scripted".to_string(),
-                    version: "1".to_string(),
-                })
-            })
-        };
-        let mut session = FileSession {
-            key: "keyA1234567890".to_string(),
-            name: "Scripted".to_string(),
-            dispatch: Box::new(|_name, _args| Ok(ToolOutput::Json(json!({})))),
-            pull,
-            images: Box::new(|_ids, _format, _scale| {
-                Err("scripted session has no store for images".to_string())
-            }),
-            watcher: Watcher::new(None),
-            backoff: BACKOFF_START,
-            mirrored: false,
-        };
-
-        do_pull(&mut session, Duration::from_secs(10), true).unwrap();
-        do_pull(&mut session, Duration::from_secs(10), false).unwrap();
-
-        assert_eq!(*seen.borrow(), vec![true, false]);
+    pub(crate) fn list(&self) -> Value {
+        let default = self.effective_default_key();
+        json!(self.sessions.iter().map(|s| {
+            let status = s.status().unwrap_or(Value::Null);
+            json!({"key": s.key, "name": status["name"], "version": status["version"], "nodes": status["nodes"],
+                "last_synced": status["synced_at_unix_ms"], "default": default.as_deref() == Some(&s.key),
+                "ready": s.mirrored, "pull": s.lifecycle()})
+        }).collect::<Vec<_>>())
     }
 }

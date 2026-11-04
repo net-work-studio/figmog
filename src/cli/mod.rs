@@ -397,7 +397,16 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         } else if let Some((tool, tool_args)) = cmd_as_tool_call(&cli.cmd) {
             let tool_args = with_current_file(strip_null_options(tool_args))?;
             if let Some(result) = socket::try_call(root, tool, tool_args) {
-                return write_json(&strip_routed_upstream_field(result?));
+                let result = result?;
+                if tool == "figmog_status" && result["ready"] == false {
+                    return Err("mirror is not ready — inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors".to_string());
+                }
+                let result = if tool == "figmog_status" {
+                    strip_routed_status_fields(result)
+                } else {
+                    result
+                };
+                return write_json(&result);
             }
         }
     }
@@ -673,20 +682,13 @@ fn strip_null_options(mut args: Value) -> Value {
     args
 }
 
-/// Strip the server-spliced `upstream` field from a routed *read command's*
-/// result (review m1): `upstream` is only ever added inside
-/// `dispatch_read_tool`/`handle_tool_call` — the `figmog_status` *tool*'s
-/// own behavior, which the plain `figmog status` read command has never
-/// gone through (`read::cmd_status` calls `query::status` directly, with
-/// no splice at all) — so leaving it in a socket-routed `status` would
-/// make the two modes diverge on this one field even after every other fix
-/// here. A no-op for every other command's result, none of which carry
-/// this key. (`figmog call figmog_status` is unaffected: both modes go
-/// through `dispatch_read_tool` there, so both already carry `upstream`
-/// consistently — this strip is not applied to `Cmd::Call`.)
-fn strip_routed_upstream_field(mut result: Value) -> Value {
+/// Preserve the direct read command's JSON shape for an existing mirror.
+/// `figmog call figmog_status` keeps the full server lifecycle instead.
+fn strip_routed_status_fields(mut result: Value) -> Value {
     if let Some(obj) = result.as_object_mut() {
         obj.remove("upstream");
+        obj.remove("ready");
+        obj.remove("pull");
     }
     result
 }
@@ -1111,8 +1113,8 @@ mod tests {
     }
 
     #[test]
-    fn strip_routed_upstream_field_removes_only_that_key() {
-        let result = strip_routed_upstream_field(json!({
+    fn strip_routed_status_fields_removes_only_that_key() {
+        let result = strip_routed_status_fields(json!({
             "name": "Fixture",
             "nodes": 12,
             "upstream": "connected",
@@ -1121,9 +1123,9 @@ mod tests {
     }
 
     #[test]
-    fn strip_routed_upstream_field_is_a_no_op_when_absent() {
+    fn strip_routed_status_fields_is_a_no_op_when_absent() {
         let result = json!({"name": "Fixture", "nodes": 12});
-        assert_eq!(strip_routed_upstream_field(result.clone()), result);
+        assert_eq!(strip_routed_status_fields(result.clone()), result);
     }
 
     #[test]

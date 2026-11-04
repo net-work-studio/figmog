@@ -81,9 +81,9 @@ that budget. Redirects are followed explicitly, with each TCP connection
 limited to the smaller of 30 seconds and the remaining overall budget.
 These are per-request bounds, not a deadline for a whole pull
 or multi-image tool call; ureq's blocking DNS lookup cannot be interrupted
-by its HTTP deadline. Requests run inline in `serve`, so a stalled HTTP
-peer delays dispatch until its request times out, then normal serving
-and polling resume with the existing error/backoff handling.
+by its HTTP deadline. Pull and metadata requests run on per-file workers
+in `serve`, so stalled peers do not delay local/control-plane dispatch.
+Image cache misses and desktop proxy calls retain their synchronous path.
 
 `webpki-roots` and `url`, already transitive ureq dependencies, are direct
 dependencies for this transport: the TLS wrapper uses the same Mozilla
@@ -251,13 +251,87 @@ failures during reset.
 ## 6. `figmog serve`: multi-file sessions, watch, MCP
 
 One `figmog serve` process owns every mirrored file's store via a
-[`SessionManager`](../src/sessions.rs): one `FileSession` per mirrored
-file, each with its own `open_store!` handle and its own `proxy_cache`
-table, retained for on-disk compatibility. A session's store can only be
-touched from behind one of three boxed closures (`dispatch`, `pull`,
-`images`) — the store's pipeline type contains fn items and can't be
-named, so this is the only way several independently-boxed `FnMut`s can share the one open,
-unnameable handle (via `Rc<RefCell<_>>`).
+[`SessionManager`](../src/sessions.rs). Each `FileSession` has one background
+worker owning its only writer and watch watermarks. Dispatch reads an owning
+fold snapshot, independently of the writer. A new snapshot is published only
+after the whole fetch → flatten → atomic sync → cache eviction → geometry
+persistence cycle succeeds. During every stage, existing readers see the
+previous complete mirror, including for the file being pulled. Other files
+have independent workers. No on-disk records or sink names change.
+An unchanged stored version skips both stale proxy-cache and image-cache
+scans, avoiding decoding cached image blobs. Initial or version-changing
+pulls still scan both tables and evict mismatched rows before publication.
+
+**Asynchronous pulls (NWS-2919):** `figmog_open {file, geometry?}` and
+`figmog_sync {file?}` acknowledge accepted work immediately:
+
+```json
+{"accepted":true,"key":"<file-key>","job_id":1,"state":"running"}
+```
+
+`state` in this acknowledgement is `queued` or `running`; it is not a
+successful pull result. Job ids increase per file for this process's lifetime;
+identify a job by `(key, job_id)`. These tools advertise an acknowledgement
+output schema and return both MCP text and `structuredContent`.
+
+Poll `figmog_status {file}` or `figmog_files` for `ready` and `pull`:
+
+```json
+{
+  "ready": true,
+  "pull": {
+    "job": {"id":1,"state":"succeeded","geometry":false,"error":null,"phase":null},
+    "queued": null,
+    "polling": false,
+    "last_completed": {"id":1,"state":"succeeded","geometry":false,"error":null,"phase":null},
+    "last_success": {"job_id":1,"name":"Example","version":"42",
+                     "churn":{"added":1,"changed":0,"removed":0,"unchanged":0}}
+  }
+}
+```
+
+A job moves from `queued` to `running` to `succeeded` or `failed`.
+`polling` reports an in-flight watch metadata poll. Running `phase` is `fetching`, `flattening`, `applying`, or `publishing`.
+The latest terminal job is retained as `last_completed`, and
+`last_success` retains the most recent successful version and churn even
+when a later job fails. A reopened existing mirror has `ready: true` and
+its persisted version/time; in-memory job history starts empty. A terminal
+`error` carries the actionable pull error (credentials, HTTP/Retry-After,
+parse error, etc.). Failure leaves the prior published snapshot readable.
+Before the first successful mirror, status/files remain available with
+`ready: false`, null metadata and zero nodes; data reads return a clear
+not-ready error pointing at these tools rather than an empty answer.
+
+Duplicate open/sync requests coalesce onto the active or queued job id.
+There is at most one worker operation and one queued pull per file. A
+`geometry: true` request arriving after a non-geometry pull started reserves
+one follow-up job; further duplicates share it. Geometry stays requested
+across retries and persists after a successful pull. Other follow-up changes
+are detected by the next metadata poll; repeated syncs during a running job
+do not create an unbounded backlog. Each file's pull retries honor
+Retry-After or exponential backoff, including explicit requests made during
+the wait; other files continue independently. A failed first mirror can be
+retried by open/sync, another data read (including `figmog_images`), or watch reconciliation. Status/files
+do not erase terminal errors by implicitly retrying them.
+
+Polls and pulls execute serially on the file's worker. No poll observed after
+a fetch can certify it, and no stale/out-of-order completion can overwrite
+a newer publication. The main loop consumes each completion once and only
+then updates the view, version/churn and default file's `.figmog/current`.
+A socket timeout/disconnect does not cancel accepted work. Stdin EOF or a
+broken stdout pipe shuts down the server: it stops accepting work, discards
+control-plane queued follow-ups, and joins workers after commands already
+sent to them finish. Forced process termination may interrupt work; fold's
+atomic transaction protects the store. Job history is not persisted.
+
+**Dependency justification:** `fjall` and `self_cell` were already transitive
+locked dependencies. Direct `fjall` use names fold's snapshot type; it is
+pinned to the version used by fold, with default features disabled.
+`self_cell` safely owns that snapshot with its borrowing fold readers,
+without unsafe application code or leaked snapshots. The small
+`SharedPipeline` adapter uses only fold's pinned public API and keeps its
+keyed writer, pipeline and schema unchanged. These are the justifications
+to carry into a PR adding these direct dependencies.
 
 **Startup:** `figmog serve [FILE]...` takes zero or more file
 URLs/keys. Zero is valid and needs no `FIGMA_TOKEN` up front — the server
@@ -269,29 +343,46 @@ that one becomes the effective default (`SessionManager::effective_default_key`)
 default at all, and an omitted `file` then errors, naming
 `figmog_open`/`figmog_files`.
 
-**Reader loop:** a background thread turns stdin lines into an `mpsc`
-channel; the main loop answers `mcp::handle_message` between poll ticks,
-using `rx.recv_timeout` against the next scheduled deadline (or plain
-`recv` under `--no-watch`, which has no ticking at all). Before each
-receive, the watch-enabled loop services an overdue poll even when
-requests remain queued. It then attempts a receive, so an immediately
-due retry also lets queued requests progress. Stdout writes
-are manual (`writeln!` + flush, not `println!`), so a reader that
-vanishes mid-write (client exited) is a clean exit 0, not a panic.
+Startup opens stores before serving and queues an initial pull for each
+missing mirror when watch is enabled. It never waits for network pulls;
+those failures appear in job state while the server stays available.
+`--no-watch` queues no startup pulls. Invalid paths, store locks and required
+watch credentials still fail startup. Explicit first references queue the
+same asynchronous lifecycle, regardless of watch mode.
 
-**Watch/poll loop:** round-robins one session's Tier-3 meta poll per
-tick; the per-tick deadline is `max(--interval / session_count, 2s)`, so
-total poll spend stays bounded (≤ 30 Tier-3 requests/min) even with many
-mirrored files — each individual file is just polled less often as the
-count grows. `--interval` is clamped to a one-day maximum before it's
-ever added to an `Instant`, so a huge or typo'd value can't overflow-panic.
-On `Tick::Changed`, the session is pulled inline
-(fetch → flatten → sync → evict stale cache rows on a version change);
-on failure, the change stays pending and its backoff advances
-(Retry-After honored for a rate limit,
-exponential otherwise, capped at 5 minutes) — every pull call site
-(watch tick, `figmog_sync`, `figmog_open`, an auto-open inside
-`resolve`) shares this one backoff discipline (`sessions::do_pull`).
+**Reader loop:** background readers send stdin and socket frames through
+one `mpsc` channel. The main loop handles due watch work and completions
+before each request, even under continuous traffic. It wakes at most 20ms
+later to consume worker completions, including under `--no-watch`.
+Stdout writes are manual (`writeln!` + flush), so a vanished stdio reader
+causes clean shutdown instead of a panic. Desktop proxy calls and image
+cache-miss networking retain their existing synchronous behavior; they are
+outside this pull-scheduling change. When a file's worker is occupied by a
+pull or metadata poll, `figmog_images` returns a prompt busy error (including
+for cache hits), rather than waiting behind that operation.
+
+**Watch/poll loop:** normal rounds visit one session every
+`max(--interval / session_count, 2s)`. Ordinary polls and retries share a
+two-second global dispatch floor (≤ 30 requests/min). The session's
+worker performs the blocking HTTP call. Busy files are skipped, and each
+file retains its own retry/poll deadline, so a delayed poll or rate-limited
+file never pauses other files' reads or polling. `--interval` is clamped
+to a one-day maximum. On `Tick::Changed`, completion queues a pull through
+the same lifecycle as explicit open/sync. Failure leaves the observation
+pending for retry; Retry-After or exponential backoff (capped at 5 minutes)
+is per file. Outstanding metadata and pull failures wake the scheduler at
+their per-file retry deadline, independently of the next normal round.
+When normal and retry work are both due, they alternate so neither starves.
+Busy workers and explicitly queued pulls remain serialized. A recovery
+poll does not postpone its next normal visit, and a retry can also satisfy
+the same file's already-due normal visit. `--no-watch` disables automatic
+ordinary retries, while explicit and expedited requests retain their
+existing behavior.
+Ordinary poll eligibility is anchored to metadata request dispatch, matching
+the global round-robin clock. An unchanged completion or successful pull
+publication does not move it later and accidentally skip the next round.
+Metadata retry deadlines and pull retry deadlines remain separate from this
+ordinary cadence; neither can be bypassed by an expedited request.
 
 **Watch watermarks:** each session keeps a successfully synchronized
 metadata `last_touched_at` and a separate pending observation in memory.
@@ -319,11 +410,10 @@ same second. This needs no extra metadata requests or on-disk schema changes.
 
 **`file`-argument routing (spec-frozen tool surface, v4):** every local
 tool's JSON schema gains an optional `file` property (URL or bare key).
-Explicit `file` routes to that mirror, auto-opening it (one Tier-1 pull)
-if it's new *or was opened but never successfully mirrored* — a failed
-auto-open leaves the session in place rather than evicting it, so a
-transient failure doesn't poison the key into permanent empty results;
-the next call for that key simply retries the pull. Omitted `file` routes
+Explicit `file` routes to that mirror, opening it and queuing a Tier-1 pull
+if it has no successful mirror. A first data read reports not-ready until
+that job succeeds. Failed sessions remain available for inspection/retry;
+retries coalesce and honor the file's backoff. Omitted `file` routes
 to the default (see "Startup" above). There is no idle-session eviction
 and no cross-file queries — once opened, a session stays open for the
 process's life.
@@ -337,8 +427,7 @@ process's life.
 `figmog_images` (§15) + 2 multi-file management tools that aren't
 per-file (`figmog_open`, `figmog_files`). Every tool but
 `figmog_sync`/`figmog_open`/`figmog_images` reads the local mirror at
-zero Figma API cost; `figmog_sync` forces one pull, `figmog_open` pulls a
-newly referenced file, and `figmog_images` fetches renders and fills, so
+zero Figma API cost; `figmog_sync` and `figmog_open` schedule pulls, and `figmog_images` fetches renders and fills, so
 those three are the local tools that spend Figma's rate budget.
 `figmog_status`'s result also carries
 `upstream: "connected" | "unreachable" | "disabled"`, spliced in at the
@@ -442,9 +531,15 @@ routing to a mirror alone is insufficient. `figmog tools` reports
 **Rate budget:** native-named calls reach the desktop server every time;
 `figmog_*` read tools continue to answer locally at zero API cost. A
 successful proxied call to a tool that isn't `get_*`/`list_*` (a likely
-write) schedules an immediate meta-poll rather than waiting for the next
-`--interval` tick, so the mirror catches up promptly (skipped under
-`--no-watch`, which has no poll loop to schedule).
+write) records an expedited meta-poll for each known session rather than
+waiting for the next `--interval` tick: the desktop supplies no authoritative
+active-file identity with which to select a single mirror. Repeated writes
+coalesce per file. A request made during a pull or poll remains pending
+until the worker is idle; a write after a metadata request started requires
+another observation. Expedited polls bypass the ordinary interval, retain
+their pending refresh after a transient failure, and honor both metadata
+and pull Retry-After/backoff deadlines. They are skipped under `--no-watch`.
+The ordinary round-robin rate bound excludes these write-triggered polls.
 
 ## 9. Variables
 
@@ -609,8 +704,10 @@ over all of these. Current is injected as a routed `file` argument only
 when no explicit non-null `file` was supplied and no node URL selects a
 file; `figmog call figmog_open` is the exception, since there `file` names the
 file to open rather than a routing target. A routed `figmog_status`
-result drops the `upstream` field serve splices in, keeping the CLI's
-output byte-identical on both paths.
+result drops the server-only `upstream`, `ready` and `pull` fields, keeping
+ordinary CLI output byte-identical for an existing mirror. Before a first
+successful mirror, plain `figmog status` returns a clear not-ready error;
+`figmog call figmog_status` exposes the full lifecycle instead.
 
 Desktop-proxy calls do not interpret `file` or node URLs as mirror
 selectors (§8): direct mode opens the current mirror (or an explicit
@@ -622,7 +719,10 @@ upstream unchanged.
 `pull` is a writer and always opens the store directly. While `serve`
 holds that store, `pull`'s lock error additionally says "or ask the
 running serve: figmog call figmog_sync", which reaches the process that
-owns it.
+owns it and returns an immediate job acknowledgement. Inspect
+`figmog call figmog_status` or `figmog call figmog_files` for completion and
+errors. With no running server, direct `figmog call figmog_sync` remains
+synchronous and returns churn.
 
 **Single-writer constraint:** fjall allows only one open handle per
 store. `figmog serve` holds its `--db`'s lock for its whole life; a CLI

@@ -174,7 +174,7 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
     name: &str,
     args: &Value,
     upstream_status: &str,
-    r: RootReaders<'_, R>,
+    r: &RootReaders<'_, R>,
 ) -> Option<Result<Value, String>> {
     let (
         (nodes, children, text, instances_of, styled_by, bound_to, by_type),
@@ -190,27 +190,27 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
     ) = r;
 
     match name {
-        "figmog_status" => Some(query::status(&nodes, &meta).map(|mut v| {
+        "figmog_status" => Some(query::status(nodes, meta).map(|mut v| {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("upstream".to_string(), json!(upstream_status));
             }
             v
         })),
-        "figmog_pages" => Some(query::pages(&nodes, &by_type)),
+        "figmog_pages" => Some(query::pages(nodes, by_type)),
         "figmog_tree" => {
             let id = arg_str(args, "id");
             let depth = arg_usize(args, "depth");
-            Some(query::tree(&nodes, &children, &by_type, id, depth))
+            Some(query::tree(nodes, children, by_type, id, depth))
         }
         "figmog_node" => Some((|| {
             let id = require_str(args, "id")?;
             let with_children = arg_bool(args, "children");
             let resolve_vars = arg_bool(args, "resolve_vars");
             query::node(
-                &nodes,
-                &children,
-                &variables,
-                &variable_collections,
+                nodes,
+                children,
+                variables,
+                variable_collections,
                 id,
                 with_children,
                 resolve_vars,
@@ -227,10 +227,10 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
             });
             let resolve_vars = arg_bool(args, "resolve_vars");
             query::subtree(
-                &nodes,
-                &children,
-                &variables,
-                &variable_collections,
+                nodes,
+                children,
+                variables,
+                variable_collections,
                 id,
                 depth,
                 fields.as_deref(),
@@ -241,29 +241,29 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
             let node_type = require_str(args, "type")?;
             let page = arg_str(args, "page");
             let under = arg_str(args, "under");
-            query::find(&nodes, &children, &by_type, node_type, page, under)
+            query::find(nodes, children, by_type, node_type, page, under)
         })()),
         "figmog_search" => Some((|| {
             let q = require_str(args, "query")?;
             let limit = arg_usize(args, "limit").unwrap_or(10);
             let under = arg_str(args, "under");
-            query::search(&text, &nodes, &children, &q, limit, under)
+            query::search(text, nodes, children, &q, limit, under)
         })()),
         "figmog_instances" => Some((|| {
             let target = require_str(args, "target")?;
-            query::instances(&nodes, &components, &component_sets, &instances_of, &target)
+            query::instances(nodes, components, component_sets, instances_of, &target)
         })()),
-        "figmog_components" => Some(query::components(&nodes, &components, &component_sets)),
+        "figmog_components" => Some(query::components(nodes, components, component_sets)),
         "figmog_styles" => {
             let style_type = arg_str(args, "type");
             let values = arg_bool(args, "values");
             let resolve_vars = arg_bool(args, "resolve_vars");
             Some(query::styles(
-                &nodes,
-                &styles,
-                &styled_by,
-                &variables,
-                &variable_collections,
+                nodes,
+                styles,
+                styled_by,
+                variables,
+                variable_collections,
                 style_type,
                 values,
                 resolve_vars,
@@ -271,28 +271,28 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         }
         "figmog_uses" => Some((|| {
             let id = require_str(args, "id")?;
-            query::uses(&nodes, &styled_by, &bound_to, &id)
+            query::uses(nodes, styled_by, bound_to, &id)
         })()),
         "figmog_vars" => {
             let id = arg_str(args, "id");
-            Some(query::vars(&nodes, &variables, &variable_collections, id))
+            Some(query::vars(nodes, variables, variable_collections, id))
         }
         "figmog_stats" => Some(query::stats(
-            &nodes,
-            &components,
-            &component_sets,
-            &styles,
-            &variables,
-            &by_type,
+            nodes,
+            components,
+            component_sets,
+            styles,
+            variables,
+            by_type,
         )),
         "figmog_path" => Some((|| {
             let id = require_str(args, "id")?;
-            query::path(&nodes, id)
+            query::path(nodes, id)
         })()),
         "figmog_text" => {
             let page = arg_str(args, "page");
             let under = arg_str(args, "under");
-            Some(query::text(&nodes, &children, &by_type, page, under))
+            Some(query::text(nodes, children, by_type, page, under))
         }
         "figmog_where" => Some((|| {
             let pointer = require_str(args, "pointer")?;
@@ -301,12 +301,12 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
             let equals = args.get("equals").cloned();
             let page = arg_str(args, "page");
             let under = arg_str(args, "under");
-            query::where_(&nodes, &children, &pointer, equals, page, under)
+            query::where_(nodes, children, &pointer, equals, page, under)
         })()),
         "figmog_at" => Some((|| {
             let x = require_f64(args, "x")?;
             let y = require_f64(args, "y")?;
-            query::at(&nodes, x, y)
+            query::at(nodes, x, y)
         })()),
         _ => None,
     }
@@ -319,7 +319,7 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
 fn file_arg_property() -> Value {
     json!({
         "type": "string",
-        "description": "Figma file URL or key; omit for the default mirrored file."
+        "description": "Figma file URL or key; omit for the default mirrored file. First reference queues a background pull; data reads report not-ready until success. Poll figmog_status or figmog_files for progress."
     })
 }
 
@@ -338,7 +338,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
             name: "figmog_status",
-            description: "File name, version, last modified time, and node count — reads the local mirror (no Figma API cost).",
+            description: "Committed file name/version/time/node count plus ready and pull lifecycle (job progress, last successful version/churn and errors). Local reads remain available during a pull; ready=false means no successful mirror yet. No Figma API cost.",
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
@@ -461,7 +461,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "figmog_sync",
-            description: "Forces one pull from Figma and returns the sync churn (+added ~changed -removed) — fetches from Figma (spends Tier-1 rate budget).",
+            description: "Queue a background pull from Figma. Returns {accepted, key, job_id, state} immediately; poll figmog_status or figmog_files for completion, version/churn or errors. Duplicate active requests coalesce. Spends Tier-1 rate budget. Direct CLI sync without serve remains synchronous.",
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
@@ -546,7 +546,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
 
     tools.push(ToolDef {
         name: "figmog_open",
-        description: "Mirror a Figma file now (spends one Tier-1 pull) — creates the mirror if it's new, or re-syncs it if already mirrored. Returns the sync churn and node count.",
+        description: "Queue a background mirror pull (Tier-1 API cost). Returns {accepted, key, job_id, state} immediately. Poll figmog_status or figmog_files for ready, job progress, version/churn or errors. Duplicate active requests coalesce; a geometry upgrade can queue one follow-up.",
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -561,11 +561,29 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
     });
     tools.push(ToolDef {
         name: "figmog_files",
-        description: "List every mirrored file: key, name, version, node count, last synced time, and which one is the default — reads local state only (no Figma API cost).",
+        description: "List every session: key, committed name/version/node count/time, default, ready, and pull lifecycle (job, queued, last_completed, last_success with version/churn). Failed jobs retain actionable errors and the previous successful mirror. Local state only (no Figma API cost).",
         input_schema: json!({"type": "object", "properties": {}}),
     });
 
     tools
+}
+
+/// Open/sync's server-side acknowledgement contract. Other local tools
+/// retain their existing text-content protocol (including array results).
+pub(crate) fn output_schema(name: &str) -> Option<Value> {
+    matches!(name, "figmog_open" | "figmog_sync").then(|| {
+        json!({
+            "type": "object",
+            "properties": {
+                "accepted": {"const": true},
+                "key": {"type": "string"},
+                "job_id": {"type": "integer", "minimum": 1},
+                "state": {"enum": ["queued", "running"]}
+            },
+            "required": ["accepted", "key", "job_id", "state"],
+            "additionalProperties": false
+        })
+    })
 }
 
 #[cfg(test)]

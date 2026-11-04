@@ -51,7 +51,7 @@ pub trait FigmaApi {
     /// `GET /v1/files/:key` — Tier 1, the full document tree. `geometry`
     /// (v0.0.2 spec §4) adds `?geometry=paths`, so vector nodes carry
     /// `fillGeometry`/`strokeGeometry` path data in the response — the
-    /// caller (`cli::pull::do_pull`, `sessions`'s pull closure) is
+    /// caller (`cli::pull::do_pull`, `sessions`'s pull worker) is
     /// responsible for combining this call's own override with whatever
     /// geometry setting is already stored (`store::effective_geometry`)
     /// before deciding what to pass here; this trait method itself just

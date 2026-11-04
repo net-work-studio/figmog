@@ -8,16 +8,12 @@
 //! wrapper over the same `query::*` functions the CLI prints — one source
 //! of truth for every answer.
 //!
-//! **v4 (spec §14): multi-file.** Every local tool's schema gains an
-//! optional `file` argument (URL or key), routed by [`SessionManager::resolve`]
-//! to the mirror it names — auto-opening it (spending one Tier-1 pull) if
-//! it's new. Omitted, a tool targets the *default* file: the first one
-//! given at startup, or whichever got mirrored first if none were. Two
-//! new tools, `figmog_open` (mirror a file now) and `figmog_files` (list
-//! every mirror), aren't per-file operations and so don't take `file`.
-//! Each session owns its own store, opened at a concrete `open_store!` call
-//! site inside `sessions::open_session`. Store access is captured by boxed
-//! closures; desktop proxy calls are independent of those stores.
+//! Every local tool accepts file routing (explicit file, node URL, then
+//! startup default or the sole session). First references queue a pull;
+//! open/sync acknowledge a job immediately, and status/files expose its
+//! progress. Each file's worker owns its writer and metadata polling.
+//! Requests use its last published committed snapshot while the worker
+//! fetches, flattens, applies indexes and evicts caches.
 //!
 //! **Desktop context:** the upstream answers for the file active in Figma,
 //! independently of the mirrors. It supplies no authoritative file/revision
@@ -48,14 +44,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::api::{FigmaApi, UreqApi};
 use crate::dispatch;
 use crate::ident::parse_file_ref;
 use crate::mcp::{self, FnHandler, ToolOutput};
 use crate::proxy;
 use crate::sessions::{self, SessionManager};
 use crate::upstream::{HttpUpstream, UpstreamMcp};
-use crate::watch::Tick;
 
 /// Default streamable-HTTP URL of Figma desktop app's Dev Mode MCP server
 /// (build design §12).
@@ -86,10 +80,9 @@ fn clamp_interval(interval: u64) -> Duration {
 // thread forwards newline-delimited JSON-RPC frames into the *same* `mpsc`
 // channel the stdin reader already feeds — tagged with a connection id
 // (`Incoming::Socket`) so the single-threaded main loop below can route
-// each response back to the connection that asked for it. The store is
-// still only ever touched from the main loop; socket traffic, stdio
-// frames, and watch ticks all interleave through one `recv`/`recv_timeout`
-// exactly as they always have.
+// each response back to the connection that asked for it. The main loop
+// handles routing, scheduling and committed read views; per-file workers
+// own all writes and blocking pull/poll work.
 
 /// One message the serve loop can receive from either its stdin reader
 /// thread or a socket connection's reader thread.
@@ -545,9 +538,34 @@ pub(crate) fn run_serve(
         if no_socket { "off" } else { "on" }
     );
 
-    let watch_api = token.map(UreqApi::new);
-    let first_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
     serve_loop(
+        manager,
+        upstream,
+        upstream_status,
+        no_watch,
+        track_current,
+        interval_dur,
+        rx,
+        registry,
+    )
+}
+
+/// Dispatch requests using real stdio output. The loop accepts an output
+/// adapter separately so tests can exercise stdio frames without sharing
+/// the test process's stdout.
+#[allow(clippy::too_many_arguments)]
+fn serve_loop(
+    manager: SessionManager,
+    upstream: Option<HttpUpstream>,
+    upstream_status: &'static str,
+    no_watch: bool,
+    track_current: bool,
+    interval_dur: Duration,
+    rx: mpsc::Receiver<Incoming>,
+    registry: ConnRegistry,
+) -> Result<(), String> {
+    let first_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
+    serve_loop_with_output(
         manager,
         upstream,
         upstream_status,
@@ -557,26 +575,25 @@ pub(crate) fn run_serve(
         first_deadline,
         rx,
         registry,
-        watch_api.as_ref().map(|api| api as &dyn FigmaApi),
+        |response| {
+            let mut stdout = std::io::stdout();
+            writeln!(stdout, "{response}").is_ok() && stdout.flush().is_ok()
+        },
     )
 }
 
-/// Dispatch and polling after startup. The HTTP boundary is injected so
-/// stalled-peer recovery can exercise this same loop with a local peer.
-/// The first deadline is supplied so queued traffic can be tested with
-/// an already-overdue poll, without sleeping.
 #[allow(clippy::too_many_arguments)]
-fn serve_loop(
+fn serve_loop_with_output(
     mut manager: SessionManager,
     mut upstream: Option<HttpUpstream>,
     upstream_status: &'static str,
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
-    mut next_deadline: Instant,
+    first_deadline: Instant,
     rx: mpsc::Receiver<Incoming>,
     registry: ConnRegistry,
-    watch_api: Option<&dyn FigmaApi>,
+    mut write_stdio: impl FnMut(&Value) -> bool,
 ) -> Result<(), String> {
     let (tools, dropped) = match &upstream {
         Some(u) => proxy::merge_registry(dispatch::tool_registry(), u.tools()),
@@ -586,41 +603,34 @@ fn serve_loop(
         eprintln!("figmog: dropping upstream tool named like a local tool: {name}");
     }
 
-    let mut next_session_idx: usize = 0;
+    let mut watch = WatchScheduler::new(first_deadline);
 
     loop {
-        // A queued message wins over recv_timeout even with a zero wait.
-        // Service an overdue poll first so a busy queue cannot starve it.
-        if !no_watch && Instant::now() >= next_deadline {
-            next_deadline = watch_tick(
-                &mut manager,
-                &mut next_session_idx,
-                interval_dur,
-                track_current,
-                watch_api,
-            );
+        // Completions and due watch work run even under continuous traffic.
+        // Polling this in-memory channel never waits on a pull or HTTP.
+        let mut published = Vec::new();
+        for session in &mut manager.sessions {
+            if session.maintain() {
+                published.push(session.key.clone());
+            }
         }
-
-        // Attempt a receive even when the poll returned a zero retry
-        // delay, so queued requests also keep making progress.
-        let msg = if no_watch {
-            // No ticking to do, so a disconnect (all senders dropped — in
-            // practice unreachable once the socket is on, since the
-            // acceptor thread holds its own `tx` clone forever, but still
-            // handled) is the only other thing `recv` can report besides a
-            // message — exit clean rather than falling into the
-            // (watch-only) timeout branch below.
-            match rx.recv() {
-                Ok(msg) => msg,
-                Err(mpsc::RecvError) => return Ok(()),
-            }
+        for key in published {
+            refresh_current(&manager, track_current, &key);
+        }
+        if !no_watch {
+            watch.service_at(&mut manager, interval_dur, Instant::now());
+        }
+        let wait = Duration::from_millis(20).min(if no_watch {
+            Duration::from_millis(20)
         } else {
-            let wait = next_deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(wait) {
-                Ok(msg) => msg,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            }
+            watch
+                .next_deadline(&manager)
+                .saturating_duration_since(Instant::now())
+        });
+        let msg = match rx.recv_timeout(wait) {
+            Ok(msg) => msg,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         };
 
         let line = match msg {
@@ -634,9 +644,8 @@ fn serve_loop(
                             &mut upstream,
                             upstream_status,
                             no_watch,
-                            track_current,
                             interval_dur,
-                            &mut next_deadline,
+                            &mut watch.next_round,
                             name,
                             args,
                         )
@@ -654,45 +663,27 @@ fn serve_loop(
                 &mut upstream,
                 upstream_status,
                 no_watch,
-                track_current,
                 interval_dur,
-                &mut next_deadline,
+                &mut watch.next_round,
                 name,
                 args,
             )
         });
 
-        if let Some(resp) = mcp::handle_message(&line, &tools, &mut handler) {
-            // `println!`/`writeln!` panic on a write error (their internal
-            // `.expect`) — and the overwhelmingly likely error here is the
-            // client's end of the stdio pipe having closed (it exited or
-            // was killed) between our last read and this write, not a real
-            // figmog fault. Write manually so that case is a clean,
-            // expected shutdown (exit 0) rather than a panic or a
-            // broken-pipe error message the operator can't act on.
-            // Untestable cheaply at the e2e level (killing the reading end
-            // of a piped subprocess mid-write isn't something
-            // `assert_cmd`'s harness can trigger deterministically); this
-            // code path is its own proof.
-            let mut stdout = std::io::stdout();
-            if writeln!(stdout, "{resp}").is_err() || stdout.flush().is_err() {
-                return Ok(());
-            }
+        if let Some(response) = mcp::handle_message(&line, &tools, &mut handler)
+            && !write_stdio(&response)
+        {
+            // A vanished stdio reader is a clean shutdown; accepted
+            // running pulls drain through FileSession's drop handler.
+            return Ok(());
         }
     }
 }
 
-/// Startup: build the [`SessionManager`] for either the legacy single-`--db`
-/// path or the (possibly zero-file) multi-file path. Returns whether
-/// successful pulls on the *default* session should refresh
-/// `.figmog/current` (`track_current`) — only true in the no-override
-/// path, matching pre-v4 behavior exactly: `--db` always resolved with no
-/// established key (see `cli::resolve_db`'s old short-circuit), so it
-/// never wrote `.figmog/current` either. A startup pull failure is a hard
-/// error (matches old `do_pull(...)?` — the process never starts serving
-/// on a file it couldn't mirror), so only the plain message half of
-/// [`sessions::do_pull`]'s `(String, Duration)` failure is used here;
-/// there is no retry loop yet to push a deadline out on.
+/// Open startup stores and queue initial pulls on their workers. Store-open
+/// and credential errors still fail startup; network pull failures are
+/// observable job failures after the server begins serving. Only committed
+/// default-file publications refresh `.figmog/current`.
 fn build_sessions(
     db_override: Option<PathBuf>,
     files: &[String],
@@ -728,20 +719,21 @@ fn build_sessions(
             display_key.clone(),
             key_opt.as_deref(),
             token.as_deref(),
-            false,
         )?;
         let mut manager = SessionManager {
             sessions: vec![session],
             root: figmog_root.to_path_buf(),
             token: token.clone(),
             default_key: Some(display_key),
+            #[cfg(test)]
+            api: None,
         };
         if !no_watch {
             let session = &mut manager.sessions[0];
             if !session.mirrored {
                 // No user-facing geometry flag at startup (spec §4) — the
                 // mirror's stored setting, if any, still drives this.
-                sessions::do_pull(session, interval, false).map_err(|(message, _wait)| message)?;
+                session.request_pull(false, interval);
             }
         }
         // `--db` never resolves a tracked key (pre-v4: `resolve_db`
@@ -767,81 +759,134 @@ fn build_sessions(
         root: figmog_root.to_path_buf(),
         token: token.clone(),
         default_key: None,
+        #[cfg(test)]
+        api: None,
     };
-    for (i, f) in files.iter().enumerate() {
-        let session = manager.open(f)?;
-        let key = session.key.clone();
-        let just_pulled = if !no_watch && !session.mirrored {
-            // No user-facing geometry flag at startup (spec §4) — the
-            // mirror's stored setting, if any, still drives this.
-            sessions::do_pull(session, interval, false).map_err(|(message, _wait)| message)?;
-            true
-        } else {
-            false
-        };
-        if i == 0 {
-            manager.default_key = Some(key.clone());
-        }
-        // I4: a startup pull that actually ran refreshes `.figmog/current`
-        // for the default session, matching the old single-file
-        // `do_pull`'s own behavior — only on a pull that happened, not on
-        // every startup file regardless.
-        if just_pulled {
-            refresh_current(&manager, true, &key);
-        }
-    }
+    add_startup_files(&mut manager, files, no_watch, interval)?;
     Ok((manager, true))
 }
 
-/// One round-robin watch tick: poll exactly one session's [`Watcher`](crate::watch::Watcher)
-/// and, on `Changed`, pull it via [`sessions::do_pull`] (typed-error
-/// backoff, shared with every other pull call site — see that function's
-/// doc comment). Returns the next deadline.
-fn watch_tick(
+/// Queue missing startup mirrors through the same session lifecycle used
+/// by implicit first reads and explicit requests.
+fn add_startup_files(
+    manager: &mut SessionManager,
+    files: &[String],
+    no_watch: bool,
+    interval: Duration,
+) -> Result<(), String> {
+    for (i, f) in files.iter().enumerate() {
+        let session = manager.open(f)?;
+        let key = session.key.clone();
+        if !no_watch && !session.mirrored {
+            session.request_pull(false, interval);
+        }
+        if i == 0 {
+            manager.default_key = Some(key);
+        }
+    }
+    Ok(())
+}
+
+/// Normal rounds and per-file retries share a rate-limited dispatch slot.
+/// Alternating when both are due keeps either queue from starving the other.
+struct WatchScheduler {
+    next_round: Instant,
+    round_cursor: usize,
+    retry_cursor: usize,
+    next_slot: Option<Instant>,
+    retry_first: bool,
+}
+
+impl WatchScheduler {
+    fn new(first_deadline: Instant) -> Self {
+        Self {
+            next_round: first_deadline,
+            round_cursor: 0,
+            retry_cursor: 0,
+            next_slot: None,
+            retry_first: true,
+        }
+    }
+
+    fn next_deadline(&self, manager: &SessionManager) -> Instant {
+        let retry = manager
+            .sessions
+            .iter()
+            .filter_map(|session| session.watch_retry_deadline())
+            .min();
+        let due = retry.map_or(self.next_round, |retry| retry.min(self.next_round));
+        self.next_slot.map_or(due, |slot| due.max(slot))
+    }
+
+    fn dispatch_retry(
+        &mut self,
+        manager: &mut SessionManager,
+        index: usize,
+        interval: Duration,
+        now: Instant,
+    ) {
+        if manager.sessions[index].retry_poll_at(interval, now) {
+            let count = manager.sessions.len();
+            // One request can satisfy a retry and the same file's due
+            // normal visit; avoid issuing another poll two seconds later.
+            if now >= self.next_round && index == self.round_cursor % count {
+                self.round_cursor = (index + 1) % count;
+                self.next_round = now + tick_deadline(interval, count);
+            }
+            self.retry_cursor = (index + 1) % count;
+            self.retry_first = false;
+            self.next_slot = Some(now + MIN_TICK_DEADLINE);
+        }
+    }
+
+    fn service_at(&mut self, manager: &mut SessionManager, interval: Duration, now: Instant) {
+        if self.next_slot.is_some_and(|slot| now < slot) {
+            return;
+        }
+        let retry = (0..manager.sessions.len())
+            .map(|offset| (self.retry_cursor + offset) % manager.sessions.len())
+            .find(|&index| {
+                manager.sessions[index]
+                    .watch_retry_deadline()
+                    .is_some_and(|due| due <= now)
+            });
+        let round_due = now >= self.next_round;
+        if let Some(index) = retry
+            && (!round_due || self.retry_first)
+        {
+            self.dispatch_retry(manager, index, interval, now);
+            return;
+        }
+        if round_due {
+            let (next, dispatched) = watch_tick_at(manager, &mut self.round_cursor, interval, now);
+            self.next_round = next;
+            if dispatched {
+                self.retry_first = true;
+                self.next_slot = Some(now + MIN_TICK_DEADLINE);
+                return;
+            }
+        }
+        if let Some(index) = retry {
+            self.dispatch_retry(manager, index, interval, now);
+        }
+    }
+}
+
+/// Schedule at most one due metadata poll; the session worker performs it.
+fn watch_tick_at(
     manager: &mut SessionManager,
     next_idx: &mut usize,
     interval: Duration,
-    track_current: bool,
-    api: Option<&dyn FigmaApi>,
-) -> Instant {
+    now: Instant,
+) -> (Instant, bool) {
     if manager.sessions.is_empty() {
-        return Instant::now() + interval;
+        return (now + interval, false);
     }
-    // A session can only exist if opening it (an auto-open, or a startup
-    // pull) already required a token — *except* a session whose own
-    // startup/auto-open pull failed (sessions.rs leaves it in place,
-    // `mirrored: false`, rather than evicting it — no idle eviction, spec
-    // §14 non-goal; a later `resolve()` retries it). Either way, without a
-    // token there's nothing safe to poll this tick.
-    let Some(api) = api else {
-        return Instant::now() + interval;
-    };
-
-    let n = manager.sessions.len();
-    let idx = *next_idx % n;
-    *next_idx = (*next_idx + 1) % n;
-    let deadline = tick_deadline(interval, n);
-
-    let session = &mut manager.sessions[idx];
-    let key = session.key.clone();
-
-    match session.watcher.tick(api, &key) {
-        Tick::Unchanged => Instant::now() + deadline,
-        Tick::Wait { after } => Instant::now() + after,
-        // A background watch tick carries no user-facing geometry flag
-        // (spec §4) — the mirror's stored setting, if any, still drives
-        // this.
-        Tick::Changed => match sessions::do_pull(session, interval, false) {
-            Ok(_outcome) => {
-                refresh_current(manager, track_current, &key);
-                Instant::now() + deadline
-            }
-            Err((message, wait)) => {
-                eprintln!("figmog: pull failed for {key}: {message}");
-                Instant::now() + wait
-            }
-        },
-    }
+    let count = manager.sessions.len();
+    let idx = *next_idx % count;
+    *next_idx = (*next_idx + 1) % count;
+    let dispatched = manager.sessions[idx].poll_at(interval, now);
+    (now + tick_deadline(interval, count), dispatched)
 }
 
 /// Refresh `.figmog/current` to `key` — only when `track` (the no-`--db`-
@@ -860,19 +905,14 @@ fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
 /// argument is extracted (and stripped before tool-specific arg parsing)
 /// and routed through [`SessionManager::resolve`]; non-local names are
 /// proxied — see this module's doc comment for the cache-routing choice.
-/// A pull failure anywhere here (auto-open inside `resolve`, an explicit
-/// `figmog_sync`, `figmog_open`) pushes `next_deadline` out by the same
-/// Retry-After-aware wait [`sessions::do_pull`] computed, so a rate-limited
-/// on-demand pull doesn't let the background watch loop immediately
-/// re-hit the same limit for that session (build design §12, restored
-/// from the pre-refactor single-session `figmog_sync` handler).
+/// Open/sync and implicit first reads schedule workers; they never perform
+/// a pull on the request thread. Status and files report job completion.
 #[allow(clippy::too_many_arguments)]
-fn handle_tool_call(
+fn handle_tool_call<U: UpstreamMcp>(
     manager: &mut SessionManager,
-    upstream: &mut Option<HttpUpstream>,
+    upstream: &mut Option<U>,
     upstream_status: &'static str,
     no_watch: bool,
-    track_current: bool,
     interval: Duration,
     next_deadline: &mut Instant,
     name: &str,
@@ -886,38 +926,12 @@ fn handle_tool_call(
         let file = dispatch::require_str(args, "file")?;
         // spec §4: `geometry` turns sticky vector-geometry requests on for
         // this mirror going forward; omitted preserves whatever's already
-        // stored (default false for a brand-new mirror) — `do_pull`'s
+        // stored (default false for a brand-new mirror) — the worker's
         // stored-flag union handles that, so `false` here is exactly "no
         // new override" rather than "force off".
         let geometry = dispatch::arg_bool(args, "geometry");
         let session = manager.open(&file)?;
-        let outcome = match sessions::do_pull(session, interval, geometry) {
-            Ok(outcome) => outcome,
-            Err((message, wait)) => {
-                *next_deadline = Instant::now() + wait;
-                return Err(message);
-            }
-        };
-        let key = session.key.clone();
-        // The node count alone — everything else in the result comes
-        // straight from `outcome`, which already has this pull's
-        // authoritative name/version/churn.
-        let nodes = match (session.dispatch)("figmog_status", &json!({}))? {
-            ToolOutput::Json(v) => v["nodes"].clone(),
-            ToolOutput::Raw(_) => Value::Null,
-        };
-        refresh_current(manager, track_current, &key);
-
-        return Ok(ToolOutput::Json(json!({
-            "key": key,
-            "name": outcome.name,
-            "version": outcome.version,
-            "nodes": nodes,
-            "added": outcome.churn.added,
-            "changed": outcome.churn.changed,
-            "removed": outcome.churn.removed,
-            "unchanged": outcome.churn.unchanged,
-        })));
+        return Ok(ToolOutput::Json(session.request_pull(geometry, interval)));
     }
 
     // spec §2b: an explicit `file` arg always wins, but when it's absent
@@ -936,55 +950,32 @@ fn handle_tool_call(
     }
 
     if proxy::is_local_tool(name) {
-        let (session, just_pulled) =
-            manager
-                .resolve(file_arg.as_deref(), interval)
-                .map_err(|e| {
-                    if let Some(wait) = e.retry_after {
-                        *next_deadline = Instant::now() + wait;
-                    }
-                    e.message
-                })?;
+        let session = manager.resolve(file_arg.as_deref(), interval)?;
 
+        if name == "figmog_sync" {
+            return Ok(ToolOutput::Json(session.request_pull(false, interval)));
+        }
+        if name == "figmog_status" {
+            let mut status = session.status()?;
+            status["upstream"] = json!(upstream_status);
+            return Ok(ToolOutput::Json(status));
+        }
+
+        if !session.mirrored {
+            session.request_pull(false, interval);
+        }
         if name == "figmog_images" {
-            // v0.0.2 spec §5: never automatic, and this is the only place
-            // that reaches `FileSession::images` — no other call site
-            // wires it in. `resolve` already spends this session's cache
-            // and, on a miss, its Figma API budget; a pull failure has no
-            // analog here (images doesn't pull the file), so unlike
-            // `figmog_sync`/`figmog_open` this never touches
-            // `next_deadline`.
+            // Failed first mirrors share the data-read retry path above.
+            // Once ready, image fetching retains its own synchronous
+            // networking/cache contract, separate from pull scheduling.
             let ids = dispatch::require_str_array(args, "ids")?;
             let format = args.get("format").and_then(Value::as_str).unwrap_or("png");
             let scale = dispatch::arg_f64(args, "scale");
-            let items = (session.images)(&ids, format, scale)?;
+            let items = session.images(&ids, format, scale)?;
             return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
         }
 
-        if name == "figmog_sync" {
-            // `resolve` already spent this call's one pull if the session
-            // was new/unmirrored — skip the redundant second Tier-1 pull
-            // `figmog_sync` would otherwise always perform.
-            let outcome = match just_pulled {
-                Some(outcome) => outcome,
-                // `figmog_sync` carries no geometry arg of its own (spec
-                // §4) — the mirror's stored setting, if any, still drives
-                // this re-pull.
-                None => match sessions::do_pull(session, interval, false) {
-                    Ok(outcome) => outcome,
-                    Err((message, wait)) => {
-                        *next_deadline = Instant::now() + wait;
-                        return Err(message);
-                    }
-                },
-            };
-            let key = session.key.clone();
-            let churn_value = serde_json::to_value(&outcome.churn).map_err(|e| e.to_string())?;
-            refresh_current(manager, track_current, &key);
-            return Ok(ToolOutput::Json(churn_value));
-        }
-
-        let result = (session.dispatch)(name, &call_args).map_err(|msg| {
+        let result = session.dispatch(name, &call_args).map_err(|msg| {
             // spec §2b: note an explicit-file/URL-file disagreement on a
             // failed call (almost always "no node ... in the mirror" —
             // the node genuinely isn't in the file the explicit arg
@@ -1008,14 +999,6 @@ fn handle_tool_call(
                 _ => msg,
             }
         })?;
-        if name == "figmog_status"
-            && let ToolOutput::Json(mut v) = result
-        {
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("upstream".to_string(), json!(upstream_status));
-            }
-            return Ok(ToolOutput::Json(v));
-        }
         return Ok(result);
     }
 
@@ -1026,6 +1009,7 @@ fn handle_tool_call(
         .ok_or_else(|| format!("upstream not attached: {name}"))?;
     let (value, trigger_poll) = proxy::proxy_call(up, name, args)?;
     if trigger_poll && !no_watch {
+        manager.expedite_polls(interval);
         *next_deadline = Instant::now();
     }
     // A proxied result is already a complete MCP `CallToolResult` from the
@@ -1039,218 +1023,23 @@ fn handle_tool_call(
 mod tests {
     use super::*;
     use crate::api::test_http::{Peer, RESPONSE_BOUND, Reply, TEST_TIMEOUT};
+    use crate::api::{FigmaApi, UreqApi};
     use crate::mcp::ToolDef;
     use crate::upstream::FakeUpstream;
-
-    /// Every receive has a message ready, including the final EOF sentinel:
-    /// an overdue poll cannot rely on a gap in the request queue to run.
-    fn serve_queued_requests(
-        manager: SessionManager,
-        api: &dyn FigmaApi,
-        no_watch: bool,
-        tool: &str,
-    ) -> Vec<Value> {
-        let (tx, rx) = mpsc::channel();
-        let (client, socket) = UnixStream::pair().unwrap();
-        client.set_read_timeout(Some(RESPONSE_BOUND)).unwrap();
-        socket.set_write_timeout(Some(RESPONSE_BOUND)).unwrap();
-        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-        registry.lock().unwrap().insert(1, socket);
-        for id in 1..=8 {
-            tx.send(Incoming::Stdio(
-                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
-            ))
-            .unwrap();
-            tx.send(Incoming::Socket(
-                1,
-                json!({
-                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                    "params": {"name": tool, "arguments": {}}
-                })
-                .to_string(),
-            ))
-            .unwrap();
-        }
-        tx.send(Incoming::StdinClosed).unwrap();
-
-        serve_loop(
-            manager,
-            None,
-            "disabled",
-            no_watch,
-            false,
-            Duration::from_secs(10),
-            Instant::now() - Duration::from_secs(1),
-            rx,
-            registry,
-            Some(api),
-        )
-        .unwrap();
-
-        let mut reader = BufReader::new(client);
-        (1..=8)
-            .map(|id| {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let response: Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(response["id"], id);
-                assert_eq!(response["result"]["isError"], false);
-                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
-                    .unwrap()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn serve_refreshes_an_overdue_mirror_before_answering_queued_reads() {
-        use crate::api::{ApiError, FileMetaResp};
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        struct VersionedApi(Cell<&'static str>);
-        impl FigmaApi for VersionedApi {
-            fn file_meta(&self, _key: &str) -> Result<FileMetaResp, ApiError> {
-                Ok(FileMetaResp {
-                    name: "Synthetic".into(),
-                    last_touched_at: self.0.get().into(),
-                })
-            }
-
-            fn file(&self, _key: &str, _geometry: bool) -> Result<Value, ApiError> {
-                Ok(json!({
-                    "name": "Synthetic", "version": self.0.get(), "lastModified": "t",
-                    "document": {"id": "0:0", "name": "Synthetic", "type": "DOCUMENT"}
-                }))
-            }
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let api = Rc::new(VersionedApi(Cell::new("1")));
-        let session = sessions::open_session_with_api(
-            dir.path().join("db"),
-            "ABC123".into(),
-            Some("ABC123"),
-            Some(api.clone()),
-            true,
-        )
-        .unwrap();
-        let manager = SessionManager {
-            sessions: vec![session],
-            root: dir.path().to_path_buf(),
-            token: None,
-            default_key: Some("ABC123".into()),
-        };
-        api.0.set("2");
-
-        let responses = serve_queued_requests(manager, &*api, false, "figmog_status");
-        for response in responses {
-            assert_eq!(
-                response["version"], "2",
-                "queued reads must see the refresh"
-            );
-        }
-    }
-
-    struct RateLimitedApi {
-        polls: std::cell::RefCell<Vec<String>>,
-        waits: std::cell::RefCell<std::collections::VecDeque<Duration>>,
-    }
-
-    impl FigmaApi for RateLimitedApi {
-        fn file_meta(&self, key: &str) -> Result<crate::api::FileMetaResp, crate::api::ApiError> {
-            self.polls.borrow_mut().push(key.to_string());
-            let retry_after = self
-                .waits
-                .borrow_mut()
-                .pop_front()
-                .expect("unexpected metadata poll");
-            Err(crate::api::ApiError::RateLimited { retry_after })
-        }
-
-        fn file(&self, _key: &str, _geometry: bool) -> Result<Value, crate::api::ApiError> {
-            Ok(json!({
-                "name": "Synthetic", "version": "1", "lastModified": "t",
-                "document": {"id": "0:0", "name": "Synthetic", "type": "DOCUMENT"}
-            }))
-        }
-    }
-
-    fn mirrored_test_sessions(root: &Path, api: std::rc::Rc<dyn FigmaApi>) -> SessionManager {
-        let sessions = ["ABC123", "DEF456"]
-            .into_iter()
-            .map(|key| {
-                sessions::open_session_with_api(
-                    root.join(key),
-                    key.into(),
-                    Some(key),
-                    Some(api.clone()),
-                    true,
-                )
-                .unwrap()
-            })
-            .collect();
-        SessionManager {
-            sessions,
-            root: root.to_path_buf(),
-            token: None,
-            default_key: Some("ABC123".into()),
-        }
-    }
-
-    #[test]
-    fn serve_round_robins_due_polls_and_honors_retry_after_with_queued_requests() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = std::rc::Rc::new(RateLimitedApi {
-            polls: Default::default(),
-            // Two immediately due retries, then a future deadline: both
-            // polling and request handling must progress through the queue.
-            waits: std::cell::RefCell::new(
-                [Duration::ZERO, Duration::ZERO, Duration::from_secs(3600)].into(),
-            ),
-        });
-        let manager = mirrored_test_sessions(dir.path(), api.clone());
-
-        let responses = serve_queued_requests(manager, &*api, false, "figmog_files");
-
-        assert_eq!(*api.polls.borrow(), ["ABC123", "DEF456", "ABC123"]);
-        for response in responses {
-            assert_eq!(response[0]["key"], "ABC123");
-            assert_eq!(response[1]["key"], "DEF456");
-        }
-    }
-
-    #[test]
-    fn serve_no_watch_answers_queued_requests_without_polling_an_overdue_deadline() {
-        let dir = tempfile::tempdir().unwrap();
-        let api = std::rc::Rc::new(RateLimitedApi {
-            polls: Default::default(),
-            waits: Default::default(),
-        });
-        let manager = mirrored_test_sessions(dir.path(), api.clone());
-
-        let responses = serve_queued_requests(manager, &*api, true, "figmog_files");
-
-        assert!(api.polls.borrow().is_empty());
-        for response in responses {
-            assert_eq!(response[0]["version"], "1");
-            assert_eq!(response[1]["version"], "1");
-        }
-    }
 
     #[test]
     fn watch_tick_reconciles_once_despite_different_endpoint_timestamps() {
         use crate::api::{ApiError, FileMetaResp};
-        use std::cell::Cell;
-        use std::rc::Rc;
+        use std::sync::atomic::AtomicUsize;
 
         struct ScriptedApi {
-            meta_calls: Cell<usize>,
-            file_calls: Cell<usize>,
+            meta_calls: AtomicUsize,
+            file_calls: AtomicUsize,
         }
 
         impl FigmaApi for ScriptedApi {
             fn file_meta(&self, _key: &str) -> Result<FileMetaResp, ApiError> {
-                self.meta_calls.set(self.meta_calls.get() + 1);
+                self.meta_calls.fetch_add(1, Ordering::Relaxed);
                 Ok(FileMetaResp {
                     name: "Synthetic".into(),
                     last_touched_at: "2026-01-01T12:00:00.123Z".into(),
@@ -1258,7 +1047,7 @@ mod tests {
             }
 
             fn file(&self, _key: &str, _geometry: bool) -> Result<Value, ApiError> {
-                self.file_calls.set(self.file_calls.get() + 1);
+                self.file_calls.fetch_add(1, Ordering::Relaxed);
                 Ok(json!({
                     "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T12:00:00Z",
                     "document": {"id": "0:0", "name": "Synthetic", "type": "DOCUMENT"}
@@ -1267,16 +1056,15 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let api = Rc::new(ScriptedApi {
-            meta_calls: Cell::new(0),
-            file_calls: Cell::new(0),
+        let api = Arc::new(ScriptedApi {
+            meta_calls: AtomicUsize::new(0),
+            file_calls: AtomicUsize::new(0),
         });
         let session = sessions::open_session_with_api(
             dir.path().join("db"),
             "ABC123".into(),
             Some("ABC123"),
             Some(api.clone()),
-            false,
         )
         .unwrap();
         let mut manager = SessionManager {
@@ -1284,30 +1072,33 @@ mod tests {
             root: dir.path().to_path_buf(),
             token: None,
             default_key: Some("ABC123".into()),
+            api: None,
         };
         let mut next_idx = 0;
-        let interval = Duration::from_secs(10);
+        let interval = Duration::ZERO;
 
-        watch_tick(&mut manager, &mut next_idx, interval, false, Some(&*api));
-        assert_eq!(api.meta_calls.get(), 1);
-        assert_eq!(api.file_calls.get(), 1);
-        assert_eq!(
-            manager.list()[0]["version"],
-            "1",
-            "the pull synced the store"
-        );
-        assert!(matches!(
-            manager.sessions[0].watcher.tick(&*api, "ABC123"),
-            Tick::Unchanged
-        ));
-
-        watch_tick(&mut manager, &mut next_idx, interval, false, Some(&*api));
-        assert_eq!(api.meta_calls.get(), 3, "both watch ticks polled metadata");
-        assert_eq!(
-            api.file_calls.get(),
-            1,
-            "unchanged polls must not fetch again"
-        );
+        watch_tick_at(&mut manager, &mut next_idx, interval, Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while manager.list()[0]["pull"]["job"]["state"] != "succeeded" {
+            manager.sessions[0].maintain();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(api.meta_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(api.file_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(manager.list()[0]["version"], "1");
+        // Poll again with a zero per-file wait. Differing endpoint
+        // timestamps must still require only the first reconciliation.
+        manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while api.meta_calls.load(Ordering::Relaxed) < 2 {
+            manager.sessions[0].maintain();
+            manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        manager.sessions[0].maintain();
+        assert_eq!(api.file_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1373,14 +1164,19 @@ mod tests {
         client.set_read_timeout(Some(response_bound)).unwrap();
         socket.set_write_timeout(Some(RESPONSE_BOUND)).unwrap();
         let worker = std::thread::spawn(move || {
-            let mut session =
-                sessions::open_session_at(db.clone(), "ABC123".into(), None, None, false).unwrap();
-            session.watcher = crate::watch::Watcher::new(Some("t".into()));
+            let session = sessions::open_session_with_api(
+                db.clone(),
+                "ABC123".into(),
+                Some("ABC123"),
+                Some(Arc::new(api)),
+            )
+            .unwrap();
             let manager = SessionManager {
                 sessions: vec![session],
                 root: db,
                 token: Some("synthetic-token".into()),
                 default_key: Some("ABC123".into()),
+                api: None,
             };
             let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
             registry.lock().unwrap().insert(1, socket);
@@ -1391,10 +1187,8 @@ mod tests {
                 false,
                 false,
                 Duration::from_secs(2),
-                Instant::now() + Duration::from_secs(2),
                 rx,
                 registry,
-                Some(&api),
             )
             .unwrap();
         });
@@ -1476,7 +1270,7 @@ mod tests {
         crate::store::sync(&mut st, &std::collections::BTreeSet::new(), &flattened, 0);
 
         let result =
-            st.rtx(|r| dispatch::dispatch_read_tool("figmog_status", &json!({}), "connected", r));
+            st.rtx(|r| dispatch::dispatch_read_tool("figmog_status", &json!({}), "connected", &r));
         let value = result
             .expect("figmog_status is a recognized local tool")
             .unwrap();
@@ -1486,7 +1280,7 @@ mod tests {
         // dispatcher — proving the namespace rule routes it away from the
         // local path without needing a live upstream to demonstrate it.
         let result =
-            st.rtx(|r| dispatch::dispatch_read_tool("get_code", &json!({}), "connected", r));
+            st.rtx(|r| dispatch::dispatch_read_tool("get_code", &json!({}), "connected", &r));
         assert!(result.is_none());
     }
 
@@ -1866,3 +1660,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod async_tests;

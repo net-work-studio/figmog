@@ -23,6 +23,7 @@ mod private_dir;
 mod proxy;
 pub(crate) mod query;
 mod serve;
+mod session_view;
 mod sessions;
 pub mod store;
 pub(crate) mod upstream;
