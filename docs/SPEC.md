@@ -258,6 +258,9 @@ after the whole fetch → flatten → atomic sync → cache eviction → geometr
 persistence cycle succeeds. During every stage, existing readers see the
 previous complete mirror, including for the file being pulled. Other files
 have independent workers. No on-disk records or sink names change.
+An unchanged stored version skips both stale proxy-cache and image-cache
+scans, avoiding decoding cached image blobs. Initial or version-changing
+pulls still scan both tables and evict mismatched rows before publication.
 
 **Asynchronous pulls (NWS-2919):** `figmog_open {file, geometry?}` and
 `figmog_sync {file?}` acknowledge accepted work immediately:

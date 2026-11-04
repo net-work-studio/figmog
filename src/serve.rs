@@ -564,6 +564,7 @@ fn serve_loop(
     rx: mpsc::Receiver<Incoming>,
     registry: ConnRegistry,
 ) -> Result<(), String> {
+    let first_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
     serve_loop_with_output(
         manager,
         upstream,
@@ -571,6 +572,7 @@ fn serve_loop(
         no_watch,
         track_current,
         interval_dur,
+        first_deadline,
         rx,
         registry,
         |response| {
@@ -588,6 +590,7 @@ fn serve_loop_with_output(
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
+    mut next_deadline: Instant,
     rx: mpsc::Receiver<Incoming>,
     registry: ConnRegistry,
     mut write_stdio: impl FnMut(&Value) -> bool,
@@ -601,7 +604,6 @@ fn serve_loop_with_output(
     }
 
     let mut next_session_idx: usize = 0;
-    let mut next_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
 
     loop {
         // Completions and due watch work run even under continuous traffic.

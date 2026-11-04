@@ -609,6 +609,7 @@ fn async_stdio_open_acknowledges_and_accepts_requests_while_fetch_is_gated() {
             true,
             false,
             Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(10),
             rx,
             Arc::default(),
             |response| output.send(response.clone()).is_ok(),
@@ -1103,3 +1104,5 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
     }
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 4);
 }
+
+mod watch_and_cache;

@@ -535,15 +535,16 @@ pub(crate) fn open_session_with_hooks(
                         // Match direct pulls: unchanged versions avoid decoding
                         // potentially large image blobs merely to evict none.
                         if prior_version.as_deref() != Some(version.as_str()) {
-                        let mut stale = st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images))| {
-                            let mut ids = store::stale_cache_ids(&cache, &version);
-                            ids.extend(store::stale_image_ids(&images, &version));
-                            ids
-                        });
-                        if !stale.is_empty() {
-                            stale.sort();
-                            store::evict_stale_cache(&mut st, &stale);
-                        }
+                            let mut stale =
+                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images))| {
+                                    let mut ids = store::stale_cache_ids(&cache, &version);
+                                    ids.extend(store::stale_image_ids(&images, &version));
+                                    ids
+                                });
+                            if !stale.is_empty() {
+                                stale.sort();
+                                store::evict_stale_cache(&mut st, &stale);
+                            }
                         }
                         store::upsert_mirror_config(&mut st, geometry);
                         phase(PullPhase::Publishing);
