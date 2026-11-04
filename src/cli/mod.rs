@@ -299,7 +299,7 @@ pub fn run() -> i32 {
 /// error.
 fn write_json(v: &Value) -> Result<(), String> {
     use std::io::Write;
-    let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+    let text = crate::deep_json::to_string_pretty(v).map_err(|e| e.to_string())?;
     let mut stdout = std::io::stdout();
     if writeln!(stdout, "{text}").is_err() || stdout.flush().is_err() {
         return Err(STDOUT_CLOSED.to_string());
@@ -399,7 +399,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             };
             if let Some(result) = socket::try_call(root, tool, parsed_args) {
                 note_ignored_upstream_flags(upstream, *no_upstream);
-                return write_json(&result?);
+                return write_json(&crate::deep_json::OwnedValue(result?));
             }
         } else if let Some((tool, tool_args)) = cmd_as_tool_call(&cli.cmd) {
             let tool_args = with_current_file(strip_null_options(tool_args))?;
@@ -413,7 +413,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 } else {
                     result
                 };
-                return write_json(&result);
+                return write_json(&crate::deep_json::OwnedValue(result));
             }
         }
     }

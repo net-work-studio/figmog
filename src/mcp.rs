@@ -141,11 +141,12 @@ fn handle_message_with_tool_errors(
     };
 
     match result {
-        Some(result) => Some(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        })),
+        Some(result) => {
+            // Moving avoids json!'s recursive conversion/cloning of a deep tree.
+            let mut response = json!({"jsonrpc": "2.0", "id": id});
+            response["result"] = result;
+            Some(response)
+        }
         None => Some(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -205,12 +206,13 @@ fn tools_call_result(
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     Ok(match handler.call(name, &args)? {
         ToolOutput::Json(v) => {
+            let mut v = crate::deep_json::OwnedValue(v);
             let mut result = json!({
-                "content": [{"type": "text", "text": serde_json::to_string(&v).unwrap()}],
+                "content": [{"type": "text", "text": crate::deep_json::to_string(&v.0).unwrap()}],
                 "isError": false,
             });
             if crate::dispatch::output_schema(name).is_some() {
-                result["structuredContent"] = v;
+                result["structuredContent"] = std::mem::take(&mut v.0);
             }
             result
         }

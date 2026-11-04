@@ -13,6 +13,7 @@ pub(crate) mod api;
 pub(crate) mod auth;
 pub mod cache;
 pub mod cli;
+mod deep_json;
 mod dispatch;
 pub mod flatten;
 pub(crate) mod ident;

@@ -184,7 +184,7 @@ fn send_and_recv(stream: UnixStream, frame: &Value) -> Result<Value, String> {
     if n == 0 {
         return Err("serve socket closed before responding".to_string());
     }
-    serde_json::from_str(&line).map_err(|e| format!("serve socket sent invalid JSON: {e}"))
+    crate::deep_json::from_str(&line).map_err(|e| format!("serve socket sent invalid JSON: {e}"))
 }
 
 fn protocol_error_message(err: &Value) -> String {
@@ -200,15 +200,21 @@ fn protocol_error_message(err: &Value) -> String {
 /// hand-built response `Value`s. Only local single-JSON tools are
 /// unwrapped; desktop results and `figmog_images` retain their MCP envelope.
 fn interpret_call_response(tool: &str, resp: Value) -> Result<Value, String> {
+    let mut resp = crate::deep_json::OwnedValue(resp);
     if let Some(err) = resp.get("error") {
         return Err(protocol_error_message(err));
     }
-    let result = resp.get("result").cloned().unwrap_or(Value::Null);
+    let mut result = crate::deep_json::OwnedValue(
+        resp.0
+            .get_mut("result")
+            .map(std::mem::take)
+            .unwrap_or(Value::Null),
+    );
     if !crate::proxy::is_local_tool(tool) {
         // Socket dispatch reports serve-generated failures as JSON-RPC
         // errors above. Only genuine desktop results reach this branch,
         // including the desktop's own tool-level `isError` responses.
-        return Ok(result);
+        return Ok(std::mem::take(&mut result.0));
     }
     let is_error = result
         .get("isError")
@@ -220,17 +226,17 @@ fn interpret_call_response(tool: &str, resp: Value) -> Result<Value, String> {
         return Err(text.unwrap_or_else(|| "unknown error from serve".to_string()));
     }
     if tool == "figmog_images" {
-        return Ok(result);
+        return Ok(std::mem::take(&mut result.0));
     }
 
     match text {
         // Local single-JSON tools answer as `ToolOutput::Json`, i.e. one
         // text block holding figmog's own JSON (see `mcp::ToolOutput`).
         // Parse it back out for the CLI's established local read shape.
-        Some(t) => serde_json::from_str(&t)
+        Some(t) => crate::deep_json::from_str(&t)
             .map_err(|e| format!("serve returned non-JSON tool content: {e}")),
         // Preserve the existing fallback for a local result without text.
-        None => Ok(result),
+        None => Ok(std::mem::take(&mut result.0)),
     }
 }
 

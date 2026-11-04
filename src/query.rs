@@ -176,32 +176,64 @@ pub fn build_tree<R: Readable>(
     node: &NodeRec,
     depth: Option<usize>,
 ) -> TreeNode {
-    let mut kids = Vec::new();
-    if depth != Some(0) {
-        let mut edges = children.get(&node.id);
+    let make = |n: &NodeRec| TreeNode {
+        id: n.id.clone(),
+        name: n.name.clone(),
+        node_type: n.node_type.clone(),
+        children: Vec::new(),
+    };
+    let edges = |id: &String, depth| {
+        let mut edges = if depth == Some(0) {
+            Vec::new()
+        } else {
+            children.get(id)
+        };
         edges.sort();
-        let next_depth = depth.map(|d| d - 1);
-        for (_, child_id) in edges {
+        edges.into_iter()
+    };
+    let mut stack = vec![(make(node), depth, edges(&node.id, depth))];
+    loop {
+        let (_, depth, edges_iter) = stack.last_mut().expect("root frame");
+        if let Some((_, child_id)) = edges_iter.next() {
             if let Some(child) = nodes.get(&child_id) {
-                kids.push(build_tree(nodes, children, &child, next_depth));
+                let depth = depth.map(|d| d - 1);
+                stack.push((make(&child), depth, edges(&child.id, depth)));
+            }
+        } else {
+            let (finished, _, _) = stack.pop().expect("root frame");
+            match stack.last_mut() {
+                Some((parent, _, _)) => parent.children.push(finished),
+                None => return finished,
             }
         }
     }
-    TreeNode {
-        id: node.id.clone(),
-        name: node.name.clone(),
-        node_type: node.node_type.clone(),
-        children: kids,
+}
+
+impl Drop for TreeNode {
+    fn drop(&mut self) {
+        let mut pending = std::mem::take(&mut self.children);
+        while let Some(mut child) = pending.pop() {
+            pending.append(&mut child.children);
+        }
     }
 }
 
 fn tree_to_json(t: &TreeNode) -> Value {
-    json!({
-        "id": t.id,
-        "name": t.name,
-        "type": t.node_type,
-        "children": t.children.iter().map(tree_to_json).collect::<Vec<_>>(),
-    })
+    let mut pending = vec![(t, false)];
+    let mut values = Vec::new();
+    while let Some((node, visited)) = pending.pop() {
+        if visited {
+            let children = values.split_off(values.len() - node.children.len());
+            // Move the child array. json! on a Value would clone it recursively.
+            let mut value = json!({"id": node.id, "name": node.name, "type": node.node_type});
+            value["children"] = Value::Array(children);
+            values.push(value);
+        } else {
+            pending.push((node, true));
+            pending.extend(node.children.iter().rev().map(|child| (child, false)));
+        }
+    }
+    values.pop().expect("root value")
 }
 
 /// Resolve the root (default: the DOCUMENT node) and build its outline as a
@@ -258,7 +290,7 @@ pub fn node<R: Readable>(
     let n = nodes
         .get(&id)
         .ok_or_else(|| format!("no node {id} in the mirror"))?;
-    let mut value: Value = serde_json::from_str(&n.raw).map_err(|e| e.to_string())?;
+    let mut value: Value = crate::deep_json::from_str(&n.raw).map_err(|e| e.to_string())?;
 
     if with_children {
         let mut edges = children.get(&id);
@@ -300,14 +332,23 @@ const SUBTREE_ALWAYS_FIELDS: [&str; 3] = ["id", "name", "type"];
 /// never happen for a real Figma node) passes through unchanged.
 fn project_raw_fields(mut value: Value, fields: &[String]) -> Value {
     if let Value::Object(ref mut map) = value {
-        map.retain(|k, _| {
-            SUBTREE_ALWAYS_FIELDS.contains(&k.as_str()) || fields.iter().any(|f| f == k)
-        });
+        let discarded: Vec<_> = map
+            .keys()
+            .filter(|k| {
+                !SUBTREE_ALWAYS_FIELDS.contains(&k.as_str()) && !fields.iter().any(|f| f == *k)
+            })
+            .cloned()
+            .collect();
+        for key in discarded {
+            if let Some(value) = map.remove(&key) {
+                drop(crate::deep_json::OwnedValue(value));
+            }
+        }
     }
     value
 }
 
-/// Recursive worker behind [`subtree`]: raw JSON of `n`, fields-projected,
+/// Iterative worker behind [`subtree`]: raw JSON of `n`, fields-projected,
 /// with `children` nested in child-index order and (when requested)
 /// `resolved_variables` — both inserted *after* projection so they always
 /// survive a `fields` filter, matching `id`/`name`/`type`.
@@ -322,43 +363,44 @@ fn build_subtree<R: Readable>(
     fields: Option<&[String]>,
     resolve_vars: bool,
 ) -> Result<Value, String> {
-    let mut value: Value = serde_json::from_str(&n.raw).map_err(|e| e.to_string())?;
-    if let Some(fs) = fields {
-        value = project_raw_fields(value, fs);
-    }
-
-    let mut kids_json = Vec::new();
-    if depth != Some(0) {
-        let mut edges = children.get(&n.id);
-        edges.sort();
-        let next_depth = depth.map(|d| d - 1);
-        for (_, child_id) in edges {
-            if let Some(child) = nodes.get(&child_id) {
-                kids_json.push(build_subtree(
-                    nodes,
-                    children,
-                    variables,
-                    variable_collections,
-                    &child,
-                    next_depth,
-                    fields,
-                    resolve_vars,
-                )?);
-            }
+    let prepare = |n: &NodeRec, depth| -> Result<_, String> {
+        let mut value = crate::deep_json::from_str(&n.raw).map_err(|e| e.to_string())?;
+        if let Some(fs) = fields {
+            value = project_raw_fields(value, fs);
         }
-    }
-
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("children".to_string(), Value::Array(kids_json));
-        if resolve_vars {
+        if resolve_vars && let Some(obj) = value.as_object_mut() {
             obj.insert(
                 "resolved_variables".to_string(),
                 resolved_variables(variables, variable_collections, &n.bound_variables),
             );
         }
+        let mut edges = if depth == Some(0) {
+            Vec::new()
+        } else {
+            children.get(&n.id)
+        };
+        edges.sort();
+        Ok((value, depth, edges.into_iter(), Vec::new()))
+    };
+    let mut stack = vec![prepare(n, depth)?];
+    loop {
+        let (_, depth, edges, _) = stack.last_mut().expect("root frame");
+        if let Some((_, child_id)) = edges.next() {
+            if let Some(child) = nodes.get(&child_id) {
+                let depth = depth.map(|d| d - 1);
+                stack.push(prepare(&child, depth)?);
+            }
+        } else {
+            let (mut value, _, _, kids) = stack.pop().expect("root frame");
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("children".to_string(), Value::Array(kids));
+            }
+            match stack.last_mut() {
+                Some((_, _, _, kids)) => kids.push(value),
+                None => return Ok(value),
+            }
+        }
     }
-
-    Ok(value)
 }
 
 /// Subtree dump rooted at `id` (spec §2): the node's full raw JSON with
@@ -897,7 +939,7 @@ pub fn where_<R: Readable>(
         if !scope.as_ref().is_none_or(|s| s.contains(&n.id)) {
             continue;
         }
-        let raw: Value = serde_json::from_str(&n.raw).map_err(|e| e.to_string())?;
+        let raw: Value = crate::deep_json::from_str(&n.raw).map_err(|e| e.to_string())?;
         let Some(v) = raw.pointer(pointer) else {
             continue;
         };

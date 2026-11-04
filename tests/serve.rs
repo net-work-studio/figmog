@@ -2843,3 +2843,41 @@ fn wait_for_pull(stdin: &mut ChildStdin, rx: &Receiver<String>, args: Value, sta
         std::thread::yield_now();
     }
 }
+
+#[test]
+fn deep_tree_reads_over_socket_match_direct_cli() {
+    #[path = "fixtures/deep_file.rs"]
+    mod deep_file;
+
+    const KEY: &str = "figmogdeepfixture01";
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("deep.json");
+    std::fs::write(&response, deep_file::file(500)).unwrap();
+    common::command()
+        .current_dir(dir.path())
+        .args(["pull", KEY, "--from-file"])
+        .arg(&response)
+        .assert()
+        .success();
+    let mut direct = Vec::new();
+    for args in [vec!["tree"], vec!["dump", "0:0"]] {
+        let output = common::command()
+            .current_dir(dir.path())
+            .args(&args)
+            .assert()
+            .success();
+        direct.push((args, output.get_output().stdout.clone()));
+    }
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+    for (args, expected) in direct {
+        let output = common::command()
+            .current_dir(dir.path())
+            .args(args)
+            .assert()
+            .success();
+        assert_eq!(output.get_output().stdout, expected);
+    }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}

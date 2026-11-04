@@ -415,7 +415,7 @@ fn write_socket_response(registry: &ConnRegistry, conn_id: u64, resp: &Value) {
         }
     };
 
-    let text = resp.to_string();
+    let text = crate::deep_json::to_string(resp).expect("Value serializes");
     let ok = writeln!(&stream, "{text}").is_ok() && (&stream).flush().is_ok();
     if !ok {
         registry.lock().unwrap().remove(&conn_id);
@@ -577,7 +577,8 @@ fn serve_loop(
         registry,
         |response| {
             let mut stdout = std::io::stdout();
-            writeln!(stdout, "{response}").is_ok() && stdout.flush().is_ok()
+            let text = crate::deep_json::to_string(response).expect("Value serializes");
+            writeln!(stdout, "{text}").is_ok() && stdout.flush().is_ok()
         },
     )
 }
@@ -651,7 +652,7 @@ fn serve_loop_with_output(
                         )
                     });
                 if let Some(resp) = mcp::handle_socket_message(&l, &tools, &mut handler) {
-                    write_socket_response(&registry, conn_id, &resp);
+                    write_socket_response(&registry, conn_id, &crate::deep_json::OwnedValue(resp));
                 }
                 continue;
             }
@@ -671,7 +672,7 @@ fn serve_loop_with_output(
         });
 
         if let Some(response) = mcp::handle_message(&line, &tools, &mut handler)
-            && !write_stdio(&response)
+            && !write_stdio(&crate::deep_json::OwnedValue(response))
         {
             // A vanished stdio reader is a clean shutdown; accepted
             // running pulls drain through FileSession's drop handler.

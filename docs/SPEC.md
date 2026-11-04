@@ -236,6 +236,21 @@ return an error with the node's location, before an ordinary CLI import,
 fresh replacement, or server pull can sync a partial tree or sweep existing
 subtrees. Other fields remain unknown-field-preserving.
 
+**Deep trees:** saved-file and REST file imports support 500 nested frames
+(and are not subject to serde_json's default 128-container parsing limit).
+Node walks, variable-binding scans, and tree/subtree reconstruction use
+explicit work stacks. File responses and emitted trees are drained
+iteratively on cleanup; JSON parsing and printing use `serde_stacker`.
+
+**Dependency justification:** `serde_stacker` is needed because disabling
+serde_json's recursion limit alone exposes the CLI and the server's ordinary
+worker stacks to overflow during deserialization and serialization. Its
+adapters grow the stack while retaining serde_json's validation and sorted
+object semantics; it avoids introducing a separate JSON parser or changing
+the persisted record schema. `serde_json/unbounded_depth` enables these
+adapters to accept full Figma trees beyond the default limit. The regression
+fixtures are generated synthetically as JSON text.
+
 **Fresh replacement:** file and optional variables responses are validated
 before opening or resetting the mirror. Every direct CLI and server-session
 store handle holds a lock on the permanent `.figmog-lock` file inside the
