@@ -45,11 +45,11 @@ impl Watcher {
     /// a pending observation (e.g. an explicit sync before the first
     /// poll), keep the previous watermark, possibly unknown. Never sample
     /// post-fetch metadata here: a newer edit may not be in the fetched file.
+    /// Metadata failure backoff resets only after a successful metadata poll.
     pub fn note_pull_success(&mut self) {
         if let Some(pending) = self.pending.take() {
             self.synchronized = Some(pending);
         }
-        self.backoff = BACKOFF_START;
     }
 
     /// Poll `file_meta` once and classify the result. Never fetches the
