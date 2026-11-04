@@ -1,0 +1,28 @@
+src/serve/async_tests.rs
+  s_ff6622ece2e1c5::t_d6c196b0659251 825-836,1203,1233,1275,1287,1311-1312
+  s_ff6622ece2e1c5::t_13261a5f37640d 1217-1218,1222-1229,1231-1232
+  s_ff6622ece2e1c5::t_78502f520a9864 1181-1202,1204-1216,1219-1221,1230,1234-1246
+  s_ff6622ece2e1c5::t_af160c6e5fe173 1247-1274,1276-1286,1288-1310,1313-1321
+src/watch.rs
+  s_ff6622ece2e1c5::t_79f039d1a1f353 48
+docs/SPEC.md
+  s_ff6622ece2e1c5::t_8c7be28810eeb7 395-397
+src/sessions.rs
+  s_ff6622ece2e1c5::t_49e55839cb3ff2 124-125,290-291,357-361,379,392,664
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4cbff68f9064bfb1ff983d9c2b01d5b65a717ae3",
+  "prompts": {},
+  "sessions": {
+    "s_ff6622ece2e1c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a8a4-7158-72f2-849f-4a62566c911b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
