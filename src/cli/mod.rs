@@ -236,9 +236,9 @@ enum Cmd {
     },
     /// Nodes whose absolute bounds contain a point, sorted by area ascending.
     At {
-        #[arg(long)]
+        #[arg(long, value_parser = finite_coordinate)]
         x: f64,
-        #[arg(long)]
+        #[arg(long, value_parser = finite_coordinate)]
         y: f64,
     },
     /// Download node renders and/or fill images to --out, caching by file version.
@@ -262,6 +262,19 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+}
+
+/// Non-finite coordinates cannot round-trip through JSON (they become
+/// `null`), so reject them consistently before direct or socket dispatch.
+fn finite_coordinate(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| "expected a finite number".to_string())?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err("expected a finite number".into())
+    }
 }
 
 /// Sentinel [`dispatch`]/[`write_json`] error string meaning "stdout
@@ -369,6 +382,10 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             return write_json(&socket::tools_rows(&tools));
         }
         return call::cmd_tools(upstream.clone(), *no_upstream);
+    }
+
+    if let Cmd::Call { tool, args, .. } = &cli.cmd {
+        call::validate_local_args(tool, &call::parse_args(args.as_deref())?)?;
     }
 
     // Socket routing (spec §1): every read command plus `call` first tries
@@ -525,6 +542,9 @@ fn is_per_file_local_tool(tool: &str) -> bool {
 /// fails direct, breaking the very byte-compatibility this routing exists
 /// to preserve (see `read_command`'s socket caller).
 fn with_current_file(mut args: Value) -> Result<Value, String> {
+    if args.is_null() {
+        args = json!({});
+    }
     // Preserve explicit non-null values for the local tool's own argument
     // handling, even when they cannot select a mirror.
     let has_file = args.get("file").is_some_and(|value| !value.is_null());
@@ -1004,6 +1024,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn at_rejects_non_finite_coordinates_before_dispatch() {
+        for coordinate in ["NaN", "inf", "-inf", "1e400"] {
+            for axis in ["--x", "--y"] {
+                let value = format!("{axis}={coordinate}");
+                let other = if axis == "--x" { "--y=1" } else { "--x=1" };
+                let error = Cli::try_parse_from(["figmog", "at", &value, other])
+                    .err()
+                    .unwrap();
+                assert!(
+                    error.to_string().contains("expected a finite number"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
     /// NWS-2902: every clap read command's socket form parses back to the
     /// same typed command the direct path executes, and the socket JSON
     /// keeps its pre-refactor shape (absent optionals omitted, flags and
@@ -1032,6 +1069,11 @@ mod tests {
                 &["find", "--type", "TEXT", "--under", "1:1"],
                 "figmog_find",
                 json!({"type": "TEXT", "under": "1:1"}),
+            ),
+            (
+                &["find", "--type", "TEXT", "--page", "0:1"],
+                "figmog_find",
+                json!({"type": "TEXT", "page": "0:1"}),
             ),
             (
                 &["search", "x"],
@@ -1063,6 +1105,24 @@ mod tests {
                 &["where", "--pointer", "/a", "--equals", "VERTICAL"],
                 "figmog_where",
                 json!({"pointer": "/a", "equals": "VERTICAL"}),
+            ),
+            (
+                &[
+                    "where",
+                    "--pointer",
+                    "/a",
+                    "--equals",
+                    "VERTICAL",
+                    "--page",
+                    "0:1",
+                ],
+                "figmog_where",
+                json!({"pointer": "/a", "equals": "VERTICAL", "page": "0:1"}),
+            ),
+            (
+                &["text", "--page", "0:1", "--under", "1:1"],
+                "figmog_text",
+                json!({"page": "0:1", "under": "1:1"}),
             ),
             (
                 &["at", "--x", "1.5", "--y", "2"],

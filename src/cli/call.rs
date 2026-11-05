@@ -112,9 +112,7 @@ pub(super) fn cmd_call(
     // nor `do_pull` reads it; still reject a wrong-typed one as serve does
     // (NWS-2944) — before the `figmog_sync` early return and before any
     // store is opened.
-    if proxy::is_local_tool(&tool) {
-        dispatch::arg_str(&args, "file")?;
-    }
+    validate_local_args(&tool, &args)?;
 
     // `figmog_sync` delegates entirely to `do_pull`, which opens its own
     // `open_store!` handle at `db.path`. fjall allows only one open handle
@@ -159,6 +157,17 @@ pub(super) fn cmd_call(
     };
 
     print_call_result(result)
+}
+
+/// Reject malformed local calls before mirror selection, socket routing,
+/// upstream attachment, or opening a store can have side effects.
+pub(super) fn validate_local_args(tool: &str, args: &Value) -> Result<(), String> {
+    if proxy::is_local_tool(tool) {
+        dispatch::validate_object_args(args)?;
+        dispatch::arg_str(args, "file")?;
+        dispatch::ReadCommand::from_tool_args(tool, args)?;
+    }
+    Ok(())
 }
 
 /// Parse call arguments identically for mirror selection and dispatch.

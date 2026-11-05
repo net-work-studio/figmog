@@ -639,14 +639,20 @@ fn stdin_eof_stops_the_desktop_queue_but_delivers_the_in_flight_call() {
     )))
     .unwrap();
     tx.send(Incoming::StdinClosed).unwrap();
-    let drained = stdout.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(drained["id"], "img2", "{drained}");
-    assert_eq!(drained["result"]["isError"], true, "{drained}");
+    let mut responses = BTreeMap::new();
+    // Both queued calls are rejected before either active operation is
+    // released. Their relative completion order is intentionally free.
+    for _ in 0..2 {
+        let response = stdout.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        responses.insert(response["id"].as_str().unwrap().to_string(), response);
+    }
+    assert!(responses.contains_key("img2"));
+    assert!(responses.contains_key("b"));
 
     desktop_release.send(()).unwrap();
     image_release.send(()).unwrap();
-    let mut responses = BTreeMap::new();
-    for _ in 0..3 {
+    for _ in 0..2 {
         let response = stdout.recv_timeout(Duration::from_secs(5)).unwrap();
         responses.insert(response["id"].as_str().unwrap().to_string(), response);
     }
@@ -696,6 +702,8 @@ fn broken_stdout_stops_the_desktop_queue_before_waiting_for_reads() {
     let read_gate = Arc::new(Mutex::new(read_gate));
     let mut offload = Offload::new(Some(desktop));
     offload.exit_drain = Duration::from_secs(3);
+    let (stopped_tx, stopped) = mpsc::channel();
+    offload.stopped = Some(stopped_tx);
     offload.reads.before_read = Some(Arc::new(move |name: &str| {
         let _ = read_seen_tx.send(name.to_string());
         let _ = read_gate
@@ -753,7 +761,7 @@ fn broken_stdout_stops_the_desktop_queue_before_waiting_for_reads() {
         json!({"jsonrpc":"2.0", "id":"p", "method":"ping"}).to_string(),
     ))
     .unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    stopped.recv_timeout(Duration::from_secs(5)).unwrap();
     // A completes during that wait; B must not be sent upstream.
     desktop_release.send(()).unwrap();
     assert!(

@@ -1093,7 +1093,7 @@ fn call_rejects_wrong_typed_optional_args() {
         (
             "figmog_tree",
             serde_json::json!({"depth": 1.5}),
-            "expected integer for `depth`, got number",
+            "expected integer for `depth`, got floating-point number 1.5",
         ),
         (
             "figmog_search",
@@ -1159,6 +1159,50 @@ fn call_rejects_wrong_typed_optional_args() {
             .is_none_or(|c| c.as_array().unwrap().is_empty()),
         "{v}"
     );
+}
+
+#[test]
+fn invalid_local_calls_fail_before_creating_a_mirror() {
+    for (tool, args, error) in [
+        (
+            "figmog_tree",
+            r#""x""#,
+            "expected object for `arguments`, got string",
+        ),
+        (
+            "figmog_tree",
+            "[1,2]",
+            "expected object for `arguments`, got array",
+        ),
+        (
+            "figmog_sync",
+            "true",
+            "expected object for `arguments`, got boolean",
+        ),
+        (
+            "figmog_tree",
+            r#"{"file":"unopenedkey12345","depth":"bad"}"#,
+            "expected integer for `depth`, got string",
+        ),
+    ] {
+        for direct_db in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("db");
+            let mut command = common::command();
+            command
+                .current_dir(dir.path())
+                .args(["call", tool, "--args", args, "--no-upstream"]);
+            if direct_db {
+                command.args(["--db", db.to_str().unwrap()]);
+            }
+            let out = command.assert().failure().code(1);
+            let stderr: serde_json::Value =
+                serde_json::from_slice(&out.get_output().stderr).unwrap();
+            assert_eq!(stderr["error"], error);
+            assert!(!db.exists());
+            assert!(!dir.path().join(".figmog").exists());
+        }
+    }
 }
 
 #[test]
@@ -2255,6 +2299,39 @@ fn direct_cli_and_call_print_identical_reads_for_every_local_tool() {
         read(&["where", "--pointer", "/layoutMode", "--equals", "null"]),
         serde_json::json!([])
     );
+    for (flagged, baseline) in [
+        (vec!["tree", "1:1", "--depth", "1"], vec!["tree", "1:1"]),
+        (
+            vec!["find", "--type", "TEXT", "--page", "0:1"],
+            vec!["find", "--type", "TEXT"],
+        ),
+        (
+            vec!["where", "--pointer", "/layoutMode", "--equals", "VERTICAL"],
+            vec!["where", "--pointer", "/layoutMode"],
+        ),
+        (
+            vec![
+                "where",
+                "--pointer",
+                "/layoutMode",
+                "--equals",
+                "VERTICAL",
+                "--page",
+                "0:1",
+            ],
+            vec!["where", "--pointer", "/layoutMode", "--equals", "VERTICAL"],
+        ),
+        (
+            vec!["text", "--page", "0:1", "--under", "1:1"],
+            vec!["text", "--page", "0:1"],
+        ),
+    ] {
+        assert_ne!(
+            read(&flagged),
+            read(&baseline),
+            "{flagged:?} must exercise its flag"
+        );
+    }
     let projected = read(&["dump", "1:1", "--depth", "1", "--fields", "id,name,fills"]);
     assert!(projected.get("layoutMode").is_none(), "{projected}");
     assert!(projected.get("fills").is_some(), "{projected}");

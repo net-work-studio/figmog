@@ -358,25 +358,31 @@ fn spawn_socket_acceptor(
             }
 
             let tx = tx.clone();
-            let registry = registry.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream);
-                loop {
-                    match read_bounded_line(&mut reader) {
-                        Ok(None) => break,
-                        Ok(Some(l)) => {
-                            if tx.send(Incoming::Socket(conn_id, l)).is_err() {
-                                break;
+            let reader_registry = registry.clone();
+            let reader = std::thread::Builder::new()
+                .name(format!("figmog-socket-reader-{conn_id}"))
+                .spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        match read_bounded_line(&mut reader) {
+                            Ok(None) => break,
+                            Ok(Some(l)) => {
+                                if tx.send(Incoming::Socket(conn_id, l)).is_err() {
+                                    break;
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
-                }
-                // The client disconnected, sent something unreadable, or
-                // was dropped by its writer: a response computed after this
-                // point finds no entry, and its pending reads are skipped.
+                    // The client disconnected, sent something unreadable, or
+                    // was dropped by its writer: a response computed after this
+                    // point finds no entry, and its pending reads are skipped.
+                    reader_registry.unregister(conn_id);
+                });
+            if let Err(error) = reader {
                 registry.unregister(conn_id);
-            });
+                eprintln!("figmog: could not start socket reader: {error}");
+            }
         }
     });
 }
@@ -681,6 +687,9 @@ struct Offload {
     reads_in_flight: std::collections::BTreeSet<u64>,
     /// How long shutdown may take: [`EXIT_DRAIN`] (tests shorten it).
     exit_drain: Duration,
+    /// Observe the shutdown boundary without scheduling sleeps in tests.
+    #[cfg(test)]
+    stopped: Option<mpsc::Sender<()>>,
 }
 
 /// Completion polling interval while worker reads are outstanding, so a
@@ -699,6 +708,8 @@ impl Offload {
             staged: None,
             reads_in_flight: std::collections::BTreeSet::new(),
             exit_drain: EXIT_DRAIN,
+            #[cfg(test)]
+            stopped: None,
         }
     }
 
@@ -899,6 +910,10 @@ fn serve_loop_with_offload(
     if let Some(desktop) = &offload.desktop {
         desktop.stop_taking_jobs();
     }
+    #[cfg(test)]
+    if let Some(stopped) = offload.stopped.take() {
+        let _ = stopped.send(());
+    }
     let deadline = Instant::now() + offload.exit_drain;
     if matches!(exit, LoopExit::Drain) {
         drain_on_exit(
@@ -1034,6 +1049,7 @@ fn request_loop(
             .desktop
             .as_ref()
             .map_or("disabled", DesktopWorker::status);
+        let list_changes = offload.desktop.is_some();
         let mut handler = LoopHandler::new(
             |name: &str, args: &Value| -> Result<ToolOutput, String> {
                 if over_limit {
@@ -1052,6 +1068,7 @@ fn request_loop(
                 )
             },
         );
+        handler.list_changes = list_changes;
         let reply = mcp::dispatch_message(&line, &tools, &mut handler, mode);
         let LoopHandler {
             initialized,
@@ -1091,7 +1108,7 @@ fn request_loop(
 
 /// The local registry merged with the desktop's current tools (none when
 /// it is missing or disabled). Collisions are dropped and logged on every
-/// merge (spec §8); the order is local tools, then the desktop's own order.
+/// merge (spec §8); the order is local tools, then canonical desktop order.
 fn merged_registry(desktop: Option<&DesktopWorker>) -> Vec<mcp::ToolDef> {
     let (tools, dropped) = match desktop {
         Some(desktop) => proxy::merge_registry(dispatch::tool_registry(), desktop.tools()),
@@ -1107,6 +1124,7 @@ fn merged_registry(desktop: Option<&DesktopWorker>) -> Vec<mcp::ToolDef> {
 /// protocol events the loop acts on after dispatch (NWS-2959).
 struct LoopHandler<F> {
     call: F,
+    list_changes: bool,
     /// The client sent `initialize`.
     initialized: bool,
     /// A `tools/call` was refused as an unknown tool.
@@ -1117,6 +1135,7 @@ impl<F> LoopHandler<F> {
     fn new(call: F) -> Self {
         Self {
             call,
+            list_changes: false,
             initialized: false,
             unknown_tool: None,
         }
@@ -1124,6 +1143,10 @@ impl<F> LoopHandler<F> {
 }
 
 impl<F: FnMut(&str, &Value) -> Result<ToolOutput, String>> mcp::ToolHandler for LoopHandler<F> {
+    fn tools_list_changes(&self) -> bool {
+        self.list_changes
+    }
+
     fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String> {
         (self.call)(name, args)
     }
@@ -1401,6 +1424,18 @@ fn handle_tool_call(
     name: &str,
     args: &Value,
 ) -> Result<ToolOutput, String> {
+    // Reject disconnected requests before any store open, pull, or upstream
+    // operation; frames can outlive their connection in the input channel.
+    if cancel.load(Ordering::Relaxed) {
+        return Err("request cancelled: its connection closed".into());
+    }
+    if proxy::is_local_tool(name) {
+        dispatch::validate_object_args(args)?;
+        // Type errors must win over routing/not-ready errors and must not
+        // auto-open a mirror or queue a pull. Execution keeps using the
+        // shared dispatcher against the selected published view below.
+        dispatch::ReadCommand::from_tool_args(name, args)?;
+    }
     if name == "figmog_files" {
         let read = manager.files_read();
         return offload.defer_read(cancel, ReadTask::Files(read));
@@ -1515,6 +1550,7 @@ fn handle_tool_call(
             name: name.to_string(),
             args: args.clone(),
             reply,
+            cancel: cancel.clone(),
         });
     }
     Ok(ToolOutput::Deferred(token))

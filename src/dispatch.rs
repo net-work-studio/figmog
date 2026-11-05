@@ -60,6 +60,19 @@ pub(crate) type RootReaders<'a, R> = (
 
 // ---- arg extraction ----
 
+/// Local tool arguments must be an object. `null` keeps the protocol's
+/// absent-arguments behavior; other JSON types cannot carry named fields.
+pub(crate) fn validate_object_args(args: &Value) -> Result<(), String> {
+    if args.is_object() || args.is_null() {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected object for `arguments`, got {}",
+            json_type_name(args)
+        ))
+    }
+}
+
 /// The value of an optional argument, treating an omitted key and an
 /// explicit JSON `null` alike as "absent" (NWS-2944) — `figmog images`
 /// itself sends `"scale": null` for an unset `--scale`, and a client that
@@ -114,8 +127,9 @@ pub(crate) fn require_str(args: &Value, key: &str) -> Result<String, String> {
 
 /// Optional non-negative integer field (`depth`, `limit`). Absent/`null`
 /// ⇒ `Ok(None)`. A non-number ⇒ `"expected integer for `key`, got
-/// string"`; a fractional number ⇒ `"… got number"`; a negative integer ⇒
-/// `"expected non-negative integer for `key`, got -1"` (NWS-2944 — a
+/// string"`; a floating-point representation ⇒ `"… got floating-point
+/// number 2.0"`; a negative integer ⇒ `"expected non-negative integer for
+/// `key`, got -1"` (NWS-2944 — a
 /// string `depth` used to read as "unlimited").
 pub(crate) fn arg_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
     let Some(v) = optional_arg(args, key) else {
@@ -127,6 +141,9 @@ pub(crate) fn arg_usize(args: &Value, key: &str) -> Result<Option<usize>, String
     match v.as_i64() {
         Some(n) => Err(format!(
             "expected non-negative integer for `{key}`, got {n}"
+        )),
+        None if v.is_number() => Err(format!(
+            "expected integer for `{key}`, got floating-point number {v}"
         )),
         None => Err(format!(
             "expected integer for `{key}`, got {}",
@@ -332,6 +349,29 @@ impl ReadCommand {
     /// helpers, so the first bad argument names the error (NWS-2944).
     /// Unknown keys — the routing `file` among them — are ignored.
     pub(crate) fn from_tool_args(name: &str, args: &Value) -> Result<Option<Self>, String> {
+        if !matches!(
+            name,
+            "figmog_status"
+                | "figmog_pages"
+                | "figmog_tree"
+                | "figmog_node"
+                | "figmog_subtree"
+                | "figmog_find"
+                | "figmog_search"
+                | "figmog_instances"
+                | "figmog_components"
+                | "figmog_styles"
+                | "figmog_uses"
+                | "figmog_vars"
+                | "figmog_stats"
+                | "figmog_path"
+                | "figmog_text"
+                | "figmog_where"
+                | "figmog_at"
+        ) {
+            return Ok(None);
+        }
+        validate_object_args(args)?;
         Ok(Some(match name {
             "figmog_status" => Self::Status,
             "figmog_pages" => Self::Pages,
@@ -698,7 +738,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Root node id; defaults to the DOCUMENT node."},
-                    "depth": {"type": "integer", "description": "Max depth to descend; omitted means unlimited."}
+                    "depth": {"type": "integer", "minimum": 0, "description": "Max depth to descend; omitted means unlimited."}
                 }
             }),
         },
@@ -722,7 +762,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Root node id (12:34 or 12-34 form)."},
-                    "depth": {"type": "integer", "description": "Max depth to descend; omitted means unlimited."},
+                    "depth": {"type": "integer", "minimum": 0, "description": "Max depth to descend; omitted means unlimited."},
                     "fields": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -753,7 +793,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "description": "Max hits (default 10)."},
+                    "limit": {"type": "integer", "minimum": 0, "description": "Max hits (default 10)."},
                     "under": {"type": "string", "description": "Scope to the subtree rooted at this node id (inclusive)."}
                 },
                 "required": ["query"]
@@ -993,7 +1033,7 @@ mod tests {
             ),
             (
                 arg_usize(&json!({"depth": 1.5}), "depth").map(drop),
-                "expected integer for `depth`, got number",
+                "expected integer for `depth`, got floating-point number 1.5",
             ),
             (
                 arg_usize(&json!({"depth": -1}), "depth").map(drop),
@@ -1030,6 +1070,30 @@ mod tests {
         ];
         for (got, want) in cases {
             assert_eq!(got, Err(want.to_string()));
+        }
+    }
+
+    #[test]
+    fn read_arguments_require_an_object_but_null_keeps_defaults() {
+        for args in [json!("x"), json!([1, 2]), json!(17), json!(false)] {
+            assert!(
+                ReadCommand::from_tool_args("figmog_tree", &args)
+                    .unwrap_err()
+                    .starts_with("expected object for `arguments`, got ")
+            );
+            assert_eq!(ReadCommand::from_tool_args("desktop_tool", &args), Ok(None));
+        }
+        assert_eq!(
+            ReadCommand::from_tool_args("figmog_tree", &Value::Null),
+            ReadCommand::from_tool_args("figmog_tree", &json!({}))
+        );
+        for raw in ["2.0", "-0", "1e20"] {
+            let number: Value = serde_json::from_str(raw).unwrap();
+            let error = arg_usize(&json!({"depth": number}), "depth").unwrap_err();
+            assert!(
+                error.contains("got floating-point number"),
+                "{raw}: {error}"
+            );
         }
     }
 

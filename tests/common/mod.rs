@@ -216,7 +216,8 @@ pub fn store_snapshot(
 /// [`fixture_v1`] plus twelve "garden bed" TEXT nodes on the Empty page, so
 /// `search garden` has more hits than the default limit of 10 — the
 /// read-adapter parity tests (NWS-2902) need omission of `limit` to be
-/// observable, not just "every hit fits either way".
+/// observable, not just "every hit fits either way". Additional nested,
+/// sibling and cross-page nodes make each scope and depth flag observable.
 #[allow(dead_code)]
 pub fn parity_fixture() -> Value {
     let mut v = fixture_v1();
@@ -229,6 +230,31 @@ pub fn parity_fixture() -> Value {
         })
         .collect();
     v["document"]["children"][2]["children"] = Value::Array(beds);
+    // Depth, equality, page and subtree scopes must each remove results,
+    // otherwise dropping one flag in an adapter would still pass parity.
+    v["document"]["children"][0]["children"][0]["children"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "1:4", "name": "Nested", "type": "FRAME", "children": [
+                {"id": "1:5", "name": "Nested text", "type": "TEXT",
+                 "characters": "A deeper title", "children": []}
+            ]
+        }));
+    v["document"]["children"][0]["children"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!({"id": "1:6", "name": "Outside text", "type": "TEXT",
+               "characters": "Outside the hero", "children": []}),
+            json!({"id": "1:7", "name": "Row", "type": "FRAME",
+               "layoutMode": "HORIZONTAL", "children": []}),
+        ]);
+    v["document"]["children"][1]["children"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": "2:4", "name": "Column", "type": "FRAME",
+               "layoutMode": "VERTICAL", "children": []}));
     v
 }
 
@@ -236,8 +262,8 @@ pub fn parity_fixture() -> Value {
 /// CLI command, the equivalent local tool name, and the tool arguments a
 /// `figmog call`/MCP client would send for the same query. Covers every
 /// local read tool with representative defaults, options and omission
-/// forms (omitted vs explicit-`null` optionals, subtree `fields`, search's
-/// default `limit`, `where` with no `equals` vs `equals: null`).
+/// forms (subtree `fields`, search's default `limit`, `where` with no
+/// `equals` vs `equals: null`). Null optionals are covered by parser tests.
 #[allow(dead_code)]
 pub fn read_parity_cases() -> Vec<(Vec<&'static str>, &'static str, Value)> {
     vec![
@@ -245,32 +271,17 @@ pub fn read_parity_cases() -> Vec<(Vec<&'static str>, &'static str, Value)> {
         (vec!["pages"], "figmog_pages", json!({})),
         (vec!["tree"], "figmog_tree", json!({})),
         (
-            vec!["tree"],
-            "figmog_tree",
-            json!({"id": null, "depth": null}),
-        ),
-        (
             vec!["tree", "1:1", "--depth", "1"],
             "figmog_tree",
             json!({"id": "1:1", "depth": 1}),
         ),
         (vec!["get", "1:1"], "figmog_node", json!({"id": "1:1"})),
         (
-            vec!["get", "1:1"],
-            "figmog_node",
-            json!({"id": "1:1", "children": null, "resolve_vars": false}),
-        ),
-        (
             vec!["get", "1:1", "--children", "--resolve-vars"],
             "figmog_node",
             json!({"id": "1:1", "children": true, "resolve_vars": true}),
         ),
         (vec!["dump", "1:1"], "figmog_subtree", json!({"id": "1:1"})),
-        (
-            vec!["dump", "1:1"],
-            "figmog_subtree",
-            json!({"id": "1:1", "depth": null, "fields": null, "resolve_vars": null}),
-        ),
         (
             vec!["dump", "1:1", "--depth", "1", "--fields", "id,name,fills"],
             "figmog_subtree",
@@ -287,9 +298,9 @@ pub fn read_parity_cases() -> Vec<(Vec<&'static str>, &'static str, Value)> {
             json!({"type": "TEXT"}),
         ),
         (
-            vec!["find", "--type", "COMPONENT", "--page", "0:2"],
+            vec!["find", "--type", "TEXT", "--page", "0:1"],
             "figmog_find",
-            json!({"type": "COMPONENT", "page": "0:2"}),
+            json!({"type": "TEXT", "page": "0:1"}),
         ),
         (
             vec!["find", "--type", "TEXT", "--under", "1:1"],
@@ -300,11 +311,6 @@ pub fn read_parity_cases() -> Vec<(Vec<&'static str>, &'static str, Value)> {
             vec!["search", "garden"],
             "figmog_search",
             json!({"query": "garden"}),
-        ),
-        (
-            vec!["search", "garden"],
-            "figmog_search",
-            json!({"query": "garden", "limit": null}),
         ),
         (
             vec!["search", "garden", "-n", "3", "--under", "0:3"],

@@ -1061,11 +1061,26 @@ impl SessionManager {
             }
             let key = session.key.clone();
             let reopen = session.reopen.clone();
+            // A sync accepted while reads were draining has an acknowledged
+            // job id. Carry that pending work into the reopened session.
+            let session = &mut self.sessions[index];
+            let job = session
+                .job
+                .take()
+                .filter(|job| job.state == JobState::Queued);
+            let queued = session.queued.take();
+            let next_job = session.next_job;
             // Closing the old session joins its idle worker and releases
             // the store before it is reopened.
             drop(self.sessions.remove(index));
             match reopen() {
-                Ok(session) => {
+                Ok(mut session) => {
+                    session.next_job = next_job;
+                    if let Some(job) = job {
+                        session.geometry |= job.geometry;
+                        session.job = Some(job);
+                    }
+                    session.queued = queued;
                     self.sessions.insert(index, session);
                     index += 1;
                     finished.push((key, Ok(())));
@@ -1084,7 +1099,14 @@ impl SessionManager {
             session.gate.close();
         }
         for session in &self.sessions {
-            session.gate.wait_drained(deadline);
+            if !session.gate.wait_drained(deadline) {
+                // A detached read still owns its SessionView. Fold's
+                // TableReaders retain the fjall Keyspace/LockedFileGuard,
+                // so releasing OwnedStore's .figmog-lock cannot let another
+                // open (and thus a reset) succeed until that view drops.
+                // Waiting here would defeat the bounded shutdown deadline.
+                debug_assert!(session.gate.is_closed());
+            }
         }
     }
 }

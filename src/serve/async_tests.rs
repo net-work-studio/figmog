@@ -11,6 +11,92 @@ fn fixture(version: &str) -> Value {
         "document": {"id": "0:0", "name": version, "type": "DOCUMENT"}})
 }
 
+#[test]
+fn invalid_local_arguments_do_not_open_or_pull_a_mirror() {
+    let mut h = Harness::new();
+    let missing = "NEW1234567890";
+    for (name, args) in [
+        ("figmog_tree", json!({"file": missing, "depth": "bad"})),
+        (
+            "figmog_search",
+            json!({"file": missing, "query": "q", "limit": false}),
+        ),
+        ("figmog_tree", json!([1, 2])),
+    ] {
+        let response = h.call(name, args);
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let error = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("expected"), "{error}");
+        assert!(!error.contains("not ready"), "{error}");
+    }
+    assert_eq!(h.manager.sessions.len(), 1);
+    assert!(!h.manager.root.join(missing).exists());
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn cancelled_socket_calls_cannot_open_sync_or_forward() {
+    let mut h = Harness::new();
+    let mut offload = Offload::new(None);
+    let cancelled = Arc::new(AtomicBool::new(true));
+    for name in ["figmog_open", "figmog_sync", "figmog_tree", "set_node_name"] {
+        let result = handle_tool_call(
+            &mut h.manager,
+            &mut offload,
+            &cancelled,
+            "disabled",
+            Duration::ZERO,
+            name,
+            &json!({"file": "NEW1234567890"}),
+        );
+        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+    }
+    assert_eq!(h.manager.sessions.len(), 1);
+    assert!(!h.manager.root.join("NEW1234567890").exists());
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn detached_read_keeps_fjall_store_locked_after_session_closes() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    let lease = h.manager.sessions[0].lease().unwrap();
+    let path = h.manager.root.join("ABC1234567890/db");
+    h.manager.close_reads(Instant::now());
+    h.manager.sessions.clear();
+    let result = crate::cli::open_store_checked(&path, |path| crate::open_store!(path));
+    assert!(matches!(result, Err(error) if error.contains("locked")));
+    assert!(sessions::read_tool(lease.view(), "figmog_node", &json!({"id":"0:0"})).is_ok());
+    drop(lease);
+    assert!(crate::cli::open_store_checked(&path, |path| crate::open_store!(path)).is_ok());
+}
+
+#[test]
+fn reset_preserves_a_pull_acknowledged_while_reads_drain() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    let lease = h.manager.sessions[0].lease().unwrap();
+    h.manager
+        .begin_reset("ABC1234567890", sessions::StoreReset::Reopen)
+        .unwrap();
+    let accepted = h.value("figmog_sync", json!({}));
+    assert!(h.manager.service_resets().is_empty());
+    drop(lease);
+    assert!(h.manager.service_resets().pop().unwrap().1.is_ok());
+    h.manager.sessions[0].maintain(false);
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    let status = h.wait_for("succeeded");
+    assert_eq!(status["pull"]["last_success"]["job_id"], accepted["job_id"]);
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 2);
+}
+
 struct Api {
     response: Mutex<Result<Value, ApiError>>,
     metadata: Mutex<String>,

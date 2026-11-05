@@ -363,10 +363,12 @@ Polls and pulls execute serially on the file's worker. No poll observed after
 a fetch can certify it, and no stale/out-of-order completion can overwrite
 a newer publication. The main loop consumes each completion once and only
 then updates the view, version/churn and default file's `.figmog/current`.
-A socket timeout/disconnect does not cancel accepted work. Stdin EOF or a
-broken stdout pipe shuts down the server: it stops accepting work, discards
-control-plane queued follow-ups, and joins workers after commands already
-sent to them finish. Forced process termination may interrupt work; fold's
+A socket timeout/disconnect does not cancel accepted file-worker work.
+Queued reads and desktop calls are skipped once their requester disconnects;
+frames still waiting on the control plane cannot open or sync a mirror.
+Stdin EOF or a broken stdout pipe shuts down the server using the bounded
+read/desktop/writer drain described in §6a. Running file-worker commands
+finish before their stores close; control-plane follow-ups are discarded. Forced process termination may interrupt work; fold's
 atomic transaction protects the store. Job history is not persisted.
 
 **Dependency justification:** `fjall` and `self_cell` were already transitive
@@ -407,16 +409,16 @@ panic.
 client and never runs a whole-mirror scan.
 
 - *Heavy reads run on read workers.* Every local read except the point
-  lookups `figmog_pages`, `figmog_node` and `figmog_path` (bounded by the
-  page count, one node with its direct children and bindings, and its
-  depth) — i.e. `figmog_components`, `figmog_tree`, `figmog_subtree`,
+  lookups `figmog_pages` and `figmog_path` (bounded by page count and node
+  depth) — i.e. `figmog_node`, `figmog_components`, `figmog_tree`, `figmog_subtree`,
   `figmog_find`, `figmog_search`, `figmog_instances`, `figmog_styles`,
   `figmog_uses`, `figmog_vars`, `figmog_stats`, `figmog_text`,
   `figmog_where`, `figmog_at`, plus `figmog_status` and `figmog_files`
   (their node count scans the mirror) — runs on a pool of
   `min(4, available_parallelism)` read workers. Classification is by
-  measured cost on a synthetic 100k-node mirror: the inline three take
-  under 0.2 ms; `figmog_components` is O(sets × components) — 0.34 s on
+  measured cost on a synthetic 100k-node mirror: the inline lookups take
+  under 0.2 ms. Node reads always run on workers because a single raw
+  payload or its direct child list can be arbitrarily large; `figmog_components` is O(sets × components) — 0.34 s on
   a 2k-set × 20k-component library (`measure_components_cost`); status ~90 ms, stats ~0.5 s, a whole-document subtree
   ~0.4 s (≈20 MB), vars ~0.3 s, tree/where ~0.2–0.4 s, the rest 25–150 ms
   (`measure_read_costs`, an ignored test). Routing, the not-ready check
@@ -432,8 +434,14 @@ client and never runs a whole-mirror scan.
   `tools/call` from it is refused at once with `too many pending
   requests on this connection (limit 32); …` (socket `-32000`, stdio
   `isError`).
-- *Dropped connections cost nothing more.* A read whose connection has
-  closed or been dropped is not started (if queued) or not accepted.
+- *Global bounds.* At most 128 reads wait in the shared read queue,
+  plus the running workers. At most 128 desktop calls wait behind its
+  active operation. A full queue answers with a busy tool error. The
+  socket admits at most 64 connections, including writers still flushing
+  after their readers close; excess connections are closed.
+- *Dropped connections cost nothing more.* A read or desktop call whose
+  connection has closed or been dropped is not started (if queued) or
+  accepted. An already-running upstream operation cannot be cancelled.
 - *Reset barrier (per store).* A store close or reset (1) validates its
   input, (2) stops admitting reads for that store only (its data reads,
   inline or worker, are refused with "this mirror's store is being reset;
@@ -446,10 +454,13 @@ client and never runs a whole-mirror scan.
   applies steps 2–3 (bounded by the exit drain) before closing stores; a
   worker read still running at the exit deadline is detached with its own
   lease rather than awaited, so shutdown stays within the deadline and no
-  store is reset or reopened under it. No
+  store is reset or reopened under it: the leased fold readers retain
+  fjall's own keyspace lock even after `.figmog-lock` is released. A pull
+  acknowledged while reset is pending retains its job id and runs after
+  reopening. No
   tool resets a store yet; `SessionManager::begin_reset` /
   `service_resets` are the mechanism NWS-2963 builds on (its only
-  operation today is a close-and-reopen, which starts fresh job history).
+  operation today is a close-and-reopen, which clears completed job history).
 
 **Off-loop images and desktop calls (NWS-2955):** `figmog_images` and
 proxied desktop calls are answered later instead of on the loop, so a slow
@@ -458,7 +469,9 @@ call (10-second timeout) never delays other requests. `figmog_images` runs
 on its file's worker, which owns the cache writes; desktop calls run one at
 a time, in arrival order, on a single desktop worker that owns the upstream
 connection (results stay verbatim and uncached, §8); the desktop
-re-detection checks (§8) run on the same worker, between calls. The loop parks each
+re-detection checks (§8) run on the same worker, with a due recovery check
+ahead of queued calls. A check may issue several HTTP requests, each
+with its own timeout; no aggregate 10-second probe budget is promised. The loop parks each
 deferred call with its requester (stdio, or the socket connection id) and
 its JSON-RPC id, drains a completion channel every iteration (at most 20ms
 latency), and writes the response to that requester, framed exactly as an
@@ -638,7 +651,7 @@ write deadline from its first byte — the remaining time is re-applied
 before every 64 KiB write call, so a client that trickle-reads cannot
 renew it. A full queue or a missed deadline drops the connection: its
 socket is shut down, queued frames discarded, and its pending reads
-skipped. A client that closes its side has frames already queued flushed
+and desktop calls skipped. A client that closes its side has frames already queued flushed
 and later responses dropped; a vanished client is a silent no-op. Stdio
 has one client (the agent), so its writer thread has an unbounded queue
 and no drop policy (dropping it would be fatal); a broken stdout shuts
@@ -650,7 +663,7 @@ off-loop work finishes (§6), to the connection that asked.
 **Shutdown with deferred work:** on stdin EOF (or the request channel
 closing) serve stops accepting requests and starts no new work, but still
 writes the responses it owes, to stdio and to still-open sockets, for up to
-15 seconds (covering the desktop's 10-second timeout), so `printf
+15 seconds, so `printf
 '<request>\n' | figmog serve` gets its image or desktop response. Image
 requests still queued (not started) are answered with a shutting-down
 error, and the desktop worker stops taking queued calls (and skips queued
@@ -661,8 +674,12 @@ a write). Responses not ready by then are dropped. Worker reads still owed
 are answered within the same window; writer threads then get what is
 left of it to flush queued frames. A running image request
 still finishes before exit with its file's worker, like a running pull; the
-desktop worker is detached, its in-flight call bounded by the upstream
-timeout.
+desktop worker is detached. Each upstream HTTP request has a 10-second
+timeout, but a probe can need several requests and outlive this drain.
+Queued desktop calls receive their shutdown errors immediately, even when
+a probe is blocked. Socket writers still unfinished at the deadline are
+aborted; dropping a connection mid-response may leave a partial JSON frame
+followed by EOF.
 
 Socket `tools/call` registry and handler failures (including upstream
 protocol/transport failures) use a top-level JSON-RPC `error` with code
@@ -699,13 +716,14 @@ restart. Every check runs on the desktop worker (§6), never on the loop,
 with a 2 s connect timeout:
 
 - while the desktop is missing, a full handshake every 30 s;
-- while it is connected, an MCP `ping` on the current session every 60 s,
-  falling back to a fresh handshake if the ping fails (a restarted
+- while it is connected, an MCP `ping` and refreshed `tools/list` on the
+  current session every 60 s, falling back to a fresh handshake if it fails (a restarted
   desktop app does not know the old session);
 - immediately (at most once a second) when a desktop call fails below
   the tool level (transport or protocol error), and when a `tools/call`
   names a non-`figmog_*` tool that is not in the registry while the
-  desktop is missing.
+  desktop is missing. Recovery runs ahead of queued calls; calls wait for
+  the one-second minimum probe gap rather than using a known stale session.
 
 The desktop counts as gone only when a check fails: one failed or timed
 out call just triggers a check, and a tool-level `isError` result never
@@ -714,12 +732,14 @@ once with `unknown tool: <name>`; it is not held for the check it
 triggers. When a check changes the exposed upstream tool list, the
 registry is re-merged under the namespace rule below and every client that
 sent `initialize` gets `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`
-(`initialize` advertises `capabilities.tools.listChanged: true`). A check
+(`initialize` advertises `capabilities.tools.listChanged: true` when the
+desktop worker is enabled, and `false` under `--no-upstream`). Tool lists
+are sorted before comparison, so reordering alone sends nothing. A check
 that confirms the current state, or a reconnect with the same tools, sends
 nothing. `figmog_status`'s `upstream` follows the current state
 (`connected` / `unreachable`). `--no-upstream` starts no desktop worker,
-never probes, and reports `disabled`. Relaying serves do not forward
-these notifications yet (NWS-2953).
+never probes, and reports `disabled`. Forwarding change notifications
+through a second figmog server is deferred to NWS-2953.
 
 **Namespace rule:** `figmog_*` names are always local; every other name
 is proxied. `merge_registry` drops (and logs) any upstream tool whose

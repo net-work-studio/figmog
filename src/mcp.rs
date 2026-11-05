@@ -56,6 +56,11 @@ pub enum ToolOutput {
 pub trait ToolHandler {
     fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String>;
 
+    /// Whether this server can announce changes to its exposed tools.
+    fn tools_list_changes(&self) -> bool {
+        false
+    }
+
     /// The client sent `initialize`: it speaks MCP and may be sent
     /// notifications such as `notifications/tools/list_changed`.
     fn initialized(&mut self) {}
@@ -200,7 +205,7 @@ pub(crate) fn dispatch_message(
     let result = match method {
         "initialize" => {
             handler.initialized();
-            Some(initialize_result(&params))
+            Some(initialize_result(&params, handler.tools_list_changes()))
         }
         "ping" => Some(json!({})),
         "tools/list" => Some(tools_list_result(tools)),
@@ -250,14 +255,14 @@ fn call_response(id: Value, mode: ToolErrorMode, result: Result<Value, String>) 
     }
 }
 
-fn initialize_result(params: &Value) -> Value {
+fn initialize_result(params: &Value, list_changes: bool) -> Value {
     let protocol_version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_PROTOCOL_VERSION);
     json!({
         "protocolVersion": protocol_version,
-        "capabilities": {"tools": {"listChanged": true}},
+        "capabilities": {"tools": {"listChanged": list_changes}},
         "serverInfo": {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION"),
@@ -414,7 +419,7 @@ mod tests {
                 "id": 1,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {"listChanged": true}},
+                    "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "figmog", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": "figmog is your Figma server: a local, instant mirror of one Figma file plus a proxy to Figma's native capabilities. Call figmog for everything Figma-related. figmog_* tools answer from the local mirror at zero API cost; native-named tools (get_*, …) go live to Figma desktop and are forwarded uncached. Pass the Figma file URL as the `file` argument to figmog_* tools when you have one; figmog queues a background pull on first reference. Open/sync return a job acknowledgement; poll figmog_status or figmog_files for ready, progress, version/churn and errors.",
                 },
