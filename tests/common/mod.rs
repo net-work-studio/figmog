@@ -77,6 +77,33 @@ pub fn fixture_v1() -> Value {
     })
 }
 
+/// Point lookup fixture: 108 visible hits on page 1, overlapping page 2,
+/// and a hidden parent with a locally visible child at the same point.
+#[allow(dead_code)]
+pub fn fixture_at() -> Value {
+    let mut fixture = fixture_v1();
+    let pages = &mut fixture["document"]["children"];
+    let small = json!({"x": 0, "y": 0, "width": 5, "height": 5});
+    let medium = json!({"x": 0, "y": 0, "width": 10, "height": 10});
+    let tiny = json!({"x": 0, "y": 0, "width": 2, "height": 2});
+    pages[0]["children"][0]["children"][0]["absoluteBoundingBox"] = small;
+    pages[0]["children"][0]["children"][1]["absoluteBoundingBox"] = medium.clone();
+    pages[0]["children"][1]["absoluteBoundingBox"] = tiny.clone();
+    pages[0]["children"][1]["children"] = json!([{
+        "id": "1:10", "name": "Child of hidden badge", "type": "RECTANGLE",
+        "visible": true, "absoluteBoundingBox": tiny, "children": []
+    }]);
+    pages[1]["children"][0]["absoluteBoundingBox"] = tiny;
+    // Reverse document order deliberately: ties must still sort by id.
+    for i in (0..105).rev() {
+        pages[0]["children"].as_array_mut().unwrap().push(json!({
+            "id": format!("4:{i:03}"), "name": "Overlap", "type": "RECTANGLE",
+            "absoluteBoundingBox": medium, "children": []
+        }));
+    }
+    fixture
+}
+
 /// v1 plus: rename 1:2, delete 1:9, add 1:4, repoint instance 1:3 at the
 /// Small variant, bump version.
 #[allow(dead_code)] // not every test binary uses v2
@@ -373,9 +400,9 @@ pub fn read_parity_cases() -> Vec<(Vec<&'static str>, &'static str, Value)> {
             json!({"pointer": "/layoutMode", "equals": "VERTICAL", "page": "0:1"}),
         ),
         (
-            vec!["at", "--x", "10", "--y", "10"],
+            vec!["at", "--x", "10", "--y", "10", "--page", "0:1"],
             "figmog_at",
-            json!({"x": 10, "y": 10}),
+            json!({"x": 10, "y": 10, "page": "0:1"}),
         ),
     ]
 }

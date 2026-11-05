@@ -97,11 +97,11 @@ pub(super) fn do_pull(
     // `vars_resp` is only ever `Some` on the network path — `--from-file`
     // ingests a saved `GET /v1/files/:key` response and never touches the
     // network at all, so it never calls `variables_local` either.
-    let (resp, vars_resp): (Value, Option<Value>) = match from_file {
+    let (resp, vars_resp): (crate::deep_json::OwnedValue, Option<Value>) = match from_file {
         Some(path) => {
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("reading {}: {e}", path.display()))?;
-            let resp = serde_json::from_str(&content)
+            let resp = crate::deep_json::from_str(&content)
                 .map_err(|e| format!("parsing {}: {e}", path.display()))?;
             (resp, None)
         }
@@ -136,7 +136,7 @@ pub(super) fn do_pull(
             };
             let request_geometry = store::effective_geometry(geometry, stored_geometry);
             let api = UreqApi::new(token);
-            let resp = api.file(&key, request_geometry)?;
+            let resp = crate::deep_json::OwnedValue(api.file(&key, request_geometry)?);
             // Opportunistic Enterprise variables sync (spec §12): `Ok(None)`
             // on non-Enterprise plans is not an error — v1 behavior
             // (import/inference, sweep-exempt) holds unchanged below.
@@ -194,10 +194,11 @@ fn apply_pull(
     // here would hit the same single-open-per-process wall `figmog call
     // figmog_sync` used to.
     if prior_version.as_deref() != Some(flattened.file.version.as_str()) {
-        let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images, _, _)| {
+        let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images, pins, _)| {
             let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
             stale.extend(crate::store::stale_image_ids(
                 &images,
+                &pins,
                 &flattened.file.version,
             ));
             stale
@@ -355,6 +356,94 @@ mod tests {
             },
             "identical Enterprise re-pull must report zero churn"
         );
+    }
+
+    #[test]
+    fn enterprise_code_metadata_edits_count_but_provenance_only_edits_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let file = synthetic_file();
+        let mut vars = variables_export();
+        apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        for (key, value) in [
+            ("codeSyntax", serde_json::json!({"WEB": "--renamed"})),
+            ("hiddenFromPublishing", serde_json::json!(true)),
+            ("remote", serde_json::json!(true)),
+        ] {
+            vars["meta"]["variables"]["VariableID:100"][key] = value;
+            let (churn, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+            assert_eq!(
+                churn.changed, 1,
+                "code metadata edit to {key} must be observable"
+            );
+            assert_eq!(churn.added, 0);
+        }
+        vars["exportedAt"] = serde_json::json!("2026-11-01T12:00:00Z");
+        let (churn, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        assert_eq!(churn.changed, 0, "provenance alone must not cause churn");
+    }
+
+    #[test]
+    fn import_enterprise_plain_pull_and_reimport_replace_whole_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let path = dir.path().join("variables.json");
+        let imported = variables_export();
+        std::fs::write(&path, serde_json::to_vec(&imported).unwrap()).unwrap();
+        super::super::call::cmd_import_variables(&db, path.clone(), false, false).unwrap();
+        assert_eq!(snapshot_source(&db).as_deref(), Some("file"));
+        let mut enterprise = imported.clone();
+        enterprise["meta"]["variables"]
+            .as_object_mut()
+            .unwrap()
+            .remove("VariableID:200");
+        enterprise["meta"]["variableCollections"]
+            .as_object_mut()
+            .unwrap()
+            .remove("VariableCollectionId:2");
+        let (churn, ..) =
+            apply_pull(&db, &synthetic_file(), Some(&enterprise), false, false).unwrap();
+        assert_eq!(churn.removed, 2);
+        assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
+        let stored = {
+            let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            assert!(
+                st.get(&crate::model::Id::Variable("VariableID:200".into()))
+                    .is_none()
+            );
+            st.get(&crate::model::Id::VariableSnapshot)
+        };
+        apply_pull(&db, &synthetic_file(), None, false, false).unwrap();
+        {
+            let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            assert_eq!(st.get(&crate::model::Id::VariableSnapshot), stored);
+            assert!(
+                st.get(&crate::model::Id::Variable("VariableID:200".into()))
+                    .is_none()
+            );
+        }
+        // Reverse direction: a file import replaces the Enterprise snapshot.
+        super::super::call::cmd_import_variables(&db, path.clone(), false, false).unwrap();
+        assert_eq!(snapshot_source(&db).as_deref(), Some("file"));
+        {
+            let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            assert!(
+                st.get(&crate::model::Id::Variable("VariableID:200".into()))
+                    .is_some()
+            );
+        }
+        std::fs::write(&path, br#"{"variables":{},"variableCollections":{}}"#).unwrap();
+        super::super::call::cmd_import_variables(&db, path, true, false).unwrap();
+        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        st.rtx(|(_, _, _, _, variables, collections, ..)| {
+            assert!(collect_variable_ids(&variables, &collections).is_empty());
+        });
     }
 
     /// The first Enterprise pull after upgrading, onto a store that already

@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::json;
 
+use crate::deep_json::OwnedValue;
 use crate::mcp::{PendingCall, ToolOutput};
 use crate::session_view::ReadLease;
 use crate::sessions::{self, FilesRead, StatusRead};
@@ -47,7 +48,7 @@ pub(crate) enum ReadTask {
     Tool {
         lease: ReadLease,
         name: String,
-        args: Value,
+        args: OwnedValue,
         explicit_key: Option<String>,
         url_key: Option<String>,
     },
@@ -183,7 +184,8 @@ impl ReadPool {
                                     Err("read worker panicked; retry and inspect server stderr"
                                         .into())
                                 });
-                        let mut frame = call.finish(output).to_string();
+                        let response = OwnedValue(call.finish(output));
+                        let mut frame = crate::deep_json::to_string(&response.0).unwrap();
                         frame.push('\n');
                         reply.send_frame(frame);
                     }

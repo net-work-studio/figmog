@@ -13,6 +13,7 @@ pub(crate) const RESPONSE_BOUND: Duration = Duration::from_secs(2);
 const PEER_LIFETIME: Duration = Duration::from_secs(4);
 
 pub(crate) enum Reply {
+    Json(String),
     Complete(&'static str),
     /// Send a partial response, then keep the connection open.
     Stall(&'static str),
@@ -33,6 +34,10 @@ pub(crate) struct Peer {
 
 impl Peer {
     pub(crate) fn new(replies: Vec<Reply>) -> Self {
+        Self::with_startup_timeout(replies, Duration::from_secs(15))
+    }
+
+    pub(crate) fn with_startup_timeout(replies: Vec<Reply>, startup_timeout: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -42,7 +47,7 @@ impl Peer {
             for reply in replies {
                 // Serve tests open a store before starting their loop;
                 // allow startup time independently of the stalled reply.
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let deadline = Instant::now() + startup_timeout;
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
@@ -71,6 +76,10 @@ impl Peer {
                 }
                 let _ = seen.send(String::from_utf8(request).unwrap());
                 let response = match &reply {
+                    Reply::Json(body) => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ),
                     Reply::Complete(s) | Reply::Stall(s) | Reply::Trickle(s) => s.to_string(),
                     Reply::Redirect { location, after } => {
                         if stopped.recv_timeout(*after) != Err(mpsc::RecvTimeoutError::Timeout) {
@@ -85,7 +94,7 @@ impl Peer {
                     continue;
                 }
                 match reply {
-                    Reply::Complete(_) | Reply::Redirect { .. } => {}
+                    Reply::Json(_) | Reply::Complete(_) | Reply::Redirect { .. } => {}
                     Reply::Stall(_) => {
                         let _ = stopped.recv_timeout(PEER_LIFETIME);
                     }

@@ -241,7 +241,12 @@ fn status_value(
             .and_then(|view| status_json(view).ok())
             .unwrap_or_else(|| {
                 json!({"name": null, "version": null, "last_modified": null,
-                    "synced_at_unix_ms": null, "nodes": 0})
+                "synced_at_unix_ms": null, "nodes": 0,
+                "variables": view.map(|view| view.with_dependent(
+                    |_, (_, _, _, _, variables, collections, _, _, _, _, _, snapshot)| {
+                        crate::query::variable_snapshot(variables, collections, snapshot)
+                    }
+                ))})
             }),
     };
     value["ready"] = json!(mirrored);
@@ -293,8 +298,8 @@ impl FileSession {
     }
 
     /// The not-ready and resetting refusals every data read shares.
-    pub(crate) fn check_readable(&self) -> Result<(), String> {
-        if !self.mirrored {
+    fn check_readable(&self, name: &str) -> Result<(), String> {
+        if !(self.mirrored || name == "figmog_vars" && self.has_variable_state()) {
             return Err(format!(
                 "mirror {} is not ready; inspect figmog_status or figmog_files for pull progress and errors",
                 self.key
@@ -307,16 +312,33 @@ impl FileSession {
     }
 
     /// Admit one off-loop data read of the published view (NWS-2962).
+    #[cfg(test)]
     pub(crate) fn lease(&self) -> Result<ReadLease, String> {
-        self.check_readable()?;
+        self.lease_for("")
+    }
+
+    pub(crate) fn lease_for(&self, name: &str) -> Result<ReadLease, String> {
+        self.check_readable(name)?;
         self.gate
             .admit(&self.view)
             .ok_or_else(|| format!("mirror {}: {RESETTING}", self.key))
     }
 
     pub(crate) fn dispatch(&self, name: &str, args: &Value) -> Result<ToolOutput, String> {
-        self.check_readable()?;
+        self.check_readable(name)?;
         read_tool(&self.view, name, args)
+    }
+
+    fn variable_snapshot(&self) -> Value {
+        self.view.with_dependent(
+            |_, (_, _, _, _, variables, collections, _, _, _, _, _, snapshot)| {
+                crate::query::variable_snapshot(variables, collections, snapshot)
+            },
+        )
+    }
+
+    pub(crate) fn has_variable_state(&self) -> bool {
+        self.variable_snapshot()["state"] != "none"
     }
 
     fn new_job(&mut self) -> Job {
@@ -784,7 +806,7 @@ pub(crate) fn open_session_with_hooks(
                             st.rtx(|(_, (.., config, _, _, _))| store::read_geometry(&config));
                         let geometry = store::effective_geometry(geometry, stored);
                         phase(PullPhase::Fetching);
-                        let response = api.file(key, geometry)?;
+                        let response = crate::deep_json::OwnedValue(api.file(key, geometry)?);
                         let vars = api.variables_local(key)?;
                         phase(PullPhase::Flattening);
                         let mut flattened =
@@ -813,9 +835,9 @@ pub(crate) fn open_session_with_hooks(
                         // potentially large image blobs merely to evict none.
                         if prior_version.as_deref() != Some(version.as_str()) {
                             let mut stale =
-                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, _, _))| {
+                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, pins, _))| {
                                     let mut ids = store::stale_cache_ids(&cache, &version);
-                                    ids.extend(store::stale_image_ids(&images, &version));
+                                    ids.extend(store::stale_image_ids(&images, &pins, &version));
                                     ids
                                 });
                             if !stale.is_empty() {
@@ -986,7 +1008,10 @@ impl SessionManager {
                 .find(|s| s.key == key)
                 .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?
         };
-        if !session.mirrored && session.job.is_none() {
+        // Imported variables already answer status/vars without a file
+        // pull. Data reads still request the missing mirror in serve's
+        // tool handler; status alone must not create a failed pull job.
+        if !session.mirrored && session.job.is_none() && !session.has_variable_state() {
             session.request_pull(false, interval);
         }
         Ok(session)

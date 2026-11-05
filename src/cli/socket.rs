@@ -29,6 +29,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::deep_json::OwnedValue;
+
 /// The CLI's multi-file root when `--db` was not passed — always `.figmog`
 /// relative to the current directory, matching `crate::serve::run_serve`'s
 /// own `--figmog-root` default (see this module's doc comment).
@@ -51,6 +53,7 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// stdout, same error shapes"). See this module's doc comment for the
 /// `None` vs `Some` contract.
 pub(super) fn try_call(root: &Path, tool: &str, args: Value) -> Option<Result<Value, String>> {
+    let args = OwnedValue(args);
     let stream = UnixStream::connect(socket_path(root)).ok()?;
     Some(call_over(stream, tool, args))
 }
@@ -114,16 +117,12 @@ pub(super) fn try_images_call(root: &Path, args: Value) -> Option<Result<Value, 
     }))
 }
 
-fn call_over(stream: UnixStream, tool: &str, args: Value) -> Result<Value, String> {
-    let resp = send_and_recv(
-        stream,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": args},
-        }),
-    )?;
+fn call_over(stream: UnixStream, tool: &str, args: OwnedValue) -> Result<Value, String> {
+    let mut params = OwnedValue(json!({"name": tool}));
+    params.insert("arguments".to_string(), args);
+    let mut frame = OwnedValue(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call"}));
+    frame.insert("params".to_string(), params);
+    let resp = send_and_recv(stream, &frame)?;
     interpret_call_response(tool, resp)
 }
 
@@ -160,19 +159,24 @@ fn send_and_recv(stream: UnixStream, frame: &Value) -> Result<Value, String> {
         .set_write_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
-    writeln!(writer, "{frame}").map_err(|e| format!("writing to serve socket: {e}"))?;
+    let request = crate::deep_json::to_string(frame).map_err(|e| e.to_string())?;
+    writeln!(writer, "{request}").map_err(|e| format!("writing to serve socket: {e}"))?;
     writer
         .flush()
         .map_err(|e| format!("writing to serve socket: {e}"))?;
 
     let mut reader = BufReader::new(stream);
-    let id = frame.get("id").cloned().unwrap_or(Value::Null);
+    let id = crate::deep_json::from_str(
+        &crate::deep_json::to_string(frame.get("id").unwrap_or(&Value::Null))
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     loop {
         let line = read_frame(&mut reader)?;
-        let resp: Value = serde_json::from_str(&line)
+        let resp = crate::deep_json::from_str(&line)
             .map_err(|e| format!("serve socket sent invalid JSON: {e}"))?;
         if is_response_to(&resp, &id) {
-            return Ok(resp);
+            return Ok(resp.into_inner());
         }
     }
 }
@@ -215,6 +219,9 @@ fn read_frame(reader: &mut BufReader<UnixStream>) -> Result<String, String> {
     if n == 0 {
         return Err("serve socket closed before responding".to_string());
     }
+    if !line.ends_with('\n') {
+        return Err("serve socket closed during a response".to_string());
+    }
     Ok(line)
 }
 
@@ -231,15 +238,21 @@ fn protocol_error_message(err: &Value) -> String {
 /// hand-built response `Value`s. Only local single-JSON tools are
 /// unwrapped; desktop results and `figmog_images` retain their MCP envelope.
 fn interpret_call_response(tool: &str, resp: Value) -> Result<Value, String> {
+    let mut resp = crate::deep_json::OwnedValue(resp);
     if let Some(err) = resp.get("error") {
         return Err(protocol_error_message(err));
     }
-    let result = resp.get("result").cloned().unwrap_or(Value::Null);
+    let mut result = crate::deep_json::OwnedValue(
+        resp.0
+            .get_mut("result")
+            .map(std::mem::take)
+            .unwrap_or(Value::Null),
+    );
     if !crate::proxy::is_local_tool(tool) {
         // Socket dispatch reports serve-generated failures as JSON-RPC
         // errors above. Only genuine desktop results reach this branch,
         // including the desktop's own tool-level `isError` responses.
-        return Ok(result);
+        return Ok(std::mem::take(&mut result.0));
     }
     let is_error = result
         .get("isError")
@@ -251,17 +264,18 @@ fn interpret_call_response(tool: &str, resp: Value) -> Result<Value, String> {
         return Err(text.unwrap_or_else(|| "unknown error from serve".to_string()));
     }
     if tool == "figmog_images" {
-        return Ok(result);
+        return Ok(std::mem::take(&mut result.0));
     }
 
     match text {
         // Local single-JSON tools answer as `ToolOutput::Json`, i.e. one
         // text block holding figmog's own JSON (see `mcp::ToolOutput`).
         // Parse it back out for the CLI's established local read shape.
-        Some(t) => serde_json::from_str(&t)
+        Some(t) => crate::deep_json::from_str(&t)
+            .map(crate::deep_json::OwnedValue::into_inner)
             .map_err(|e| format!("serve returned non-JSON tool content: {e}")),
         // Preserve the existing fallback for a local result without text.
-        None => Ok(result),
+        None => Ok(std::mem::take(&mut result.0)),
     }
 }
 

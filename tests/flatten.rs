@@ -341,6 +341,38 @@ fn malformed_children_are_rejected_at_any_depth() {
 }
 
 #[test]
+fn malformed_node_errors_preserve_nested_child_indices() {
+    use serde_json::json;
+
+    let mut response = json!({
+        "name": "Error paths", "version": "1", "lastModified": "now",
+        "document": {"id": "doc", "type": "DOCUMENT", "children": [
+            {"id": "first", "type": "CANVAS"},
+            {"id": "second", "type": "CANVAS", "children": [
+                {"id": "sibling", "type": "FRAME"},
+                {"id": "parent", "type": "FRAME", "children": [
+                    {"id": "leaf", "type": "TEXT"}, null
+                ]}
+            ]}
+        ]}
+    });
+    for (invalid, reason) in [
+        (json!(null), "expected an object"),
+        (json!({"id": "bad"}), "expected a non-empty string type"),
+        (
+            json!({"id": "bad", "type": "FRAME", "children": null}),
+            "children must be an array when present",
+        ),
+    ] {
+        response["document"]["children"][1]["children"][1]["children"][1] = invalid;
+        assert_eq!(
+            flatten_file(&response).unwrap_err().to_string(),
+            format!("invalid node at document.children[1].children[1].children[1]: {reason}"),
+        );
+    }
+}
+
+#[test]
 fn empty_documents_and_unknown_descendant_types_remain_valid() {
     use serde_json::json;
 

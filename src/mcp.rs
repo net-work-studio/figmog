@@ -8,6 +8,8 @@
 
 use serde_json::{Value, json};
 
+use crate::deep_json::OwnedValue;
+
 /// Steering text carried verbatim in the `initialize` result. Local tools
 /// answer from mirrors; native tools forward live to desktop, whose active
 /// file/revision is independent of those mirrors. `file` routes local tools.
@@ -116,6 +118,20 @@ pub fn handle_message(
 }
 
 #[cfg(test)]
+fn handle_socket_message(
+    raw: &str,
+    tools: &[ToolDef],
+    handler: &mut dyn ToolHandler,
+) -> Option<Value> {
+    immediate(dispatch_message(
+        raw,
+        tools,
+        handler,
+        ToolErrorMode::JsonRpc,
+    ))
+}
+
+#[cfg(test)]
 fn immediate(reply: Option<Reply>) -> Option<Value> {
     reply.map(|reply| match reply {
         Reply::Now(value) => value,
@@ -146,12 +162,34 @@ pub(crate) enum Reply {
 /// eventual response needs — the caller's JSON-RPC `id`, the tool name
 /// (for `structuredContent`) and the transport's error mode — so a late
 /// result is framed identically to an immediate one.
-#[derive(Clone, Debug)]
 pub(crate) struct PendingCall {
-    id: Value,
+    id: OwnedValue,
     name: String,
     mode: ToolErrorMode,
     token: u64,
+}
+
+impl Clone for PendingCall {
+    fn clone(&self) -> Self {
+        Self {
+            id: crate::deep_json::from_str(&crate::deep_json::to_string(&self.id.0).unwrap())
+                .unwrap(),
+            name: self.name.clone(),
+            mode: self.mode,
+            token: self.token,
+        }
+    }
+}
+
+impl std::fmt::Debug for PendingCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingCall")
+            .field("id", &crate::deep_json::to_string(&self.id.0).unwrap())
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("token", &self.token)
+            .finish()
+    }
 }
 
 impl PendingCall {
@@ -181,7 +219,7 @@ pub(crate) fn dispatch_message(
     handler: &mut dyn ToolHandler,
     tool_errors: ToolErrorMode,
 ) -> Option<Reply> {
-    let msg: Value = match serde_json::from_str(raw) {
+    let mut msg = match crate::deep_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
             return Some(Reply::Now(json!({
@@ -192,17 +230,23 @@ pub(crate) fn dispatch_message(
         }
     };
 
-    let id = msg.get("id").cloned();
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = msg.get("params").cloned().unwrap_or(Value::Null);
-
-    // Notifications: no `id`, or method under the `notifications/` namespace.
+    let id = msg.0.get_mut("id").map(|id| OwnedValue(std::mem::take(id)));
+    let method = msg
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut params = OwnedValue(
+        msg.0
+            .get_mut("params")
+            .map(std::mem::take)
+            .unwrap_or(Value::Null),
+    );
     if id.is_none() || method.starts_with("notifications/") {
         return None;
     }
     let id = id.unwrap();
-
-    let result = match method {
+    let result = match method.as_str() {
         "initialize" => {
             handler.initialized();
             Some(initialize_result(&params, handler.tools_list_changes()))
@@ -210,7 +254,7 @@ pub(crate) fn dispatch_message(
         "ping" => Some(json!({})),
         "tools/list" => Some(tools_list_result(tools)),
         "tools/call" => {
-            return Some(match tools_call_result(&params, tools, handler) {
+            return Some(match tools_call_result(&mut params, tools, handler) {
                 Ok(Called::Now(result)) => Reply::Now(call_response(id, tool_errors, Ok(result))),
                 Ok(Called::Later { name, token }) => Reply::Later(PendingCall {
                     id,
@@ -223,36 +267,40 @@ pub(crate) fn dispatch_message(
         }
         _ => None,
     };
-
-    Some(Reply::Now(match result {
-        Some(result) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        }),
-        None => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": -32601, "message": "method not found"},
-        }),
-    }))
+    let mut response = OwnedValue(json!({"jsonrpc": "2.0"}));
+    response.insert("id".to_string(), id);
+    match result {
+        Some(result) => response.insert("result".to_string(), OwnedValue(result)),
+        None => response.insert(
+            "error".to_string(),
+            OwnedValue(json!({
+                "code": -32601, "message": "method not found",
+            })),
+        ),
+    }
+    Some(Reply::Now(response.into_inner()))
 }
 
-/// Frame a `tools/call` outcome per the transport's error mode.
-fn call_response(id: Value, mode: ToolErrorMode, result: Result<Value, String>) -> Value {
+/// Frame a `tools/call` outcome per the transport's error mode. Move deep
+/// IDs/results into the response rather than recursively cloning them.
+fn call_response(id: OwnedValue, mode: ToolErrorMode, result: Result<Value, String>) -> Value {
+    let mut response = OwnedValue(json!({"jsonrpc": "2.0"}));
+    response.insert("id".into(), id);
     match result {
-        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Ok(result) => response.insert("result".into(), OwnedValue(result)),
         Err(message) => match mode {
             ToolErrorMode::McpContent => {
-                json!({"jsonrpc": "2.0", "id": id, "result": error_content(&message)})
+                response.insert("result".into(), OwnedValue(error_content(&message)))
             }
-            ToolErrorMode::JsonRpc => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32000, "message": message},
-            }),
+            ToolErrorMode::JsonRpc => response.insert(
+                "error".into(),
+                OwnedValue(json!({
+                    "code": -32000, "message": message,
+                })),
+            ),
         },
     }
+    response.into_inner()
 }
 
 fn initialize_result(params: &Value, list_changes: bool) -> Value {
@@ -295,27 +343,28 @@ enum Called {
 }
 
 fn tools_call_result(
-    params: &Value,
+    params: &mut OwnedValue,
     tools: &[ToolDef],
     handler: &mut dyn ToolHandler,
 ) -> Result<Called, String> {
     let name = match params.get("name").and_then(Value::as_str) {
-        Some(name) => name,
+        Some(name) => name.to_string(),
         None => return Err("missing required field: name".to_string()),
     };
-
     if !tools.iter().any(|t| t.name == name) {
-        handler.unknown_tool(name);
+        handler.unknown_tool(&name);
         return Err(format!("unknown tool: {name}"));
     }
-
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    Ok(match handler.call(name, &args)? {
-        ToolOutput::Deferred(token) => Called::Later {
-            name: name.to_string(),
-            token,
-        },
-        output => Called::Now(tool_output_result(name, output)),
+    let args = OwnedValue(
+        params
+            .0
+            .get_mut("arguments")
+            .map(std::mem::take)
+            .unwrap_or(json!({})),
+    );
+    Ok(match handler.call(&name, &args)? {
+        ToolOutput::Deferred(token) => Called::Later { name, token },
+        output => Called::Now(tool_output_result(&name, output)),
     })
 }
 
@@ -323,14 +372,18 @@ fn tools_call_result(
 fn tool_output_result(name: &str, output: ToolOutput) -> Value {
     match output {
         ToolOutput::Json(v) => {
-            let mut result = json!({
-                "content": [{"type": "text", "text": serde_json::to_string(&v).unwrap()}],
+            let mut v = OwnedValue(v);
+            let mut result = OwnedValue(json!({
+                "content": [{"type": "text", "text": crate::deep_json::to_string(&v.0).unwrap()}],
                 "isError": false,
-            });
+            }));
             if crate::dispatch::output_schema(name).is_some() {
-                result["structuredContent"] = v;
+                result.insert(
+                    "structuredContent".into(),
+                    OwnedValue(std::mem::take(&mut v.0)),
+                );
             }
-            result
+            result.into_inner()
         }
         ToolOutput::Raw(v) => v,
         ToolOutput::Deferred(_) => error_content("internal error: unexpected deferred output"),
@@ -347,6 +400,66 @@ fn error_content(msg: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_message_arguments_are_moved_and_cleaned_up_on_every_exit() {
+        crate::test_support::small_stack(|| {
+            let payload = format!(
+                "{}null{}",
+                r#"{"layer":["#.repeat(5_000),
+                "]}".repeat(5_000)
+            );
+            for (name, is_error) in [("ok", false), ("err", true), ("unknown", true)] {
+                let request = format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","unused":{payload},"params":{{"name":"{name}","arguments":{{"equals":{payload}}}}}}}"#
+                );
+                let response =
+                    OwnedValue(handle_message(&request, &fake_tools(), &mut FakeHandler).unwrap());
+                assert_eq!(response["result"]["isError"], is_error);
+                let response = OwnedValue(
+                    handle_socket_message(&request, &fake_tools(), &mut FakeHandler).unwrap(),
+                );
+                assert_eq!(response.get("error").is_some(), is_error);
+            }
+            let notification = format!(
+                r#"{{"method":"notifications/initialized","params":{{"arguments":{payload}}}}}"#
+            );
+            assert!(handle_message(&notification, &fake_tools(), &mut FakeHandler).is_none());
+        });
+    }
+
+    #[test]
+    fn deep_deferred_ids_and_results_are_safe_on_a_small_stack() {
+        crate::test_support::small_stack(|| {
+            let payload = format!("{}null{}", "[".repeat(5_000), "]".repeat(5_000));
+            let request = format!(
+                r#"{{"jsonrpc":"2.0","id":{payload},"method":"tools/call","params":{{"name":"ok"}}}}"#,
+            );
+            for raw in [false, true] {
+                let call = match dispatch_message(
+                    &request,
+                    &fake_tools(),
+                    &mut DeferringHandler,
+                    ToolErrorMode::McpContent,
+                ) {
+                    Some(Reply::Later(call)) => call,
+                    _ => panic!("expected deferred call"),
+                };
+                // Clone and abandoning a pending call must also clean its
+                // deep id iteratively, without recursively dropping it.
+                drop(call.clone());
+                let output = crate::deep_json::from_str(&payload).unwrap().into_inner();
+                let output = if raw {
+                    ToolOutput::Raw(output)
+                } else {
+                    ToolOutput::Json(output)
+                };
+                let response = OwnedValue(call.finish(Ok(output)));
+                let serialized = crate::deep_json::to_string(&response.0).unwrap();
+                assert!(serialized.contains(&format!(r#""id":{payload}"#)));
+            }
+        });
+    }
 
     /// A `ToolHandler` test double: returns `Ok(Json({"ok":true}))` for a
     /// tool named `"ok"`, `Ok(Raw(...))` for `"raw"` (an already-complete

@@ -777,7 +777,7 @@ fn apply_done(
 
 /// One response as a newline-terminated frame (compact JSON, as always).
 fn frame(response: &Value) -> String {
-    let mut frame = response.to_string();
+    let mut frame = crate::deep_json::to_string(response).expect("Value serializes");
     frame.push('\n');
     frame
 }
@@ -786,7 +786,7 @@ fn frame(response: &Value) -> String {
 fn answer_frame(answer: Answer, call: PendingCall) -> String {
     match answer {
         Answer::Frame(frame) => frame,
-        Answer::Output(output) => frame(&call.finish(output)),
+        Answer::Output(output) => frame(&crate::deep_json::OwnedValue(call.finish(output))),
     }
 }
 
@@ -1086,6 +1086,7 @@ fn request_loop(
         // probe; a client that sent `initialize` hears about the tools
         // through `tools/list_changed` and can retry.
         if let Some(name) = unknown_tool
+            && !cancel.load(Ordering::Relaxed)
             && !proxy::is_local_tool(&name)
             && let Some(desktop) = &mut offload.desktop
             && !desktop.connected()
@@ -1098,10 +1099,12 @@ fn request_loop(
                 offload.park(&call);
                 pending.insert(to, call);
             }
-            Some(Reply::Now(response)) if !deliver(to, frame(&response), registry, stdio) => {
-                return LoopExit::StdoutGone;
+            Some(Reply::Now(response)) => {
+                let response = crate::deep_json::OwnedValue(response);
+                if !deliver(to, frame(&response), registry, stdio) {
+                    return LoopExit::StdoutGone;
+                }
             }
-            Some(Reply::Now(_)) => {}
         }
     }
 }
@@ -1454,7 +1457,7 @@ fn handle_tool_call(
     }
 
     // spec §2b: an explicit `file` arg always wins, but when it's absent
-    // and the call's node-id-shaped argument (`id`/`under`/`target`) is a
+    // and the call's node-id-shaped argument (`id`/`under`/`target`/`page`) is a
     // full Figma URL naming a file, that URL's file key routes the call
     // (auto-open semantics apply, same as an explicit `file`). When both
     // are present and disagree, the explicit arg still wins — the
@@ -1469,10 +1472,6 @@ fn handle_tool_call(
     };
     let url_file_key = dispatch::infer_file_from_node_ref(args);
     let file_arg = explicit_file.clone().or_else(|| url_file_key.clone());
-    let mut call_args = args.clone();
-    if let Some(obj) = call_args.as_object_mut() {
-        obj.remove("file");
-    }
 
     if proxy::is_local_tool(name) {
         let session = manager.resolve(file_arg.as_deref(), interval)?;
@@ -1491,7 +1490,7 @@ fn handle_tool_call(
             );
         }
 
-        if !session.mirrored {
+        if !(session.mirrored || name == "figmog_vars" && session.has_variable_state()) {
             session.request_pull(false, interval);
         }
         if name == "figmog_images" {
@@ -1516,11 +1515,20 @@ fn handle_tool_call(
             return Ok(ToolOutput::Deferred(token));
         }
 
+        // The worker owns these arguments. Clone through the growing-stack
+        // parser/serializer so arbitrarily deep equality values remain safe.
+        let mut call_args = crate::deep_json::from_str(
+            &crate::deep_json::to_string(args).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(obj) = call_args.0.as_object_mut() {
+            obj.remove("file");
+        }
         let explicit_key = explicit_file
             .as_deref()
             .map(|f| parse_file_ref(f).unwrap_or_else(|| f.to_string()));
         if !reads::is_inline_read(name) {
-            let lease = session.lease()?;
+            let lease = session.lease_for(name)?;
             return offload.defer_read(
                 cancel,
                 ReadTask::Tool {
@@ -1548,7 +1556,11 @@ fn handle_tool_call(
     if let Some(desktop) = &offload.desktop {
         desktop.submit(DesktopJob::Call {
             name: name.to_string(),
-            args: args.clone(),
+            args: crate::deep_json::from_str(
+                &crate::deep_json::to_string(args).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
+            .into_inner(),
             reply,
             cancel: cancel.clone(),
         });

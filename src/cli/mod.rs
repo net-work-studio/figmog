@@ -207,7 +207,15 @@ enum Cmd {
     },
     /// Import a variables export (REST or plugin-console shape), replacing
     /// the previous variable snapshot.
-    ImportVariables { path: PathBuf },
+    ImportVariables {
+        path: PathBuf,
+        /// Permit an empty export to replace the stored variable snapshot.
+        #[arg(long)]
+        allow_empty: bool,
+        /// Validate and report the replacement without changing the store.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Node counts by type and page, table totals, text-node count, max tree depth.
     Stats,
     /// Ancestor chain root→node for one id.
@@ -234,12 +242,21 @@ enum Cmd {
         #[arg(long)]
         under: Option<String>,
     },
-    /// Nodes whose absolute bounds contain a point, sorted by area ascending.
+    /// Visible nodes on one page containing a point, sorted by area then id.
     At {
         #[arg(long, value_parser = finite_coordinate)]
         x: f64,
         #[arg(long, value_parser = finite_coordinate)]
         y: f64,
+        /// Page id or Figma page URL defining the coordinate space.
+        #[arg(long)]
+        page: String,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
+        /// Maximum number of matches after filtering and sorting.
+        #[arg(long, default_value_t = crate::query::DEFAULT_AT_LIMIT)]
+        limit: usize,
     },
     /// Download node renders and/or fill images to --out, caching by file version.
     ///
@@ -312,7 +329,7 @@ pub fn run() -> i32 {
 /// error.
 fn write_json(v: &Value) -> Result<(), String> {
     use std::io::Write;
-    let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+    let text = crate::deep_json::to_string_pretty(v).map_err(|e| e.to_string())?;
     let mut stdout = std::io::stdout();
     if writeln!(stdout, "{text}").is_err() || stdout.flush().is_err() {
         return Err(STDOUT_CLOSED.to_string());
@@ -385,7 +402,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     }
 
     if let Cmd::Call { tool, args, .. } = &cli.cmd {
-        call::validate_local_args(tool, &call::parse_args(args.as_deref())?)?;
+        let args = crate::deep_json::OwnedValue(call::parse_args(args.as_deref())?);
+        call::validate_local_args(tool, &args)?;
     }
 
     // Socket routing (spec §1): every read command plus `call` first tries
@@ -416,7 +434,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             };
             if let Some(result) = socket::try_call(root, tool, parsed_args) {
                 note_ignored_upstream_flags(upstream, *no_upstream);
-                return write_json(&result?);
+                return write_json(&crate::deep_json::OwnedValue(result?));
             }
         } else if let Some(read) = read_command(&cli.cmd) {
             let (tool, tool_args) = read.to_tool_call();
@@ -424,11 +442,17 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             if let Some(result) = socket::try_call(root, tool, tool_args) {
                 let result = result?;
                 // Not ready is an error, except for an import-only store
-                // (SPEC §9): its stored variable snapshot still answers.
+                // (SPEC §9) with no pull attempted. Once a pull is in
+                // progress or failed, report its lifecycle before stripping it.
                 if tool == "figmog_status"
                     && result["ready"] == false
-                    && !has_variable_state(&result)
+                    && (!has_variable_state(&result) || !result["pull"]["job"].is_null())
                 {
+                    if let Some(error) = result["pull"]["last_completed"]["error"].as_str() {
+                        return Err(format!(
+                            "mirror is not ready — pull failed: {error}; inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors"
+                        ));
+                    }
                     return Err("mirror is not ready — inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors".to_string());
                 }
                 let result = if tool == "figmog_status" {
@@ -436,7 +460,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 } else {
                     result
                 };
-                return write_json(&result);
+                return write_json(&crate::deep_json::OwnedValue(result));
             }
         }
     }
@@ -451,7 +475,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             fresh,
             geometry,
         } => pull::cmd_pull(&db, file, from_file, fresh, geometry),
-        Cmd::ImportVariables { path } => call::cmd_import_variables(&db, path),
+        Cmd::ImportVariables {
+            path,
+            allow_empty,
+            dry_run,
+        } => call::cmd_import_variables(&db, path, allow_empty, dry_run),
         Cmd::Images {
             ids,
             format,
@@ -474,7 +502,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // the query runs through the same `ReadCommand::execute` arm
             // every tool adapter uses (NWS-2902).
             let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
-            write_json(&st.rtx(|r| read.execute(&r))?)
+            write_json(&crate::deep_json::OwnedValue(st.rtx(|r| read.execute(&r))?))
         }
     }
 }
@@ -541,22 +569,23 @@ fn is_per_file_local_tool(tool: &str) -> bool {
 /// (no `--args`) succeed over the socket while the exact same invocation
 /// fails direct, breaking the very byte-compatibility this routing exists
 /// to preserve (see `read_command`'s socket caller).
-fn with_current_file(mut args: Value) -> Result<Value, String> {
+fn with_current_file(args: Value) -> Result<Value, String> {
+    let mut args = crate::deep_json::OwnedValue(args);
     if args.is_null() {
-        args = json!({});
+        args.0 = json!({});
     }
     // Preserve explicit non-null values for the local tool's own argument
     // handling, even when they cannot select a mirror.
     let has_file = args.get("file").is_some_and(|value| !value.is_null());
     let url_file = crate::dispatch::infer_file_from_node_ref(&args);
-    if let Some(obj) = args.as_object_mut()
+    if let Some(obj) = args.0.as_object_mut()
         && !has_file
         && url_file.is_none()
         && let Some(key) = read_current_key()?
     {
         obj.insert("file".to_string(), json!(key));
     }
-    Ok(args)
+    Ok(args.into_inner())
 }
 
 /// Whether a status result carries a variable snapshot summary with
@@ -666,7 +695,19 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
             page: page.clone(),
             under: under.clone(),
         },
-        Cmd::At { x, y } => ReadCommand::At { x: *x, y: *y },
+        Cmd::At {
+            x,
+            y,
+            page,
+            under,
+            limit,
+        } => ReadCommand::At {
+            x: *x,
+            y: *y,
+            page: page.clone(),
+            under: under.clone(),
+            limit: *limit,
+        },
         Cmd::Version
         | Cmd::Auth { .. }
         | Cmd::Pull { .. }
@@ -681,8 +722,10 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
 /// `--equals <json>`: parse as JSON, falling back to treating the bare word
 /// as a JSON string (so `--equals VERTICAL` works without quoting). A
 /// literal `--equals null` is equality to null (NWS-2897).
-fn parse_equals(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+fn parse_equals(raw: &str) -> String {
+    let value = crate::deep_json::from_str(raw)
+        .unwrap_or_else(|_| crate::deep_json::OwnedValue(Value::String(raw.to_string())));
+    crate::deep_json::to_string(&*value).expect("JSON value serializes")
 }
 
 // ---- config / db resolution ----
@@ -720,14 +763,18 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
     // current is only a fallback. Desktop calls keep the current mirror
     // regardless of their arguments, since they cannot select the
     // desktop's open file. Reuse the read command's tool arguments so
-    // `id`, `under`, and `target` follow the socket/server URL inference.
+    // `id`, `under`, `target`, and `page` follow socket/server URL inference.
     // `figmog_open` and `figmog_files` keep their management semantics.
     let file = match &cli.cmd {
         Cmd::Call { tool, args, .. } if is_per_file_local_tool(tool) => {
-            requested_file(&call::parse_args(args.as_deref())?)?
+            let args = crate::deep_json::OwnedValue(call::parse_args(args.as_deref())?);
+            requested_file(&args)?
         }
         cmd => match read_command(cmd) {
-            Some(read) => requested_file(&read.to_tool_call().1)?,
+            Some(read) => {
+                let args = crate::deep_json::OwnedValue(read.to_tool_call().1);
+                requested_file(&args)?
+            }
             None => None,
         },
     };
@@ -993,6 +1040,28 @@ mod tests {
     // ---- socket-routing helpers (review C1/C2/m1 fix round) ----
 
     #[test]
+    fn resolve_db_safely_discards_deep_equals_arguments() {
+        crate::test_support::small_stack(|| {
+            let equals = format!("{}null{}", r#"{"":["#.repeat(15_000), "]}".repeat(15_000));
+            let cli = Cli::try_parse_from([
+                "figmog",
+                "--no-socket",
+                "where",
+                "--pointer",
+                "/id",
+                "--equals",
+                &equals,
+                "--under",
+                "https://www.figma.com/file/SyntheticFileKey123/Test?node-id=0-0",
+            ])
+            .unwrap();
+            let db = resolve_db(&cli).unwrap();
+            assert_eq!(db.key.as_deref(), Some("SyntheticFileKey123"));
+            assert_eq!(db.path, PathBuf::from(".figmog/SyntheticFileKey123/db"));
+        });
+    }
+
+    #[test]
     fn strip_routed_status_fields_removes_only_that_key() {
         let result = strip_routed_status_fields(json!({
             "name": "Fixture",
@@ -1030,7 +1099,7 @@ mod tests {
             for axis in ["--x", "--y"] {
                 let value = format!("{axis}={coordinate}");
                 let other = if axis == "--x" { "--y=1" } else { "--x=1" };
-                let error = Cli::try_parse_from(["figmog", "at", &value, other])
+                let error = Cli::try_parse_from(["figmog", "at", &value, other, "--page", "0:1"])
                     .err()
                     .unwrap();
                 assert!(
@@ -1125,9 +1194,9 @@ mod tests {
                 json!({"page": "0:1", "under": "1:1"}),
             ),
             (
-                &["at", "--x", "1.5", "--y", "2"],
+                &["at", "--x", "1.5", "--y", "2", "--page", "0:1"],
                 "figmog_at",
-                json!({"x": 1.5, "y": 2.0}),
+                json!({"x": 1.5, "y": 2.0, "page": "0:1", "limit": crate::query::DEFAULT_AT_LIMIT}),
             ),
         ];
         for (argv, tool, want) in cases {

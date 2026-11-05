@@ -189,6 +189,10 @@ impl DesktopWorker {
                         reply,
                         cancel,
                     } => {
+                        // A socket/MCP request can contain a deeply nested
+                        // argument. Drain it iteratively on every exit path,
+                        // including cancellation and proxy panics.
+                        let args = crate::deep_json::OwnedValue(args);
                         if stopped.load(Ordering::Relaxed) {
                             reply.send(Err(DESKTOP_SHUTDOWN.into()), false);
                             continue;
@@ -368,9 +372,7 @@ impl DesktopWorker {
         };
         self.jobs.ready.notify_all();
         for job in calls {
-            if let DesktopJob::Call { reply, .. } = job {
-                reply.send(Err(DESKTOP_SHUTDOWN.into()), false);
-            }
+            reject_call(job, DESKTOP_SHUTDOWN);
         }
     }
 
@@ -378,9 +380,7 @@ impl DesktopWorker {
         let mut queue = self.jobs.queue.lock().unwrap();
         if queue.stopped {
             drop(queue);
-            if let DesktopJob::Call { reply, .. } = job {
-                reply.send(Err(DESKTOP_SHUTDOWN.into()), false);
-            }
+            reject_call(job, DESKTOP_SHUTDOWN);
             return;
         }
         match job {
@@ -390,12 +390,9 @@ impl DesktopWorker {
             DesktopJob::Call { .. } if queue.calls.len() < MAX_QUEUED_CALLS => {
                 queue.calls.push_back(job);
             }
-            DesktopJob::Call { reply, .. } => {
+            DesktopJob::Call { .. } => {
                 drop(queue);
-                reply.send(
-                    Err("desktop call queue is full; try again later".into()),
-                    false,
-                );
+                reject_call(job, "desktop call queue is full; try again later");
                 return;
             }
         }
@@ -406,6 +403,22 @@ impl DesktopWorker {
 impl Drop for DesktopWorker {
     fn drop(&mut self) {
         self.stop_taking_jobs();
+    }
+}
+
+/// Reject a queued call while preserving iterative cleanup of its arguments.
+fn reject_call(job: DesktopJob, message: &str) {
+    if let DesktopJob::Call { args, reply, .. } = job {
+        let _args = crate::deep_json::OwnedValue(args);
+        reply.send(Err(message.into()), false);
+    }
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        for job in self.calls.drain(..) {
+            reject_call(job, DESKTOP_SHUTDOWN);
+        }
     }
 }
 
@@ -691,6 +704,38 @@ mod tests {
             "after_handshake"
         );
         assert_eq!(upstream.handshakes, 1);
+    }
+
+    #[test]
+    fn deep_arguments_are_drained_on_cancel_rejection_and_queue_drop() {
+        crate::test_support::small_stack(|| {
+            fn job(token: u64, done: &mpsc::Sender<super::super::Done>) -> DesktopJob {
+                let mut args = Value::Null;
+                for _ in 0..10_000 {
+                    args = Value::Array(vec![args]);
+                }
+                DesktopJob::Call {
+                    name: "get_code".into(),
+                    args,
+                    reply: DeferredReply {
+                        token,
+                        done: Some(done.clone()),
+                    },
+                    cancel: Arc::new(AtomicBool::new(true)),
+                }
+            }
+            let (worker, _, _) = scripted(false);
+            let (done, answers) = mpsc::channel();
+            worker.submit(job(1, &done));
+            assert_eq!(answers.recv_timeout(EXPECT).unwrap().token, 1);
+            worker.stop_taking_jobs();
+            worker.submit(job(2, &done));
+            assert_eq!(answers.recv_timeout(EXPECT).unwrap().token, 2);
+            let mut queue = Queue::default();
+            queue.calls.push_back(job(3, &done));
+            drop(queue);
+            assert_eq!(answers.recv_timeout(EXPECT).unwrap().token, 3);
+        });
     }
 
     #[test]
