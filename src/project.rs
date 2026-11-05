@@ -1165,6 +1165,11 @@ impl Layout {
         if let Some(key) = self.config.default_key() {
             return Ok(Some(key.to_string()));
         }
+        self.current_key()
+    }
+
+    /// `.figmog/current` alone (no config): the last file pulled here.
+    pub(crate) fn current_key(&self) -> Result<Option<String>, String> {
         read_current(&self.current_file())
     }
 

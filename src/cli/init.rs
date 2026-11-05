@@ -97,7 +97,9 @@ const AGENTS_BEGIN: &str =
     "<!-- figmog:begin (managed by `figmog init`; edits inside are replaced) -->";
 const AGENTS_END: &str = "<!-- figmog:end -->";
 
-pub(super) fn cmd_init(args: InitArgs) -> Result<Value, String> {
+/// `no_socket` is the global `--no-socket`: the first pull then never
+/// tries a running serve's socket and opens the store directly.
+pub(super) fn cmd_init(args: InitArgs, no_socket: bool) -> Result<Value, String> {
     // 1. Flags first: nothing is written for an invalid one.
     let file_ref = |flag: &str, value: &Option<String>| {
         value
@@ -194,18 +196,26 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<Value, String> {
         }
         (product, committed.library_key().map(str::to_string))
     } else {
+        // What is committed never comes from figmog.local.toml (a
+        // machine-only `[files] default` there stays local): --file, else
+        // the file last pulled here (`.figmog/current`).
         let product = match file {
             Some(file) => file,
-            None => layout.default_key()?.ok_or_else(|| {
-                "no product file: pass --file <Figma file URL or key>".to_string()
+            None => layout.current_key()?.ok_or_else(|| {
+                let local = if layout.config.default_key().is_some() {
+                    " (figmog.local.toml's [files] default is machine-local and is not written \
+                     to figmog.toml)"
+                } else {
+                    ""
+                };
+                format!("no product file: pass --file <Figma file URL or key>{local}")
             })?,
         };
         (product, library)
     };
 
     let mut settings = committed.settings();
-    let stack_source;
-    if has("stack") {
+    let stack_source = if has("stack") {
         let stack = &settings.stack;
         conflict(
             framework.map(Framework::as_str),
@@ -225,7 +235,7 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<Value, String> {
             "stack.tokens",
             &config_path,
         )?;
-        stack_source = json!({"framework": CONFIG_FILE, "styling": CONFIG_FILE});
+        json!({"framework": CONFIG_FILE, "styling": CONFIG_FILE})
     } else {
         let detected = detect_stack(&root, framework, styling)?;
         settings.stack.framework = detected.framework.0;
@@ -233,8 +243,8 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<Value, String> {
         if let Some(tokens) = &args.tokens {
             settings.stack.tokens = tokens.clone();
         }
-        stack_source = json!({"framework": detected.framework.1, "styling": detected.styling.1});
-    }
+        json!({"framework": detected.framework.1, "styling": detected.styling.1})
+    };
     if has("verify") {
         conflict(
             args.dev_server.as_deref(),
@@ -321,8 +331,8 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<Value, String> {
     let pull = if args.no_pull {
         json!({"skipped": true})
     } else {
-        let churn =
-            super::pull::pull_for_init(&layout, &pull_key, args.from_file).map_err(|e| {
+        let churn = super::pull::pull_for_init(&layout, &pull_key, args.from_file, no_socket)
+            .map_err(|e| {
                 format!(
                     "first pull failed: {e} — everything else is set up; fix that and rerun \
                  `figmog init` (or run `figmog pull`)"

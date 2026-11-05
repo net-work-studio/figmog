@@ -370,7 +370,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         return Err("init and doctor work on the project and do not take --db".into());
     }
     if let Cmd::Init(args) = cli.cmd {
-        return write_json(&init::cmd_init(args)?);
+        return write_json(&init::cmd_init(args, cli.no_socket)?);
     }
     if let Cmd::Doctor { upstream } = &cli.cmd {
         let (report, failed) = doctor::cmd_doctor(upstream);
