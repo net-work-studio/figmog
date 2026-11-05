@@ -359,7 +359,7 @@ fn a_pull_taking_the_worker_answers_queued_images_busy() {
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     let (tag, result) = loop {
-        h.manager.sessions[0].maintain();
+        h.manager.sessions[0].maintain(true);
         if let Ok(answer) = answers.try_recv() {
             break answer;
         }
@@ -516,4 +516,158 @@ fn a_poll_due_during_images_gets_the_worker_before_queued_images() {
         answers.recv_timeout(Duration::from_secs(5)).unwrap(),
         ("second", true)
     );
+}
+
+#[test]
+fn no_watch_images_do_not_dispatch_a_due_watch_retry() {
+    // Existing mirror, then a failed explicit sync: that arms the watch
+    // retry deadline even under --no-watch.
+    let mut h = mirrored_harness();
+    *h.api.response.lock().unwrap() = Err(ApiError::Network("synthetic".into()));
+    h.value("figmog_sync", json!({}));
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "fetch"
+    );
+    h.release.send(()).unwrap();
+    h.wait_for("failed");
+    let past_retry = Instant::now() + Duration::from_secs(24 * 3600);
+    assert!(
+        h.manager.sessions[0]
+            .watch_retry_deadline()
+            .is_some_and(|due| due <= past_retry),
+        "the failed sync armed a watch retry"
+    );
+
+    h.api.block_images.store(true, Ordering::Relaxed);
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    let (answers_tx, answers) = mpsc::channel();
+    let reply = |tag: &'static str| -> sessions::ImageReply {
+        let answers = answers_tx.clone();
+        Box::new(move |result| answers.send((tag, result.is_ok())).unwrap())
+    };
+    let ids = vec!["0:0".to_string()];
+    let session = &mut h.manager.sessions[0];
+    session.images(&ids, "png", None, reply("first")).unwrap();
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "render"
+    );
+    session.images(&ids, "png", None, reply("second")).unwrap();
+    h.release.send(()).unwrap();
+    assert_eq!(
+        answers.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ("first", true)
+    );
+    // The retry deadline has passed, but --no-watch (serve's loop passes
+    // `watch = false`) dispatches no poll: the queued image runs next.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let event = loop {
+        h.manager.sessions[0].maintain_at(past_retry, false);
+        if let Ok(event) = h.entered.try_recv() {
+            break event;
+        }
+        assert!(Instant::now() < deadline, "queued image never started");
+        std::thread::yield_now();
+    };
+    assert_eq!(event, "render", "no metadata poll under --no-watch");
+    assert_eq!(
+        h.manager.sessions[0].status().unwrap()["pull"]["polling"],
+        false
+    );
+    h.release.send(()).unwrap();
+    assert_eq!(
+        answers.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ("second", true)
+    );
+}
+
+#[test]
+fn stdin_eof_stops_the_desktop_queue_but_delivers_the_in_flight_call() {
+    let h = mirrored_harness();
+    h.api.block_images.store(true, Ordering::Relaxed);
+    let (entered_tx, desktop_entered) = mpsc::channel();
+    let (desktop_release, gate) = mpsc::channel();
+    let first = json!({"content":[{"type":"text","text":"a"}], "isError": false});
+    let second = json!({"content":[{"type":"text","text":"b"}], "isError": false});
+    let desktop = DesktopWorker::spawn(GatedUpstream {
+        tools: vec![json!({"name":"set_node_name", "inputSchema":{"type":"object"}})],
+        results: [first.clone(), second].into(),
+        entered: entered_tx,
+        release: gate,
+    });
+    let Harness {
+        release: image_release,
+        entered: image_entered,
+        manager,
+        _dir: _dir_guard,
+        ..
+    } = h;
+    let (tx, stdout, server) = spawn_stdio_loop(manager, Some(desktop));
+    // An image request runs and another queues behind it: the queued one's
+    // shutting-down error marks the moment the drain began.
+    tx.send(Incoming::Stdio(frame(
+        json!("img1"),
+        "figmog_images",
+        json!({"ids": ["0:0"]}),
+    )))
+    .unwrap();
+    assert_eq!(
+        image_entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "render"
+    );
+    tx.send(Incoming::Stdio(frame(
+        json!("img2"),
+        "figmog_images",
+        json!({"ids": ["0:0"]}),
+    )))
+    .unwrap();
+    // Desktop call A blocks upstream; B (a possible write) queues behind.
+    tx.send(Incoming::Stdio(frame(
+        json!("a"),
+        "set_node_name",
+        json!({}),
+    )))
+    .unwrap();
+    assert_eq!(
+        desktop_entered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        "set_node_name"
+    );
+    tx.send(Incoming::Stdio(frame(
+        json!("b"),
+        "set_node_name",
+        json!({}),
+    )))
+    .unwrap();
+    tx.send(Incoming::StdinClosed).unwrap();
+    let drained = stdout.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(drained["id"], "img2", "{drained}");
+    assert_eq!(drained["result"]["isError"], true, "{drained}");
+
+    desktop_release.send(()).unwrap();
+    image_release.send(()).unwrap();
+    let mut responses = BTreeMap::new();
+    for _ in 0..3 {
+        let response = stdout.recv_timeout(Duration::from_secs(5)).unwrap();
+        responses.insert(response["id"].as_str().unwrap().to_string(), response);
+    }
+    assert_eq!(
+        responses["a"],
+        json!({"jsonrpc":"2.0", "id":"a", "result": first})
+    );
+    let b = &responses["b"];
+    assert_eq!(b["result"]["isError"], true, "{b}");
+    assert!(
+        b["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("shutting down"),
+        "{b}"
+    );
+    assert!(responses["img1"]["result"]["content"].is_array());
+    server.join().unwrap().unwrap();
+    // B never reached the upstream.
+    assert!(desktop_entered.try_recv().is_err());
 }

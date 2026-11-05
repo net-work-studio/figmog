@@ -416,12 +416,14 @@ impl FileSession {
 
     /// Apply completions in dispatch order, exactly once. Workers run
     /// serially per file, so neither an old poll nor an old pull can
-    /// overwrite a newer publication.
-    pub(crate) fn maintain(&mut self) -> bool {
-        self.maintain_at(Instant::now())
+    /// overwrite a newer publication. `watch` is false under `--no-watch`:
+    /// completions and queued explicit pulls and image requests still
+    /// advance, but no watch poll or retry is dispatched (spec §6).
+    pub(crate) fn maintain(&mut self, watch: bool) -> bool {
+        self.maintain_at(Instant::now(), watch)
     }
 
-    pub(crate) fn maintain_at(&mut self, now: Instant) -> bool {
+    pub(crate) fn maintain_at(&mut self, now: Instant, watch: bool) -> bool {
         let mut published = false;
         while let Ok(completion) = self.completions.try_recv() {
             if let Completion::Phase(phase) = completion {
@@ -488,17 +490,19 @@ impl FileSession {
             }
         }
         self.start_if_ready_at(now);
-        if self.expedited_poll {
+        if watch && self.expedited_poll {
             self.poll_at(self.interval, now);
         }
         // Fairness with queued images: a watch poll the scheduler could not
         // dispatch because images held the worker, or a due watch retry
         // (which the scheduler skips while the worker is busy), gets the
-        // worker before the next queued image request.
-        if !self.busy && self.poll_owed {
+        // worker before the next queued image request. Under `--no-watch`
+        // there are no watch polls or retries to be fair to.
+        if watch && !self.busy && self.poll_owed {
             self.poll_at(self.interval, now);
         }
-        if !self.busy
+        if watch
+            && !self.busy
             && !self.image_queue.is_empty()
             && self.watch_retry_deadline().is_some_and(|due| due <= now)
         {

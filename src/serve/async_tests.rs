@@ -203,7 +203,7 @@ impl Harness {
 
     fn call(&mut self, name: &str, args: Value) -> Value {
         for session in &mut self.manager.sessions {
-            session.maintain();
+            session.maintain(false);
         }
         let mut offload = Offload::new(None);
         let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
@@ -865,7 +865,7 @@ impl Harness {
         self.manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.api.calls.load(Ordering::Relaxed) == 0 {
-            self.manager.sessions[0].maintain();
+            self.manager.sessions[0].maintain(true);
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
@@ -880,7 +880,7 @@ impl Harness {
     fn finish_poll_at(&mut self, now: Instant) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            self.manager.sessions[0].maintain_at(now);
+            self.manager.sessions[0].maintain_at(now, true);
             if self.manager.sessions[0].status().unwrap()["pull"]["polling"] == false {
                 return;
             }
@@ -892,7 +892,7 @@ impl Harness {
     fn finish_pull_at(&mut self, now: Instant) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            self.manager.sessions[0].maintain_at(now);
+            self.manager.sessions[0].maintain_at(now, true);
             if self.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] == "succeeded" {
                 return;
             }
@@ -962,7 +962,7 @@ impl Harness {
     fn wait_for_event_at(&mut self, now: Instant, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            self.manager.sessions[0].maintain_at(now);
+            self.manager.sessions[0].maintain_at(now, true);
             if let Ok(event) = self.entered.try_recv() {
                 assert_eq!(event, expected);
                 return;
@@ -1022,7 +1022,7 @@ fn desktop_write_expedites_recent_poll_and_retains_writes_during_poll() {
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 1);
 
     h.desktop_write(true);
-    h.manager.sessions[0].maintain_at(base + Duration::from_secs(1));
+    h.manager.sessions[0].maintain_at(base + Duration::from_secs(1), true);
     assert_eq!(
         h.manager.sessions[0].status().unwrap()["pull"]["polling"],
         false,
@@ -1049,7 +1049,7 @@ fn desktop_write_during_pull_is_polled_immediately_after_publication() {
         "fetch"
     );
     h.desktop_write(false);
-    h.manager.sessions[0].maintain_at(base + Duration::from_millis(200));
+    h.manager.sessions[0].maintain_at(base + Duration::from_millis(200), true);
     assert_eq!(
         h.manager.sessions[0].status().unwrap()["pull"]["polling"],
         false
@@ -1078,7 +1078,7 @@ fn expedited_poll_retries_honor_metadata_retry_after_and_network_backoff() {
         *h.api.metadata_error.lock().unwrap() = Some(error);
         let base = Instant::now() + Duration::from_secs(60);
         h.desktop_write(false);
-        h.manager.sessions[0].maintain_at(base);
+        h.manager.sessions[0].maintain_at(base, true);
         assert_eq!(
             h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
             "metadata"
@@ -1090,7 +1090,7 @@ fn expedited_poll_retries_honor_metadata_retry_after_and_network_backoff() {
         if seconds == 90 {
             h.desktop_write(false);
         }
-        h.manager.sessions[0].maintain_at(base + Duration::from_secs(seconds - 1));
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(seconds - 1), true);
         assert_eq!(
             h.manager.sessions[0].status().unwrap()["pull"]["polling"],
             false
@@ -1122,14 +1122,14 @@ fn expedited_poll_preserves_pull_retry_after() {
     h.release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] != "failed" {
-        h.manager.sessions[0].maintain_at(base);
+        h.manager.sessions[0].maintain_at(base, true);
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
     h.desktop_write(false);
     // Pull rate limits retain the existing max(interval, Retry-After)
     // cooldown, even when an expedited metadata request is pending.
-    h.manager.sessions[0].maintain_at(base + Duration::from_secs(3599));
+    h.manager.sessions[0].maintain_at(base + Duration::from_secs(3599), true);
     assert_eq!(
         h.manager.sessions[0].status().unwrap()["pull"]["polling"],
         false
@@ -1222,7 +1222,7 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
         h.release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while h.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] != "succeeded" {
-            h.manager.sessions[0].maintain_at(due + Duration::from_millis(200));
+            h.manager.sessions[0].maintain_at(due + Duration::from_millis(200), true);
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
@@ -1322,7 +1322,7 @@ fn successful_explicit_sync_preserves_metadata_retry_after_and_expedited_reconci
         if expedited {
             h.desktop_write(false);
         }
-        h.manager.sessions[0].maintain_at(base + Duration::from_secs(sync_finished));
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(sync_finished), true);
         assert_eq!(
             h.manager.sessions[0].status().unwrap()["pull"]["polling"],
             false,
@@ -1346,7 +1346,7 @@ fn successful_explicit_sync_preserves_metadata_retry_after_and_expedited_reconci
         );
         if sync_finished < seconds {
             let before = base + Duration::from_secs(seconds - 1);
-            h.manager.sessions[0].maintain_at(before);
+            h.manager.sessions[0].maintain_at(before, true);
             watch.service_at(&mut h.manager, interval, before);
             assert_eq!(
                 h.manager.sessions[0].status().unwrap()["pull"]["polling"],
@@ -1367,7 +1367,7 @@ fn successful_explicit_sync_preserves_metadata_retry_after_and_expedited_reconci
         h.release.send(()).unwrap();
         h.finish_pull_at(recovery);
         assert_eq!(h.manager.sessions[0].status().unwrap()["version"], "3");
-        h.manager.sessions[0].maintain_at(recovery + Duration::from_secs(1));
+        h.manager.sessions[0].maintain_at(recovery + Duration::from_secs(1), true);
         assert!(matches!(
             h.entered.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -1452,7 +1452,7 @@ fn ordinary_metadata_failure_retries_at_backoff_before_next_hourly_round() {
     h.release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.manager.sessions[0].status().unwrap()["version"] != "2" {
-        h.manager.sessions[0].maintain_at(base + Duration::from_secs(15));
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(15), true);
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
@@ -1493,7 +1493,7 @@ fn ordinary_watch_pull_failure_retries_at_backoff_before_next_hourly_round() {
     h.release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] != "failed" {
-        h.manager.sessions[0].maintain_at(base);
+        h.manager.sessions[0].maintain_at(base, true);
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
@@ -1526,7 +1526,7 @@ fn ordinary_watch_pull_failure_retries_at_backoff_before_next_hourly_round() {
     h.release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.manager.sessions[0].status().unwrap()["version"] != "2" {
-        h.manager.sessions[0].maintain_at(base + Duration::from_secs(5));
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(5), true);
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
@@ -1572,7 +1572,7 @@ fn ordinary_retries_share_rate_limit_and_do_not_starve_normal_rounds() {
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while first.manager.sessions[index].status().unwrap()["pull"]["polling"] == true {
-            first.manager.sessions[index].maintain_at(now);
+            first.manager.sessions[index].maintain_at(now, true);
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }

@@ -754,9 +754,10 @@ enum DesktopJob {
 
 /// The thread that owns the desktop upstream connection. Jobs run one at a
 /// time, in arrival order, so the upstream session handshake state is
-/// never shared. Dropping it detaches the thread: a call already in flight
-/// finishes within the upstream's own timeout and its result is dropped;
-/// queued calls are discarded unanswered (the loop has exited).
+/// never shared. Dropping it (or [`DesktopWorker::stop_taking_jobs`])
+/// stops it taking jobs: a call already in flight finishes within the
+/// upstream's own timeout and answers; queued calls are answered with a
+/// shutdown error without being sent (dropped if the loop has exited).
 struct DesktopWorker {
     jobs: mpsc::Sender<DesktopJob>,
     stop: Arc<AtomicBool>,
@@ -772,7 +773,15 @@ impl DesktopWorker {
         std::thread::spawn(move || {
             while let Ok(job) = work.recv() {
                 if stopped.load(Ordering::Relaxed) {
-                    break;
+                    // Shutdown (spec §6a): a queued call is never sent
+                    // upstream — it may be a write — and its caller gets
+                    // an error instead of silence.
+                    match job {
+                        DesktopJob::Call { reply, .. } => {
+                            reply.send(Err(DESKTOP_SHUTDOWN.into()), false)
+                        }
+                    }
+                    continue;
                 }
                 match job {
                     DesktopJob::Call { name, args, reply } => {
@@ -802,6 +811,13 @@ impl DesktopWorker {
         Self { jobs, stop, tools }
     }
 
+    /// Shutdown: stop taking queued jobs. A call already in flight still
+    /// finishes and answers; every queued one is answered with an error
+    /// without reaching the upstream.
+    fn stop_taking_jobs(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
     fn submit(&self, job: DesktopJob) {
         // A dead worker hands the job back; dropping it answers the
         // caller with an error.
@@ -814,6 +830,9 @@ impl Drop for DesktopWorker {
         self.stop.store(true, Ordering::Relaxed);
     }
 }
+
+const DESKTOP_SHUTDOWN: &str =
+    "figmog serve is shutting down; the desktop call was not sent upstream";
 
 /// Apply a deferred result's loop-side effects and return its answer.
 fn apply_done(
@@ -866,9 +885,10 @@ const EXIT_DRAIN: Duration = Duration::from_secs(15);
 
 /// Shutdown: answer the deferred calls already accepted before exiting, so
 /// `printf '<request>\n' | figmog serve` still gets its response. Accepts
-/// no new requests and starts no new work (queued image requests are
-/// answered with an error); waits until `deadline`. A vanished stdout or
-/// closed socket just drops that response.
+/// no new requests and starts no new work (queued image requests and
+/// queued desktop calls are answered with an error; running ones finish
+/// and answer); waits until `deadline`. A vanished stdout or closed socket
+/// just drops that response.
 fn drain_on_exit(
     manager: &mut SessionManager,
     offload: &Offload,
@@ -877,6 +897,11 @@ fn drain_on_exit(
     stdio: &StdioWriter,
     deadline: Instant,
 ) {
+    // Before anything waits: the desktop worker must not pick up a queued
+    // (possibly mutating) call while in-flight work drains.
+    if let Some(desktop) = &offload.desktop {
+        desktop.stop_taking_jobs();
+    }
     for session in &mut manager.sessions {
         session.abandon_queued_images();
     }
@@ -1017,7 +1042,7 @@ fn request_loop(
         // Polling this in-memory channel never waits on a pull or HTTP.
         let mut published = Vec::new();
         for session in &mut manager.sessions {
-            if session.maintain() {
+            if session.maintain(!no_watch) {
                 published.push(session.key.clone());
             }
         }
@@ -1557,7 +1582,7 @@ mod tests {
         watch_tick_at(&mut manager, &mut next_idx, interval, Instant::now());
         let deadline = Instant::now() + Duration::from_secs(5);
         while manager.list()[0]["pull"]["job"]["state"] != "succeeded" {
-            manager.sessions[0].maintain();
+            manager.sessions[0].maintain(true);
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
@@ -1569,12 +1594,12 @@ mod tests {
         manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
         let deadline = Instant::now() + Duration::from_secs(5);
         while api.meta_calls.load(Ordering::Relaxed) < 2 {
-            manager.sessions[0].maintain();
+            manager.sessions[0].maintain(true);
             manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
-        manager.sessions[0].maintain();
+        manager.sessions[0].maintain(true);
         assert_eq!(api.file_calls.load(Ordering::Relaxed), 1);
     }
 

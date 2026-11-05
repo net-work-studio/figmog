@@ -87,7 +87,7 @@ fn mirrored(dir: &std::path::Path, key: &str, nodes: usize) -> FileSession {
     session.request_pull(false, Duration::ZERO);
     let deadline = Instant::now() + Duration::from_secs(300);
     while !session.mirrored {
-        session.maintain();
+        session.maintain(true);
         assert!(Instant::now() < deadline, "synthetic pull timed out");
         std::thread::sleep(Duration::from_millis(2));
     }

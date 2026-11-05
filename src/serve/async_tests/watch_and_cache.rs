@@ -340,7 +340,7 @@ fn round_robin_watch_preserves_per_file_retry_after_without_blocking_other_files
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while first.manager.sessions[index].status().unwrap()["pull"]["polling"] == true {
-            first.manager.sessions[index].maintain_at(now);
+            first.manager.sessions[index].maintain_at(now, true);
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
