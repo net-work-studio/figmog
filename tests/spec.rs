@@ -27,11 +27,11 @@ fn fixtures() -> PathBuf {
 
 /// A fresh store holding the card file and the variable snapshot.
 fn card_store() -> (tempfile::TempDir, String) {
-    store("card.json")
+    store("card.json", "variables.json")
 }
 
-/// A fresh store holding `file` and the variable snapshot.
-fn store(file: &str) -> (tempfile::TempDir, String) {
+/// A fresh store holding `file` and the variable snapshot `variables`.
+fn store(file: &str, variables: &str) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db").display().to_string();
     let run = |args: &[&str]| {
@@ -43,7 +43,7 @@ fn store(file: &str) -> (tempfile::TempDir, String) {
     };
     let path = |name: &str| fixtures().join(name).display().to_string();
     run(&["pull", "--from-file", &path(file)]);
-    run(&["import-variables", &path("variables.json")]);
+    run(&["import-variables", &path(variables)]);
     (dir, db)
 }
 
@@ -80,29 +80,39 @@ fn entries<'a>(node: &'a Value, out: &mut Vec<(String, &'a Value)>) {
     }
 }
 
-/// Every (node id, variable id) binding in a file subtree: each
-/// `VARIABLE_ALIAS`, attributed to the nearest enclosing node.
-fn file_bindings(root: &Value) -> BTreeSet<(String, String)> {
-    fn scan(v: &Value, id: &str, out: &mut BTreeSet<(String, String)>) {
+/// Every binding in a file subtree: (node id, JSON pointer of the
+/// `VARIABLE_ALIAS` relative to that node, variable id).
+fn file_bindings(root: &Value) -> BTreeSet<(String, String, String)> {
+    fn scan(v: &Value, id: &str, at: &str, out: &mut BTreeSet<(String, String, String)>) {
         match v {
             Value::Object(m) => {
                 if m.get("type").and_then(Value::as_str) == Some("VARIABLE_ALIAS") {
-                    out.insert((id.to_string(), m["id"].as_str().unwrap().to_string()));
+                    let var = m["id"].as_str().unwrap().to_string();
+                    out.insert((id.to_string(), at.to_string(), var));
                     return;
                 }
-                let id = m.get("id").and_then(Value::as_str).unwrap_or(id);
                 for (k, x) in m {
-                    if k != "id" {
-                        scan(x, id, out);
+                    if k == "children" {
+                        for child in x.as_array().into_iter().flatten() {
+                            let cid = child["id"].as_str().unwrap();
+                            scan(child, cid, "", out);
+                        }
+                    } else {
+                        let key = k.replace('~', "~0").replace('/', "~1");
+                        scan(x, id, &format!("{at}/{key}"), out);
                     }
                 }
             }
-            Value::Array(xs) => xs.iter().for_each(|x| scan(x, id, out)),
+            Value::Array(xs) => {
+                for (i, x) in xs.iter().enumerate() {
+                    scan(x, id, &format!("{at}/{i}"), out);
+                }
+            }
             _ => {}
         }
     }
     let mut out = BTreeSet::new();
-    scan(root, "", &mut out);
+    scan(root, root["id"].as_str().unwrap(), "", &mut out);
     out
 }
 
@@ -117,23 +127,46 @@ fn file_node<'a>(file: &'a Value, id: &str) -> &'a Value {
     find(&file["document"], id).unwrap()
 }
 
-/// The issue's done-when line (NWS-2947), for one fixture: every bound
-/// value appears as its token reference, every unbound value is flagged
-/// (a token whose value it equals is only ever a `matches`), and the CSS
-/// a token feeds is that token's `var()`.
+/// The issue's done-when line (NWS-2947), for one fixture: every binding
+/// in the file — by pointer — appears as a token reference (an entry whose
+/// `bound_at` names it) or, where the spec can't use it, is listed under
+/// `unsupported` by that pointer; every unbound value is flagged (a token
+/// whose value it equals is only ever a `matches`); and each `css` name is
+/// one the token export emits.
 fn assert_bound_and_flagged(spec: &Value, file: &Value, root: &str, css_export: &str) {
     let mut all = Vec::new();
     entries(&spec["node"], &mut all);
-    let spec_bindings: BTreeSet<(String, String)> = all
-        .iter()
-        .filter_map(|(id, e)| Some((id.clone(), e["variable_id"].as_str()?.to_string())))
-        .collect();
-    assert_eq!(spec_bindings, file_bindings(file_node(file, root)));
+    let covers = |q: &str, p: &str| p == q || p.starts_with(&format!("{q}/"));
+    for (node, ptr, var) in file_bindings(file_node(file, root)) {
+        let as_token = all.iter().any(|(id, e)| {
+            *id == node
+                && e["variable_id"] == var.as_str()
+                && e["bound_at"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|q| covers(q.as_str().unwrap(), &ptr))
+        });
+        let listed = spec["unsupported"].as_array().unwrap().iter().any(|u| {
+            u["id"] == node.as_str()
+                && u["reason"]
+                    .as_str()
+                    .unwrap()
+                    .split(": ")
+                    .next()
+                    .is_some_and(|q| q.starts_with('/') && covers(q, &ptr))
+        });
+        assert!(
+            as_token || listed,
+            "{node} {ptr} ({var}) is neither a token reference nor listed"
+        );
+    }
     for (id, e) in &all {
         if e.get("variable_id").is_some() {
             assert!(e.get("untokenized").is_none(), "{id}: {e}");
             assert!(e["token"].is_string(), "{id}: {e}");
             assert!(e.get("matches").is_none(), "{id}: {e}");
+            assert!(!e["bound_at"].as_array().unwrap().is_empty(), "{id}: {e}");
         } else {
             assert_eq!(
                 e["untokenized"], true,
@@ -289,7 +322,7 @@ fn bindings_untokenized_values_and_unsupported_cases() {
 /// done-when line on a second fixture.
 #[test]
 fn edge_cases_spec() {
-    let (_dir, db) = store("edge.json");
+    let (_dir, db) = store("edge.json", "edge-variables.json");
     let bytes = spec_bytes(&db, "2:1", true);
     golden("edge.spec.json", &bytes);
     let css = stdout(&db, &["tokens", "export"]);
@@ -333,7 +366,7 @@ fn edge_cases_spec() {
     assert_eq!(node("2:24")["css"]["left"], "calc(50% + 10px)");
     assert_eq!(node("2:25")["css"]["width"], "25%");
     // Text: auto-resize, truncation, mixed runs.
-    assert_eq!(node("2:31")["css"]["white-space"], "nowrap");
+    assert_eq!(node("2:31")["css"]["white-space"], "pre");
     assert_eq!(node("2:34")["css"]["text-overflow"], "ellipsis");
     assert_eq!(node("2:35")["css"]["-webkit-line-clamp"], "2");
     let runs = &node("2:33")["content"]["runs"];
@@ -369,6 +402,53 @@ fn edge_cases_spec() {
         assert!(
             hint.split(' ').any(|c| c == class),
             "{class} missing: {hint}"
+        );
+    }
+    // Review findings: a unitless token gets its unit in CSS; a bound size
+    // or spacing CSS can't use is still a token reference, and listed; an
+    // absolute child of a bordered frame is offset from the padding box;
+    // several shadows are listed, not ordered; text keeps its newlines.
+    assert_eq!(
+        node("2:40")["css"]["padding-left"],
+        "calc(var(--space-unitless) * 1px)"
+    );
+    assert_eq!(
+        node("2:50")["css"]["opacity"],
+        "calc(var(--opacity-unitless) / 100)"
+    );
+    assert_eq!(node("2:17")["css"]["opacity"], "var(--opacity-muted)");
+    assert_eq!(node("2:23")["layout"]["width"]["token"], "space/4");
+    assert_eq!(node("2:23")["css"]["height"], "var(--spacing-2)");
+    assert!(node("2:23")["css"].get("width").is_none());
+    assert_eq!(node("2:60")["layout"]["item_spacing"]["token"], "space/2");
+    assert_eq!(
+        node("2:71")["css"]["right"],
+        "calc(8px - var(--stroke-thin))"
+    );
+    assert!(node("2:21")["css"].get("box-shadow").is_none());
+    assert_eq!(node("2:36")["css"]["white-space"], "pre-wrap");
+    assert_eq!(node("2:31")["css"]["white-space"], "pre");
+    let reasons: Vec<(String, String)> = spec["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| {
+            (
+                u["id"].as_str().unwrap().into(),
+                u["reason"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    for (id, prefix) in [
+        ("2:21", "effects: 2 shadows"),
+        ("2:23", "/boundVariables/size/x: width is bound"),
+        ("2:60", "/boundVariables/itemSpacing: itemSpacing is bound"),
+    ] {
+        assert!(
+            reasons
+                .iter()
+                .any(|(i, r)| i == id && r.starts_with(prefix)),
+            "{id}: {prefix} not listed: {reasons:?}"
         );
     }
     // The rotated child is the one untranslatable placement.

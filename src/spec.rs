@@ -73,6 +73,9 @@ struct Tokens {
     css: BTreeMap<String, String>,
     /// Variable id → Tailwind theme name, from the token export.
     theme: BTreeMap<String, String>,
+    /// Variable id → the unit a FLOAT token is exported with (`None`:
+    /// unitless), from the token export.
+    units: BTreeMap<String, Option<&'static str>>,
     /// Variable id → its value in the root mode (the mode the token export
     /// writes to `:root`, else the collection's default mode), aliases
     /// followed.
@@ -193,42 +196,6 @@ const DESIGN_STYLE_KEYS: [&str; 5] = [
     "textTruncation",
 ];
 
-/// Node-level `boundVariables` keys the spec reads; any other bound key
-/// is listed as unsupported, so no binding disappears silently.
-const HANDLED_BINDINGS: [&str; 31] = [
-    "bottomLeftRadius",
-    "bottomRightRadius",
-    "characters",
-    "componentProperties",
-    "counterAxisSpacing",
-    "fills",
-    "fontFamily",
-    "fontSize",
-    "fontWeight",
-    "gridColumnGap",
-    "gridRowGap",
-    "height",
-    "itemSpacing",
-    "letterSpacing",
-    "lineHeight",
-    "maxHeight",
-    "maxWidth",
-    "minHeight",
-    "minWidth",
-    "opacity",
-    "paddingBottom",
-    "paddingLeft",
-    "paddingRight",
-    "paddingTop",
-    "rectangleCornerRadii",
-    "size",
-    "strokeWeight",
-    "strokes",
-    "topLeftRadius",
-    "topRightRadius",
-    "width",
-];
-
 /// Build the spec. `tree` is the `figmog_subtree` answer for the node;
 /// `vars` the `figmog_vars {snapshot: true}` answer; `components` maps a
 /// component id to `{name, key, remote, component_set}` for the subtree's
@@ -245,11 +212,12 @@ pub fn build(
     tailwind: bool,
     map: Option<&CodeMap>,
 ) -> Value {
-    let (css, theme, theme_names, roots, css_unavailable) = match export_css(vars, tokens) {
+    let (css, theme, theme_names, units, roots, css_unavailable) = match export_css(vars, tokens) {
         Ok(export) => (
             export.names,
             export.theme,
             export.theme_names,
+            export.units,
             export.root_modes,
             Value::Null,
         ),
@@ -258,16 +226,20 @@ pub fn build(
             None,
             BTreeMap::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
             Value::String(e),
         ),
     };
-    let tokens = Tokens::new(vars, css, theme_names, &roots);
+    let mut tokens = Tokens::new(vars, css, theme_names, &roots);
+    tokens.units = units;
     let mut cx = Cx {
         tokens: &tokens,
         components,
         tailwind,
         map,
         unsupported: BTreeSet::new(),
+        consumed: BTreeSet::new(),
+        style_base: "/style".into(),
     };
     let node = cx.node(
         tree,
@@ -275,6 +247,7 @@ pub fn build(
             kind: Parent::Root,
             bbox: None,
             margin: None,
+            border: None,
         },
     );
     let unsupported: Vec<Value> = cx
@@ -360,17 +333,23 @@ impl Tokens {
             vars: all,
             css,
             theme,
+            units: BTreeMap::new(),
             root,
         }
     }
 
-    /// A bound value: the token, its CSS name and the raw value.
-    fn bound(&self, variable_id: &str, raw: Value) -> Value {
+    /// A bound value: the token, its CSS name, the raw value, and the
+    /// JSON pointers (relative to the node) of the binding.
+    fn bound(&self, bind: &Bind, raw: Value) -> Value {
+        let mut at = bind.at.clone();
+        at.sort();
+        at.dedup();
         json!({
-            "token": self.vars.get(variable_id).map(|v| v.name.clone()),
-            "variable_id": variable_id,
-            "css": self.css.get(variable_id),
+            "token": self.vars.get(&bind.var).map(|v| v.name.clone()),
+            "variable_id": bind.var,
+            "css": self.css.get(&bind.var),
             "raw": raw,
+            "bound_at": at,
         })
     }
 
@@ -406,34 +385,11 @@ impl Tokens {
     }
 
     /// The value entry for `raw` with optional binding `variable_id`.
-    fn entry(&self, binding: Option<String>, raw: Value, lit: Option<&Lit>, prop: Prop) -> Value {
+    fn entry(&self, binding: Option<Bind>, raw: Value, lit: Option<&Lit>, prop: Prop) -> Value {
         match binding {
-            Some(id) => self.bound(&id, raw),
+            Some(b) => self.bound(&b, raw),
             None => self.untokenized(raw, lit, prop),
         }
-    }
-
-    /// An entry's CSS value: the bound token's `var()` (with its Tailwind
-    /// theme name) when the token export names it, else `literal` of the
-    /// raw value. `None` when neither exists.
-    fn css_of(&self, e: &Value, literal: impl Fn(&Value) -> Option<String>) -> Option<CssVal> {
-        if let Some(id) = e["variable_id"].as_str()
-            && let Some(name) = self.css.get(id)
-        {
-            return Some(CssVal {
-                value: format!("var({name})"),
-                theme: self.theme.get(id).cloned(),
-            });
-        }
-        literal(&e["raw"]).map(CssVal::lit)
-    }
-
-    /// A length entry's CSS value (`<n>px`), `None` for an unbound zero.
-    fn length(&self, e: &Value) -> Option<CssVal> {
-        if is_unbound_zero(e) {
-            return None;
-        }
-        self.css_of(e, |raw| raw.as_f64().map(px))
     }
 }
 
@@ -488,6 +444,86 @@ fn alias_id(v: Option<&Value>) -> Result<Option<String>, ()> {
     }
 }
 
+/// Every variable an alias or an alias array names.
+fn alias_ids(v: Option<&Value>) -> BTreeSet<String> {
+    let items = match v {
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(a) => vec![a],
+        None => vec![],
+    };
+    items
+        .into_iter()
+        .filter(|a| a["type"] == "VARIABLE_ALIAS")
+        .filter_map(|a| a["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A binding: the variable, and the JSON pointers (relative to the node)
+/// that name it.
+#[derive(Debug, Clone, PartialEq)]
+struct Bind {
+    var: String,
+    at: Vec<String>,
+}
+
+/// `base` + the RFC 6901 pointer of `path`.
+fn pointer(base: &str, path: &[&str]) -> String {
+    let mut out = base.to_string();
+    for p in path {
+        out.push('/');
+        out.push_str(&p.replace('~', "~0").replace('/', "~1"));
+    }
+    out
+}
+
+/// `v[p]`, an array index when `v` is an array.
+fn step<'a>(v: &'a Value, p: &str) -> Option<&'a Value> {
+    match v {
+        Value::Array(items) => items.get(p.parse::<usize>().ok()?),
+        _ => v.get(p),
+    }
+}
+
+/// Every `VARIABLE_ALIAS` under `v` (children excluded), by pointer.
+fn alias_pointers(v: &Value, at: &str, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) if m.get("type").and_then(Value::as_str) == Some("VARIABLE_ALIAS") => {
+            out.push(at.to_string());
+        }
+        Value::Object(m) => {
+            for (k, x) in m {
+                if !(at.is_empty() && k == "children") {
+                    alias_pointers(x, &pointer(at, &[k]), out);
+                }
+            }
+        }
+        Value::Array(xs) => {
+            for (i, x) in xs.iter().enumerate() {
+                alias_pointers(x, &pointer(at, &[&i.to_string()]), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What CSS needs from a value.
+#[derive(Clone, Copy, PartialEq)]
+enum Want {
+    /// A length: px literals; a unitless token is scaled by `1px`.
+    Px,
+    /// A length, left out when it is an unbound zero.
+    PxNonZero,
+    /// `opacity`: a 0–1 literal; a `%` token as is, a unitless (0–100)
+    /// token divided by 100.
+    Opacity,
+    /// A plain number (`font-weight`).
+    Number,
+    /// A color.
+    Color,
+    /// A font family (a quoted string).
+    Family,
+}
+
 /// A node's absolute bounding box.
 #[derive(Debug, Clone, Copy)]
 struct Rect {
@@ -531,6 +567,9 @@ struct Up {
     /// A negative auto-layout gap, as a margin on every in-flow child
     /// after the first.
     margin: Option<(&'static str, CssVal)>,
+    /// The parent's CSS border width (a stroke included in layout): CSS
+    /// offsets an absolute child from the padding box, inside it.
+    border: Option<CssVal>,
 }
 
 /// What a node is as a container.
@@ -551,6 +590,12 @@ struct Cx<'a> {
     tailwind: bool,
     map: Option<&'a CodeMap>,
     unsupported: BTreeSet<(String, String)>,
+    /// The current node's binding pointers read so far; any other is
+    /// listed as unsupported (never dropped silently).
+    consumed: BTreeSet<String>,
+    /// Where the type style read by [`Cx::binding`] lives in the node
+    /// (`/style`, or a run's `/styleOverrideTable/<n>`).
+    style_base: String,
 }
 
 /// `SOLID` paint color as `#rrggbb[aa]`, the paint's opacity folded into
@@ -598,45 +643,99 @@ impl Cx<'_> {
         self.unsupported.insert((id.to_string(), reason.into()));
     }
 
-    /// A node's binding for `key` (node `boundVariables`, then — for text
-    /// properties — the type style's own; the style first when
-    /// `style_first`), reporting a mixed binding.
-    fn binding(
-        &mut self,
-        n: &Value,
-        id: &str,
-        key: &str,
-        style_first: bool,
-    ) -> Result<Option<String>, ()> {
-        let node = || alias_id(n.get("boundVariables").and_then(|b| b.get(key)));
-        let style = || {
-            alias_id(
-                n.get("style")
-                    .and_then(|s| s.get("boundVariables"))
-                    .and_then(|b| b.get(key)),
-            )
-        };
-        let (first, second): (&dyn Fn() -> _, &dyn Fn() -> _) = if style_first {
-            (&style, &node)
-        } else {
-            (&node, &style)
-        };
-        let found = first().and_then(|b| match b {
-            Some(b) => Ok(Some(b)),
-            None => second(),
-        });
-        if found.is_err() {
-            self.unsupported(
-                id,
-                format!("{key}: bound to several variables (mixed): not specified"),
-            );
+    /// The binding at `path` under `v` (whose pointer is `base`): marked
+    /// read, and `Err(pointer)` for a mixed alias array.
+    fn lookup(&mut self, v: &Value, base: &str, path: &[&str]) -> Result<Option<Bind>, String> {
+        let mut at = Some(v);
+        for p in path {
+            at = at.and_then(|x| step(x, p));
         }
-        found
+        let ptr = pointer(base, path);
+        if at.is_some() {
+            self.consumed.insert(ptr.clone());
+        }
+        match alias_id(at) {
+            Ok(Some(var)) => Ok(Some(Bind { var, at: vec![ptr] })),
+            Ok(None) => Ok(None),
+            Err(()) => Err(ptr),
+        }
+    }
+
+    /// Two places one property can be bound (a paint and the node's
+    /// `fills[i]`, a node and its type style): the first wins; the second
+    /// naming the same variable joins it, another variable is listed.
+    fn either(
+        &mut self,
+        id: &str,
+        first: Result<Option<Bind>, String>,
+        second: Result<Option<Bind>, String>,
+    ) -> Result<Option<Bind>, ()> {
+        let mixed = |cx: &mut Self, p: &str| {
+            cx.unsupported(
+                id,
+                format!("{p}: bound to several variables (mixed): not specified"),
+            );
+        };
+        match (first, second) {
+            (Err(p), _) => {
+                mixed(self, &p);
+                Err(())
+            }
+            (Ok(None), Err(p)) => {
+                mixed(self, &p);
+                Err(())
+            }
+            (Ok(None), Ok(b)) => Ok(b),
+            (Ok(Some(mut a)), other) => {
+                match other {
+                    Ok(Some(b)) if b.var == a.var => a.at.extend(b.at),
+                    Ok(Some(b)) => self.unsupported(
+                        id,
+                        format!(
+                            "{}: bound to {}, but {} ({}) is used: not specified",
+                            b.at[0], b.var, a.at[0], a.var
+                        ),
+                    ),
+                    Err(p) => mixed(self, &p),
+                    Ok(None) => {}
+                }
+                Ok(Some(a))
+            }
+        }
+    }
+
+    /// A node's binding for `key`: the node's `boundVariables`, then — for
+    /// text properties — the type style's own, reporting a mixed binding.
+    /// With `runs` (a mixed-run node, or a run), only the type style's: the
+    /// node-level per-range arrays are read when the style and the runs'
+    /// overrides name every variable in them, else they stay unread (and
+    /// listed).
+    fn binding(&mut self, n: &Value, id: &str, key: &str, runs: bool) -> Result<Option<Bind>, ()> {
+        let style_base = self.style_base.clone();
+        if !runs {
+            let node = self.lookup(n, "", &["boundVariables", key]);
+            let style = self.lookup(&n["style"], &style_base, &["boundVariables", key]);
+            return self.either(id, node, style);
+        }
+        let style = self.lookup(&n["style"], &style_base, &["boundVariables", key]);
+        if let Some(v) = n.get("boundVariables").and_then(|b| b.get(key)) {
+            let mut named = BTreeSet::new();
+            if let Ok(Some(b)) = &style {
+                named.insert(b.var.clone());
+            }
+            for (_, o) in n["styleOverrideTable"].as_object().into_iter().flatten() {
+                named.extend(alias_ids(o.get("boundVariables").and_then(|b| b.get(key))));
+            }
+            if alias_ids(Some(v)).is_subset(&named) {
+                self.consumed.insert(pointer("", &["boundVariables", key]));
+            }
+        }
+        self.either(id, style, Ok(None))
     }
 
     /// A numeric property: bound or untokenized, raw value as stored.
     /// `keys` are the binding keys tried in order (a property Figma binds
-    /// under more than one name).
+    /// under more than one name; `size.x` is a path).
     fn number(
         &mut self,
         n: &Value,
@@ -645,25 +744,97 @@ impl Cx<'_> {
         raw: Value,
         prop: Prop,
     ) -> Option<Value> {
-        let mut binding = None;
+        let binding = self.bind_any(n, id, keys).ok()?;
+        let lit = raw.as_f64().map(Lit::Number);
+        Some(self.tokens.entry(binding, raw, lit.as_ref(), prop))
+    }
+
+    /// The first of `keys` that is bound (see [`Cx::number`]).
+    fn bind_any(&mut self, n: &Value, id: &str, keys: &[&str]) -> Result<Option<Bind>, ()> {
         for key in keys {
             let path: Vec<&str> = key.split('.').collect();
             let found = if path.len() == 1 {
-                self.binding(n, id, key, false).ok()?
+                self.binding(n, id, key, false)?
             } else {
-                let mut at = n.get("boundVariables");
-                for p in &path {
-                    at = at.and_then(|v| v.get(*p));
+                let mut full = vec!["boundVariables"];
+                full.extend(path);
+                match self.lookup(n, "", &full) {
+                    Ok(b) => b,
+                    Err(p) => {
+                        self.unsupported(
+                            id,
+                            format!("{p}: bound to several variables (mixed): not specified"),
+                        );
+                        return Err(());
+                    }
                 }
-                alias_id(at).ok()?
             };
             if found.is_some() {
-                binding = found;
-                break;
+                return Ok(found);
             }
         }
-        let lit = raw.as_f64().map(Lit::Number);
-        Some(self.tokens.entry(binding, raw, lit.as_ref(), prop))
+        Ok(None)
+    }
+
+    /// An entry's CSS value for `prop`: the bound token's `var()` (with
+    /// its Tailwind theme name) when the token export names it — scaled to
+    /// what `prop` takes when the export writes it unitless, listed as
+    /// unsupported when the export's unit can't be converted — else the
+    /// raw value. `None` when neither exists.
+    fn css_value(&mut self, id: &str, prop: &str, e: &Value, want: Want) -> Option<CssVal> {
+        if let Some(var) = e["variable_id"].as_str()
+            && let Some(name) = self.tokens.css.get(var)
+        {
+            let plain = CssVal {
+                value: format!("var({name})"),
+                theme: self.tokens.theme.get(var).cloned(),
+            };
+            let unit = self.tokens.units.get(var).copied();
+            return match (want, unit) {
+                (Want::Color | Want::Family, _) | (_, None) => Some(plain),
+                (Want::Px | Want::PxNonZero, Some(Some("px")))
+                | (Want::Opacity, Some(Some("%")))
+                | (Want::Number, Some(None)) => Some(plain),
+                (Want::Px | Want::PxNonZero, Some(None)) => {
+                    Some(CssVal::lit(format!("calc(var({name}) * 1px)")))
+                }
+                (Want::Opacity, Some(None)) => {
+                    Some(CssVal::lit(format!("calc(var({name}) / 100)")))
+                }
+                (_, Some(unit)) => {
+                    let unit = unit.unwrap_or("unitless");
+                    self.unsupported(
+                        id,
+                        format!("{prop}: token {name} is exported in {unit}, which {prop} can't take: not specified"),
+                    );
+                    None
+                }
+            };
+        }
+        let raw = &e["raw"];
+        match want {
+            Want::PxNonZero if is_unbound_zero(e) => None,
+            Want::Px | Want::PxNonZero => raw.as_f64().map(px),
+            Want::Opacity | Want::Number => raw.as_f64().map(num),
+            Want::Color => raw.as_str().map(str::to_string),
+            Want::Family => raw.as_str().map(|s| format!("{s:?}")),
+        }
+        .map(CssVal::lit)
+    }
+
+    /// Bindings of this node the spec didn't read: listed, never dropped.
+    fn unread_bindings(&mut self, n: &Value, id: &str) {
+        let mut all = Vec::new();
+        alias_pointers(n, "", &mut all);
+        for p in all {
+            let read = self
+                .consumed
+                .iter()
+                .any(|c| p == *c || p.starts_with(&format!("{c}/")));
+            if !read {
+                self.unsupported(id, format!("{p}: bound to a variable: not specified"));
+            }
+        }
     }
 
     fn node(&mut self, n: &Value, up: &Up) -> Value {
@@ -681,7 +852,7 @@ impl Cx<'_> {
             self.unsupported(&id, "hidden layer (visible: false): not specified");
             return Value::Object(out);
         }
-        self.unread_bindings(n, &id);
+        self.consumed.clear();
         let mut css = Css::default();
         if let Some((prop, margin)) = &up.margin {
             css.set(prop, margin.clone());
@@ -693,6 +864,15 @@ impl Cx<'_> {
 
         // Own layout.
         let kids: &[Value] = if vector {
+            if let Some(k) = n["children"].as_array().filter(|k| !k.is_empty()) {
+                self.unsupported(
+                    &id,
+                    format!(
+                        "{} children are part of the vector asset: not specified",
+                        k.len()
+                    ),
+                );
+            }
             &[]
         } else {
             n["children"].as_array().map(Vec::as_slice).unwrap_or(&[])
@@ -768,6 +948,7 @@ impl Cx<'_> {
         });
         let fills = self.paints(
             n,
+            "",
             &id,
             "fills",
             fill_prop(&node_type),
@@ -849,7 +1030,9 @@ impl Cx<'_> {
             Container::Free => Parent::Free,
             Container::Unplaced | Container::Leaf => Parent::Unplaced,
         };
+        self.unread_bindings(n, &id);
         let bbox = rect(n);
+        let border = css.get("border-width").cloned();
         let mut seen_in_flow = false;
         let mut children = Vec::with_capacity(kids.len());
         for (i, k) in kids.iter().enumerate() {
@@ -870,6 +1053,7 @@ impl Cx<'_> {
                 kind,
                 bbox,
                 margin: margin.clone().filter(|_| in_flow && seen_in_flow),
+                border: border.clone(),
             };
             seen_in_flow |= in_flow;
             children.push(self.node(k, &child_up));
@@ -882,20 +1066,6 @@ impl Cx<'_> {
         }
         out.insert("children".into(), Value::Array(children));
         Value::Object(out)
-    }
-
-    /// Bound node properties the spec doesn't read: listed, never dropped.
-    fn unread_bindings(&mut self, n: &Value, id: &str) {
-        let keys: Vec<String> = n["boundVariables"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(k, _)| k.clone())
-            .filter(|k| !HANDLED_BINDINGS.contains(&k.as_str()))
-            .collect();
-        for key in keys {
-            self.unsupported(id, format!("{key}: bound to a variable: not specified"));
-        }
     }
 
     /// An auto-layout frame: direction, wrap, gap, padding, alignment.
@@ -937,11 +1107,25 @@ impl Cx<'_> {
         let mut margin = None;
         if primary == "SPACE_BETWEEN" {
             layout.insert("gap".into(), json!("auto"));
+            // Figma ignores the item spacing here; a binding on it is
+            // still shown (and that CSS doesn't use it, listed).
+            if let Ok(Some(bind)) = self.binding(n, id, "itemSpacing", false) {
+                let raw = n.get("itemSpacing").cloned().unwrap_or(json!(0));
+                let e = self.tokens.bound(&bind, raw);
+                self.unsupported(
+                    id,
+                    format!(
+                        "{}: itemSpacing is bound, but primaryAxisAlignItems SPACE_BETWEEN spaces the children: the token is not used in CSS",
+                        bind.at[0]
+                    ),
+                );
+                layout.insert("item_spacing".into(), e);
+            }
         } else {
             let raw = n.get("itemSpacing").cloned().unwrap_or(json!(0));
             let negative = raw.as_f64().is_some_and(|g| g < 0.0);
             if let Some(gap) = self.number(n, id, &["itemSpacing"], raw, GAP) {
-                let value = self.tokens.length(&gap);
+                let value = self.css_value(id, "gap", &gap, Want::PxNonZero);
                 layout.insert("gap".into(), gap);
                 match (value, negative, wrap) {
                     (None, _, _) => {}
@@ -965,21 +1149,26 @@ impl Cx<'_> {
             }
         }
         if wrap {
-            // Figma's counter-axis spacing defaults to the item spacing.
-            let raw = n
-                .get("counterAxisSpacing")
-                .filter(|v| !v.is_null())
+            // Figma's counter-axis spacing defaults to the item spacing
+            // (value and binding).
+            let own = n.get("counterAxisSpacing").filter(|v| !v.is_null());
+            let raw = own
                 .or_else(|| n.get("itemSpacing"))
                 .cloned()
                 .unwrap_or(json!(0));
+            let keys: &[&str] = if own.is_some() {
+                &["counterAxisSpacing"]
+            } else {
+                &["counterAxisSpacing", "itemSpacing"]
+            };
             let negative = raw.as_f64().is_some_and(|g| g < 0.0);
-            if let Some(gap) = self.number(n, id, &["counterAxisSpacing"], raw, GAP) {
+            if let Some(gap) = self.number(n, id, keys, raw, GAP) {
                 if negative {
                     self.unsupported(
                         id,
                         "counterAxisSpacing: negative gap between wrapped rows: row-gap not specified",
                     );
-                } else if let Some(v) = self.tokens.length(&gap) {
+                } else if let Some(v) = self.css_value(id, "row-gap", &gap, Want::PxNonZero) {
                     css.set("row-gap", v);
                 }
                 layout.insert("wrap_gap".into(), gap);
@@ -1056,7 +1245,7 @@ impl Cx<'_> {
                         id,
                         format!("{key}: negative grid gap: {prop} not specified"),
                     );
-                } else if let Some(v) = self.tokens.length(&gap) {
+                } else if let Some(v) = self.css_value(id, prop, &gap, Want::PxNonZero) {
                     css.set(prop, v);
                 }
                 grid.insert(name.into(), gap);
@@ -1070,18 +1259,18 @@ impl Cx<'_> {
     fn padding(&mut self, n: &Value, id: &str, layout: &mut Map<String, Value>, css: &mut Css) {
         let mut padding = Map::new();
         let mut sides: [Option<CssVal>; 4] = Default::default();
-        for (i, (side, key)) in [
-            ("top", "paddingTop"),
-            ("right", "paddingRight"),
-            ("bottom", "paddingBottom"),
-            ("left", "paddingLeft"),
+        for (i, (side, key, prop)) in [
+            ("top", "paddingTop", "padding-top"),
+            ("right", "paddingRight", "padding-right"),
+            ("bottom", "paddingBottom", "padding-bottom"),
+            ("left", "paddingLeft", "padding-left"),
         ]
         .into_iter()
         .enumerate()
         {
             let raw = n.get(key).cloned().unwrap_or(json!(0));
             if let Some(e) = self.number(n, id, &[key], raw, GAP) {
-                sides[i] = self.tokens.length(&e);
+                sides[i] = self.css_value(id, prop, &e, Want::PxNonZero);
                 padding.insert(side.into(), e);
             }
         }
@@ -1119,7 +1308,7 @@ impl Cx<'_> {
             return;
         }
         if let Some(e) = self.number(n, id, &keys, raw, SIZE) {
-            if let Some(v) = self.tokens.css_of(&e, |raw| raw.as_f64().map(px)) {
+            if let Some(v) = self.css_value(id, prop, &e, Want::Px) {
                 css.set(prop, v);
             }
             layout.insert(key.into(), e);
@@ -1184,16 +1373,67 @@ impl Cx<'_> {
         if absolute {
             layout.insert("position".into(), json!("absolute"));
             self.position(n, id, up, [&h, &v], layout, css);
-            return true;
+        } else {
+            self.flow(n, id, up, [&h, &v], layout, css);
         }
-        for (axis, s) in [("HORIZONTAL", h.as_str()), ("VERTICAL", v.as_str())] {
+        // A bound width/height the CSS doesn't declare (it follows the
+        // sizing or the constraints): shown as its token, and listed.
+        for (key, keys, s) in [
+            ("width", ["size.x", "width"], &h),
+            ("height", ["size.y", "height"], &v),
+        ] {
+            if layout.contains_key(key) {
+                continue;
+            }
+            if let Ok(Some(bind)) = self.bind_any(n, id, &keys) {
+                let why = if absolute {
+                    "its constraints".to_string()
+                } else {
+                    format!("its {s} sizing")
+                };
+                self.unsupported(
+                    id,
+                    format!(
+                        "{}: {key} is bound, but the CSS {key} follows {why}: the token is not used in CSS",
+                        bind.at[0]
+                    ),
+                );
+                let raw = n["absoluteBoundingBox"][key].clone();
+                layout.insert(key.into(), self.tokens.bound(&bind, raw));
+            }
+        }
+        absolute
+    }
+
+    /// An in-flow node's size (and grid placement) in its parent.
+    fn flow(
+        &mut self,
+        n: &Value,
+        id: &str,
+        up: &Up,
+        sizing: [&str; 2],
+        layout: &mut Map<String, Value>,
+        css: &mut Css,
+    ) {
+        for (axis, s) in [("HORIZONTAL", sizing[0]), ("VERTICAL", sizing[1])] {
             let horizontal = axis == "HORIZONTAL";
             let full = if horizontal { "width" } else { "height" };
             match (up.kind, s) {
                 (_, "fixed") => self.dim(n, id, axis, layout, css),
                 (Parent::Root, "hug") if horizontal => css.lit("width", "fit-content"),
                 (Parent::Root, "fill") => css.lit(full, "100%"),
-                (Parent::Flex(d), "fill") if d == axis => css.lit("flex", "1 1 0%"),
+                (Parent::Flex(d), "fill") if d == axis => {
+                    // Fill shares the space, down to nothing like Figma's.
+                    css.lit("flex", "1 1 0%");
+                    css.lit(
+                        if horizontal {
+                            "min-width"
+                        } else {
+                            "min-height"
+                        },
+                        "0",
+                    );
+                }
                 (Parent::Flex(_), "fill") => css.lit("align-self", "stretch"),
                 (Parent::Grid, "fill") => css.lit(
                     if horizontal {
@@ -1239,7 +1479,6 @@ impl Cx<'_> {
                 }
             }
         }
-        false
     }
 
     /// An absolutely positioned node: offsets from its constraints,
@@ -1276,22 +1515,28 @@ impl Cx<'_> {
             let constraint = n["constraints"][key].as_str().unwrap_or(default);
             let size = sizing[i] != "hug";
             let percent = |v: f64| format!("{}%", num(v / ps * 100.0));
+            // CSS offsets from the padding box: inside the parent's border.
+            let inset = |v: f64| match &up.border {
+                None => px(v),
+                Some(b) if b.is_var() => format!("calc({} - {})", px(v), b.value),
+                Some(b) => px(v - b.value.trim_end_matches("px").parse::<f64>().unwrap_or(0.0)),
+            };
             match constraint {
                 "LEFT" | "TOP" | "MIN" => {
-                    css.lit(start, px(d));
+                    css.lit(start, inset(d));
                     if size {
                         self.dim(n, id, axis, layout, css);
                     }
                 }
                 "RIGHT" | "BOTTOM" | "MAX" => {
-                    css.lit(end, px(ps - d - s));
+                    css.lit(end, inset(ps - d - s));
                     if size {
                         self.dim(n, id, axis, layout, css);
                     }
                 }
                 "LEFT_RIGHT" | "TOP_BOTTOM" | "STRETCH" => {
-                    css.lit(start, px(d));
-                    css.lit(end, px(ps - d - s));
+                    css.lit(start, inset(d));
+                    css.lit(end, inset(ps - d - s));
                 }
                 "CENTER" => {
                     // The node's center keeps its offset from the parent's.
@@ -1307,6 +1552,12 @@ impl Cx<'_> {
                         self.dim(n, id, axis, layout, css);
                     }
                 }
+                "SCALE" if up.border.is_some() => self.unsupported(
+                    id,
+                    format!(
+                        "constraints.{key} SCALE inside a border: CSS percentages are of the padding box: {start} not specified"
+                    ),
+                ),
                 "SCALE" if ps > 0.0 => {
                     css.lit(start, percent(d));
                     css.lit(if i == 0 { "width" } else { "height" }, percent(s));
@@ -1337,7 +1588,7 @@ impl Cx<'_> {
                 continue;
             };
             if let Some(e) = self.number(n, id, &[key], raw, SIZE) {
-                if let Some(v) = self.tokens.css_of(&e, |raw| raw.as_f64().map(px)) {
+                if let Some(v) = self.css_value(id, prop, &e, Want::Px) {
                     css.set(prop, v);
                 }
                 layout.insert(name.into(), e);
@@ -1355,7 +1606,7 @@ impl Cx<'_> {
             let e = self
                 .tokens
                 .entry(binding, n["opacity"].clone(), Some(&lit), OPACITY);
-            if let Some(v) = self.tokens.css_of(&e, |_| Some(num(o))) {
+            if let Some(v) = self.css_value(id, "opacity", &e, Want::Opacity) {
                 css.set("opacity", v);
             }
             values.insert("opacity".into(), e);
@@ -1372,9 +1623,11 @@ impl Cx<'_> {
     /// `IMAGE` fill becomes an asset reference; any other paint type is
     /// unsupported. With `css`, a single visible solid paint is declared
     /// as that property.
+    #[allow(clippy::too_many_arguments)]
     fn paints(
         &mut self,
         n: &Value,
+        base: &str,
         id: &str,
         key: &str,
         prop: Prop,
@@ -1418,16 +1671,10 @@ impl Cx<'_> {
             };
             // The node-level binding is a fallback only when the paint has
             // none of its own: a mixed paint binding stays an error.
-            let binding = match alias_id(paint.get("boundVariables").and_then(|b| b.get("color"))) {
-                Ok(None) => alias_id(
-                    n.get("boundVariables")
-                        .and_then(|b| b.get(key))
-                        .and_then(|b| b.get(i)),
-                ),
-                other => other,
-            };
-            let Ok(binding) = binding else {
-                self.unsupported(id, format!("{key}[{i}]: mixed variable bindings"));
+            let index = i.to_string();
+            let own = self.lookup(n, base, &[key, &index, "boundVariables", "color"]);
+            let node = self.lookup(n, base, &["boundVariables", key, &index]);
+            let Ok(binding) = self.either(id, own, node) else {
                 continue;
             };
             let lit = Lit::Color(hex.clone());
@@ -1436,10 +1683,7 @@ impl Cx<'_> {
         if let Some((property, css)) = css {
             match (visible, out.as_slice()) {
                 (1, [e]) => {
-                    if let Some(v) = self
-                        .tokens
-                        .css_of(e, |raw| raw.as_str().map(str::to_string))
-                    {
+                    if let Some(v) = self.css_value(id, property, e, Want::Color) {
                         css.set(property, v);
                     }
                 }
@@ -1466,7 +1710,7 @@ impl Cx<'_> {
         css: &mut Css,
     ) {
         let mut ignored = Vec::new();
-        let strokes = self.paints(n, id, "strokes", STROKE_COLOR, &mut ignored, None);
+        let strokes = self.paints(n, "", id, "strokes", STROKE_COLOR, &mut ignored, None);
         if strokes.is_empty() {
             return;
         }
@@ -1476,12 +1720,11 @@ impl Cx<'_> {
             .flatten()
             .filter(|p| p["visible"] != false)
             .count();
-        let color = (visible == 1)
-            .then(|| {
-                self.tokens
-                    .css_of(&strokes[0], |raw| raw.as_str().map(str::to_string))
-            })
-            .flatten();
+        let color = if visible == 1 {
+            self.css_value(id, "outline-color", &strokes[0], Want::Color)
+        } else {
+            None
+        };
         values.insert("stroke".into(), Value::Array(strokes));
         let mut weight = None;
         if n.get("individualStrokeWeights").is_some() {
@@ -1489,7 +1732,7 @@ impl Cx<'_> {
         } else if let Some(raw) = n.get("strokeWeight").cloned()
             && let Some(e) = self.number(n, id, &["strokeWeight"], raw, STROKE_WEIGHT)
         {
-            weight = self.tokens.css_of(&e, |raw| raw.as_f64().map(px));
+            weight = self.css_value(id, "outline-width", &e, Want::Px);
             values.insert("stroke_weight".into(), e);
         }
         if vector {
@@ -1573,14 +1816,14 @@ impl Cx<'_> {
         }
         let mut out = Map::new();
         let mut sides: [Option<CssVal>; 4] = Default::default();
-        for (i, (side, key, alt, _)) in CORNERS.iter().enumerate() {
+        for (i, (side, key, alt, prop)) in CORNERS.iter().enumerate() {
             let raw = per_corner
                 .and_then(|r| r.get(i))
                 .or_else(|| n.get("cornerRadius"))
                 .cloned()
                 .unwrap_or(json!(0));
             if let Some(e) = self.number(n, id, &[key, alt], raw, RADIUS) {
-                sides[i] = self.tokens.length(&e);
+                sides[i] = self.css_value(id, prop, &e, Want::PxNonZero);
                 out.insert(side.to_string(), e);
             }
         }
@@ -1597,9 +1840,11 @@ impl Cx<'_> {
         Some(Value::Object(out))
     }
 
-    /// Visible effects as value entries; drop and inner shadows become
-    /// `box-shadow` (`text-shadow` for a TEXT drop shadow), blurs are
-    /// unsupported (Figma's blur radius has no exact CSS `blur()`).
+    /// Visible effects as value entries; one drop or inner shadow becomes
+    /// `box-shadow` (`text-shadow` for a TEXT drop shadow). Several
+    /// shadows are unsupported: CSS lists them top-most first and Figma's
+    /// effect order isn't verified. Blurs are unsupported (Figma's blur
+    /// radius has no exact CSS `blur()`).
     fn effects(
         &mut self,
         n: &Value,
@@ -1610,22 +1855,21 @@ impl Cx<'_> {
     ) -> Vec<Value> {
         let mut out = Vec::new();
         let mut shadows = Vec::new();
-        let mut text_shadows = Vec::new();
         for (i, effect) in n["effects"].as_array().into_iter().flatten().enumerate() {
             if effect["visible"] == false {
                 continue;
             }
             let ty = effect["type"].as_str().unwrap_or("unknown").to_string();
-            let bv = |k: &str| alias_id(effect.get("boundVariables").and_then(|b| b.get(k)));
             let mut entry = Map::new();
             entry.insert("type".into(), json!(ty));
+            let index = i.to_string();
             let mut field = |cx: &mut Self, name: &str, key: &str, raw: Value| -> Option<Value> {
-                let binding = match bv(key) {
+                let binding = match cx.lookup(n, "", &["effects", &index, "boundVariables", key]) {
                     Ok(b) => b,
-                    Err(()) => {
+                    Err(p) => {
                         cx.unsupported(
                             id,
-                            format!("effects[{i}].{key}: bound to several variables (mixed): not specified"),
+                            format!("{p}: bound to several variables (mixed): not specified"),
                         );
                         return None;
                     }
@@ -1644,31 +1888,28 @@ impl Cx<'_> {
             };
             match ty.as_str() {
                 "DROP_SHADOW" | "INNER_SHADOW" => {
-                    let parts = [
-                        field(self, "offset_x", "offsetX", effect["offset"]["x"].clone()),
-                        field(self, "offset_y", "offsetY", effect["offset"]["y"].clone()),
-                        field(self, "radius", "radius", effect["radius"].clone()),
-                        field(
-                            self,
-                            "spread",
-                            "spread",
-                            effect.get("spread").cloned().unwrap_or(json!(0)),
-                        ),
-                        field(self, "color", "color", effect["color"].clone()),
-                    ];
-                    let len = |e: &Option<Value>| {
-                        e.as_ref()
-                            .and_then(|e| self.tokens.css_of(e, |raw| raw.as_f64().map(px)))
+                    let x = field(self, "offset_x", "offsetX", effect["offset"]["x"].clone());
+                    let y = field(self, "offset_y", "offsetY", effect["offset"]["y"].clone());
+                    let r = field(self, "radius", "radius", effect["radius"].clone());
+                    let sp = field(
+                        self,
+                        "spread",
+                        "spread",
+                        effect.get("spread").cloned().unwrap_or(json!(0)),
+                    );
+                    let c = field(self, "color", "color", effect["color"].clone());
+                    if vector {
+                        out.push(Value::Object(entry));
+                        continue;
+                    }
+                    let prop = if text { "text-shadow" } else { "box-shadow" };
+                    let len = |cx: &mut Self, e: &Option<Value>| {
+                        e.as_ref().and_then(|e| cx.css_value(id, prop, e, Want::Px))
                     };
-                    let [x, y, r, s, c] = &parts;
-                    let c = c.as_ref().and_then(|e| {
-                        self.tokens
-                            .css_of(e, |raw| raw.as_str().map(str::to_string))
-                    });
-                    let (x, y, r, s) = (len(x), len(y), len(r), len(s));
-                    let why = if vector {
-                        None
-                    } else if effect["showShadowBehindNode"] == true {
+                    let (x, y, r, sp) =
+                        (len(self, &x), len(self, &y), len(self, &r), len(self, &sp));
+                    let c = c.and_then(|e| self.css_value(id, prop, &e, Want::Color));
+                    let why = if effect["showShadowBehindNode"] == true {
                         Some("showShadowBehindNode")
                     } else if effect["blendMode"]
                         .as_str()
@@ -1677,26 +1918,24 @@ impl Cx<'_> {
                         Some("blendMode")
                     } else if text && ty == "INNER_SHADOW" {
                         Some("inner shadow on text")
-                    } else if text && s.as_ref().is_some_and(|s| s.value != "0px") {
+                    } else if text && sp.as_ref().is_some_and(|s| s.value != "0px") {
                         Some("spread on a text shadow")
                     } else {
                         None
                     };
                     if let Some(why) = why {
                         self.unsupported(id, format!("effects[{i}]: {ty} {why}: not specified"));
-                    } else if !vector
-                        && let (Some(x), Some(y), Some(r), Some(s), Some(c)) = (x, y, r, s, c)
+                    } else if let (Some(x), Some(y), Some(r), Some(sp), Some(c)) = (x, y, r, sp, c)
                     {
                         let inset = if ty == "INNER_SHADOW" { "inset " } else { "" };
-                        if text {
-                            text_shadows
-                                .push(format!("{} {} {} {}", x.value, y.value, r.value, c.value));
+                        shadows.push(if text {
+                            format!("{} {} {} {}", x.value, y.value, r.value, c.value)
                         } else {
-                            shadows.push(format!(
+                            format!(
                                 "{inset}{} {} {} {} {}",
-                                x.value, y.value, r.value, s.value, c.value
-                            ));
-                        }
+                                x.value, y.value, r.value, sp.value, c.value
+                            )
+                        });
                     }
                 }
                 "LAYER_BLUR" | "BACKGROUND_BLUR" => {
@@ -1710,14 +1949,17 @@ impl Cx<'_> {
             }
             out.push(Value::Object(entry));
         }
-        // Figma lists effects bottom-most first, CSS top-most first.
-        shadows.reverse();
-        text_shadows.reverse();
-        if !shadows.is_empty() {
-            css.lit("box-shadow", shadows.join(", "));
-        }
-        if !text_shadows.is_empty() {
-            css.lit("text-shadow", text_shadows.join(", "));
+        let prop = if text { "text-shadow" } else { "box-shadow" };
+        match shadows.as_slice() {
+            [] => {}
+            [one] => css.lit(prop, one.clone()),
+            many => self.unsupported(
+                id,
+                format!(
+                    "effects: {} shadows: their stacking order is unverified: {prop} not specified",
+                    many.len()
+                ),
+            ),
         }
         out
     }
@@ -1734,7 +1976,7 @@ impl Cx<'_> {
         let runs = self.runs(n, id);
         let mixed = runs.is_some();
         let typography = self.typography(n, id, mixed);
-        self.type_css(&n["style"], &typography, css);
+        self.type_css(id, &n["style"], &typography, css);
         if !typography.is_empty() {
             values.insert("typography".into(), Value::Object(typography));
         }
@@ -1742,9 +1984,16 @@ impl Cx<'_> {
         let resize = style["textAutoResize"]
             .as_str()
             .or(n["textAutoResize"].as_str());
-        if resize == Some("WIDTH_AND_HEIGHT") {
-            css.lit("white-space", "nowrap");
-        }
+        // Figma keeps every newline and space: `pre-wrap`, or `pre` for
+        // text that grows in width instead of wrapping.
+        css.lit(
+            "white-space",
+            if resize == Some("WIDTH_AND_HEIGHT") {
+                "pre"
+            } else {
+                "pre-wrap"
+            },
+        );
         if style["textTruncation"] == "ENDING" || resize == Some("TRUNCATE") {
             match style["maxLines"].as_u64().or(n["maxLines"].as_u64()) {
                 Some(lines) if lines > 1 => {
@@ -1756,7 +2005,7 @@ impl Cx<'_> {
                 _ => {
                     css.lit("overflow", "hidden");
                     css.lit("text-overflow", "ellipsis");
-                    css.lit("white-space", "nowrap");
+                    css.lit("white-space", "pre");
                 }
             }
         }
@@ -1783,10 +2032,10 @@ impl Cx<'_> {
             self.unsupported(id, "list text (lineTypes): not specified");
         }
         content.insert("text".into(), n["characters"].clone());
-        if let Ok(Some(var)) = self.binding(n, id, "characters", false) {
+        if let Ok(Some(bind)) = self.binding(n, id, "characters", false) {
             content.insert(
                 "text_token".into(),
-                self.tokens.bound(&var, n["characters"].clone()),
+                self.tokens.bound(&bind, n["characters"].clone()),
             );
         }
         if let Some(runs) = runs {
@@ -1844,9 +2093,12 @@ impl Cx<'_> {
                     continue;
                 };
                 let pseudo = json!({"style": o, "type": "TEXT"});
+                let base = pointer("", &["styleOverrideTable", &style.to_string()]);
+                self.style_base = base.clone();
                 let typography = self.typography(&pseudo, id, true);
+                self.style_base = "/style".into();
                 let mut run_css = Css::default();
-                self.type_css(o, &typography, &mut run_css);
+                self.type_css(id, o, &typography, &mut run_css);
                 if !typography.is_empty() {
                     run.insert("typography".into(), Value::Object(typography));
                 }
@@ -1854,6 +2106,7 @@ impl Cx<'_> {
                 let mut assets = Vec::new();
                 let fills = self.paints(
                     &paint_node,
+                    &base,
                     id,
                     "fills",
                     fill_prop("TEXT"),
@@ -1938,8 +2191,13 @@ impl Cx<'_> {
     }
 
     /// Text CSS from a type style and its typography entries.
-    fn type_css(&self, style: &Value, typography: &Map<String, Value>, css: &mut Css) {
-        let t = self.tokens;
+    fn type_css(
+        &mut self,
+        id: &str,
+        style: &Value,
+        typography: &Map<String, Value>,
+        css: &mut Css,
+    ) {
         for (name, prop) in [
             ("font_family", "font-family"),
             ("font_size", "font-size"),
@@ -1951,13 +2209,13 @@ impl Cx<'_> {
                 continue;
             };
             let v = match name {
-                "font_family" => t.css_of(e, |raw| raw.as_str().map(|s| format!("{s:?}"))),
-                "font_weight" => t.css_of(e, |raw| raw.as_f64().map(num)),
+                "font_family" => self.css_value(id, prop, e, Want::Family),
+                "font_weight" => self.css_value(id, prop, e, Want::Number),
                 "line_height" if e["raw"] == "auto" && e.get("variable_id").is_none() => {
                     Some(CssVal::lit("normal"))
                 }
-                "letter_spacing" => t.length(e),
-                _ => t.css_of(e, |raw| raw.as_f64().map(px)),
+                "letter_spacing" => self.css_value(id, prop, e, Want::PxNonZero),
+                _ => self.css_value(id, prop, e, Want::Px),
             };
             if let Some(v) = v {
                 css.set(prop, v);
@@ -2002,23 +2260,14 @@ impl Cx<'_> {
             let mut prop = Map::new();
             prop.insert("type".into(), p["type"].clone());
             prop.insert("value".into(), p["value"].clone());
-            let binding = match alias_id(p.get("boundVariables").and_then(|b| b.get("value"))) {
-                Ok(None) => alias_id(
-                    n.get("boundVariables")
-                        .and_then(|b| b.get("componentProperties"))
-                        .and_then(|b| b.get(name)),
-                ),
-                other => other,
-            };
-            match binding {
-                Ok(Some(var)) => {
-                    prop.insert("token".into(), self.tokens.bound(&var, p["value"].clone()));
-                }
-                Ok(None) => {}
-                Err(()) => self.unsupported(
-                    id,
-                    format!("componentProperties.{name}: bound to several variables (mixed): not specified"),
-                ),
+            let own = self.lookup(
+                n,
+                "",
+                &["componentProperties", name, "boundVariables", "value"],
+            );
+            let node = self.lookup(n, "", &["boundVariables", "componentProperties", name]);
+            if let Ok(Some(bind)) = self.either(id, own, node) {
+                prop.insert("token".into(), self.tokens.bound(&bind, p["value"].clone()));
             }
             properties.insert(name.clone(), Value::Object(prop));
         }
@@ -2167,7 +2416,7 @@ mod tests {
         assert!(out["node"]["values"].get("fill").is_none(), "{out}");
         assert_eq!(
             out["unsupported"],
-            json!([{"id": "1:1", "reason": "fills[0]: mixed variable bindings"}])
+            json!([{"id": "1:1", "reason": "/fills/0/boundVariables/color: bound to several variables (mixed): not specified"}])
         );
         // A paint without its own binding still falls back to the node's.
         let mut tree = tree;
@@ -2197,7 +2446,8 @@ mod tests {
         let out = spec(&tree);
         assert_eq!(
             out["node"]["layout"]["gap"],
-            json!({"token": null, "variable_id": "V:9", "css": null, "raw": 8})
+            json!({"token": null, "variable_id": "V:9", "css": null, "raw": 8,
+                "bound_at": ["/boundVariables/itemSpacing"]})
         );
         assert_eq!(
             out["node"]["layout"]["padding"]["top"],
@@ -2311,7 +2561,180 @@ mod tests {
             "boundVariables": {"visible": {"type": "VARIABLE_ALIAS", "id": "V:1"}}});
         assert_eq!(
             spec(&tree)["unsupported"],
-            json!([{"id": "1:1", "reason": "visible: bound to a variable: not specified"}])
+            json!([{"id": "1:1", "reason": "/boundVariables/visible: bound to a variable: not specified"}])
+        );
+    }
+
+    /// A snapshot with one unitless (ALL_SCOPES) FLOAT, one `%` (OPACITY)
+    /// FLOAT and one px (GAP) FLOAT.
+    fn unit_vars() -> Value {
+        let row = |id: &str, name: &str, scopes: Value, v: f64| {
+            json!({"source": "imported", "variable_id": id, "name": name,
+                "resolved_type": "FLOAT", "collection": "C", "collection_id": "C:1",
+                "default_mode": "M", "scopes": scopes, "values_by_mode": {"M": v}})
+        };
+        json!({
+            "snapshot": {"state": "current", "source": "file", "format": "bare",
+                "format_version": 1, "exported_at": "2026-01-01T00:00:00Z",
+                "digest": "fnv1a64:0", "variables": 3, "collections": 1},
+            "collections": [{"collection_id": "C:1", "name": "C", "modes": ["M"],
+                "default_mode": "M", "source": "imported"}],
+            "variables": [
+                row("V:1", "space/raw", json!(["ALL_SCOPES"]), 12.0),
+                row("V:2", "fade", json!(["OPACITY"]), 50.0),
+                row("V:3", "space/px", json!(["GAP"]), 4.0),
+            ],
+        })
+    }
+
+    #[test]
+    fn unitless_tokens_get_units_in_css_and_mismatches_are_listed() {
+        let alias = |v: &str| json!({"type": "VARIABLE_ALIAS", "id": v});
+        let tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "VERTICAL",
+            "paddingTop": 12, "paddingLeft": 4, "opacity": 0.5, "itemSpacing": 50,
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 10, "height": 10},
+            "boundVariables": {"paddingTop": alias("V:1"), "paddingLeft": alias("V:3"),
+                "opacity": alias("V:2"), "itemSpacing": alias("V:2")},
+            "children": []});
+        let out = build(
+            &tree,
+            &unit_vars(),
+            &json!({}),
+            &ExportOptions::default(),
+            true,
+            None,
+        );
+        assert_eq!(
+            out["tokens_snapshot"]["css_unavailable"],
+            Value::Null,
+            "{out}"
+        );
+        let css = &out["node"]["css"];
+        assert_eq!(css["padding-top"], "calc(var(--space-raw) * 1px)");
+        assert_eq!(css["padding-left"], "var(--space-px)");
+        assert_eq!(css["opacity"], "var(--fade)");
+        assert!(css.get("gap").is_none(), "{css}");
+        assert!(
+            out["unsupported"].as_array().unwrap().contains(&json!({"id": "1:1",
+                "reason": "gap: token --fade is exported in %, which gap can't take: not specified"})),
+            "{out}"
+        );
+        // A unitless opacity token is a 0–100 number.
+        let mut tree = tree;
+        tree["boundVariables"]["opacity"] = alias("V:1");
+        let out = build(
+            &tree,
+            &unit_vars(),
+            &json!({}),
+            &ExportOptions::default(),
+            false,
+            None,
+        );
+        assert_eq!(
+            out["node"]["css"]["opacity"],
+            "calc(var(--space-raw) / 100)"
+        );
+    }
+
+    #[test]
+    fn bindings_css_cant_use_are_still_token_references() {
+        let alias = |v: &str| json!({"type": "VARIABLE_ALIAS", "id": v});
+        let tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL",
+            "primaryAxisAlignItems": "SPACE_BETWEEN", "itemSpacing": 8,
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 100},
+            "layoutSizingHorizontal": "FIXED", "layoutSizingVertical": "FIXED",
+            "boundVariables": {"itemSpacing": alias("V:3")},
+            "children": [{"id": "1:2", "type": "RECTANGLE", "layoutPositioning": "ABSOLUTE",
+                "constraints": {"horizontal": "LEFT_RIGHT", "vertical": "TOP"},
+                "absoluteBoundingBox": {"x": 10, "y": 10, "width": 80, "height": 10},
+                "boundVariables": {"size": {"x": alias("V:3")}}}]});
+        let out = build(
+            &tree,
+            &unit_vars(),
+            &json!({}),
+            &ExportOptions::default(),
+            false,
+            None,
+        );
+        let node = &out["node"];
+        assert_eq!(node["layout"]["gap"], "auto");
+        assert_eq!(node["layout"]["item_spacing"]["variable_id"], "V:3");
+        assert_eq!(node["children"][0]["layout"]["width"]["variable_id"], "V:3");
+        assert_eq!(
+            node["children"][0]["layout"]["width"]["bound_at"],
+            json!(["/boundVariables/size/x"])
+        );
+        let reasons: Vec<&str> = out["unsupported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["reason"].as_str().unwrap())
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with("/boundVariables/itemSpacing: itemSpacing is bound")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with("/boundVariables/size/x: width is bound")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn absolute_children_inside_a_border_are_offset_from_the_padding_box() {
+        let tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL",
+            "strokes": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0, "a": 1}}],
+            "strokeWeight": 2, "strokeAlign": "INSIDE", "strokesIncludedInLayout": true,
+            "layoutSizingHorizontal": "FIXED", "layoutSizingVertical": "FIXED",
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 50},
+            "children": [{"id": "1:2", "type": "RECTANGLE", "layoutPositioning": "ABSOLUTE",
+                "constraints": {"horizontal": "RIGHT", "vertical": "SCALE"},
+                "absoluteBoundingBox": {"x": 80, "y": 10, "width": 10, "height": 10}}]});
+        let out = spec(&tree);
+        assert_eq!(out["node"]["css"]["border-width"], "2px");
+        let child = &out["node"]["children"][0];
+        assert_eq!(child["css"]["right"], "8px");
+        assert!(
+            out["unsupported"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|u| u["reason"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("constraints.vertical SCALE inside a border")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn several_shadows_are_unsupported_one_is_css() {
+        let shadow = |y: i64| {
+            json!({"type": "DROP_SHADOW", "visible": true, "blendMode": "NORMAL",
+            "color": {"r": 0, "g": 0, "b": 0, "a": 1}, "offset": {"x": 0, "y": y},
+            "radius": 2, "spread": 0, "showShadowBehindNode": false})
+        };
+        let mut tree = json!({"id": "1:1", "type": "RECTANGLE",
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 10, "height": 10},
+            "effects": [shadow(1)]});
+        assert_eq!(
+            spec(&tree)["node"]["css"]["box-shadow"],
+            "0px 1px 2px 0px #000000"
+        );
+        tree["effects"] = json!([shadow(1), shadow(2)]);
+        let out = spec(&tree);
+        assert!(out["node"]["css"].get("box-shadow").is_none());
+        assert_eq!(
+            out["node"]["values"]["effects"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            out["unsupported"][0]["reason"],
+            "effects: 2 shadows: their stacking order is unverified: box-shadow not specified"
         );
     }
 }

@@ -2185,7 +2185,8 @@ positioned nodes, and the root when it carries `layoutSizing*`):
   (the `counterAxisSpacing` entry; Figma's default, the item spacing, when
   absent) for `layoutWrap: WRAP`;
 - `gap`: a value entry for `itemSpacing`, or `"auto"` under
-  `SPACE_BETWEEN`;
+  `SPACE_BETWEEN` (a bound `itemSpacing` there is still shown, as
+  `item_spacing`, and listed: CSS doesn't use it);
 - `grid` (`layoutMode: GRID`): `{columns, rows, column_gap, row_gap}` —
   the counts and the `gridColumnGap`/`gridRowGap` entries;
 - `padding`: `{top, right, bottom, left}` value entries (an absent padding
@@ -2201,7 +2202,9 @@ positioned nodes, and the root when it carries `layoutSizing*`):
   `textAutoResize` (`WIDTH_AND_HEIGHT` both axes, `HEIGHT` vertical) ⇒
   hug; else fixed;
 - `width`/`height`: value entries for a fixed dimension the CSS declares
-  (bindings: `boundVariables.size.x`/`.y`, else `width`/`height`);
+  (bindings: `boundVariables.size.x`/`.y`, else `width`/`height`); a bound
+  dimension the CSS doesn't declare (a fill/hug sizing, a LEFT_RIGHT or
+  SCALE constraint) is still shown as its token here, and listed;
 - `min_width`, `max_width`, `min_height`, `max_height`: value entries;
 - `position: "absolute"` for an absolutely positioned node;
 - `size`: `{width, height}` from `absoluteBoundingBox`, whenever `layout`
@@ -2225,7 +2228,10 @@ style has it.
 
 **Value entries.** Bound:
 `{"token": <variable name | null>, "variable_id", "css": <name | null>,
-"raw": <Figma's baked value>}`. Bindings are read from the paint's
+"raw": <Figma's baked value>, "bound_at": [<JSON pointer>, ...]}` —
+`bound_at` lists (sorted) the RFC 6901 pointers, relative to the node's
+raw JSON, of the bindings read for it (`/fills/0/boundVariables/color`,
+`/boundVariables/fills/0`, `/styleOverrideTable/1/boundVariables/fontWeight`…). Bindings are read from the paint's
 `boundVariables.color`, else the node's `boundVariables.fills[i]` /
 `strokes[i]`; `itemSpacing`, `counterAxisSpacing`, `gridColumnGap`,
 `gridRowGap`, `paddingTop`…, `strokeWeight`, `topLeftRadius`… (else
@@ -2258,9 +2264,14 @@ min/max), `OPACITY`, `EFFECT_COLOR`, `EFFECT_FLOAT`, `FONT_FAMILY`,
 `FONT_SIZE`, `FONT_WEIGHT`, `LINE_HEIGHT`, `LETTER_SPACING`. Omitted when
 nothing matches.
 
-A node-level `boundVariables` key the spec doesn't read (`visible`,
-`textRangeFills`, …) is listed under `unsupported`, so no binding
-disappears silently.
+**No binding disappears silently.** Every `VARIABLE_ALIAS` in a node's
+raw JSON (children excluded) is either read — and then shown in a bound
+entry's `bound_at` — or listed under `unsupported` by its pointer
+(`/boundVariables/visible: bound to a variable: not specified`; a binding
+a hidden paint carries, a gradient stop's, `textRangeFills`…). A
+property bound in two places to different variables is listed too. A
+mixed-run node's node-level per-range arrays count as read when the base
+style and the runs' overrides name every variable in them.
 
 ### Content and instances
 
@@ -2301,24 +2312,29 @@ Per node, from the parent's layout and its own:
 | negative `itemSpacing` (no wrap) | no gap; `margin-left`/`margin-top` = the spacing on every in-flow child after the first (exact: the children overlap the same way) |
 | `layoutMode: GRID` | `display: grid`, `grid-template-columns`/`-rows` = `gridColumnsSizing`/`gridRowsSizing` (Figma's own CSS track lists), `column-gap`, `row-gap`; a child gets `grid-column`/`grid-row: <anchor + 1> / span <span>` and `justify-self`/`align-self` from `gridChild*Align` |
 | padding | `padding` when all four sides are equal, else the longhands; an unbound 0 is left out |
-| sizing in a flex parent | main axis: fill → `flex: 1 1 0%`, fixed → `width`/`height` + `flex-shrink: 0`, hug → `flex-shrink: 0`; cross axis: fill → `align-self: stretch`, fixed → the dimension |
+| sizing in a flex parent | main axis: fill → `flex: 1 1 0%` + `min-width: 0` (`min-height: 0` in a column: Figma lets a fill child shrink to nothing), fixed → `width`/`height` + `flex-shrink: 0`, hug → `flex-shrink: 0`; cross axis: fill → `align-self: stretch`, fixed → the dimension |
 | sizing in a grid parent | fill → `justify-self`/`align-self: stretch`, fixed → the dimension, hug → `fit-content` |
 | sizing of the root | fixed → the dimension, horizontal hug → `width: fit-content`, fill → `100%` |
 | `min/max*` | `min-width`… |
-| absolute child (`layoutPositioning: ABSOLUTE`, or any child of a frame without auto layout) | `position: absolute` (the parent gets `position: relative`); per axis from `constraints` (default LEFT/TOP) and the boxes: LEFT/TOP → `left`/`top`, RIGHT/BOTTOM → `right`/`bottom`, LEFT_RIGHT/TOP_BOTTOM → both, CENTER → `calc(50% ± offset)` + `translate(-50%)`, SCALE → percentages for offset and size; a fixed dimension otherwise |
+| absolute child (`layoutPositioning: ABSOLUTE`, or any child of a frame without auto layout) | `position: absolute` (the parent gets `position: relative`); per axis from `constraints` (default LEFT/TOP) and the boxes: LEFT/TOP → `left`/`top`, RIGHT/BOTTOM → `right`/`bottom`, LEFT_RIGHT/TOP_BOTTOM → both, CENTER → `calc(50% ± offset)` + `translate(-50%)`, SCALE → percentages for offset and size; a fixed dimension otherwise. Inside a parent with a CSS border (a stroke included in layout) the offsets are reduced by the border width (CSS measures them from the padding box); SCALE there is unsupported |
 | `clipsContent` (with children) | `overflow: hidden` |
 | fill | one visible solid paint → `background-color` (`color` on TEXT) |
 | stroke | one visible solid paint with `strokeAlign`: `outline-*` (Figma strokes take no layout space), `outline-offset` −weight (INSIDE) or −weight/2 (CENTER); a `border-*` for INSIDE with `strokesIncludedInLayout` |
 | radius | `border-radius`, or the corner longhands |
-| drop/inner shadow | `box-shadow` (`inset`), listed top-most first (Figma lists effects bottom-most first); a TEXT drop shadow → `text-shadow` |
+| one drop/inner shadow | `box-shadow` (`inset`); a TEXT drop shadow → `text-shadow`. Two or more shadows are unsupported: CSS lists them top-most first and Figma's effect order is unverified |
 | opacity | `opacity` |
 | typography | `font-family` (quoted), `font-size`, `font-weight`, `line-height` (`normal` for auto), `letter-spacing`, `font-style: italic`, `text-align`, `text-transform` / `font-variant-caps`, `text-decoration-line` |
-| `textAutoResize` | `WIDTH_AND_HEIGHT` → `white-space: nowrap`; `HEIGHT` and `NONE` follow from the sizing |
-| `textTruncation: ENDING` | one line: `overflow: hidden; text-overflow: ellipsis; white-space: nowrap`; `maxLines` > 1: `-webkit-line-clamp` |
+| text | `white-space: pre-wrap` (Figma keeps newlines and runs of spaces); `textAutoResize: WIDTH_AND_HEIGHT` → `pre`; `HEIGHT` and `NONE` follow from the sizing |
+| `textTruncation: ENDING` | one line: `overflow: hidden; text-overflow: ellipsis; white-space: pre`; `maxLines` > 1: `-webkit-line-clamp` |
 | padding or border | `box-sizing: border-box` (Figma sizes include both) |
 
 Lengths are `px` with at most three decimals; a bound value with a CSS
-name is its `var()`.
+name is its `var()` — matched to the unit the token export writes it in
+(§9): a unitless FLOAT (e.g. `ALL_SCOPES`) used as a length is
+`calc(var(--x) * 1px)`, a unitless one used as opacity (Figma's 0–100)
+`calc(var(--x) / 100)`, a `%` one as opacity as is; a unit the property
+can't take (a `%` token as a gap, a px token as a font weight) is listed
+and left out.
 
 **Tailwind hint** (`tailwind`). One class per declaration, ordered by
 property group (position, layout, size, paint, text): keyword utilities
@@ -2355,7 +2371,12 @@ the affected part is left out of `css` (and, where noted, of the spec):
 | several visible fills or strokes | that CSS property |
 | a non-normal `blendMode` (layer or paint) | the blend |
 | a property bound to several variables (mixed alias array) | that property |
-| a bound property the spec doesn't read | that binding |
+| a binding the spec doesn't read (by pointer), or a property bound to different variables in two places | that binding |
+| a bound size or `itemSpacing` the CSS doesn't use (sizing, constraints, `SPACE_BETWEEN`) | the token in CSS (still shown as a token reference) |
+| a token whose exported unit the property can't take | that declaration |
+| two or more shadows | the `box-shadow` / `text-shadow` |
+| a SCALE constraint inside a CSS border | that offset |
+| a vector-like node's children | the children (part of the asset) |
 | `LAYER_BLUR`/`BACKGROUND_BLUR` (no exact CSS `blur()`), `showShadowBehindNode`, a non-normal shadow blend, an inner or spread shadow on text | that effect |
 | `individualStrokeWeights`, `strokeDashes`, a text stroke, a missing `strokeAlign` | the CSS stroke |
 | `cornerSmoothing` | the smoothing |
@@ -2373,13 +2394,19 @@ a span and an aligned cell, min/max sizes, a frame without auto layout
 with every constraint, a rotated child and clipping, text auto-resize,
 truncation, line clamp and mixed runs, an instance with variant
 properties and a vector icon, an image fill with a shadow and opacity, an
-absolute ribbon), with `tests/fixtures/spec/variables.json`, produce the
-golden `card.spec.json` (no hint) and `edge.spec.json` (with the Tailwind
-hint), and `tokens.css` (the token export of the same variables)
+absolute ribbon, plus the review cases: unitless and `%` tokens used as
+lengths and opacity, a bound size under a LEFT_RIGHT constraint, a
+`SPACE_BETWEEN` row with a bound spacing, an absolute child inside a CSS
+border, two shadows, a text with a newline), with
+`tests/fixtures/spec/variables.json` (card) and `edge-variables.json`
+(the same plus unitless/`%` FLOATs), produce the golden `card.spec.json`
+(no hint) and `edge.spec.json` (with the Tailwind hint), and `tokens.css`
+(the token export of the edge variables)
 (`tests/spec.rs`; `FIGMOG_BLESS=1` regenerates them). The tests check
 byte-identical output across runs and against `figmog call figmog_spec`,
 the issue's done-when line on both fixtures — every binding in the
-subtree appears as its token reference, every value entry without one is
+subtree, by pointer, appears in a token reference's `bound_at` or is
+listed under `unsupported` by that pointer, every value entry without one is
 flagged untokenized, each `css` name appears in the `tokens export`
 output — and the project defaults for `tokens` and `tailwind`.
 
@@ -2391,7 +2418,8 @@ node's `css` inline, and its Tailwind hint compiled by Tailwind v4 against
 (relative to the root) equals its recorded `absoluteBoundingBox` within
 half a pixel, except nodes under a position-related `unsupported` entry
 and the width of a hugging text node (font-dependent); and that bound
-tokens, clipping, truncation and run styles resolve.
+tokens (including unitless and `%` ones scaled for padding and opacity),
+clipping, truncation, run styles and kept newlines resolve.
 
 ## 18. Figma → code component map (NWS-2949)
 

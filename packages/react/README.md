@@ -62,7 +62,8 @@ clipping, text auto-resize and truncation, mixed runs, an instance) as nested
 elements — once with each node's `css` inline, once with its Tailwind class
 hint compiled against `tests/fixtures/spec/tokens.css` — and asserts at
 1440 px and 390 px that every node's box equals the design's recorded
-bounding box, and that bound tokens and text rules resolve.
+bounding box (also inside a CSS border, and with a unitless token as padding),
+and that bound tokens, opacity tokens, kept newlines and text rules resolve.
 `tailwindcss` (pinned `4.3.4`, a dev dependency) is the compiler itself and
 has no dependencies of its own; `@tailwindcss/cli`/`@tailwindcss/node` would
 add native `lightningcss` binaries and a file-watcher stack this test does

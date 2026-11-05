@@ -66,6 +66,10 @@ impl Css {
         self.set(prop, CssVal::lit(value));
     }
 
+    pub(super) fn get(&self, prop: &str) -> Option<&CssVal> {
+        self.decls.get(prop)
+    }
+
     pub(super) fn has(&self, prop: &str) -> bool {
         self.decls.contains_key(prop)
     }
@@ -332,6 +336,10 @@ fn class(prop: &str, v: &CssVal) -> Option<String> {
         ("width", "100%") => "w-full",
         ("height", "100%") => "h-full",
         ("white-space", "nowrap") => "whitespace-nowrap",
+        ("white-space", "pre") => "whitespace-pre",
+        ("white-space", "pre-wrap") => "whitespace-pre-wrap",
+        ("min-width", "0") => "min-w-0",
+        ("min-height", "0") => "min-h-0",
         ("text-overflow", "ellipsis") => "text-ellipsis",
         ("text-align", "center") => "text-center",
         ("text-align", "right") => "text-right",

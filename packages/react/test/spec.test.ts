@@ -9,6 +9,11 @@
 // same variables (`tests/fixtures/spec/tokens.css`) — and each element's box,
 // relative to the root, must equal the node's recorded `absoluteBoundingBox`.
 //
+// The fixture also pins the review findings: a unitless token used as a
+// length (scaled to px), opacity tokens in % and unitless, absolute children
+// inside a CSS border, and a text with a newline and a run of spaces (two
+// lines high only if both are kept).
+//
 // Skipped, because the spec says so: nodes under an `unsupported` entry about
 // position (their placement is deliberately not specified), and the width of
 // a text node that hugs its content (it depends on the font, which the
@@ -190,7 +195,7 @@ describe("figmog spec's CSS translation in Chromium", () => {
           checked += 1;
         });
         // Every node of the fixture but the rotated one (and nothing under it).
-        assert.equal(checked, 36);
+        assert.equal(checked, 43);
       });
     }
 
@@ -213,6 +218,12 @@ describe("figmog spec's CSS translation in Chromium", () => {
           runWeight: getComputedStyle(run).fontWeight,
           runColor: getComputedStyle(run).color,
           tags: style("2:7").outlineColor,
+          // A unitless token, scaled to px; opacity tokens in % and unitless.
+          buttonPadding: style("2:40").paddingLeft,
+          opacityPercent: style("2:17").opacity,
+          opacityUnitless: style("2:50").opacity,
+          // Newlines and runs of spaces are kept.
+          lines: (document.querySelector('[data-id="2:36"]') as HTMLElement | null)?.innerText ?? "",
         };
       });
       assert.deepEqual(computed, {
@@ -221,10 +232,14 @@ describe("figmog spec's CSS translation in Chromium", () => {
         brand: "rgb(0, 102, 204)",
         gap: "16px",
         clip: "hidden",
-        truncated: ["ellipsis", "nowrap"],
+        truncated: ["ellipsis", "pre"],
         runWeight: "700",
         runColor: "rgb(0, 102, 204)",
         tags: "rgb(224, 227, 230)",
+        buttonPadding: "12px",
+        opacityPercent: "0.9",
+        opacityUnitless: "0.9",
+        lines: "First line\nSecond  line",
       });
     });
   }
