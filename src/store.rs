@@ -479,11 +479,31 @@ pub fn stale_image_ids<R: fold::stream::Readable>(
     stale.into_iter().collect()
 }
 
+/// Every image row and pin, including orphan pins, in deterministic order.
+/// A changed pull with the same Figma version cannot distinguish old rows
+/// by their version label, so it invalidates the entire image cache.
+pub fn all_image_ids<R: fold::stream::Readable>(
+    images: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImageBlobRec>,
+    pins: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImagePinRec>,
+) -> Vec<Id> {
+    #[cfg(test)]
+    STALE_SCAN_COUNTS.with(|counts| {
+        let (cache, images) = counts.get();
+        counts.set((cache, images + 1));
+    });
+    let mut ids: Vec<_> = images
+        .iter()
+        .map(|(key, _)| Id::ImageBlob(key))
+        .chain(pins.iter().map(|(key, _)| Id::ImagePin(key)))
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// Remove `stale` rows in one write transaction. Never touches variables,
 /// collections, or the meta row — pass only ids gathered by
-/// [`stale_cache_ids`] and/or [`stale_image_ids`], the only two sources
-/// that feed this (both version-triggered, not file-sweep-triggered — see
-/// this section's own note above).
+/// [`stale_cache_ids`], [`stale_image_ids`] or [`all_image_ids`]. Cache
+/// eviction is separate from the file-record sweep and its churn counts.
 pub fn evict_stale_cache<P: Push<Keyed<Id, Rec>>>(st: &mut KeyedStream<Id, Rec, P>, stale: &[Id]) {
     st.wtx(|tx| {
         for id in stale {

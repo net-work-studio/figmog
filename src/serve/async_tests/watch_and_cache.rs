@@ -1,21 +1,12 @@
 //! Main's cache-scan and queued-watch invariants exercised with async workers.
 use super::*;
-use crate::model::{FileMeta, Id, ImageBlobRec, Rec};
+use crate::model::{Id, ImageBlobRec, ImagePinRec, Rec};
 
 fn seed_cache(path: &std::path::Path, prior_version: Option<&str>) {
     let mut st = crate::open_store!(path);
     if let Some(version) = prior_version {
-        st.wtx(|tx| {
-            tx.upsert(
-                &Id::Meta,
-                &Rec::Meta(FileMeta {
-                    name: "Synthetic".into(),
-                    version: version.into(),
-                    last_modified: "t".into(),
-                    synced_at_unix_ms: 0,
-                }),
-            );
-        });
+        let flattened = crate::flatten::flatten_file(&fixture(version)).unwrap();
+        store::sync(&mut st, &std::collections::BTreeSet::new(), &flattened, 0);
     }
     for version in ["0", "1"] {
         crate::cache::store(&mut st, "get_code", version, version, &json!([])).unwrap();
@@ -32,6 +23,15 @@ fn seed_cache(path: &std::path::Path, prior_version: Option<&str>) {
                 bytes: vec![42; 1024 * 1024],
             };
             st.wtx(|tx| {
+                if kind == "render" {
+                    tx.upsert(
+                        &Id::ImagePin(key.clone()),
+                        &Rec::ImagePin(ImagePinRec {
+                            generation: crate::images::RENDER_PIN_GENERATION,
+                            file_version: version.into(),
+                        }),
+                    );
+                }
                 tx.upsert(&Id::ImageBlob(key.clone()), &Rec::ImageBlob(rec));
             });
         }
@@ -95,6 +95,40 @@ fn unchanged_async_pulls_skip_both_cache_scans_with_large_images() {
         cache_rows(&h._dir.path().join("ABC1234567890/db")),
         expected
     );
+}
+
+#[test]
+fn same_version_async_pulls_evict_images_when_metadata_or_records_change() {
+    for metadata_only in [false, true] {
+        let (mut h, rows, scans) = cached_harness(Some("1"));
+        let expected: Vec<_> = rows
+            .into_iter()
+            .filter(|rec| matches!(rec, Rec::ProxyCache(_)))
+            .collect();
+        let mut response = fixture("1");
+        if metadata_only {
+            response["lastModified"] = json!("2026-01-01T12:01:00Z");
+        } else {
+            response["document"]["name"] = json!("Edited without a new version");
+        }
+        *h.api.response.lock().unwrap() = Ok(response);
+        h.value("figmog_sync", json!({}));
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "fetch"
+        );
+        h.release.send(()).unwrap();
+        h.wait_for("succeeded");
+        assert_eq!(scans.recv_timeout(Duration::from_secs(5)).unwrap(), (0, 1));
+        h.manager.sessions.clear();
+        let path = h._dir.path().join("ABC1234567890/db");
+        assert_eq!(cache_rows(&path), expected);
+        let st = crate::open_store!(&path);
+        assert_eq!(
+            st.rtx(|(_, _, _, _, _, _, _, _, _, _, pins, _)| pins.iter().count()),
+            0
+        );
+    }
 }
 
 #[test]

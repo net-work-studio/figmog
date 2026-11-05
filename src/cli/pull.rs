@@ -180,9 +180,16 @@ fn apply_pull(
         );
         prior.extend(stored_var_ids);
     }
-    let prior_version =
-        st.rtx(|(_, _, _, _, _, _, meta, _, _, _, _, _)| meta.get(&0).map(|m| m.version.clone()));
+    let prior_meta = st.rtx(|(_, _, _, _, _, _, meta, _, _, _, _, _)| meta.get(&0));
     let churn = sync(&mut st, &prior, &flattened, now_ms());
+    let version_changed = prior_meta.as_ref().map(|meta| meta.version.as_str())
+        != Some(flattened.file.version.as_str());
+    let snapshot_changed = prior_meta
+        .as_ref()
+        .is_some_and(|meta| meta.last_modified != flattened.file.last_modified)
+        || churn.added > 0
+        || churn.changed > 0
+        || churn.removed > 0;
 
     // Every caller of `do_pull` (`pull` and `figmog call figmog_sync`) goes
     // through here, so eviction lives here rather than duplicated at each
@@ -193,15 +200,21 @@ fn apply_pull(
     // eviction blocks, since they already hold `st` open and re-opening it
     // here would hit the same single-open-per-process wall `figmog call
     // figmog_sync` used to.
-    if prior_version.as_deref() != Some(flattened.file.version.as_str()) {
+    // Figma can change live contents without changing the returned version.
+    // Such pulls must invalidate even rows labelled with that same version.
+    if version_changed || snapshot_changed {
         let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images, pins, _)| {
-            let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
-            stale.extend(crate::store::stale_image_ids(
-                &images,
-                &pins,
-                &flattened.file.version,
-            ));
-            stale
+            if version_changed {
+                let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
+                stale.extend(crate::store::stale_image_ids(
+                    &images,
+                    &pins,
+                    &flattened.file.version,
+                ));
+                stale
+            } else {
+                crate::store::all_image_ids(&images, &pins)
+            }
         });
         if !stale.is_empty() {
             stale.sort();
@@ -307,6 +320,77 @@ mod tests {
             "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
             "document": {"id": "0:0", "name": "Document", "type": "DOCUMENT"}
         })
+    }
+
+    #[test]
+    fn same_version_pulls_evict_images_when_metadata_or_records_change() {
+        use crate::model::{Id, ImageBlobRec, ImagePinRec, Rec};
+
+        for metadata_only in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db {
+                path: dir.path().join("db"),
+                key: None,
+            };
+            let mut file = synthetic_file();
+            file["document"]["children"] = serde_json::json!([
+                {"id":"1:0", "type":"CANVAS", "name":"Page", "children":[
+                    {"id":"1:2", "type":"FRAME", "name":"Synthetic frame",
+                    "fills":[{"type":"SOLID", "color":{"r":1,"g":0,"b":0,"a":1}}]}
+                ]}
+            ]);
+            let render_key = crate::images::image_key("render", "1:2", "png", 1000);
+            let fill_key = crate::images::image_key("fill", "synthetic-fill", "", 1000);
+            apply_pull(&db, &file, None, false, false).unwrap();
+            {
+                let mut st = crate::open_store!(&db.path);
+                st.wtx(|tx| {
+                    for (kind, key, subject) in [
+                        ("render", &render_key, "1:2"),
+                        ("fill", &fill_key, "synthetic-fill"),
+                    ] {
+                        tx.upsert(
+                            &Id::ImageBlob(key.clone()),
+                            &Rec::ImageBlob(ImageBlobRec {
+                                key_hash: key.clone(),
+                                kind: kind.into(),
+                                subject: subject.into(),
+                                format: "png".into(),
+                                scale_milli: 1000,
+                                file_version: "1".into(),
+                                bytes: vec![1],
+                            }),
+                        );
+                    }
+                    for key in [render_key.as_str(), "orphan"] {
+                        tx.upsert(
+                            &Id::ImagePin(key.into()),
+                            &Rec::ImagePin(ImagePinRec {
+                                generation: crate::images::RENDER_PIN_GENERATION,
+                                file_version: "1".into(),
+                            }),
+                        );
+                    }
+                });
+            }
+            if metadata_only {
+                file["lastModified"] = serde_json::json!("2026-01-01T00:01:00Z");
+            } else {
+                file["document"]["children"][0]["children"][0]["fills"][0]["color"] =
+                    serde_json::json!({"r":0,"g":0,"b":1,"a":1});
+            }
+            let (churn, ..) = apply_pull(&db, &file, None, false, false).unwrap();
+            assert_eq!(churn.changed, usize::from(!metadata_only));
+            let st = crate::open_store!(&db.path);
+            for id in [
+                Id::ImageBlob(render_key.clone()),
+                Id::ImageBlob(fill_key),
+                Id::ImagePin(render_key),
+                Id::ImagePin("orphan".into()),
+            ] {
+                assert!(st.get(&id).is_none(), "stale image state survived: {id:?}");
+            }
+        }
     }
 
     fn variables_export() -> Value {

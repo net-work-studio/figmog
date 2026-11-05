@@ -595,20 +595,32 @@ pub(crate) fn open_session_with_hooks(
                             }));
                         }
                         phase(PullPhase::Applying);
-                        let prior_version =
-                            st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _, _))| {
-                                meta.get(&0).map(|meta| meta.version.clone())
-                            });
+                        let prior_meta =
+                            st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _, _))| meta.get(&0));
                         let churn = store::sync(&mut st, &prior, &flattened, now_ms());
                         let version = flattened.file.version.clone();
-                        // Match direct pulls: unchanged versions avoid decoding
-                        // potentially large image blobs merely to evict none.
-                        if prior_version.as_deref() != Some(version.as_str()) {
+                        let version_changed = prior_meta.as_ref().map(|meta| meta.version.as_str())
+                            != Some(version.as_str());
+                        let snapshot_changed = prior_meta
+                            .as_ref()
+                            .is_some_and(|meta| meta.last_modified != flattened.file.last_modified)
+                            || churn.added > 0
+                            || churn.changed > 0
+                            || churn.removed > 0;
+                        // Match direct pulls: only an unchanged snapshot skips
+                        // scans; live edits can retain the same version string.
+                        if version_changed || snapshot_changed {
                             let mut stale =
                                 st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, pins, _))| {
-                                    let mut ids = store::stale_cache_ids(&cache, &version);
-                                    ids.extend(store::stale_image_ids(&images, &pins, &version));
-                                    ids
+                                    if version_changed {
+                                        let mut ids = store::stale_cache_ids(&cache, &version);
+                                        ids.extend(store::stale_image_ids(
+                                            &images, &pins, &version,
+                                        ));
+                                        ids
+                                    } else {
+                                        store::all_image_ids(&images, &pins)
+                                    }
                                 });
                             if !stale.is_empty() {
                                 stale.sort();

@@ -153,10 +153,12 @@ proxied responses.
 `ImagePinRec` (§15): `generation: u32` and `file_version`, keyed by the
 same image key as the render row it marks. A render row is a hit only
 with a marker whose `generation` equals `images::RENDER_PIN_GENERATION`
-(currently 1, meaning "requested with `version=<file_version>`") and
-whose `file_version` equals the row's. It is a separate record kind
+(currently 2, meaning version-pinned requests with same-version snapshot
+invalidation) and whose `file_version` equals the row's. It is a separate record kind
 rather than a new `ImageBlobRec` field for the same reason as
-`MirrorConfig`. Fill rows carry no marker.
+`MirrorConfig`. Generation-1 pins are treated as misses because those
+builds could retain stale images across same-version edits. Fill rows
+carry no marker.
 
 `VariableSnapshotRec` (§9): `source` (`"file"` for `import-variables`,
 `"enterprise_rest"` for a pull's `variables/local` fetch), `format`
@@ -331,9 +333,12 @@ after the whole fetch → flatten → atomic sync → cache eviction → geometr
 persistence cycle succeeds. During every stage, existing readers see the
 previous complete mirror, including for the file being pulled. Other files
 have independent workers. No on-disk records or sink names change.
-An unchanged stored version skips both stale proxy-cache and image-cache
-scans, avoiding decoding cached image blobs. Initial or version-changing
-pulls still scan both tables and evict mismatched rows before publication.
+An unchanged version, modification timestamp and record set skip both
+stale proxy-cache and image-cache scans, avoiding decoding cached image
+blobs. Initial or version-changing pulls scan both tables and evict
+mismatched rows before publication. When the version stays the same but
+the modification timestamp or stored records change, all image rows and
+pins are invalidated; Figma can reuse a version ID across live edits.
 
 **Asynchronous pulls (NWS-2919):** `figmog_open {file, geometry?}` and
 `figmog_sync {file?}` acknowledge accepted work immediately:
@@ -1017,15 +1022,17 @@ agent asks for one.
 /v1/images/:key?ids=…&format=…&scale=…&version=…`, which returns per-node
 URLs that are then downloaded. `version` is the mirror's current
 `FileMeta.version` (percent-encoded), read once before the request and
-reused as the cached row's `file_version`, so a render matches the
-mirrored design even after the file is edited upstream, and a pull that
-lands mid-request can't relabel it. A node deleted upstream but still in
-the mirror is requested from that version too. A rejected pinned request
+reused as the cached row's `file_version`, so a pull that lands mid-request
+can't relabel it. **This does not freeze live edits.** A live check against
+an owned test file found different node contents and modification times
+under the same returned version ID. A cache miss can therefore reflect
+later upstream edits, and a node deleted upstream may no longer render
+even while it remains in the mirror. A rejected pinned request
 fails without an unpinned retry; HTTP 400/404 errors identify the file and
 mirrored version and advise re-pulling. Saved exports must belong to the
-selected file and reference a version Figma can still render. Live
-edit/delete behavior has not been verified against an owned test file;
-the request contract follows Figma's [image endpoint documentation](https://developers.figma.com/docs/rest-api/file-endpoints/#get-image).
+selected file and reference a version Figma can still render. The
+request parameter follows Figma's [image endpoint documentation](https://developers.figma.com/docs/rest-api/file-endpoints/#get-image);
+an immutable historical-render guarantee remains unresolved (NWS-2997).
 Fills come from the `fills` of the requested nodes:
 every `imageRef` hash found there is resolved through `GET
 /v1/files/:key/images` (fetched at most once per invocation) and
@@ -1037,9 +1044,11 @@ requests.
 **Cache.** Bytes land in `images` as `Rec::ImageBlob` rows keyed by a
 hash of kind, subject, format and scale (§3). A hit requires the stored
 row's identity fields to match the request and its `file_version` to
-equal the mirror's current version, so a repeat request against an
-unedited file spends nothing. A render hit additionally requires its
-`image_pins` marker (§3), written in the same transaction as the row.
+equal the mirror's current version. Pulls that change metadata or records
+without changing the version invalidate all cached images and pins, so
+repeated requests against an unchanged mirror spend nothing. A render hit
+additionally requires its `image_pins` marker (§3), written in the same
+transaction as the row.
 Renders saved by builds that requested them without `version` have no
 marker — their bytes may show a newer design than their label — so they
 read as misses. With a file identity and credentials they are refetched

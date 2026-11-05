@@ -50,15 +50,15 @@ pub const RENDER: &str = "render";
 pub const FILL: &str = "fill";
 
 /// Current render cache generation (NWS-2960). A render row is a cache
-/// hit only when its [`ImagePinRec`] marker carries this generation:
-/// generation 1 means "requested with `version=<the row's file_version>`",
-/// so the bytes really are that version's render. Render rows an older
-/// binary stored (requested unpinned — possibly showing a newer design
-/// than their label) have no marker and read as misses, so they get
+/// hit only when its [`ImagePinRec`] marker carries this generation.
+/// Generation 1 added version-pinned requests but retained stale rows when
+/// live edits reused that version. Generation 2 also invalidates images
+/// when a same-version pull changes metadata or records. Older rows may
+/// not match the mirror and read as misses, so they get
 /// refetched and overwritten when the file key and credentials are
 /// available. Without either, they return an upgrade-specific error.
 /// Fill rows never need a marker.
-pub const RENDER_PIN_GENERATION: u32 = 1;
+pub const RENDER_PIN_GENERATION: u32 = 2;
 
 /// A caller with no Figma API token still gets every cache hit for free
 /// (spec §5: "a repeat request on an unchanged file spends zero budget");
@@ -1275,6 +1275,7 @@ mod tests {
 
         for (generation, version, expect_hit) in [
             (RENDER_PIN_GENERATION, "100", true),
+            (RENDER_PIN_GENERATION - 1, "100", false),
             (RENDER_PIN_GENERATION + 1, "100", false),
             (RENDER_PIN_GENERATION, "99", false),
         ] {
