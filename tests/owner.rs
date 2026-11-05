@@ -529,6 +529,19 @@ fn clients_arriving_during_idle_exit_are_served() {
 /// explanation (and starts no owner of its own), and so does the CLI.
 #[test]
 fn a_mismatched_owner_is_refused_with_an_explanation() {
+    refuses_owner("0.0.1", 1);
+}
+
+/// NWS-2958: an owner of this very version built before `figmog_images`
+/// took `reuse`/`refresh` (protocol 1) would silently ignore them; the
+/// protocol bump makes every client refuse it instead (with protocol
+/// still 1, this same-version owner would be accepted).
+#[test]
+fn an_owner_from_before_the_render_reuse_protocol_is_refused() {
+    refuses_owner(env!("CARGO_PKG_VERSION"), 1);
+}
+
+fn refuses_owner(old_version: &str, old_protocol: u64) {
     let repo = repo();
     let root = repo.path().join(".git/figmog");
     std::fs::create_dir_all(&root).unwrap();
@@ -536,12 +549,13 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
     let socket = repo.path().join("old.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let record = json!({"generation": "old", "pid": 4_000_000u64, "project": root.display().to_string(),
-        "protocol": 1, "socket": socket.display().to_string(), "version": "0.0.1"});
+        "protocol": old_protocol, "socket": socket.display().to_string(), "version": old_version});
     std::fs::write(root.join("owner.json"), record.to_string()).unwrap();
     let served = Arc::new(AtomicUsize::new(0));
     {
         let served = served.clone();
         let root = root.clone();
+        let old_version = old_version.to_string();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 served.fetch_add(1, Ordering::SeqCst);
@@ -553,9 +567,9 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
                 let hello: Value = serde_json::from_str(&line).unwrap();
                 let reply = json!({"jsonrpc": "2.0", "id": hello["id"], "result": {
                     "attach_errors": {}, "generation": "old", "pid": 4_000_000u64,
-                    "project": root.display().to_string(), "protocol": 1,
+                    "project": root.display().to_string(), "protocol": old_protocol,
                     "settings": {"interval": 10, "upstream": null, "watch": false},
-                    "version": "0.0.1"}});
+                    "version": old_version}});
                 let mut out = stream;
                 let _ = writeln!(out, "{reply}");
             }
@@ -569,7 +583,9 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
     let error = error["error"].as_str().unwrap();
     assert!(
-        error.contains("runs figmog 0.0.1") && error.contains("cannot share it"),
+        error.contains(&format!(
+            "runs figmog {old_version} (protocol {old_protocol})"
+        )) && error.contains("cannot share it"),
         "{error}"
     );
     assert!(error.contains("kill 4000000"), "{error}");

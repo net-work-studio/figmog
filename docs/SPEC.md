@@ -932,7 +932,7 @@ removes the record at exit if it is still its own.
 `{"method": "figmog/hello", "id": "figmog-hello", "params": {"client":
 "relay"|"cli", "project", "version", "protocol", "settings"?, "attach"?}}`.
 The owner refuses a different project, binary version or protocol version
-(currently 1) with error `-32002` and an explanation; the client checks the
+(currently 2; 2 since `figmog_images` took `reuse`/`refresh`, NWS-2958) with error `-32002` and an explanation; the client checks the
 owner's answer `{"attach_errors", "generation", "pid", "project",
 "protocol", "settings", "version"}` the same way. Either way the relay (and
 the CLI) stops with that explanation — "let it exit (it stops on its own
@@ -1779,62 +1779,98 @@ fingerprint of what it shows, and stays a hit across file versions for as
 long as that fingerprint is unchanged — editing one frame leaves the
 cached renders of unrelated frames valid. Reuse is **off by default**:
 until the rendering contract is confirmed against Figma's images endpoint
-(below), a request without the opt-in behaves exactly as described
-above and never reads or writes the fingerprint tables.
+(below), a request without the opt-in is served exactly as described
+above and never adds a fingerprinted render.
 
 - **Fingerprint** (`images::render_fingerprint`, computed lazily at
   render time from the mirror, never during a pull): SHA-256 over the
-  fingerprint-scheme version (`images::RENDER_FINGERPRINT_SCHEME`, 1),
-  format, scale and three parts: (1) the node's subtree — every node's
-  stored canonical raw JSON in preorder and child order, as nested
-  `[raw, [children…]]` arrays; instance children arrive expanded in the
-  REST response, variable and style values are baked into raw properties,
-  image fills are referenced by content hash and fonts are named in text
-  styles, so this covers nearly everything a single-node export shows.
-  Node ids are part of the raw JSON, so a fingerprint belongs to exactly
-  one node. (2) Conservatively, for every INSTANCE in the subtree whose
-  main component is mirrored, that component's own subtree hash,
-  transitively, so editing a main component invalidates its instances
-  even where the expansion doesn't show the edit. (3) Conservatively,
-  every ancestor's `explicitVariableModes`, root first.
+  fingerprint-scheme version (`images::RENDER_FINGERPRINT_SCHEME`,
+  currently 2), format, scale and three parts. (1) The node's subtree, as
+  a Merkle hash over every node's stored raw JSON in child order;
+  instance children arrive expanded in the REST response, variable and
+  style values are baked into raw properties, image fills are referenced
+  by content hash and fonts are named in text styles, so this covers
+  nearly everything a single-node export shows. Two things are
+  normalized out first: prototype-only keys (`images::PROTOTYPE_ONLY_KEYS`:
+  `interactions`, `reactions`, `transitionNodeID`, `transitionDuration`,
+  `transitionEasing`, `prototypeStartNodeID`, `flowStartingPoints`,
+  `prototypeDevice`, `prototypeBackgrounds`), and page-absolute position:
+  each node's `absoluteBoundingBox` keeps only its size,
+  `absoluteRenderBounds` becomes an offset from the node's own box, the
+  translation of `absoluteTransform`/`relativeTransform` is dropped, and
+  each child's offset from its parent (rounded to 1/1000 px, so float
+  noise can't matter) is hashed with it instead. Moving the rendered node,
+  or reflowing it in an auto-layout parent, keeps its fingerprint;
+  resizing or moving anything inside it changes it. Node ids are part of
+  the raw JSON, so a fingerprint belongs to exactly one node. (2)
+  Conservatively, for every INSTANCE in the subtree whose main component
+  is mirrored, that component's own subtree hash, transitively, so
+  editing a main component invalidates its instances even where the
+  expansion doesn't show the edit. (3) Conservatively, every ancestor's
+  `explicitVariableModes`, root first. Subtree hashes are memoized per
+  node within a request.
 - **Conservative fallback.** A node gets no fingerprint — and so only
   the per-version cache — when it, an ancestor or a subtree node is
-  missing from the mirror, when an earlier sibling is a mask
-  (`isMask`) that may clip it, or when the tree is inconsistent; also
-  when the mirror has no version to pin the request to. With reuse on, a
-  fingerprint miss still falls back to the per-version lookup.
+  missing from the mirror, when a sibling drawn before it *or before any
+  of its ancestors* is a mask (`isMask`) that may clip it, or when the
+  tree is inconsistent; also when the mirror has no version to pin the
+  request to. With reuse on, a fingerprint miss still falls back to the
+  per-version lookup.
 - **Storage.** A fetched fingerprinted render is written as a
   `render_index` row (§3) plus an immutable, content-addressed
-  `render_blobs` row keyed by the bytes' SHA-256 (the in-house
-  implementation `figmog assets` uses — no new dependency), in one
-  transaction, instead of an `images` row. The request is still pinned to
-  the mirrored version (NWS-2960), which is the version the fingerprint
-  was computed at. A hit requires the row's scheme, subject, format and
-  scale to match, and the blob's bytes to still hash to the digest the
-  row names (validated on every read; anything else is a miss and is
-  refetched, repairing the blob).
+  `render_blobs` row keyed by the bytes' SHA-256 (the hash `figmog
+  assets` uses — no new dependency), in one transaction, instead of an
+  `images` row. The request is still pinned to the mirrored version
+  (NWS-2960), which is the version the fingerprint was computed at. A hit
+  requires the row's scheme, subject, format and scale to match, and the
+  blob's bytes to still hash to the digest the row names (validated on
+  every read; anything else is a miss and is refetched, repairing the
+  blob).
+- **One newest render per node.** Whichever policy fetches a render, the
+  other cache's copy of that node at the same format and scale is
+  retired in the same request: a fingerprinted write drops the node's
+  per-version row, and a per-version write retires the node's
+  fingerprinted renders. Switching policies therefore never serves bytes
+  older than the newest fetch (a refresh can't be undone).
 - **Force refresh.** `--refresh` (tool: `refresh: true`) ignores every
   cached render, per-version and fingerprinted, and fetches again; a
   refetched fingerprinted render replaces its index row, and the blob it
   displaced is dropped once nothing references it. Fills are unaffected.
-- **Eviction**, after every opted-in request that wrote a fingerprinted
-  render or found orphans, in two separate passes over the index ordered
-  oldest first (`seq`, then fingerprint as a deterministic tie-break;
-  `images::plan_render_eviction`): **orphan cleanup** removes every row
+- **Eviction**, in two separate passes over the index ordered oldest
+  first (`seq`, then fingerprint as a deterministic tie-break;
+  `images::plan_render_eviction`). **Orphan cleanup** removes every row
   whose fingerprint no node has any more (its subject's current
   fingerprint differs, the subject is gone, or the row's scheme is
-  stale); then a **hard byte quota** (`images::RENDER_CACHE_MAX_BYTES`,
-  256 MiB of distinct blobs) removes the oldest remaining rows, still
-  valid or not, until the cache fits. A blob goes when no remaining row
-  references it. The version-change pass (§5) never touches these
-  tables; `pull --fresh` wipes them with the rest of the store.
-- **Unconfirmed contract.** The claim that a single-node export shows
-  nothing outside the node's subtree (no ancestor effects) has not been
-  checked against the live REST images endpoint — figmog's suite has no
-  network access — which is why reuse stays opt-in. The fixtures in
-  `images::tests` (text, fonts, instances and main components, image
-  fills, inherited variable modes, sibling masks) pin what the
-  fingerprint covers, not what Figma renders.
+  stale). Orphans only appear when the mirror changes, so the pass runs
+  only for an opted-in request with a render miss, or the first one after
+  the mirror version (or the scheme) moved: a `render_index` row under the
+  key `cleanup` (`images::RENDER_CLEANUP_KEY` — not a render; never
+  served, counted or evicted) records the version and scheme of the last
+  pass. A **hard byte quota** (`images::RENDER_CACHE_MAX_BYTES`, 256 MiB
+  of distinct blobs) then removes the oldest remaining rows, still valid
+  or not, until the cache fits — except the renders the current request
+  serves or writes, so the cache can exceed the quota by one request's
+  own renders until a later request evicts. "Oldest" is insertion order:
+  a hit never writes. A blob goes when no remaining row references it.
+  The version-change pass (§5) never touches these tables; `pull
+  --fresh` wipes them with the rest of the store.
+- **Older servers.** A background owner from before these arguments
+  existed speaks owner protocol 1 and is refused by the handshake (§6b).
+  A plain `figmog serve` socket has no handshake, so `figmog images
+  --reuse-renders`/`--refresh` first checks the server's `figmog_images`
+  schema lists the argument, and fails with an explanation (restart
+  serve, or `--no-socket`) rather than have it silently ignored.
+- **Unconfirmed contract.** Not checked against the live REST images
+  endpoint — figmog's suite has no network access — which is why reuse
+  stays opt-in: that a single-node export shows nothing outside the
+  node's subtree, in particular no ancestor effects, ancestor opacity or
+  visibility, or ancestor clipping (`clipsContent`), none of which are
+  hashed; that a mask outside the subtree needs the fallback above; and
+  that bound variable values in the raw JSON are already resolved for the
+  node's effective mode. The fixtures in `images::tests` (text, fonts,
+  instances and main components, image fills, inherited variable modes,
+  masks, moves, resizes and prototype edits) pin what the fingerprint
+  covers, not what Figma renders.
 
 **Explicit stores.** `figmog --db <store> images <node-id>...` exports
 matching cached renders and fills without a token or file key. The store

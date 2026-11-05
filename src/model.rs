@@ -313,6 +313,8 @@ pub struct VariableCodeRec {
 ///
 /// The bytes live in a separate, content-addressed [`RenderBlobRec`] row
 /// so the orphan and quota scans read only these small metadata rows.
+/// One row under the key `images::RENDER_CLEANUP_KEY` is not a render:
+/// its `scheme` and `file_version` record the last orphan cleanup.
 /// A new record kind rather than new [`ImageBlobRec`] fields, for the
 /// same reason as [`MirrorConfigRec`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
