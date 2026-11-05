@@ -73,6 +73,7 @@ is deterministic: running it twice gives byte-identical outputs.
 | `app/variants/Card.hardcoded.jsx` | Test fixture: the card with every token value written as a literal. |
 | `app/scripts/` | `slice.mjs` (the run) and `lib.mjs` (shared plumbing). |
 | `app/test/slice.test.mjs` | The slice tests. |
+| `app/test/icons.test.mjs` | NWS-2952: renders the icon components `figmog assets export` generates (`tests/fixtures/assets/export/`) with React and checks that repeated instances never share an id. Needs only `npm ci`. |
 | `evidence/` | Run outputs (committed). |
 
 ## The card and the tokens

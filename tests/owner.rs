@@ -1267,3 +1267,108 @@ fn a_relay_maps_instances_with_the_projects_map() {
     relay.finish();
     wait_owner_gone(repo.path());
 }
+
+/// NWS-2952: with the shared owner running (it holds the store),
+/// `figmog assets export` reads, renders and fetches through it — cache
+/// hits only, no token — and the relay passes the project's asset manifest
+/// to `figmog_spec`, which then names the exported icon component and
+/// image file instead of raw ids.
+#[test]
+fn assets_export_routes_through_the_owner_and_the_relay_passes_the_manifest() {
+    use figmog::model::{Id, ImageBlobRec, ImagePinRec, Rec};
+    let repo = repo();
+    std::fs::write(
+        repo.path().join("figmog.toml"),
+        format!("[files]\ndefault = \"{KEY}\"\n"),
+    )
+    .unwrap();
+    let mut fixture = common::fixture_v1();
+    fixture["document"]["children"][0]["children"][0]["fills"] =
+        json!([{"type": "IMAGE", "imageRef": "feed01", "scaleMode": "FILL"}]);
+    seed(repo.path(), KEY, &fixture);
+    let png = b"\x89PNG\r\n\x1a\nsynthetic".to_vec();
+    {
+        let db = mirror_root(repo.path()).join(KEY).join("db");
+        let mut st = figmog::open_store!(&db);
+        let blob = |kind: &str, subject: &str, format: &str, bytes: Vec<u8>| {
+            let key = figmog::images::image_key(
+                kind,
+                subject,
+                if kind == "render" { format } else { "" },
+                1000,
+            );
+            (
+                key.clone(),
+                ImageBlobRec {
+                    key_hash: key,
+                    kind: kind.into(),
+                    subject: subject.into(),
+                    format: format.into(),
+                    scale_milli: 1000,
+                    file_version: "100".into(),
+                    bytes,
+                },
+            )
+        };
+        st.wtx(|tx| {
+            for id in ["2:2", "2:3"] {
+                let svg = format!(
+                    "<svg width=\"8\" height=\"8\" viewBox=\"0 0 8 8\" xmlns=\"http://www.w3.org/2000/svg\"><rect id=\"r{id}\" width=\"8\" height=\"8\" fill=\"#123456\"/></svg>"
+                );
+                let (key, rec) = blob("render", id, "svg", svg.into_bytes());
+                tx.upsert(&Id::ImageBlob(key.clone()), &Rec::ImageBlob(rec));
+                tx.upsert(
+                    &Id::ImagePin(key),
+                    &Rec::ImagePin(ImagePinRec {
+                        generation: figmog::images::RENDER_PIN_GENERATION,
+                        file_version: "100".into(),
+                    }),
+                );
+            }
+            let (key, rec) = blob("fill", "feed01", "png", png.clone());
+            tx.upsert(&Id::ImageBlob(key), &Rec::ImageBlob(rec));
+        });
+    }
+    let mut relay = spawn_relay(&mut relay_command(
+        repo.path(),
+        &["--no-watch", "--no-upstream"],
+    ));
+    relay.initialize();
+    assert!(discovery(repo.path()).is_some(), "the owner is running");
+
+    let out = common::command()
+        .args(["assets", "export", "--icons", "2:1", "--images", "1:1"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(summary["written"], 7, "{summary}");
+    let names: Vec<&str> = summary["icons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["component"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["IconButtonLargeDefault", "IconButtonSmallHover"]);
+    let image = &summary["images"][0];
+    assert_eq!(image["image_ref"], "feed01");
+    let path = image["path"].as_str().unwrap();
+    assert_eq!(std::fs::read(repo.path().join(path)).unwrap(), png);
+
+    // 1:3 is an instance of 2:2 (key22): the relay passes the manifest.
+    let spec = relay.call("figmog_spec", json!({"id": "1:1"})).unwrap();
+    let button = spec["node"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "1:3")
+        .unwrap();
+    assert_eq!(
+        button["content"]["assets"][0]["component"], "IconButtonLargeDefault",
+        "{button}"
+    );
+    assert_eq!(spec["node"]["content"]["assets"][0]["path"], path);
+    relay.finish();
+    wait_owner_gone(repo.path());
+}

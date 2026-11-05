@@ -429,6 +429,16 @@ impl Relay {
             {
                 params["arguments"]["map"] = map.to_json();
             }
+            // ... and names exported assets from the project's asset
+            // manifest (NWS-2952), unless the agent passed `assets`.
+            if params["arguments"].get("assets").is_none_or(Value::is_null)
+                && let Some(assets) = crate::assets::AssetIndex::load(
+                    &self.layout.project_root,
+                    &settings.assets.manifest,
+                )?
+            {
+                params["arguments"]["assets"] = assets.to_json();
+            }
         }
         let args = &frame["params"]["arguments"];
         let explicit = match args.get("file") {

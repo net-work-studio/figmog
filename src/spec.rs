@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value, json};
 
+use crate::assets::AssetIndex;
 use crate::map::CodeMap;
 use crate::tokens::{ExportOptions, color, export_css};
 use css::{Css, CssVal, num, px};
@@ -203,7 +204,9 @@ const DESIGN_STYLE_KEYS: [&str; 5] = [
 /// project's `[tokens]` settings), so the CSS names and root modes match
 /// the committed token file; `tailwind` adds the per-node class hint;
 /// `map` is the project's Figma → code component map (NWS-2949), which
-/// fills each mapped instance's `code_component`.
+/// fills each mapped instance's `code_component`; `assets` the project's
+/// asset manifest (NWS-2952), which names the exported icon component
+/// and image file in `content.assets`.
 pub fn build(
     tree: &Value,
     vars: &Value,
@@ -211,6 +214,7 @@ pub fn build(
     tokens: &ExportOptions,
     tailwind: bool,
     map: Option<&CodeMap>,
+    assets: Option<&AssetIndex>,
 ) -> Value {
     let (css, theme, theme_names, units, roots, css_unavailable) = match export_css(vars, tokens) {
         Ok(export) => (
@@ -237,6 +241,7 @@ pub fn build(
         components,
         tailwind,
         map,
+        assets,
         unsupported: BTreeSet::new(),
         consumed: BTreeSet::new(),
         style_base: "/style".into(),
@@ -589,6 +594,7 @@ struct Cx<'a> {
     components: &'a Value,
     tailwind: bool,
     map: Option<&'a CodeMap>,
+    assets: Option<&'a AssetIndex>,
     unsupported: BTreeSet<(String, String)>,
     /// The current node's binding pointers read so far; any other is
     /// listed as unsupported (never dropped silently).
@@ -971,8 +977,13 @@ impl Cx<'_> {
         }
         out.insert("values".into(), Value::Object(values));
 
-        // Content: assets.
-        if vector {
+        // Content: assets. An exported icon (NWS-2952) — the node itself,
+        // or the component an instance shows — is referenced by its
+        // generated component instead of a raw vector.
+        let icon = self.icon(n, &id, &node_type);
+        if let Some(icon) = icon {
+            assets.push(icon);
+        } else if vector {
             assets.push(json!({"kind": "vector", "node_id": id, "format": "svg"}));
         }
         let formats: BTreeSet<String> = n["exportSettings"]
@@ -1649,19 +1660,31 @@ impl Cx<'_> {
                 self.unsupported(id, format!("{key}[{i}]: blendMode {mode}: not specified"));
             }
             if ty == "IMAGE" && key == "fills" {
-                assets.push(json!({
+                let mut asset = json!({
                     "kind": "image",
                     "node_id": id,
                     "paint": format!("fills[{i}]"),
                     "image_ref": paint["imageRef"],
                     "scale_mode": paint["scaleMode"],
-                }));
-                self.unsupported(
-                    id,
-                    format!(
+                });
+                let exported = paint["imageRef"]
+                    .as_str()
+                    .and_then(|r| self.assets?.image(r));
+                let reason = match exported {
+                    Some(image) => {
+                        asset["path"] = json!(image.path);
+                        asset["url"] = json!(image.url);
+                        format!(
+                            "fills[{i}]: IMAGE paint: exported as {} (content.assets); its scaling and cropping are not translated to CSS",
+                            image.path
+                        )
+                    }
+                    None => format!(
                         "fills[{i}]: IMAGE paint: referenced under content.assets, no CSS background until the asset manifest (NWS-2952)"
                     ),
-                );
+                };
+                assets.push(asset);
+                self.unsupported(id, reason);
                 continue;
             }
             let hex = (ty == "SOLID").then(|| paint_color(paint)).flatten();
@@ -2247,6 +2270,29 @@ impl Cx<'_> {
 
     /// An INSTANCE: its component, variant and other properties, and the
     /// code component the project's map names (NWS-2949), else `null`.
+    /// The exported icon (NWS-2952) this node is — by its own node id, or
+    /// for an instance by its main component's key, else id — as a
+    /// `content.assets` entry; `None` without a manifest.
+    fn icon(&self, n: &Value, id: &str, node_type: &str) -> Option<Value> {
+        let assets = self.assets?;
+        let icon = match node_type {
+            "INSTANCE" => {
+                let cid = n["componentId"].as_str()?;
+                let key = self.components[cid]["key"].as_str();
+                assets.icon(key, cid)?
+            }
+            _ => assets.icon(None, id)?,
+        };
+        Some(json!({
+            "kind": "icon",
+            "node_id": id,
+            "component": icon.component,
+            "path": icon.path,
+            "svg": icon.svg,
+            "jsx": format!("<{} />", icon.component),
+        }))
+    }
+
     fn instance(&mut self, n: &Value, id: &str) -> Value {
         let component_id = n["componentId"].as_str().unwrap_or_default();
         let component = &self.components[component_id];
@@ -2354,6 +2400,7 @@ mod tests {
             &json!({}),
             &ExportOptions::default(),
             false,
+            None,
             None,
         )
     }
@@ -2603,6 +2650,7 @@ mod tests {
             &ExportOptions::default(),
             true,
             None,
+            None,
         );
         assert_eq!(
             out["tokens_snapshot"]["css_unavailable"],
@@ -2629,6 +2677,7 @@ mod tests {
             &ExportOptions::default(),
             false,
             None,
+            None,
         );
         assert_eq!(
             out["node"]["css"]["opacity"],
@@ -2654,6 +2703,7 @@ mod tests {
             &json!({}),
             &ExportOptions::default(),
             false,
+            None,
             None,
         );
         let node = &out["node"];

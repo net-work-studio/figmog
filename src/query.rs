@@ -453,7 +453,8 @@ pub fn subtree<R: Readable>(
 /// Binding-aware spec of the subtree rooted at `id` (NWS-2968): the
 /// [`subtree`] answer and the [`vars`] `{snapshot, variables}` answer,
 /// rendered by [`crate::spec::build`] with the project's token `tokens`
-/// options (NWS-2948) and Figma → code component `map` (NWS-2949).
+/// options (NWS-2948), Figma → code component `map` (NWS-2949) and
+/// asset manifest `assets` (NWS-2952).
 #[allow(clippy::too_many_arguments)]
 pub fn spec<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
@@ -467,6 +468,7 @@ pub fn spec<R: Readable>(
     tokens: &crate::tokens::ExportOptions,
     tailwind: bool,
     map: Option<&crate::map::CodeMap>,
+    assets: Option<&crate::assets::AssetIndex>,
 ) -> Result<Value, String> {
     let tree = subtree(
         nodes,
@@ -522,6 +524,7 @@ pub fn spec<R: Readable>(
         tokens,
         tailwind,
         map,
+        assets,
     ))
 }
 

@@ -18,6 +18,7 @@ use crate::dispatch::{DEFAULT_SEARCH_LIMIT, ReadCommand};
 use crate::ident::{is_file_key, parse_file_ref};
 use crate::project::Layout;
 
+mod assets;
 mod auth;
 mod call;
 mod doctor;
@@ -258,6 +259,12 @@ enum Cmd {
         #[command(subcommand)]
         command: map::MapCommand,
     },
+    /// Icons and images exported into the project (figmog.toml's
+    /// `[assets]`), with the manifest `figmog spec` references.
+    Assets {
+        #[command(subcommand)]
+        command: assets::AssetsCommand,
+    },
     /// Node counts by type and page, table totals, text-node count, max tree depth.
     Stats,
     /// Ancestor chain root→node for one id.
@@ -489,6 +496,15 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         }
     }
 
+    // `assets` writes into the project: no project, nowhere to write.
+    if let Cmd::Assets { .. } = &cli.cmd
+        && layout.is_none()
+    {
+        return Err(
+            "assets writes into the project's [assets] folders and does not take --db".into(),
+        );
+    }
+
     if let Cmd::Migrate { file } = &cli.cmd {
         let Some(layout) = &layout else {
             return Err("migrate works on the project's mirrors and does not take --db".into());
@@ -637,6 +653,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             scale,
             out,
         } => images::cmd_images(&db, socket_root.as_ref(), ids, format, scale, out),
+        Cmd::Assets { command } => assets::run(&db, socket_root.as_ref(), &command),
         Cmd::Call {
             tool,
             args,
@@ -666,8 +683,10 @@ fn dispatch(cli: Cli) -> Result<(), String> {
 /// `tokens` argument (NWS-2948), and its `[stack] styling` turns on the
 /// Tailwind class hint (NWS-2947) unless `--tailwind`/`--no-tailwind`
 /// said otherwise; its `figmog.map.json`, when there is one, rides along
-/// as `map` (NWS-2949) — an invalid map fails the command. With `--db`
-/// (no project): the defaults, no hint, no map.
+/// as `map` (NWS-2949) — an invalid map fails the command — and its asset
+/// manifest (`[assets] manifest`), when there is one, as `assets`
+/// (NWS-2952), likewise. With `--db` (no project): the defaults, no hint,
+/// no map, no manifest.
 fn with_project_settings(
     read: ReadCommand,
     layout: Option<&Layout>,
@@ -678,12 +697,21 @@ fn with_project_settings(
             tokens,
             tailwind,
             map,
+            assets,
         } => {
             let settings = layout.map(Layout::settings);
             let map = match (map, layout) {
                 (Some(map), _) => Some(map),
                 (None, Some(layout)) => crate::map::CodeMap::load(&layout.project_root)?,
                 (None, None) => None,
+            };
+            let assets = match (assets, layout, &settings) {
+                (Some(assets), _, _) => Some(assets),
+                (None, Some(layout), Some(settings)) => crate::assets::AssetIndex::load(
+                    &layout.project_root,
+                    &settings.assets.manifest,
+                )?,
+                _ => None,
             };
             ReadCommand::Spec {
                 id,
@@ -694,6 +722,7 @@ fn with_project_settings(
                         .map(|s| s.stack.styling == crate::project::Styling::Tailwind)
                 }),
                 map,
+                assets,
             }
         }
         other => other,
@@ -856,8 +885,8 @@ fn strip_routed_status_fields(mut result: Value) -> Value {
 /// produces byte-identical results to the direct-open path (spec §6a).
 /// `None` for every other command: the writers `pull` and
 /// `import-variables` route as serve operations (NWS-2963, in `dispatch`);
-/// `serve`/`tools`/`call`/`images` are each handled at their own call
-/// sites.
+/// `serve`/`tools`/`call`/`images`/`assets` are each handled at their own
+/// call sites.
 fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
     Some(match cmd {
         Cmd::Status => ReadCommand::Status,
@@ -953,6 +982,7 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
                 _ => None,
             },
             map: None,
+            assets: None,
         },
         Cmd::Tokens { .. } => tokens::read(),
         Cmd::Map { .. } => map::read(),
@@ -964,6 +994,7 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
         | Cmd::Call { .. }
         | Cmd::ImportVariables { .. }
         | Cmd::Images { .. }
+        | Cmd::Assets { .. }
         | Cmd::Migrate { .. }
         | Cmd::Init(_)
         | Cmd::Doctor { .. }
@@ -1494,6 +1525,7 @@ mod tests {
             &["pull"][..],
             &["call", "figmog_status"],
             &["images", "1:1"],
+            &["assets", "export", "--icons", "1:1"],
         ] {
             let cli =
                 Cli::try_parse_from(std::iter::once("figmog").chain(argv.iter().copied())).unwrap();
