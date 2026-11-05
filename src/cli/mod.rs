@@ -267,6 +267,10 @@ enum Cmd {
         #[arg(long)]
         y: f64,
     },
+    /// Binding-aware spec of an auto-layout subtree: layout and values,
+    /// each value as its bound token (with the `tokens export` CSS name)
+    /// or flagged untokenized; out-of-scope cases listed as unsupported.
+    Spec { id: String },
     /// Download node renders and/or fill images to --out, caching by file version.
     ///
     /// With --db, export cached images only: stores do not record a file key.
@@ -800,6 +804,7 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
             under: under.clone(),
         },
         Cmd::At { x, y } => ReadCommand::At { x: *x, y: *y },
+        Cmd::Spec { id } => ReadCommand::Spec { id: id.clone() },
         Cmd::Tokens { .. } => tokens::read(),
         Cmd::Version
         | Cmd::Auth { .. }
@@ -1308,6 +1313,7 @@ mod tests {
                 "figmog_at",
                 json!({"x": 1.5, "y": 2.0}),
             ),
+            (&["spec", "1:1"], "figmog_spec", json!({"id": "1:1"})),
         ];
         for (argv, tool, want) in cases {
             let cli =

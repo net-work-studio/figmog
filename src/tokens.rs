@@ -66,6 +66,10 @@ pub struct Export {
     pub theme: Option<Theme>,
     /// Sorted by variable id, then reason.
     pub report: Vec<ReportEntry>,
+    /// Variable id → the custom property name it exports as (`--x`), for
+    /// every emitted variable — what `figmog spec` (NWS-2968) shows as a
+    /// bound token's `css`, so the two can't drift.
+    pub names: BTreeMap<String, String>,
 }
 
 /// One authoritative variable row of `figmog vars --snapshot`.
@@ -392,6 +396,10 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         tokens: tokens.len(),
         theme,
         report: report.into_iter().collect(),
+        names: tokens
+            .iter()
+            .map(|(id, t)| (id.clone(), t.name.clone()))
+            .collect(),
     })
 }
 
@@ -591,7 +599,7 @@ fn value(raw: &Value, kind: Kind) -> Result<Val, String> {
 }
 
 /// `{r, g, b, a}` (0–1 floats) as `#rrggbb`, or `#rrggbbaa` below full alpha.
-fn color(raw: &Value) -> Option<String> {
+pub(crate) fn color(raw: &Value) -> Option<String> {
     let channel = |k: &str, default: Option<f64>| -> Option<u8> {
         let x = raw.get(k).and_then(Value::as_f64).or(default)?;
         x.is_finite()

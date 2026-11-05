@@ -286,9 +286,21 @@ light/dark modes as `:root` and `[data-theme="dark"]`, and a Tailwind v4
 theme. Names come from each variable's WEB code syntax, else its kebab-cased
 path; a name collision is an error. See `docs/SPEC.md` §9 "Token export".
 
+### A spec of one component
+
+`figmog spec <node>` (tool `figmog_spec`) describes an auto-layout card the
+way you rebuild it: direction, gap, padding, alignment and hug/fill/fixed
+sizing for every frame, and fill, stroke, radius and typography for every
+layer. Each value is shown as the variable token it is bound to, with the
+CSS name `figmog tokens export` gives it and the raw value beside it. An
+unbound value is flagged as untokenized, and named "matches X" when it
+equals a token's light/default value. Grid layout, absolutely positioned
+children, mixed text runs, gradients and the like are listed under
+`unsupported` instead of being guessed. See `docs/SPEC.md` §17.
+
 ### The tools
 
-`figmog serve` exposes 21 `figmog_*` tools: 17 reads of the local mirror,
+`figmog serve` exposes 22 `figmog_*` tools: 18 reads of the local mirror,
 `figmog_sync`, `figmog_images`, and the two mirror-management tools. Unless
 `--no-upstream`, it also proxies Figma's desktop Dev Mode MCP server (paid
 Dev or Full seat, desktop app running), merging those tools into the same

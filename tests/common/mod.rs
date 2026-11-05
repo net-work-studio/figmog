@@ -371,5 +371,7 @@ pub fn read_parity_cases() -> Vec<(Vec<&'static str>, &'static str, Value)> {
             "figmog_at",
             json!({"x": 10, "y": 10}),
         ),
+        (vec!["spec", "1:1"], "figmog_spec", json!({"id": "1:1"})),
+        (vec!["spec", "1-1"], "figmog_spec", json!({"id": "1-1"})),
     ]
 }

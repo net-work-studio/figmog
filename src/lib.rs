@@ -28,6 +28,7 @@ pub(crate) mod query;
 mod serve;
 mod session_view;
 mod sessions;
+pub(crate) mod spec;
 pub mod store;
 pub(crate) mod tokens;
 pub(crate) mod upstream;
