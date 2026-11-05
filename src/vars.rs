@@ -38,6 +38,28 @@ pub fn snapshot_digest(bytes: &[u8]) -> String {
     format!("fnv1a64:{hash:016x}")
 }
 
+/// `import-variables`' stricter validation (NWS-2961): every variable and
+/// collection entry must be a JSON object, else the whole file is
+/// rejected. Deliberately not part of [`parse_variables_export`], which
+/// Enterprise pulls share and which stays lenient per entry.
+pub fn check_import_entries(v: &Value) -> Result<(), ImportError> {
+    let root = v.get("meta").unwrap_or(v);
+    for (kind, key) in [
+        ("variable", "variables"),
+        ("collection", "variableCollections"),
+    ] {
+        let Some(map) = root.get(key).and_then(Value::as_object) else {
+            continue; // shape errors are parse_variables_export's to report
+        };
+        if let Some((id, _)) = map.iter().find(|(_, e)| !e.is_object()) {
+            return Err(ImportError::Shape(format!(
+                "{kind} `{id}` is not an object"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A parsed export: the variable/collection records plus the provenance
 /// row describing them (NWS-2961).
 #[derive(Debug)]
@@ -122,8 +144,10 @@ pub fn enterprise_snapshot_recs(v: &Value) -> Result<Vec<(Id, Rec)>, ImportError
 
 /// Parse a variables export: either the Enterprise REST `variables/local`
 /// response (`{meta: {variables, variableCollections}}`) or the bare
-/// object a plugin-console export produces. Every variable and collection
-/// entry must be a JSON object; anything else rejects the whole export.
+/// object a plugin-console export produces. Lenient about individual
+/// entries (a non-object entry yields a record with empty fields), so one
+/// malformed `variables/local` entry never fails a whole pull;
+/// `import-variables` adds [`check_import_entries`] on top.
 pub fn parse_variables_export(v: &Value) -> Result<Vec<(Id, Rec)>, ImportError> {
     let root = v.get("meta").unwrap_or(v);
     let variables = root
@@ -134,14 +158,6 @@ pub fn parse_variables_export(v: &Value) -> Result<Vec<(Id, Rec)>, ImportError> 
         .get("variableCollections")
         .and_then(Value::as_object)
         .ok_or_else(|| ImportError::Shape("missing `variableCollections` object".into()))?;
-
-    for (kind, map) in [("variable", variables), ("collection", collections)] {
-        if let Some((id, _)) = map.iter().find(|(_, e)| !e.is_object()) {
-            return Err(ImportError::Shape(format!(
-                "{kind} `{id}` is not an object"
-            )));
-        }
-    }
 
     let s = |v: &Value, k: &str| {
         v.get(k)

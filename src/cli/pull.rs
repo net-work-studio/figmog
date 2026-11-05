@@ -301,6 +301,114 @@ mod tests {
         assert_eq!(st.get(&crate::model::Id::MirrorConfig), config);
     }
 
+    fn synthetic_file() -> Value {
+        serde_json::json!({
+            "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
+            "document": {"id": "0:0", "name": "Document", "type": "DOCUMENT"}
+        })
+    }
+
+    fn variables_export() -> Value {
+        serde_json::from_str(include_str!("../../tests/fixtures/variables-export.json")).unwrap()
+    }
+
+    fn snapshot_source(db: &Db) -> Option<String> {
+        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        st.rtx(|(.., snapshot)| snapshot.get(&0).map(|s| s.source))
+    }
+
+    /// NWS-2961: the provenance row rides in the pull's transaction but not
+    /// its churn — a first Enterprise pull counts only real records, and an
+    /// identical re-pull is all-unchanged with nothing added.
+    #[test]
+    fn enterprise_snapshot_row_is_excluded_from_pull_churn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let file = synthetic_file();
+        let vars = variables_export();
+
+        let (plain, ..) = apply_pull(&db, &file, None, false, false).unwrap();
+        let file_recs = plain.added;
+        let (first, ..) = apply_pull(&db, &file, Some(&vars), true, false).unwrap();
+        assert_eq!(
+            first,
+            Churn {
+                added: file_recs + 5, // + 2 collections + 3 variables, no snapshot row
+                changed: 0,
+                removed: 0,
+                unchanged: 0,
+            }
+        );
+        assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
+
+        let (again, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        assert_eq!(
+            again,
+            Churn {
+                added: 0,
+                changed: 0,
+                removed: 0,
+                unchanged: file_recs + 5,
+            },
+            "identical Enterprise re-pull must report zero churn"
+        );
+    }
+
+    /// The first Enterprise pull after upgrading, onto a store that already
+    /// holds the same variables but no snapshot row, adds nothing.
+    #[test]
+    fn enterprise_pull_onto_pre_snapshot_store_reports_zero_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let file = synthetic_file();
+        let vars = variables_export();
+        let (plain, ..) = apply_pull(&db, &file, None, false, false).unwrap();
+        {
+            let mut st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            let recs = crate::vars::parse_variables_export(&vars).unwrap();
+            st.wtx(|tx| {
+                for (id, rec) in &recs {
+                    tx.upsert(id, rec);
+                }
+            });
+        }
+        assert_eq!(snapshot_source(&db), None);
+
+        let (churn, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        assert_eq!(
+            churn,
+            Churn {
+                added: 0,
+                changed: 0,
+                removed: 0,
+                unchanged: plain.added + 5,
+            }
+        );
+        assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
+    }
+
+    /// The pull path stays lenient per entry: a malformed `variables/local`
+    /// entry doesn't fail the pull (only `import-variables` rejects it).
+    #[test]
+    fn enterprise_pull_tolerates_a_non_object_variable_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let mut vars = variables_export();
+        vars["meta"]["variables"]["VariableID:999"] = serde_json::json!(7);
+        let (churn, ..) = apply_pull(&db, &synthetic_file(), Some(&vars), false, false).unwrap();
+        assert_eq!(churn.removed, 0);
+        assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
+    }
+
     #[test]
     fn rate_limited_waits_max_of_interval_and_retry_after() {
         let mut backoff = BACKOFF_START;

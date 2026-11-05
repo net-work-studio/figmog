@@ -604,8 +604,13 @@ Three layers, each covering what the one above can't:
    error and is silently skipped, falling through to the two paths below.
    `--from-file` pulls never call it (no network involved). A `Some`
    pull also writes the `VariableSnapshot` row (`source:
-   "enterprise_rest"`) into the same sync, so it counts in that pull's
-   churn like any other record.
+   "enterprise_rest"`) in the same sync transaction, but — like the meta
+   row — it is provenance, not a record: `store::sync` excludes it from
+   churn, so `pull`, `figmog_sync` and serve's `last_success.churn` count
+   only nodes/components/sets/styles/variables/collections, exactly as
+   before the row existed. An identical Enterprise re-pull reports zero
+   churn, and the first Enterprise pull onto a store that already holds
+   those variables without a snapshot row reports `added: 0`.
 2. **Mirrored bindings + inference (always on).** Every node's
    `bound_variables` plus Figma's own baked-in resolved value are scanned
    at read time (`vars::infer_from_nodes`) into per-variable usage
@@ -629,7 +634,10 @@ Three layers, each covering what the one above can't:
 
    **Invalid files are rejected whole.** The file is read, parsed and
    validated (top-level `variables` and `variableCollections` objects,
-   every entry an object) before the store is opened; an unreadable,
+   every entry an object — `vars::check_import_entries`, which only
+   `import-variables` applies; an Enterprise pull's parse stays lenient
+   per entry, so one malformed `variables/local` entry never fails a
+   pull) before the store is opened; an unreadable,
    non-JSON or wrongly shaped file exits 1 with `invalid variables file
    …` and leaves the previous snapshot — records and provenance —
    untouched. A rejected attempt is not persisted, so "invalid" is the
@@ -649,6 +657,14 @@ Three layers, each covering what the one above can't:
 Each summary also carries `source`, `format`, `format_version`,
 `exported_at`, `digest` (null without a snapshot row) and the stored
 `variables`/`collections` counts.
+
+**Import-only stores.** `figmog status`/`figmog_status` on a store that
+was never pulled (no `meta` row) but holds variable state (snapshot
+state other than `none` — e.g. `import-variables --db <new path>`)
+answers rather than erroring: `name`, `version`, `last_modified` and
+`synced_at_unix_ms` are null, `nodes` is the stored node count (0), and
+`variables` carries the snapshot summary as usual. Only a store with no
+`meta` row and state `none` keeps the "no mirror here" error.
 
 `figmog vars`/`figmog_vars` prefer an authoritative record (auto-synced
 or imported) over inference whenever one exists for a given variable id.
@@ -794,7 +810,8 @@ their management semantics: `file` names the file to open for the former,
 and the latter lists all sessions without a routing target. A routed
 `figmog_status` result drops the server-only `upstream`, `ready` and `pull`
 fields, keeping ordinary CLI output byte-identical for an existing mirror.
-Before a first successful mirror, plain `figmog status` returns a clear not-ready error;
+Before a first successful mirror, plain `figmog status` returns a clear not-ready error
+(unless the store already holds an imported variable snapshot — §9 "Import-only stores");
 `figmog call figmog_status` exposes the full lifecycle instead.
 
 Desktop-proxy calls do not interpret `file` or node URLs as mirror

@@ -378,10 +378,83 @@ fn parses_code_names_into_snapshot() {
     assert!(!s.variables[2].remote);
 }
 
+/// Non-object entries fail `import-variables`' own check only; the parser
+/// Enterprise pulls share stays lenient, as before NWS-2961.
 #[test]
-fn non_object_entries_are_shape_errors() {
+fn non_object_entries_fail_import_check_but_not_pull_parser() {
+    use figmog::vars::{check_import_entries, enterprise_snapshot_recs};
     let bad = json!({"variables": {"V:1": "x"}, "variableCollections": {}});
-    assert!(parse_variables_export(&bad).is_err());
-    let bad = json!({"variables": {}, "variableCollections": {"C:1": []}});
-    assert!(parse_variables_export(&bad).is_err());
+    assert!(check_import_entries(&bad).is_err());
+    assert_eq!(parse_variables_export(&bad).unwrap().len(), 1);
+    let bad = json!({"meta": {"variables": {}, "variableCollections": {"C:1": []}}});
+    assert!(check_import_entries(&bad).is_err());
+    assert_eq!(parse_variables_export(&bad).unwrap().len(), 1);
+    assert_eq!(
+        enterprise_snapshot_recs(&bad).unwrap().len(),
+        2,
+        "rec + snapshot row"
+    );
+    assert!(check_import_entries(&export()).is_ok());
+}
+
+/// A file that parses as JSON but holds a non-object variable entry is
+/// rejected whole, leaving the previous snapshot byte-identical.
+#[test]
+fn import_with_non_object_entry_fails_and_keeps_snapshot() {
+    let (dir, db) = common::fixture_db();
+    import(
+        dir.path(),
+        &db,
+        "good.json",
+        include_bytes!("fixtures/variables-export.json"),
+    );
+    let before = run_ok(&db, &["vars", "--snapshot"]);
+
+    let mut bad = export();
+    bad["meta"]["variables"]["VariableID:999"] = json!("not an object");
+    import_err(
+        dir.path(),
+        &db,
+        "bad.json",
+        &serde_json::to_vec(&bad).unwrap(),
+    );
+
+    assert_eq!(run_ok(&db, &["vars", "--snapshot"]), before);
+}
+
+/// A store only ever imported into (never pulled) reports its snapshot in
+/// status — file fields null — via the CLI and `figmog call`; a truly
+/// empty store keeps the "no mirror here" error.
+#[test]
+fn import_only_store_reports_snapshot_in_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty_db");
+    let out = common::command()
+        .args(["status", "--db", empty.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1);
+    let err = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(err.contains("no mirror here"), "{err}");
+
+    let db = dir.path().join("fresh_db");
+    import(
+        dir.path(),
+        &db,
+        "a.json",
+        include_bytes!("fixtures/variables-export.json"),
+    );
+    let status = run_ok(&db, &["status"]);
+    assert_eq!(status["name"], Value::Null);
+    assert_eq!(status["version"], Value::Null);
+    assert_eq!(status["last_modified"], Value::Null);
+    assert_eq!(status["synced_at_unix_ms"], Value::Null);
+    assert_eq!(status["nodes"], 0);
+    assert_eq!(status["variables"]["state"], "current");
+    assert_eq!(status["variables"]["source"], "file");
+    assert_eq!(status["variables"]["variables"], 3);
+
+    let call = run_ok(&db, &["call", "figmog_status", "--no-upstream"]);
+    assert_eq!(call["variables"], status["variables"]);
+    assert_eq!(call["name"], Value::Null);
 }

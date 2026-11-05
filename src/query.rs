@@ -126,6 +126,12 @@ fn resolved_variables<R: Readable>(
 
 /// File name, version, last modified, node count, and the variable
 /// snapshot summary ([`variable_snapshot`]) under `variables`.
+///
+/// A store with no `meta` row (never pulled) but some variable state —
+/// e.g. only ever `import-variables`'d into — still answers: the file
+/// fields are null and `nodes` is the stored count (0), mirroring
+/// `figmog serve`'s not-yet-mirrored status shape. Only a store with no
+/// meta row *and* snapshot state `none` is the "no mirror here" error.
 pub fn status<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     meta: &TableReader<'_, R, u8, FileMeta>,
@@ -133,17 +139,19 @@ pub fn status<R: Readable>(
     variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
 ) -> Result<Value, String> {
-    let m = meta
-        .get(&0)
-        .ok_or_else(|| "no mirror here — run `figmog pull <file-url>` first".to_string())?;
+    let vars = variable_snapshot(variables, variable_collections, snapshot);
+    let m = meta.get(&0);
+    if m.is_none() && vars["state"] == "none" {
+        return Err("no mirror here — run `figmog pull <file-url>` first".to_string());
+    }
     let count = nodes.iter().count();
     Ok(json!({
-        "name": m.name,
-        "version": m.version,
-        "last_modified": m.last_modified,
-        "synced_at_unix_ms": m.synced_at_unix_ms,
+        "name": m.as_ref().map(|m| m.name.clone()),
+        "version": m.as_ref().map(|m| m.version.clone()),
+        "last_modified": m.as_ref().map(|m| m.last_modified.clone()),
+        "synced_at_unix_ms": m.as_ref().map(|m| m.synced_at_unix_ms),
         "nodes": count,
-        "variables": variable_snapshot(variables, variable_collections, snapshot),
+        "variables": vars,
     }))
 }
 

@@ -24,6 +24,7 @@ pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String>
     let invalid = |e: String| format!("invalid variables file {}: {e}", path.display());
     let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let v: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    crate::vars::check_import_entries(&v).map_err(|e| invalid(e.to_string()))?;
     let parsed = crate::vars::parse_variables_snapshot(
         &v,
         crate::vars::SOURCE_FILE,

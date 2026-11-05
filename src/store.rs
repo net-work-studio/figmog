@@ -271,6 +271,8 @@ pub struct Churn {
 /// exempt too *unless* the caller opted them in via `prior_sweepable`
 /// (`collect_variable_ids`, spec §12 — an Enterprise `variables_local`
 /// pull makes them file state for that cycle).
+/// A [`Id::VariableSnapshot`] row in `flattened.recs` is written but
+/// excluded from the returned [`Churn`] (NWS-2961).
 pub fn sync<P: Push<Keyed<Id, Rec>>>(
     st: &mut KeyedStream<Id, Rec, P>,
     prior_sweepable: &BTreeSet<Id>,
@@ -288,7 +290,16 @@ pub fn sync<P: Push<Keyed<Id, Rec>>>(
     let mut churn = Churn::default();
     st.wtx(|tx| {
         for (id, rec) in &flattened.recs {
-            match tx.upsert(id, rec) {
+            let previous = tx.upsert(id, rec);
+            // The variable-snapshot provenance row (NWS-2961) is written in
+            // this same transaction but, like the meta row, is bookkeeping
+            // about the records rather than one of them: it never counts in
+            // churn, so an Enterprise pull's numbers mean what they did
+            // before the row existed.
+            if matches!(id, Id::VariableSnapshot) {
+                continue;
+            }
+            match previous {
                 None => churn.added += 1,
                 Some(old) if old == *rec => churn.unchanged += 1,
                 Some(_) => churn.changed += 1,
