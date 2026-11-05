@@ -380,6 +380,11 @@ failures during reset.
 
 ## 6. `figmog serve`: multi-file sessions, watch, MCP
 
+By default `figmog serve` is a stdio relay to the repository's shared
+background owner (§6b), and this section describes that owner's engine.
+`--db`, `--figmog-root` and `--no-socket` run the same engine in the
+`figmog serve` process itself, with stdio as one more client.
+
 One `figmog serve` process owns every mirrored file's store via a
 [`SessionManager`](../src/sessions.rs). Each `FileSession` has one background
 worker owning its only writer and watch watermarks. Dispatch reads an owning
@@ -746,8 +751,9 @@ type like `get_screenshot`'s image block).
 
 ## 6a. The unix-socket control plane
 
-`figmog serve` binds `<figmog-root>/serve.sock` — by default the project
-root's per-checkout `.figmog/` (§16); `--db` serves keep the
+The background owner's socket, election and handshake are §6b. An
+in-process serve (`--figmog-root`, or `--db` with a socket) binds
+`<figmog-root>/serve.sock` — `--db` serves use the
 working-directory-relative `.figmog/` — (mode 0600, inside a root
 tightened to 0700) before it opens any session store, and unlinks it on
 exit through a guard held for `run_serve`'s whole scope. A pre-existing
@@ -824,6 +830,161 @@ tool-level `isError: true`; those are successful forwarding operations.
 Stdio retains MCP `isError` content for registry and handler failures.
 
 The CLI side of the plane is in §10.
+
+## 6b. One background owner per repository (NWS-2953)
+
+Source: `src/owner.rs` (election lock, socket address, discovery,
+handshake, launch), `src/serve/background.rs` (the owner's loop side),
+`src/serve/relay.rs` (the stdio relay).
+
+**Shape.** Every `figmog serve` without `--db`, `--figmog-root` or
+`--no-socket` is a thin relay between its agent's stdio and the
+repository's *owner*: one detached `figmog serve --background` process per
+mirror root (§16) that opens the mirrors, polls and pulls them (§6), and
+owns the desktop probe (§8). The first relay launches it; every later relay
+and CLI command connects to it. Closing an agent's session only closes that
+relay's connection. Relays never open a store, poll, pull or probe the
+desktop.
+
+**Project identity** is the canonical mirror root (`<git-common-dir>/figmog`
+inside Git, `<project>/.figmog` outside), the same from every worktree.
+
+**Election.** `<mirror root>/owner.lock` is a permanent lock file (0600,
+never deleted), opened close-on-exec. An owner takes an exclusive `flock`
+on it (`File::try_lock`) before anything else and holds it across stale
+socket removal, bind, readiness (discovery), serving and shutdown; it is
+released only after the stores are closed and compacted and the socket and
+discovery record are removed (or by the kernel when the process dies,
+including a crash during startup). A launched owner that cannot take it
+exits 0 at once without touching anything: another process is or is about
+to be the owner. Relays may launch concurrently (each launches at most one
+owner at a time, again only after its launched one exited with the owner
+still unreachable); exactly one wins, and every relay connects to it. A
+lock file that disappears or is replaced makes its holder shut down (see
+"Idle shutdown" below), since another process could lock the new file.
+
+**Socket.** `/tmp/figmog-<uid>/<16 hex>.sock`, the hex a 64-bit FNV-1a hash
+of the project identity: under 40 bytes, so always within `sun_path`
+(104 bytes on macOS), and independent of `$TMPDIR` and
+`$XDG_RUNTIME_DIR`. The directory is created 0700 and checked like a
+mirror directory (§10: owned by the user, no replaceable ancestors; `/tmp`
+is sticky), so other OS users can neither connect nor pre-plant it; the
+socket is 0600. Under the lock, a file already at the address is a
+leftover of this project's previous owner: it is removed only if a connect
+to it fails and it is a socket owned by the user (a live listener or a
+foreign file is an error). On exit the socket is unlinked only if it is
+still the inode this owner bound. An owner whose socket disappears or is
+replaced (checked every second) shuts down rather than run unreachable.
+
+**Discovery.** Once it can answer, the owner writes `<mirror
+root>/owner.json` (0600; temp file, fsync, rename):
+`{"generation","pid","project","protocol","socket","version"}`. The
+generation is the owner's pid and start time (hex), also the prefix of its
+operation ids (§6). Clients connect to the socket it names, so every
+process finds the same endpoint whatever its environment. The owner
+removes the record at exit if it is still its own.
+
+**Handshake.** The first frame on every owner connection is
+`{"method": "figmog/hello", "id": "figmog-hello", "params": {"client":
+"relay"|"cli", "project", "version", "protocol", "settings"?, "attach"?}}`.
+The owner refuses a different project, binary version or protocol version
+(currently 1) with error `-32002` and an explanation; the client checks the
+owner's answer `{"attach_errors", "generation", "pid", "project",
+"protocol", "settings", "version"}` the same way. Either way the relay (and
+the CLI) stops with that explanation — "let it exit (it stops on its own
+after it has had no clients for a while), or stop it now with `kill <pid>`"
+— and never starts a second owner beside it. A relay connection is then
+answered like stdio: tool failures as MCP `isError` content and no
+internal tools (`figmog_internal_*` are unknown tools there); a CLI
+connection keeps §6a's JSON-RPC errors and internal write tools. `attach`
+lists the relay's startup files: the owner opens each, queueing a first
+pull for a missing mirror when it watches (the old `figmog serve FILE...`
+startup); open failures come back in `attach_errors` and fail the relay's
+startup.
+
+**Worktree context stays in the relay.** The owner has no default file and
+writes no `.figmog/current`. For every per-file local tool call with no
+explicit `file` and no node URL naming one, the relay injects its own file:
+the first startup `FILE`, else `figmog.toml`'s default (else
+`.figmog/current`), else the single file this relay has itself referenced;
+with none it answers the "no file specified" error itself. A file whose
+mirror in this worktree is still in the old per-checkout location (§16) is
+refused with a pointer at `figmog migrate` (and a startup file fails the
+relay's start), never shadowed by a new shared mirror; the CLI likewise
+opens such a mirror directly instead of routing it. Desktop and management
+calls pass through unchanged.
+
+**Settings.** The owner runs with the watch, `--interval` and
+`--upstream`/`--no-upstream` settings of the relay that launched it, and
+with that relay's environment (credentials included). A later relay asking
+for different settings prints one stderr note per setting (`figmog: note:
+interval 30s was not applied — ... runs with interval 10s ...`); nothing
+changes until the owner restarts. Credentials therefore apply after the
+owner's idle restart (§10 "Credentials").
+
+**Idle shutdown.** The owner exits by itself once it has had no open
+connection, no unanswered deferred call and no pending CLI write for its
+idle timeout (10 minutes; `FIGMOG_OWNER_IDLE_MS` overrides it, for tests).
+Relays hold their connection for the agent's whole session, so an owner
+idles out only when no agent is attached. Shutdown first *closes*: every
+new request on any connection, the handshake included, is answered with
+JSON-RPC error `-32001` `not accepted: ... reconnect and retry`, and nothing
+is started for it; accepted work (deferred replies, writes) finishes; then
+the loop exits and §6a's shutdown runs (drain, store close, compaction per
+§4 "post-write compaction"), the socket and discovery record are removed,
+and only then is the lock released. A connection accepted after the loop
+exited is closed unanswered; clients treat that like "not accepted".
+
+**Reconnects.** Only a request answered "not accepted" is ever sent again:
+the relay reconnects — launching a new owner if none is left — and re-sends
+it (at most 5 times); the CLI reconnects and retries (reads and writes
+alike: nothing was started), waiting up to 60 s for the closing owner to go
+away, then falls back to a direct open if no new owner appeared. A write
+the owner accepted is never retried: NWS-2963's `outcome unknown` stands.
+If the owner connection drops with requests unanswered (the owner crashed
+or was killed), the relay answers each with an `outcome unknown` tool error
+and reconnects at once. On every new connection the relay repeats the
+handshake (with its startup files) and the agent's `initialize` (under a
+relay-internal id whose answer it swallows), so notifications keep
+flowing.
+
+**Notifications.** Notifications from the owner — `tools/list_changed`
+from desktop re-detection (§8) — are forwarded verbatim to the relay's
+agent once the agent has sent `initialize` (which the relay forwarded,
+subscribing its connection).
+
+**Launch.** The relay runs its own executable as `figmog serve
+--background <settings>` with `setsid` (its own session: no terminal or
+process-group signal of the agent's reaches it), stdin and stdout on
+`/dev/null`, stderr appended to `<mirror root>/owner.log` (truncated at
+launch past 1 MiB), working directory the relay's project root. A thread
+reaps it, so it is never left a zombie. A launched owner that exits
+non-zero before becoming ready fails the relay with the log's tail; the
+relay waits at most 60 s for an owner (an old one's shutdown drain is
+bounded at 15 s).
+
+**Cost of an idle restart.** The watch watermark is not persisted (§6
+"Watch watermarks"), so a restarted owner makes one reconciliation pull
+per watched file at its first poll; no record kind was added to avoid it.
+The acceptance test measures relay spawn → owner launched → first answer
+at about 30 ms, and relay spawn → new owner → first read of an existing
+mirror at 40–65 ms (debug build, Linux, synthetic fixture).
+
+**Acceptance (tests/owner.rs).** Three worktrees (`git worktree add`), each
+with its own relay, share one owner and read one mirror concurrently
+through relays and the CLI with no lock errors, and one edit on a
+synthetic Figma API causes exactly one pull. Also tested: 10 concurrent
+relays → one owner (3 trials), 10 concurrent owner launches → one survivor,
+a SIGKILLed owner (lock released, stale socket replaced), a relay surviving
+its owner's crash, clients and relays arriving around the idle deadline
+(12 trials), a version-mismatched owner refused by relay and CLI, two
+repositories' independent owners, per-worktree default files, settings
+notes, and a mirror awaiting migration.
+
+The synthetic API is reached through `FIGMOG_API_BASE`, honored by serve's
+sessions in debug builds only (release builds always use
+`https://api.figma.com`, so no environment variable can send a token
+elsewhere).
 
 ## 7. Style values: derived, not authoritative
 
@@ -1086,7 +1247,9 @@ An explicitly empty environment value disables saved credentials. A
 locked/unavailable store is treated as no usable token for these callers,
 so cached reads and token-free idle servers still work; `auth status`
 reports the storage error for diagnosis. Credential changes take effect
-on the next CLI invocation or server restart. Tokens remain subject to
+on the next CLI invocation or, for agents, when the shared background
+owner restarts after idling out (§6b); stop it sooner with `kill <pid>`
+from `<mirror root>/owner.json`. Tokens remain subject to
 Figma expiration/revocation; this is personal-token storage, not OAuth.
 
 The new dependencies are justified by native secret storage (`keyring`)
@@ -1119,9 +1282,11 @@ Ignore-update failures emit a JSON warning on stderr without failing an
 already successful pull. This does not untrack committed files or share
 mirror data between worktrees.
 
-**Socket-first routing (§6a).** When neither `--no-socket` nor `--db` is
+**Socket-first routing (§6a, §6b).** When neither `--no-socket` nor `--db` is
 given, every read command, plus `tools`, `call` and `images`, first tries
-`<.figmog>/serve.sock`. Reachable ⇒ the command becomes a client of the
+the repository's background owner (through `<mirror root>/owner.json` and
+the handshake), then an in-process serve's `<.figmog>/serve.sock`.
+Reachable ⇒ the command becomes a client of the
 running `serve`: `cli::read_command` maps the subcommand to its typed
 `dispatch::ReadCommand`, whose `to_tool_call` produces the tool name and
 argument object serve parses back into the same command, so the
@@ -1363,7 +1528,7 @@ Source: `src/project.rs` (discovery, config, active-store rules),
 `figmog.toml`, walking up from the working directory but never past the
 Git top level (a stray `figmog.toml` above a repository is ignored); else
 the Git top level; else the working directory. Its `.figmog/` is the
-*local root*: per checkout, it holds `current` and serve's `serve.sock`.
+*local root*: per checkout, it holds `current`.
 
 **Mirror root.** Inside Git: `<git-common-dir>/figmog/`, from one
 `git rev-parse --path-format=absolute --show-toplevel --git-common-dir`
@@ -1429,12 +1594,10 @@ root.
 `--db` bypasses all of this. `figmog serve --figmog-root <dir>` (hidden,
 for tests) pins the socket and every store to `<dir>`/`<dir>/<key>/db`.
 
-**Socket location.** Deliberately unchanged in spirit: the socket stays in
-the per-checkout `.figmog/` (now anchored at the project root rather than
-the raw working directory), not the shared mirror root. A shared,
-repository-wide background serve is future work; until then two
-worktrees' serves that open the same shared mirror contend on its store
-lock exactly like two serves on one store always have.
+**Socket location.** One background owner per mirror root serves every
+worktree (§6b); its lock, discovery record and log live in the mirror root
+and its socket under `/tmp/figmog-<uid>/`. An in-process serve
+(`--figmog-root`) still binds `<root>/serve.sock`.
 
 **`figmog migrate [FILE]`.** Moves each old `.figmog/<key>/` directory
 (all of it: today that is `db/`, whose image cache is an in-store sink) to

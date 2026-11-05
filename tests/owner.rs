@@ -3,13 +3,15 @@
 //! End-to-end tests of the repository's shared background figmog
 //! (NWS-2953): every `figmog serve` is a stdio relay to one detached owner
 //! per mirror root. Drives real relays (the compiled binary) in synthetic
-//! Git repositories and worktrees. Linux process inspection (`/proc`) is
-//! used to count owners.
+//! Git repositories and worktrees, and a synthetic Figma REST server for
+//! the one-pull-per-edit acceptance test. Linux process inspection
+//! (`/proc`) is used to count owners.
 
 mod common;
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -659,4 +661,227 @@ fn a_relay_refuses_a_mirror_awaiting_migration() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("figmog migrate"), "{error}");
     assert!(!repo.path().join(".git/figmog").join(KEY).exists());
+}
+
+// ---- acceptance: three worktrees, one mirror, one pull per edit ----
+
+/// A synthetic Figma REST API: `/meta` reports `touched`, the file
+/// endpoint serves `file` and counts full-file fetches.
+struct FakeFigma {
+    state: Mutex<(String, Value)>,
+    file_fetches: AtomicUsize,
+}
+
+fn serve_fake_figma(fake: Arc<FakeFigma>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let fake = fake.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                if reader.read_line(&mut request).is_err() {
+                    return;
+                }
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                        break;
+                    }
+                }
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, body) = {
+                    let state = fake.state.lock().unwrap();
+                    if path == format!("/v1/files/{KEY}/meta") {
+                        let meta = json!({"file": {"name": "Fixture", "last_touched_at": state.0}});
+                        ("200 OK", meta.to_string())
+                    } else if path == format!("/v1/files/{KEY}") {
+                        fake.file_fetches.fetch_add(1, Ordering::SeqCst);
+                        ("200 OK", state.1.to_string())
+                    } else {
+                        (
+                            "404 Not Found",
+                            json!({"status": 404, "err": "Not found"}).to_string(),
+                        )
+                    }
+                };
+                let mut out = stream;
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = out.flush();
+                let mut rest = Vec::new();
+                let _ = reader.read_to_end(&mut rest);
+            });
+        }
+    });
+    address
+}
+
+/// The NWS-2953 acceptance test: three worktrees of one repository, each
+/// with its own `figmog serve` relay, read the same mirror concurrently
+/// with no lock errors, and one (synthetic) Figma edit causes exactly one
+/// pull. Also measures the cold start: first relay spawn → owner launched
+/// → its first answer.
+#[test]
+fn three_worktrees_share_one_mirror_and_one_edit_pulls_once() {
+    let repo = repo();
+    std::fs::write(
+        repo.path().join("figmog.toml"),
+        format!("[files]\ndefault = \"{KEY}\"\n"),
+    )
+    .unwrap();
+    git(repo.path(), &["add", "figmog.toml"]);
+    git(repo.path(), &["commit", "-q", "-m", "figmog"]);
+    let worktrees: Vec<PathBuf> = ["two", "three"]
+        .iter()
+        .map(|name| {
+            let wt = repo.path().join(name);
+            git(
+                repo.path(),
+                &["worktree", "add", "-q", wt.to_str().unwrap()],
+            );
+            wt
+        })
+        .collect();
+    let fake = Arc::new(FakeFigma {
+        state: Mutex::new(("2026-08-01T00:00:00Z".into(), common::fixture_v1())),
+        file_fetches: AtomicUsize::new(0),
+    });
+    let api = serve_fake_figma(fake.clone());
+    let cwds: Vec<PathBuf> = std::iter::once(repo.path().to_path_buf())
+        .chain(worktrees)
+        .collect();
+    let started = Instant::now();
+    let mut relays: Vec<Relay> = cwds
+        .iter()
+        .map(|cwd| {
+            spawn_relay(
+                relay_command(cwd, &["--no-upstream", "--interval", "1"])
+                    .env("FIGMA_TOKEN", "synthetic-token")
+                    .env("FIGMOG_API_BASE", &api)
+                    .env("FIGMOG_OWNER_IDLE_MS", "1000"),
+            )
+        })
+        .collect();
+    relays[0].initialize();
+    let cold_start = started.elapsed();
+    eprintln!("cold start (relay spawn → owner launched → first answer): {cold_start:?}");
+    assert!(cold_start < Duration::from_secs(10), "{cold_start:?}");
+    for relay in &mut relays[1..] {
+        relay.initialize();
+    }
+    let owner = relays[0].owner_pid();
+    assert!(relays.iter().all(|r| r.owner_pid() == owner));
+
+    // The first reference pulls the (new) mirror once for every worktree.
+    let version = |relay: &mut Relay| -> Option<String> {
+        relay
+            .call("figmog_status", json!({}))
+            .ok()
+            .and_then(|s| s["version"].as_str().map(str::to_string))
+    };
+    for relay in &mut relays {
+        wait_until("the first pull", || {
+            version(relay).as_deref() == Some("100")
+        });
+    }
+
+    // Concurrent reads from all three worktrees, relays and CLI: no lock
+    // errors anywhere.
+    let readers: Vec<_> = cwds
+        .iter()
+        .cloned()
+        .map(|cwd| {
+            std::thread::spawn(move || {
+                for _ in 0..5 {
+                    let out = common::command()
+                        .args(["find", "--type", "FRAME"])
+                        .current_dir(&cwd)
+                        .output()
+                        .unwrap();
+                    assert!(out.status.success(), "{out:?}");
+                }
+            })
+        })
+        .collect();
+    for _ in 0..5 {
+        for relay in &mut relays {
+            let found = relay.call("figmog_find", json!({"type": "FRAME"})).unwrap();
+            assert!(found.as_array().is_some_and(|f| !f.is_empty()), "{found}");
+        }
+    }
+    for reader in readers {
+        reader.join().unwrap();
+    }
+
+    // Settle: the startup reconciliation pull (spec §6) is allowed; then
+    // the count must hold still.
+    let settle = |fake: &FakeFigma| {
+        let mut last = fake.file_fetches.load(Ordering::SeqCst);
+        let mut since = Instant::now();
+        let deadline = Instant::now() + TIMEOUT;
+        while since.elapsed() < Duration::from_secs(5) {
+            assert!(Instant::now() < deadline, "fetches never settled");
+            std::thread::sleep(Duration::from_millis(100));
+            let now = fake.file_fetches.load(Ordering::SeqCst);
+            if now != last {
+                last = now;
+                since = Instant::now();
+            }
+        }
+        last
+    };
+    let before = settle(&fake);
+    assert!(before <= 2, "startup fetched the file {before} times");
+
+    // One edit in Figma.
+    *fake.state.lock().unwrap() = ("2026-08-02T00:00:00Z".into(), common::fixture_v2());
+    for relay in &mut relays {
+        wait_until("the edit to arrive", || {
+            version(relay).as_deref() == Some("101")
+        });
+    }
+    let after = settle(&fake);
+    assert_eq!(after, before + 1, "one edit must cause exactly one pull");
+    for cwd in &cwds {
+        let out = common::command()
+            .arg("status")
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(status["version"], "101");
+    }
+    for relay in relays {
+        relay.finish();
+    }
+    wait_owner_gone(repo.path());
+
+    // Idle restart: the next agent's relay starts a new owner, which
+    // reopens the existing mirror (answering from it at once) and accepts
+    // one reconciliation pull — the watch watermark is not persisted.
+    let restarted = Instant::now();
+    let mut relay = spawn_relay(
+        relay_command(repo.path(), &["--no-upstream", "--interval", "1"])
+            .env("FIGMA_TOKEN", "synthetic-token")
+            .env("FIGMOG_API_BASE", &api)
+            .env("FIGMOG_OWNER_IDLE_MS", "1000"),
+    );
+    relay.initialize();
+    assert_eq!(version(&mut relay).as_deref(), Some("101"));
+    let restart = restarted.elapsed();
+    eprintln!("idle restart (relay spawn → new owner → first mirror read): {restart:?}");
+    assert!(restart < Duration::from_secs(10), "{restart:?}");
+    let reconciled = settle(&fake);
+    assert!(
+        reconciled <= after + 1,
+        "{reconciled} fetches after a restart"
+    );
+    relay.finish();
+    wait_owner_gone(repo.path());
 }

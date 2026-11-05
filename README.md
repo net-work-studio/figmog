@@ -49,8 +49,12 @@ $ figmog auth logout       # remove the saved token
 `FIGMA_TOKEN` still overrides the saved token for CI or another account.
 Unset it to use your saved credential; an explicitly empty `FIGMA_TOKEN`
 disables saved credentials for offline use. Logout removes only the saved
-credential, so an environment override remains active. Restart a running
-MCP server after changing credentials.
+credential, so an environment override remains active. The shared
+background figmog (below) picks up a changed credential when it restarts:
+it exits on its own once no agent or command has used it for 10 minutes,
+and the next `figmog serve` starts a fresh one. To apply a change sooner,
+close every agent session in the repository and wait for it to exit, or
+stop it with `kill <pid>` (the pid is in `.git/figmog/owner.json`).
 
 For a password manager or other noninteractive secret source, pipe its
 output to `figmog auth login --token-stdin`. The token is never accepted
@@ -132,8 +136,7 @@ Inside Git, mirrors live in the repository's Git directory,
 `<git-common-dir>/figmog/<key>/db` (for example `.git/figmog/`), shared by
 every worktree of the repository, so a new worktree needs no re-pull. Git
 never tracks that directory. Outside Git, mirrors live in the project's
-`.figmog/<key>/db`. The per-checkout `.figmog/` still holds `current` and
-serve's socket.
+`.figmog/<key>/db`. The per-checkout `.figmog/` still holds `current`.
 
 Mirrors that earlier versions put in a checkout's `.figmog/<key>/db` keep
 working in place, with a "migration pending" warning on stderr. Run
@@ -169,13 +172,37 @@ free.
 
 ## What the mirror gives an agent
 
+### One background figmog per repository
+
+Every agent's `figmog serve` is a thin stdio relay. The first one starts a
+detached *background figmog* for the repository, which opens the mirrors,
+watches Figma and pulls each changed file once, for every worktree and every
+agent at the same time. Each further `figmog serve`, in any worktree,
+connects to that same process, so ten agents in three worktrees cost one
+poll loop and one pull per edit, with no lock errors. Closing an agent's
+session never affects the others. The background figmog exits on its own
+after 10 minutes with no clients, and the next `figmog serve` starts it
+again, which costs one reconciliation pull per file. Agent setup stays
+`figmog serve`. Its log is `.git/figmog/owner.log` (outside Git,
+`.figmog/owner.log`).
+
+Each relay keeps its worktree's context: calls without a `file` go to that
+worktree's `figmog.toml` default (or the relay's own startup file), never
+to another worktree's. Watch, interval and desktop settings come from the
+`figmog serve` that started the background figmog; a later one asking for
+different settings prints a note on stderr saying which were not applied.
+Two repositories get two independent background processes. A relay and a
+background figmog from different figmog versions refuse to talk and say
+how to let the old one exit. See `docs/SPEC.md` §6b.
+
 ### Reads work while the server runs
 
-`figmog serve` owns the store, and it listens on a unix socket at
-`.figmog/serve.sock` in the project root. Read commands, `figmog tools` and `figmog call` connect
-there first and answer from the running server's live view; with no server
-listening they open the store directly. `--no-socket` forces direct mode on
-both sides. The writers go through the server too: `figmog pull` (with
+The background figmog owns the stores and listens on a unix socket under
+`/tmp/figmog-<uid>/`, published in `.git/figmog/owner.json`. Read commands,
+`figmog tools` and `figmog call` connect there first and answer from its
+live view; with no background figmog running they open the store directly.
+`--no-socket` forces direct mode (and makes `figmog serve` serve in its own
+process, without the shared background figmog). The writers go through the server too: `figmog pull` (with
 `--fresh`, `--from-file` or `--geometry`) and `figmog import-variables` become
 operations of the running server, and return only once the change is
 committed and visible, with the same output as without a server. Files are
@@ -405,7 +432,7 @@ job succeeds. No custom repository secrets are required.
 - macOS and Linux only. The control plane is a unix domain socket and the
   code uses unix filesystem APIs directly, so there is no Windows build.
 - One process may open a store at a time (fjall is single-writer).
-  `figmog serve` holds that handle for its life. Other commands, writers
+  The background figmog holds that handle for its life. Other commands, writers
   included, reach it over the socket instead; `--no-socket`, or a `--db`
   naming the store `serve` owns, gets a `store is locked by figmog serve (pid
   …, socket …)` error naming the owner.
