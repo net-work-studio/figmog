@@ -1127,6 +1127,26 @@ mod tests {
         });
     }
 
+    /// Seed `rec` under `key` together with a valid render pin marker
+    /// (current generation, matching `file_version`), so the marker check
+    /// passes and only `rec`'s own identity fields can reject a hit.
+    fn seed_pinned_row<P: Push<Keyed<Id, Rec>>>(
+        st: &mut KeyedStream<Id, Rec, P>,
+        key: String,
+        rec: ImageBlobRec,
+    ) {
+        st.wtx(|tx| {
+            tx.upsert(
+                &Id::ImagePin(key.clone()),
+                &Rec::ImagePin(ImagePinRec {
+                    generation: RENDER_PIN_GENERATION,
+                    file_version: rec.file_version.clone(),
+                }),
+            );
+            tx.upsert(&Id::ImageBlob(key), &Rec::ImageBlob(rec));
+        });
+    }
+
     // ---- I-3-style collision safety (mirrors cache.rs's own test) ----
 
     /// A row that collides on `image_key`'s hash but actually belongs to a
@@ -1154,9 +1174,7 @@ mod tests {
             file_version: "100".to_string(),
             bytes: vec![9, 9, 9],
         };
-        st.wtx(|tx| {
-            tx.upsert(&Id::ImageBlob(key), &Rec::ImageBlob(colliding));
-        });
+        seed_pinned_row(&mut st, key, colliding);
 
         let ids = vec![requested_id.clone()];
         let scanned = st.rtx(
@@ -1192,9 +1210,7 @@ mod tests {
             file_version: "100".to_string(),
             bytes: vec![9, 9, 9],
         };
-        st.wtx(|tx| {
-            tx.upsert(&Id::ImageBlob(key), &Rec::ImageBlob(colliding));
-        });
+        seed_pinned_row(&mut st, key, colliding);
 
         let ids = vec![requested_id.clone()];
         let scanned = st.rtx(
