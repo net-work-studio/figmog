@@ -158,8 +158,22 @@ impl FileSession {
                 ToolOutput::Raw(_) => unreachable!("local read tools return JSON"),
             }
         } else {
-            json!({"name": null, "version": null, "last_modified": null,
-                "synced_at_unix_ms": null, "nodes": 0})
+            // Not mirrored yet, but the store may already hold an imported
+            // variable snapshot (SPEC §9 "Import-only stores"): the shared
+            // status query then answers with null file fields plus the
+            // `variables` summary. Readiness stays false either way — a
+            // snapshot is not a mirrored file. With no variable state the
+            // query reports "no mirror here", so keep the bare shape.
+            self.dispatch("figmog_status", &json!({}))
+                .ok()
+                .and_then(|output| match output {
+                    ToolOutput::Json(value) => Some(value),
+                    ToolOutput::Raw(_) => None,
+                })
+                .unwrap_or_else(|| {
+                    json!({"name": null, "version": null, "last_modified": null,
+                        "synced_at_unix_ms": null, "nodes": 0})
+                })
         };
         value["ready"] = json!(self.mirrored);
         value["pull"] = self.lifecycle();

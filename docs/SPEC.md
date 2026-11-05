@@ -341,7 +341,10 @@ its persisted version/time; in-memory job history starts empty. A terminal
 parse error, etc.). Failure leaves the prior published snapshot readable.
 Before the first successful mirror, status/files remain available with
 `ready: false`, null metadata and zero nodes; data reads return a clear
-not-ready error pointing at these tools rather than an empty answer.
+not-ready error pointing at these tools rather than an empty answer. If
+the store already holds an imported variable snapshot (§9 "Import-only
+stores"), status also carries its `variables` summary; `ready` stays
+false until a pull succeeds.
 
 Duplicate open/sync requests coalesce onto the active or queued job id.
 There is at most one worker operation and one queued pull per file. A
@@ -664,7 +667,10 @@ state other than `none` — e.g. `import-variables --db <new path>`)
 answers rather than erroring: `name`, `version`, `last_modified` and
 `synced_at_unix_ms` are null, `nodes` is the stored node count (0), and
 `variables` carries the snapshot summary as usual. Only a store with no
-`meta` row and state `none` keeps the "no mirror here" error.
+`meta` row and state `none` keeps the "no mirror here" error. Through
+`figmog serve` the same summary appears in `figmog_status` before the
+first successful pull (with `ready: false`), and socket-routed plain
+`figmog status` prints the same output as direct `figmog status --db`.
 
 `figmog vars`/`figmog_vars` prefer an authoritative record (auto-synced
 or imported) over inference whenever one exists for a given variable id.
