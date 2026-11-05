@@ -679,19 +679,20 @@ fn is_per_file_local_tool(tool: &str) -> bool {
 /// (no `--args`) succeed over the socket while the exact same invocation
 /// fails direct, breaking the very byte-compatibility this routing exists
 /// to preserve (see `dispatch::cmd_as_tool_call`'s caller).
-fn with_current_file(mut args: Value) -> Result<Value, String> {
+fn with_current_file(args: Value) -> Result<Value, String> {
+    let mut args = crate::deep_json::OwnedValue(args);
     // Preserve explicit non-null values for the local tool's own argument
     // handling, even when they cannot select a mirror.
     let has_file = args.get("file").is_some_and(|value| !value.is_null());
     let url_file = crate::dispatch::infer_file_from_node_ref(&args);
-    if let Some(obj) = args.as_object_mut()
+    if let Some(obj) = args.0.as_object_mut()
         && !has_file
         && url_file.is_none()
         && let Some(key) = read_current_key()?
     {
         obj.insert("file".to_string(), json!(key));
     }
-    Ok(args)
+    Ok(args.into_inner())
 }
 
 /// Omit absent optional flags that `json!` encoded as null in a mapped

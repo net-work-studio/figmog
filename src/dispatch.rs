@@ -313,7 +313,7 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
             let pointer = require_str(args, "pointer")?;
             // Presence means equality to this JSON value, including null;
             // only an omitted key means "pointer exists".
-            let equals = args.get("equals").cloned();
+            let equals = args.get("equals");
             let page = arg_str(args, "page");
             let under = arg_str(args, "under");
             query::where_(nodes, children, &pointer, equals, page, under)

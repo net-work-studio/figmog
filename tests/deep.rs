@@ -345,3 +345,57 @@ fn deep_where_values_remain_readable_through_cli_and_mcp() {
         }
     }
 }
+
+#[test]
+fn deep_equals_matches_through_direct_cli_and_stdio_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("raw-features.json");
+    let db = dir.path().join("db");
+    let payload = format!("{}null{}", r#"{"layer":["#.repeat(500), "]}".repeat(500));
+    std::fs::write(&response, raw_feature_fixture()).unwrap();
+    common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .assert()
+        .success();
+    let direct = common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["where", "--pointer", "/payload", "--equals", &payload])
+        .assert()
+        .success();
+    assert_deep_equals_match(parse_deep(&direct.get_output().stdout));
+
+    let request = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"figmog_where","arguments":{{"pointer":"/payload","equals":{payload}}}}}}}
+"#
+    );
+    let output = common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["--no-socket", "serve", "--no-watch", "--no-upstream"])
+        .write_stdin(request)
+        .assert()
+        .success();
+    let envelope: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert!(envelope.get("error").is_none(), "{envelope}");
+    assert_eq!(envelope["result"]["isError"], false);
+    assert_deep_equals_match(parse_deep(
+        envelope["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .as_bytes(),
+    ));
+}
+
+fn assert_deep_equals_match(mut rows: serde_json::Value) {
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], "0:0");
+    let mut value = rows[0]["value"].take();
+    for _ in 0..500 {
+        value = value["layer"][0].take();
+    }
+    assert!(value.is_null());
+}

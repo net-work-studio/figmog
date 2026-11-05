@@ -29,6 +29,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::deep_json::OwnedValue;
+
 /// The CLI's multi-file root when `--db` was not passed — always `.figmog`
 /// relative to the current directory, matching `crate::serve::run_serve`'s
 /// own `--figmog-root` default (see this module's doc comment).
@@ -51,6 +53,7 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// stdout, same error shapes"). See this module's doc comment for the
 /// `None` vs `Some` contract.
 pub(super) fn try_call(root: &Path, tool: &str, args: Value) -> Option<Result<Value, String>> {
+    let args = OwnedValue(args);
     let stream = UnixStream::connect(socket_path(root)).ok()?;
     Some(call_over(stream, tool, args))
 }
@@ -114,16 +117,12 @@ pub(super) fn try_images_call(root: &Path, args: Value) -> Option<Result<Value, 
     }))
 }
 
-fn call_over(stream: UnixStream, tool: &str, args: Value) -> Result<Value, String> {
-    let resp = send_and_recv(
-        stream,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": args},
-        }),
-    )?;
+fn call_over(stream: UnixStream, tool: &str, args: OwnedValue) -> Result<Value, String> {
+    let mut params = OwnedValue(json!({"name": tool}));
+    params.insert("arguments".to_string(), args);
+    let mut frame = OwnedValue(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call"}));
+    frame.insert("params".to_string(), params);
+    let resp = send_and_recv(stream, &frame)?;
     interpret_call_response(tool, resp)
 }
 
@@ -156,6 +155,7 @@ fn send_and_recv(stream: UnixStream, frame: &Value) -> Result<Value, String> {
         .set_write_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    let frame = crate::deep_json::to_string(frame).map_err(|e| e.to_string())?;
     writeln!(writer, "{frame}").map_err(|e| format!("writing to serve socket: {e}"))?;
     writer
         .flush()

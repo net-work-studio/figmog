@@ -7,6 +7,8 @@
 
 use serde_json::{Value, json};
 
+use crate::deep_json::OwnedValue;
+
 /// Steering text carried verbatim in the `initialize` result. Local tools
 /// answer from mirrors; native tools forward live to desktop, whose active
 /// file/revision is independent of those mirrors. `file` routes local tools.
@@ -99,7 +101,7 @@ fn handle_message_with_tool_errors(
     handler: &mut dyn ToolHandler,
     tool_errors: ToolErrorMode,
 ) -> Option<Value> {
-    let msg: Value = match serde_json::from_str(raw) {
+    let mut msg = match crate::deep_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
             return Some(json!({
@@ -110,30 +112,40 @@ fn handle_message_with_tool_errors(
         }
     };
 
-    let id = msg.get("id").cloned();
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    let id = msg.0.get_mut("id").map(|id| OwnedValue(std::mem::take(id)));
+    let method = msg
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut params = OwnedValue(
+        msg.0
+            .get_mut("params")
+            .map(std::mem::take)
+            .unwrap_or(Value::Null),
+    );
 
     // Notifications: no `id`, or method under the `notifications/` namespace.
     if id.is_none() || method.starts_with("notifications/") {
         return None;
     }
-    let id = id.unwrap();
+    let mut response = OwnedValue(json!({"jsonrpc": "2.0"}));
+    response.insert("id".to_string(), id.unwrap());
 
-    let result = match method {
+    let result = match method.as_str() {
         "initialize" => Some(initialize_result(&params)),
         "ping" => Some(json!({})),
         "tools/list" => Some(tools_list_result(tools)),
-        "tools/call" => match tools_call_result(&params, tools, handler) {
+        "tools/call" => match tools_call_result(&mut params, tools, handler) {
             Ok(result) => Some(result),
             Err(message) => match tool_errors {
                 ToolErrorMode::McpContent => Some(error_content(&message)),
                 ToolErrorMode::JsonRpc => {
-                    return Some(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {"code": -32000, "message": message},
-                    }));
+                    response.insert(
+                        "error".to_string(),
+                        OwnedValue(json!({"code": -32000, "message": message})),
+                    );
+                    return Some(response.into_inner());
                 }
             },
         },
@@ -142,17 +154,14 @@ fn handle_message_with_tool_errors(
 
     match result {
         Some(result) => {
-            // Moving avoids json!'s recursive conversion/cloning of a deep tree.
-            let mut response = json!({"jsonrpc": "2.0", "id": id});
-            response["result"] = result;
-            Some(response)
+            response.insert("result".to_string(), OwnedValue(result));
         }
-        None => Some(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": -32601, "message": "method not found"},
-        })),
+        None => response.insert(
+            "error".to_string(),
+            OwnedValue(json!({"code": -32601, "message": "method not found"})),
+        ),
     }
+    Some(response.into_inner())
 }
 
 fn initialize_result(params: &Value) -> Value {
@@ -190,12 +199,12 @@ fn tools_list_result(tools: &[ToolDef]) -> Value {
 }
 
 fn tools_call_result(
-    params: &Value,
+    params: &mut OwnedValue,
     tools: &[ToolDef],
     handler: &mut dyn ToolHandler,
 ) -> Result<Value, String> {
     let name = match params.get("name").and_then(Value::as_str) {
-        Some(name) => name,
+        Some(name) => name.to_string(),
         None => return Err("missing required field: name".to_string()),
     };
 
@@ -203,15 +212,21 @@ fn tools_call_result(
         return Err(format!("unknown tool: {name}"));
     }
 
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    Ok(match handler.call(name, &args)? {
+    let args = OwnedValue(
+        params
+            .0
+            .get_mut("arguments")
+            .map(std::mem::take)
+            .unwrap_or(json!({})),
+    );
+    Ok(match handler.call(&name, &args)? {
         ToolOutput::Json(v) => {
             let mut v = crate::deep_json::OwnedValue(v);
             let mut result = json!({
                 "content": [{"type": "text", "text": crate::deep_json::to_string(&v.0).unwrap()}],
                 "isError": false,
             });
-            if crate::dispatch::output_schema(name).is_some() {
+            if crate::dispatch::output_schema(&name).is_some() {
                 result["structuredContent"] = std::mem::take(&mut v.0);
             }
             result
@@ -230,6 +245,33 @@ fn error_content(msg: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_message_arguments_are_moved_and_cleaned_up_on_every_exit() {
+        crate::test_support::small_stack(|| {
+            let payload = format!(
+                "{}null{}",
+                r#"{"layer":["#.repeat(5_000),
+                "]}".repeat(5_000)
+            );
+            for (name, is_error) in [("ok", false), ("err", true), ("unknown", true)] {
+                let request = format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","unused":{payload},"params":{{"name":"{name}","arguments":{{"equals":{payload}}}}}}}"#
+                );
+                let response =
+                    OwnedValue(handle_message(&request, &fake_tools(), &mut FakeHandler).unwrap());
+                assert_eq!(response["result"]["isError"], is_error);
+                let response = OwnedValue(
+                    handle_socket_message(&request, &fake_tools(), &mut FakeHandler).unwrap(),
+                );
+                assert_eq!(response.get("error").is_some(), is_error);
+            }
+            let notification = format!(
+                r#"{{"method":"notifications/initialized","params":{{"arguments":{payload}}}}}"#
+            );
+            assert!(handle_message(&notification, &fake_tools(), &mut FakeHandler).is_none());
+        });
+    }
 
     /// A `ToolHandler` test double: returns `Ok(Json({"ok":true}))` for a
     /// tool named `"ok"`, `Ok(Raw(...))` for `"raw"` (an already-complete

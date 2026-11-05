@@ -945,10 +945,6 @@ fn handle_tool_call<U: UpstreamMcp>(
     let explicit_file = args.get("file").and_then(Value::as_str).map(str::to_string);
     let url_file_key = dispatch::infer_file_from_node_ref(args);
     let file_arg = explicit_file.clone().or_else(|| url_file_key.clone());
-    let mut call_args = args.clone();
-    if let Some(obj) = call_args.as_object_mut() {
-        obj.remove("file");
-    }
 
     if proxy::is_local_tool(name) {
         let session = manager.resolve(file_arg.as_deref(), interval)?;
@@ -976,7 +972,7 @@ fn handle_tool_call<U: UpstreamMcp>(
             return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
         }
 
-        let result = session.dispatch(name, &call_args).map_err(|msg| {
+        let result = session.dispatch(name, args).map_err(|msg| {
             // spec §2b: note an explicit-file/URL-file disagreement on a
             // failed call (almost always "no node ... in the mirror" —
             // the node genuinely isn't in the file the explicit arg

@@ -1,6 +1,125 @@
 use super::*;
 
 #[test]
+fn tree_builders_skip_cycles_but_keep_repeated_noncyclic_paths() {
+    use fold::pipeline::{FilterMap, FlatMap, Keyed, Map, terminal};
+
+    type GraphNode = (NodeRec, Vec<String>);
+    let dir = tempfile::tempdir().unwrap();
+    // A synthetic children index permits a shared descendant as well as cycles;
+    // normal imports assign only one parent to each node.
+    let mut store = fold::stream::KeyedStream::<String, GraphNode, _>::new(
+        dir.path().join("db"),
+        (
+            Map::new(
+                |d: &Keyed<String, GraphNode>| Keyed::new(d.key.clone(), d.val.0.clone()),
+                terminal::Table::new("nodes"),
+            ),
+            FlatMap::new(
+                |d: &Keyed<String, GraphNode>| {
+                    d.val
+                        .1
+                        .iter()
+                        .enumerate()
+                        .map(|(i, id)| Keyed::new(d.key.clone(), (i as u32, id.clone())))
+                        .collect::<Vec<_>>()
+                },
+                terminal::Multimap::new("children"),
+            ),
+            FilterMap::new(
+                |_: &Keyed<String, GraphNode>| None::<Keyed<String, VariableRec>>,
+                terminal::Table::new("variables"),
+            ),
+            FilterMap::new(
+                |_: &Keyed<String, GraphNode>| None::<Keyed<String, VariableCollectionRec>>,
+                terminal::Table::new("variable_collections"),
+            ),
+        ),
+    );
+    let fixture = json!({
+        "name":"Cycle fixture", "version":"1", "lastModified":"now",
+        "document":{"id":"R", "name":"R", "type":"DOCUMENT"}
+    });
+    let flattened = crate::flatten::flatten_file(&fixture).unwrap();
+    let crate::model::Rec::Node(template) = &flattened.recs[0].1 else {
+        panic!("document record");
+    };
+    store.wtx(|tx| {
+        for (id, edges) in [
+            ("R", vec!["R", "A", "B"]),
+            ("A", vec!["C"]),
+            ("B", vec!["C"]),
+            ("C", vec!["A", "C", "R"]),
+        ] {
+            let mut node = template.clone();
+            node.id = id.to_string();
+            node.name = id.to_string();
+            node.node_type = "FRAME".to_string();
+            node.raw = json!({"id":id, "name":id, "type":"FRAME"}).to_string();
+            tx.upsert(
+                &id.to_string(),
+                &(node, edges.into_iter().map(str::to_string).collect()),
+            );
+        }
+    });
+    let leaf = |id| json!({"id":id, "name":id, "type":"FRAME", "children":[]});
+    let mut c = leaf("C");
+    c["children"] = json!([leaf("A")]);
+    let mut a = leaf("A");
+    a["children"] = json!([leaf("C")]);
+    let mut b = leaf("B");
+    b["children"] = json!([c]);
+    let mut expected = leaf("R");
+    expected["children"] = json!([a, b]);
+    store.rtx(|(nodes, children, variables, collections)| {
+        let root = nodes.get(&"R".to_string()).unwrap();
+        // Check a bounded traversal first so a regression fails instead of hanging.
+        for depth in [Some(8), None] {
+            assert_eq!(
+                tree_to_json(&build_tree(&nodes, &children, &root, depth)),
+                expected
+            );
+            assert_eq!(
+                build_subtree(
+                    &nodes,
+                    &children,
+                    &variables,
+                    &collections,
+                    &root,
+                    depth,
+                    None,
+                    false,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        for (depth, kids) in [(0, vec![]), (1, vec![leaf("A"), leaf("B")])] {
+            let mut expected = leaf("R");
+            expected["children"] = Value::Array(kids);
+            assert_eq!(
+                tree_to_json(&build_tree(&nodes, &children, &root, Some(depth))),
+                expected
+            );
+            assert_eq!(
+                build_subtree(
+                    &nodes,
+                    &children,
+                    &variables,
+                    &collections,
+                    &root,
+                    Some(depth),
+                    None,
+                    false,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    });
+}
+
+#[test]
 fn search_ties_keep_order_and_top_k_after_a_broad_query_on_the_same_thread() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = crate::open_store!(&dir.path().join("db"));
@@ -221,8 +340,9 @@ fn deep_where_queries_move_values_and_clean_up_all_exits() {
                 ("/missing", None, 0),
                 ("/id", Some(json!("absent")), 0),
             ] {
-                let rows =
-                    OwnedValue(where_(&nodes, &children, pointer, equals, None, None).unwrap());
+                let rows = OwnedValue(
+                    where_(&nodes, &children, pointer, equals.as_ref(), None, None).unwrap(),
+                );
                 assert_eq!(rows.as_array().unwrap().len(), expected_count);
             }
             for (pointer, equals, count) in [
@@ -236,7 +356,7 @@ fn deep_where_queries_move_values_and_clean_up_all_exits() {
                 ("/equal_cases/array", json!([true]), 0),
             ] {
                 let rows = OwnedValue(
-                    where_(&nodes, &children, pointer, Some(equals), None, None).unwrap(),
+                    where_(&nodes, &children, pointer, Some(&equals), None, None).unwrap(),
                 );
                 assert_eq!(rows.as_array().unwrap().len(), count, "{pointer}");
             }
@@ -248,28 +368,10 @@ fn deep_where_queries_move_values_and_clean_up_all_exits() {
             );
             let equals = crate::deep_json::from_str(&payload).unwrap();
             let rows = OwnedValue(
-                where_(
-                    &nodes,
-                    &children,
-                    "/payload",
-                    Some(equals.into_inner()),
-                    None,
-                    None,
-                )
-                .unwrap(),
+                where_(&nodes, &children, "/payload", Some(&equals), None, None).unwrap(),
             );
             assert_eq!(rows.as_array().unwrap().len(), 1);
-            assert!(
-                where_(
-                    &nodes,
-                    &children,
-                    "invalid",
-                    Some(crate::deep_json::from_str(&payload).unwrap().into_inner()),
-                    None,
-                    None
-                )
-                .is_err()
-            );
+            assert!(where_(&nodes, &children, "invalid", Some(&equals), None, None).is_err());
         });
         // A malformed later record must safely dispose of the earlier deep match.
         for (_, rec) in &mut flattened.recs {

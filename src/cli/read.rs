@@ -7,6 +7,8 @@
 
 use serde_json::Value;
 
+use crate::deep_json::OwnedValue;
+
 use fold::pipeline::terminal::{InvertedIndexReader, MultimapReader, TableReader};
 use fold::stream::Readable;
 
@@ -188,7 +190,9 @@ pub(super) fn cmd_vars<R: Readable>(
 /// `figmog_where` call's `equals` argument identically to this module's own
 /// `cmd_where`.
 pub(super) fn parse_equals(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+    crate::deep_json::from_str(raw)
+        .map(OwnedValue::into_inner)
+        .unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 pub(super) fn cmd_stats<R: Readable>(
@@ -235,9 +239,14 @@ pub(super) fn cmd_where<R: Readable>(
     page: Option<String>,
     under: Option<String>,
 ) -> Result<(), String> {
-    let equals = equals.as_deref().map(parse_equals);
+    let equals = equals.as_deref().map(|raw| OwnedValue(parse_equals(raw)));
     print_value(query::where_(
-        nodes, children, &pointer, equals, page, under,
+        nodes,
+        children,
+        &pointer,
+        equals.as_deref(),
+        page,
+        under,
     )?)
 }
 

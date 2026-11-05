@@ -197,15 +197,19 @@ pub fn build_tree<R: Readable>(
         edges.into_iter()
     };
     let mut stack = vec![(make(node), depth, edges(&node.id, depth))];
+    let mut ancestors = BTreeSet::from([node.id.clone()]);
     loop {
         let (_, depth, edges_iter) = stack.last_mut().expect("root frame");
         if let Some((_, child_id)) = edges_iter.next() {
-            if let Some(child) = nodes.get(&child_id) {
+            if let Some(child) = nodes.get(&child_id)
+                && ancestors.insert(child.id.clone())
+            {
                 let depth = depth.map(|d| d - 1);
                 stack.push((make(&child), depth, edges(&child.id, depth)));
             }
         } else {
             let (finished, _, _) = stack.pop().expect("root frame");
+            ancestors.remove(&finished.id);
             match stack.last_mut() {
                 Some((parent, _, _)) => parent.children.push(finished),
                 None => return finished,
@@ -393,23 +397,33 @@ fn build_subtree<R: Readable>(
             children.get(&n.id)
         };
         edges.sort();
-        Ok((value, depth, edges.into_iter(), OwnedValue::array()))
+        Ok((
+            n.id.clone(),
+            value,
+            depth,
+            edges.into_iter(),
+            OwnedValue::array(),
+        ))
     };
     let mut stack = vec![prepare(n, depth)?];
+    let mut ancestors = BTreeSet::from([n.id.clone()]);
     loop {
-        let (_, depth, edges, _) = stack.last_mut().expect("root frame");
+        let (_, _, depth, edges, _) = stack.last_mut().expect("root frame");
         if let Some((_, child_id)) = edges.next() {
-            if let Some(child) = nodes.get(&child_id) {
+            if let Some(child) = nodes.get(&child_id)
+                && ancestors.insert(child.id.clone())
+            {
                 let depth = depth.map(|d| d - 1);
                 stack.push(prepare(&child, depth)?);
             }
         } else {
-            let (mut value, _, _, kids) = stack.pop().expect("root frame");
+            let (id, mut value, _, _, kids) = stack.pop().expect("root frame");
+            ancestors.remove(&id);
             if value.is_object() {
                 value.insert("children".to_string(), kids);
             }
             match stack.last_mut() {
-                Some((_, _, _, kids)) => kids.push(value),
+                Some((_, _, _, _, kids)) => kids.push(value),
                 None => return Ok(value.into_inner()),
             }
         }
@@ -932,11 +946,10 @@ pub fn where_<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
     pointer: &str,
-    equals: Option<Value>,
+    equals: Option<&Value>,
     page: Option<String>,
     under: Option<String>,
 ) -> Result<Value, String> {
-    let equals = equals.map(OwnedValue);
     if !pointer.starts_with('/') {
         return Err(format!(
             "pointer must be an RFC 6901 pointer starting with '/': {pointer}"
@@ -958,10 +971,7 @@ pub fn where_<R: Readable>(
         let Some(value) = raw.0.pointer_mut(pointer) else {
             continue;
         };
-        if equals
-            .as_ref()
-            .is_some_and(|want| !json_values_equal(value, want))
-        {
+        if equals.is_some_and(|want| !json_values_equal(value, want)) {
             continue;
         }
         let value = OwnedValue(std::mem::take(value));

@@ -2872,6 +2872,7 @@ fn deep_tree_reads_over_socket_match_direct_cli() {
         vec!["where", "--pointer", "/id"],
         vec!["where", "--pointer", "/missing"],
         vec!["where", "--pointer", "/payload"],
+        vec!["where", "--pointer", "/payload", "--equals", &payload],
     ] {
         let output = common::command()
             .current_dir(dir.path())

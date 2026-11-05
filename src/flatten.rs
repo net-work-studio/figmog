@@ -7,6 +7,7 @@
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use crate::model::{ComponentRec, ComponentSetRec, Id, NodeRec, Rec, StyleRec};
 
@@ -109,10 +110,11 @@ fn str_field(v: &Value, k: &str) -> Option<String> {
 /// Depth-first walk. `page_id` is the nearest CANVAS ancestor (None above
 /// pages — the record then carries the node's own id).
 fn walk(document: &Value, out: &mut Vec<(Id, Rec)>) -> Result<(), FlattenError> {
-    let mut pending = vec![(document, "document".to_string(), None, 0, None)];
+    let mut paths = Vec::new();
+    let mut pending = vec![(document, None, None, 0, None)];
     while let Some((node, path, parent_id, child_index, page_id)) = pending.pop() {
         let invalid = |reason| FlattenError::InvalidNode {
-            path: path.to_string(),
+            path: node_path(&paths, path),
             reason,
         };
         let object = node
@@ -187,17 +189,36 @@ fn walk(document: &Value, out: &mut Vec<(Id, Rec)>) -> Result<(), FlattenError> 
                 .ok_or_else(|| invalid("children must be an array when present"))?;
             // Reverse the pending stack to retain document/child-index order.
             for (i, child) in children.iter().enumerate().rev() {
-                pending.push((
-                    child,
-                    format!("{path}.children[{i}]"),
-                    Some(id),
-                    i as u32,
-                    Some(page),
-                ));
+                let child_path = paths.len();
+                paths.push(NodePath {
+                    parent: path,
+                    child_index: i,
+                });
+                pending.push((child, Some(child_path), Some(id), i as u32, Some(page)));
             }
         }
     }
     Ok(())
+}
+
+/// Arena links avoid copying ancestor paths and recursively dropping them.
+struct NodePath {
+    parent: Option<usize>,
+    child_index: usize,
+}
+
+fn node_path(paths: &[NodePath], mut path: Option<usize>) -> String {
+    let mut indices = Vec::new();
+    while let Some(index) = path {
+        let segment = &paths[index];
+        indices.push(segment.child_index);
+        path = segment.parent;
+    }
+    let mut path = "document".to_string();
+    for index in indices.into_iter().rev() {
+        write!(path, ".children[{index}]").expect("writing a String cannot fail");
+    }
+    path
 }
 
 /// Turn a JSON object into sorted (key, f(value)) pairs; absent/None entries drop.
