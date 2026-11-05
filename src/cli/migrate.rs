@@ -18,7 +18,10 @@
 //!    [`MIGRATED_MARKER`] naming `L`;
 //! 4. rename `S` to `D` — the held anchor moves with it, so `D` is owned
 //!    from the moment it appears;
-//! 5. remove `L`, then the marker.
+//! 5. rename `L` to its tombstone `T` = `<checkout>/.figmog/.<key>.deleting`
+//!    (same directory, so atomic; `L`'s anchor is still held and its fjall
+//!    writer lock was checked in 2), remove `T` recursively, then the
+//!    marker.
 //!
 //! Interrupted states and what a rerun does: a crash in 3 leaves `L`
 //! intact (still the active store) plus a partial `S`, which the rerun
@@ -28,7 +31,11 @@
 //! but only from the checkout the marker names: another worktree's own old
 //! mirror is an independent copy, so there the rerun refuses and names the
 //! checkout that must finish (or, if the recorded source is already gone,
-//! just removes the marker).
+//! just removes its tombstone, if any, and the marker). A tombstone is never
+//! opened as a store, only removed, so a deletion interrupted half way is
+//! simply finished (NWS-2964). An `L` an older binary's interrupted step 5
+//! left half deleted in place is still checked for live writers before it
+//! is retired, but a failure to open it as a store is not one.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -79,6 +86,15 @@ fn staging_dir(layout: &Layout, key: &str) -> PathBuf {
     layout.mirror_root.join(format!(".{key}.migrating"))
 }
 
+/// Where step 5 moves the old store `legacy` before deleting it:
+/// `.<name>.deleting` beside it, derived from the path the marker records.
+fn tombstone(legacy: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(legacy.file_name().unwrap_or_default());
+    name.push(".deleting");
+    legacy.with_file_name(name)
+}
+
 fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
@@ -104,6 +120,12 @@ fn candidate_keys(layout: &Layout) -> Result<BTreeSet<String>, String> {
     for name in names(&layout.local_root)? {
         if is_file_key(&name) && exists(&layout.legacy_dir(&name).join("db")) {
             keys.insert(name);
+        } else if let Some(key) = name
+            .strip_prefix('.')
+            .and_then(|n| n.strip_suffix(".deleting"))
+            .filter(|k| is_file_key(k))
+        {
+            keys.insert(key.to_string());
         }
     }
     for name in names(&layout.mirror_root)? {
@@ -131,6 +153,42 @@ fn migration_lock_path(layout: &Layout, key: &str) -> PathBuf {
 /// holds only the latter), then close the database but keep the anchor.
 fn lock_store(db: &Path) -> Result<StoreOwner, String> {
     Ok(open_store_checked(db, |path| crate::open_store!(path))?.into_owner())
+}
+
+/// Lock an old store a migration already published elsewhere, before
+/// retiring it: figmog's anchor (never creating the directory) and fjall's
+/// own writer lock. Unlike [`lock_store`], a store that fails to open for
+/// any reason other than lock contention — one an older binary's
+/// interrupted cleanup left half deleted — is not an error: nothing can be
+/// writing it, and it is only going to be removed. `None` if it is gone.
+fn lock_leftover(db: &Path) -> Result<Option<StoreOwner>, String> {
+    let Some(owner) = StoreOwner::acquire_existing(db)? else {
+        return Ok(None);
+    };
+    if super::writer_locked(&owner) {
+        return Err(super::STORE_LOCKED_MSG.to_string());
+    }
+    Ok(Some(owner))
+}
+
+/// Step 5: atomically move the (locked, checked) old store `legacy` to its
+/// tombstone — replacing a stale one — then remove the tombstone.
+fn retire(legacy: &Path) -> Result<(), String> {
+    let tomb = tombstone(legacy);
+    remove_tombstone(&tomb)?;
+    fs::rename(legacy, &tomb).map_err(|e| format!("renaming {}: {e}", legacy.display()))?;
+    if let Some(parent) = legacy.parent() {
+        sync_path(parent)?;
+    }
+    remove_tombstone(&tomb)
+}
+
+/// Remove a tombstone (never opened as a store), if there is one.
+fn remove_tombstone(tomb: &Path) -> Result<(), String> {
+    if exists(tomb) {
+        fs::remove_dir_all(tomb).map_err(|e| format!("removing {}: {e}", tomb.display()))?;
+    }
+    Ok(())
 }
 
 /// The source path a [`MIGRATED_MARKER`] records (raw path bytes).
@@ -187,18 +245,18 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
                 dest.display()
             ));
         }
-        // Finish under both stores' anchors and fjall writer locks.
+        // Finish under both stores' anchors and fjall writer locks, checked
+        // on the old store before it moves to its tombstone.
         let _dest_owner = lock_store(&dest.join("db"))?;
         if ours {
-            let _legacy_owner = if exists(&legacy.join("db")) {
-                Some(lock_store(&legacy.join("db"))?)
-            } else {
-                None
-            };
+            let _legacy_owner = lock_leftover(&legacy.join("db"))?;
             if exists(&legacy) {
-                fs::remove_dir_all(&legacy).map_err(|e| io("removing", &legacy, e))?;
+                retire(&legacy)?;
             }
         }
+        // A tombstone is past the point of no return, whichever checkout
+        // it is in: finish deleting it without opening it.
+        remove_tombstone(&tombstone(&source))?;
         // The recorded source is gone now (or was already): drop the marker.
         fs::remove_file(&marker).map_err(|e| io("removing", &marker, e))?;
         return Ok(Some(Moved {
@@ -210,11 +268,12 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
     }
 
     if !exists(&legacy.join("db")) {
-        // Nothing to move; under the migration lock, a staging dir is
-        // debris from an interrupted run.
+        // Nothing to move; under the migration lock, a staging dir or a
+        // tombstone is debris from an interrupted run.
         if exists(&staging) {
             fs::remove_dir_all(&staging).map_err(|e| io("removing", &staging, e))?;
         }
+        remove_tombstone(&tombstone(&legacy))?;
         return Ok(None);
     }
     if exists(&dest) {
@@ -249,7 +308,7 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
     }
     fs::rename(&staging, &dest).map_err(|e| io("renaming into", &dest, e))?;
     sync_path(&layout.mirror_root)?;
-    fs::remove_dir_all(&legacy).map_err(|e| io("removing", &legacy, e))?;
+    retire(&legacy)?;
     drop(source);
     fs::remove_file(&marker).map_err(|e| io("removing", &marker, e))?;
     drop(staged);
@@ -482,6 +541,87 @@ mod tests {
         }
         assert!(migrate_key(&layout, KEY).unwrap().unwrap().resumed);
         assert!(!legacy_db.exists());
+        assert!(!dest.join(MIGRATED_MARKER).exists());
+    }
+
+    /// Delete roughly half of a store directory's entries (every other one,
+    /// sorted, recursively), as an interrupted `remove_dir_all` would.
+    fn half_delete(dir: &Path) {
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for (i, entry) in entries.iter().enumerate() {
+            if entry.is_dir() {
+                half_delete(entry);
+            } else if i % 2 == 0 {
+                fs::remove_file(entry).unwrap();
+            }
+        }
+    }
+
+    /// NWS-2964 follow-up: step 5 retires the old store to a tombstone
+    /// before deleting it. A crash part way through that deletion leaves a
+    /// half-deleted tombstone, which a rerun removes without opening it.
+    #[test]
+    fn rerun_finishes_a_partially_deleted_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let legacy_db = legacy_store(&layout);
+        let dest = interrupted_after_rename(&layout);
+        let tomb = tombstone(&layout.legacy_dir(KEY));
+        assert_eq!(tomb, layout.local_root.join(format!(".{KEY}.deleting")));
+        fs::rename(layout.legacy_dir(KEY), &tomb).unwrap();
+        half_delete(&tomb.join("db"));
+        assert!(!legacy_db.exists());
+
+        let moved = migrate_key(&layout, KEY).unwrap().unwrap();
+        assert!(moved.resumed);
+        assert!(!tomb.exists());
+        assert!(!layout.legacy_dir(KEY).exists());
+        assert!(!dest.join(MIGRATED_MARKER).exists());
+        assert!(!layout.active_store(KEY).unwrap().migration_pending);
+
+        // A stray tombstone with no marker left is debris, too.
+        fs::create_dir_all(tomb.join("db")).unwrap();
+        fs::write(tomb.join("db/torn"), "x").unwrap();
+        assert_eq!(cmd_migrate(&layout, None).unwrap()["migrated"], json!([]));
+        assert!(!tomb.exists());
+    }
+
+    /// An older binary deleted the old store in place and was interrupted:
+    /// the half-deleted store is still checked for writers, but failing to
+    /// open as a store does not stop the rerun from retiring it.
+    #[test]
+    fn rerun_finishes_an_old_versions_partially_deleted_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let legacy_db = legacy_store(&layout);
+        let dest = interrupted_after_rename(&layout);
+        // Torn beyond what fjall recovers from: its journal directories and
+        // every other file are gone, and one file is garbage.
+        half_delete(&legacy_db);
+        for entry in fs::read_dir(&legacy_db).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() && path.file_name().unwrap() != LOCK_NAME {
+                fs::write(&path, b"torn").unwrap();
+            }
+        }
+        // A held destination still refuses before anything moves.
+        let error = {
+            let held = crate::open_store!(&dest.join("db"));
+            let error = migrate_key(&layout, KEY).unwrap_err();
+            drop(held);
+            error
+        };
+        assert_eq!(error, super::super::STORE_LOCKED_MSG);
+        assert!(legacy_db.exists());
+
+        let moved = migrate_key(&layout, KEY).unwrap().unwrap();
+        assert!(moved.resumed);
+        assert!(!layout.legacy_dir(KEY).exists());
+        assert!(!tombstone(&layout.legacy_dir(KEY)).exists());
         assert!(!dest.join(MIGRATED_MARKER).exists());
     }
 

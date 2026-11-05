@@ -163,6 +163,11 @@ impl PendingCall {
         self.token
     }
 
+    /// The request's JSON-RPC id.
+    pub(crate) fn id(&self) -> &Value {
+        &self.id
+    }
+
     /// Frame the deferred handler result as this call's response.
     pub(crate) fn finish(self, output: Result<ToolOutput, String>) -> Value {
         let result = match output {

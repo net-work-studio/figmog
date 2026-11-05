@@ -179,6 +179,70 @@ fn routed_pulls_and_imports_match_direct_and_only_identical_plain_pulls_coalesce
     live.stop();
 }
 
+/// A plain pull joins only a plain pull queued directly before it (NWS-2963):
+/// one queued behind an intervening write — here an import — must run after
+/// that write, not share an earlier pull's result from before it.
+#[test]
+fn a_plain_pull_does_not_coalesce_across_an_intervening_write() {
+    let h = Harness::new();
+    let Harness {
+        release,
+        entered,
+        api,
+        manager,
+        ..
+    } = h;
+    let live = Live::start(manager, Offload::new(None));
+
+    let running = live.write(PULL, json!({"file": KEY}));
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "fetch"
+    );
+    let early = live.write(PULL, json!({"file": KEY}));
+    settle();
+    let vars = std::str::from_utf8(include_bytes!(
+        "../../../tests/fixtures/variables-export.json"
+    ))
+    .unwrap();
+    let import = live.write(
+        IMPORT_VARIABLES,
+        json!({"file": KEY, "content": vars, "name": "vars.json"}),
+    );
+    settle();
+    let late = live.write(PULL, json!({"file": KEY}));
+    settle();
+    release.send(()).unwrap();
+    running.join().unwrap().unwrap();
+
+    // The early pull's fetch; the late one is not riding on it.
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "fetch"
+    );
+    release.send(()).unwrap();
+    let early = early.join().unwrap().unwrap();
+    // The import runs next, then the late pull fetches on its own.
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "fetch"
+    );
+    settle();
+    assert!(import.is_finished(), "the import ran after the late pull");
+    assert!(!late.is_finished(), "the late pull shared an earlier fetch");
+    release.send(()).unwrap();
+    let late = late.join().unwrap().unwrap();
+    import.join().unwrap().unwrap();
+    assert_eq!(api.calls.load(Ordering::Relaxed), 3);
+    assert_ne!(early["operation"], late["operation"]);
+    // The late pull ran against the store the early pull left: no churn.
+    assert_eq!(
+        late["result"],
+        json!({"added": 0, "changed": 0, "removed": 0, "unchanged": 1})
+    );
+    live.stop();
+}
+
 /// `pull --fresh` through serve: validation (the fetch) touches nothing;
 /// then the per-store reset barrier waits for a worker read still holding
 /// the old view, which answers from it; only then is the store cleared,
@@ -253,6 +317,60 @@ fn routed_fresh_pull_waits_for_the_reset_barrier_and_turns_geometry_off() {
     let node = live.call("figmog_node", json!({"file": KEY, "id": "0:0"}));
     assert!(node.join().unwrap().get("result").is_some());
     live.stop();
+}
+
+/// Stdin EOF while routed writes are in flight (NWS-2963): the running
+/// write — a fresh pull, whose reset and apply continue after its fetch —
+/// still commits, publishes and answers its CLI during the shutdown drain,
+/// while a write still queued is answered "not accepted" (nothing applied,
+/// safe to retry) instead of being started or left "outcome unknown".
+#[test]
+fn shutdown_finishes_a_running_write_and_refuses_a_queued_one() {
+    let h = Harness::new();
+    let Harness {
+        release,
+        entered,
+        api,
+        manager,
+        ..
+    } = h;
+    let mut live = Live::start(manager, Offload::new(None));
+    let seed = live.write(PULL, json!({"file": KEY}));
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    release.send(()).unwrap();
+    seed.join().unwrap().unwrap();
+
+    let fresh = live.write(PULL, json!({"file": KEY, "fresh": true}));
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "fetch"
+    );
+    let queued = live.write(PULL, json!({"file": KEY, "geometry": true}));
+    settle();
+    live.tx.send(Incoming::StdinClosed).unwrap();
+    settle();
+    assert!(!fresh.is_finished(), "answered before it committed");
+    release.send(()).unwrap();
+    // The loop exits once the drain answered everything (or its deadline
+    // passed); a client left unanswered would then wait out its timeout.
+    live.thread.take().unwrap().join().unwrap().unwrap();
+    let answered = Instant::now() + Duration::from_secs(5);
+    while !(fresh.is_finished() && queued.is_finished()) && Instant::now() < answered {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(fresh.is_finished(), "the running write was never answered");
+    assert!(queued.is_finished(), "the queued write was never answered");
+    let fresh = fresh.join().unwrap().unwrap();
+    assert_eq!(
+        fresh["result"],
+        json!({"added": 1, "changed": 0, "removed": 0, "unchanged": 0})
+    );
+    let queued = queued.join().unwrap().unwrap_err();
+    assert!(
+        queued.contains("before accepting this write; nothing was applied"),
+        "{queued}"
+    );
+    assert_eq!(api.calls.load(Ordering::Relaxed), 2, "the queued write ran");
 }
 
 /// The CLI's side when the owner goes away mid-write: it reports "outcome

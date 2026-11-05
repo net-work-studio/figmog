@@ -219,8 +219,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// applied). If the connection ends first (serve killed or stopped), the
 /// write is reported as **outcome unknown**, naming the operation id serve
 /// announced when it accepted the write; it is never retried. Only a write
-/// the background owner explicitly did not accept (it is shutting down,
-/// NWS-2953) is sent again, on a new connection from `route`.
+/// serve explicitly did not accept or start (a background owner shutting
+/// down, NWS-2953, or any serve draining with the write still queued,
+/// NWS-2963) is sent again, on a new connection from `route`.
 pub(crate) fn write_over(
     route: &Route,
     client: Client,
@@ -324,7 +325,10 @@ fn write_once(client: Client, tool: &str, frame: &str) -> Result<Value, Failure>
             continue;
         }
         if is_response_to(&resp, &id) {
-            if operation.is_none() && not_accepted(&resp) {
+            // "Not accepted" means nothing was started, even after an
+            // operation id was announced: a serve shutting down answers a
+            // write still queued that way (NWS-2963).
+            if not_accepted(&resp) {
                 return Err(Failure::NotAccepted);
             }
             return Ok(interpret_call_response(tool, resp)?);
@@ -332,7 +336,7 @@ fn write_once(client: Client, tool: &str, frame: &str) -> Result<Value, Failure>
     }
 }
 
-/// The owner answered "not accepted": it started nothing for this request.
+/// Serve answered "not accepted": it started nothing for this request.
 fn not_accepted(resp: &Value) -> bool {
     resp["error"]["code"].as_i64() == Some(owner::NOT_ACCEPTED)
 }

@@ -950,37 +950,79 @@ fn deliver(to: ReplyTo, frame: String, registry: &ConnRegistry, stdio: &StdioWri
 /// running pull).
 const EXIT_DRAIN: Duration = Duration::from_secs(15);
 
+/// How often shutdown's drain services sessions while it waits.
+const DRAIN_POLL: Duration = Duration::from_millis(20);
+
 /// Shutdown: answer the deferred calls already accepted before exiting, so
 /// `printf '<request>\n' | figmog serve` still gets its response. Accepts
-/// no new requests and starts no new work (queued image requests and
-/// queued desktop calls — the desktop queue was already stopped by the
-/// caller — are answered with an error; running ones finish and answer);
-/// waits until `deadline`. A vanished stdout or closed socket
-/// just drops that response.
+/// no new requests and starts no new work: queued image requests, queued
+/// CLI writes and queued desktop calls (the desktop queue was already
+/// stopped by the caller) are answered with an error — a queued write with
+/// "not accepted" (code [`crate::owner::NOT_ACCEPTED`]: it never started, so
+/// the CLI may retry it). Running work finishes and answers: sessions keep
+/// processing completions (NWS-2963) — a routed write answers only once
+/// its session published it, and a fresh pull's reset and apply still run
+/// — with no watch work. Waits until `deadline`. A vanished stdout or
+/// closed socket just drops that response.
 fn drain_on_exit(
     manager: &mut SessionManager,
     offload: &Offload,
     pending: &mut Pending,
     registry: &ConnRegistry,
     stdio: &StdioWriter,
+    track_current: bool,
     deadline: Instant,
 ) {
     for session in &mut manager.sessions {
-        session.abandon_queued_images();
+        session.begin_drain();
     }
     while !pending.is_empty() {
+        let mut published = Vec::new();
+        for session in &mut manager.sessions {
+            if session.maintain(false) {
+                published.push(session.key.clone());
+            }
+        }
+        for (key, outcome) in manager.service_resets() {
+            match outcome {
+                Ok(()) => published.push(key),
+                Err(error) => eprintln!("figmog: reopening {key} after a reset failed: {error}"),
+            }
+        }
+        for key in published {
+            refresh_current(manager, track_current, &key);
+        }
         let left = deadline.saturating_duration_since(Instant::now());
-        let Ok(done) = offload.done_rx.recv_timeout(left) else {
+        if left.is_zero() {
             return;
+        }
+        let Ok(done) = offload.done_rx.recv_timeout(left.min(DRAIN_POLL)) else {
+            continue;
         };
         let Some((to, call)) = pending.remove(done.token) else {
             continue;
         };
         // No poll expedite: the server is exiting.
-        if !deliver(to, answer_frame(done.answer, call), registry, stdio) {
+        let frame = match done.answer {
+            Answer::Output(Err(error)) if error == sessions::WRITE_NOT_STARTED => {
+                not_accepted_frame(&call, &error)
+            }
+            answer => answer_frame(answer, call),
+        };
+        if !deliver(to, frame, registry, stdio) {
             return;
         }
     }
+}
+
+/// A "not accepted" response frame for `call`: nothing was started for it.
+fn not_accepted_frame(call: &PendingCall, message: &str) -> String {
+    frame(
+        &serde_json::json!({"jsonrpc": "2.0", "id": call.id(), "error": {
+            "code": crate::owner::NOT_ACCEPTED,
+            "message": message,
+        }}),
+    )
 }
 
 /// Why the request loop returned.
@@ -1060,6 +1102,7 @@ fn serve_loop_with_offload(
             &mut pending,
             &registry,
             &stdio,
+            track_current,
             deadline,
         );
     }

@@ -579,8 +579,11 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   only writer) in arrival order, ahead of queued watch/sync jobs, and,
   like a direct pull, without waiting out a failed pull's backoff. Two
   writes are never merged, except identical plain pulls (network, not
-  fresh, same `geometry`) that have not started yet: they share one fetch
-  and apply, each keeping its own operation id. A network write uses
+  fresh, same `geometry`) that have not started yet *and are adjacent in
+  the queue* — a plain pull joins only the last queued write, never one
+  with another write (an import, a saved-file, fresh or differently
+  configured pull) queued after it: they share one fetch and apply, each
+  keeping its own operation id. A network write uses
   serve's credentials. While a write is pending on a not-yet-mirrored
   store, reads queue no implicit first pull. A successful routed pull
   updates `last_success` (`"job_id": null`, plus `"operation"`); it is not
@@ -594,6 +597,14 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   `outcome unknown: ...`; if the connection ends first, the CLI reports
   `outcome unknown` with the announced operation id (exit 1) and never
   retries or falls back to a direct open.
+- *Shutdown.* When serve shuts down (stdin EOF, or a background owner's
+  loop exiting), a write already running still finishes within the
+  15-second drain (§6a "Shutdown with deferred work"): its session keeps
+  processing completions — a fresh pull's reset and apply included — so
+  it commits, publishes and is answered as usual. A write still queued is
+  not started: it is answered JSON-RPC error `-32001` `not accepted: ...
+  reconnect and retry` even though its operation id was announced, and
+  the CLI treats it like any "not accepted" answer (nothing was applied).
 - *Store owner records.* A serve writes `figmog serve (pid N, socket
   <path>)` (or `no socket`) into each store lock (`.figmog-lock`) it
   takes; every other opener clears it. A command finding a store held
@@ -811,7 +822,10 @@ writes the responses it owes, to stdio and to still-open sockets, for up to
 15 seconds (covering the desktop's 10-second timeout), so `printf
 '<request>\n' | figmog serve` gets its image or desktop response. Image
 requests still queued (not started) are answered with a shutting-down
-error, and the desktop worker stops taking queued calls (and skips queued
+error, CLI writes still queued with "not accepted" (§6 "CLI writers through
+serve"), and queued watch/sync pulls are not started; running work —
+including a routed write and its fresh-pull reset — keeps being serviced
+(no watch polls) until it publishes and answers. The desktop worker stops taking queued calls (and skips queued
 desktop checks) at once: its
 in-flight call still finishes and is answered, while each queued one is
 answered with a shutting-down error without being sent upstream (it may be
@@ -1623,7 +1637,10 @@ Outside Git it is a no-op. Per key:
 4. Atomically rename the staging dir to `<mirror root>/<key>`; the staged
    anchor (still held) moves with it, so the destination is owned the
    moment it appears.
-5. Remove the old directory, then the marker.
+5. Atomically rename the old directory to its tombstone
+   `.figmog/.<key>.deleting` beside it (its anchor is still held and its
+   fjall lock was checked in 2), remove the tombstone recursively, then the
+   marker. A tombstone is never opened as a store.
 
 A crash during 3 leaves the old store intact and active (the staging dir
 is ignored and redone on rerun). A crash after 4 leaves the marker, which
@@ -1633,5 +1650,10 @@ binary's serve on either store refuses it). The marker names the source
 checkout's old directory, and only a rerun from that checkout removes it:
 another worktree's own old mirror is an independent copy, so there the
 rerun refuses, naming the checkout that must finish — unless the recorded
-source is already gone, when it just removes the marker. A crash after
-5's first step leaves only the marker, which a rerun removes.
+source is already gone, when it just removes the source's tombstone (if
+any) and the marker. A crash during 5's deletion leaves a half-deleted
+tombstone, which a rerun removes without opening it. An old directory an
+older binary's interrupted step 5 left half deleted in place is still
+checked for anchors and fjall locks, but failing to open as a store (it is
+not lock contention) does not stop the rerun from retiring it. A stray
+tombstone with no marker is removed by any rerun.

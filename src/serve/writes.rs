@@ -19,8 +19,10 @@
 //! is also kept as a receipt for [`RECEIPT_RETENTION`], readable with
 //! [`OPERATION`] `{id}` from any connection (a reconnecting client); a
 //! running one reads as `running`. Distinct writes are never merged; only
-//! identical plain pulls that have not started share one worker run (each
-//! keeps its own operation id). Nothing here retries a write.
+//! identical plain pulls that have not started and are adjacent in the
+//! queue share one worker run (each keeps its own operation id). Nothing
+//! here retries a write; at shutdown a write still queued is answered "not
+//! accepted" (nothing applied), which the CLI may retry.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

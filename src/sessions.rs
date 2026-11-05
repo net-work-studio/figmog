@@ -148,6 +148,11 @@ enum WriteWork {
     },
 }
 
+/// The answer to a CLI write still queued when serve shuts down
+/// ([`FileSession::begin_drain`]): it never started, so nothing was applied
+/// and the requester may send it again.
+pub(crate) const WRITE_NOT_STARTED: &str = "not accepted: figmog serve is shutting down and did not start this write; nothing was applied — reconnect and retry";
+
 /// A validated pull, not yet applied to any store.
 pub(crate) struct Prepared {
     flattened: crate::flatten::Flattened,
@@ -199,6 +204,7 @@ struct PendingWrite {
 pub(crate) struct Carry {
     fresh: Option<(Prepared, Waiters)>,
     writes: VecDeque<PendingWrite>,
+    draining: bool,
 }
 
 impl Carry {
@@ -305,6 +311,9 @@ pub(crate) struct FileSession {
     writing: Option<Waiters>,
     /// A validated fresh pull waiting for this store's reset barrier.
     fresh: Option<(Prepared, Waiters)>,
+    /// Shutdown's drain ([`Self::begin_drain`]): in-flight work finishes
+    /// and publishes, nothing new starts.
+    draining: bool,
 }
 
 type Reopen = Arc<dyn Fn(bool) -> Result<FileSession, String> + Send + Sync>;
@@ -682,7 +691,9 @@ impl FileSession {
         }
         // CLI writes go first: their callers are waiting on them.
         self.start_write();
-        self.start_if_ready_at(now);
+        if !self.draining {
+            self.start_if_ready_at(now);
+        }
         if watch && self.expedited_poll {
             self.poll_at(self.interval, now);
         }
@@ -710,6 +721,7 @@ impl FileSession {
             }
         } else if !self.busy
             && self.reset.is_none()
+            && !self.draining
             && let Some(job) = self.image_queue.pop_front()
         {
             self.start_images(job);
@@ -722,17 +734,23 @@ impl FileSession {
     /// no store). Writes run on the worker in arrival order, ahead of
     /// queued watch/sync pulls, and — like a direct `figmog pull` — do not
     /// wait out a failed pull's backoff. An identical plain pull that has
-    /// not started yet is shared; nothing else is merged.
+    /// not started yet is shared only when it is the last queued write:
+    /// joining an earlier one would reorder this pull ahead of whatever was
+    /// queued after it (an import, a saved-file pull, a fresh or
+    /// differently configured pull), so its result would not reflect the
+    /// store that write left behind. Nothing else is merged.
     pub(crate) fn write(&mut self, operation: String, op: WriteOp, reply: WriteReply) {
+        if self.draining {
+            reply(Err(WRITE_NOT_STARTED.to_string()));
+            return;
+        }
         if let WriteOp::Pull {
             source: PullSource::Network,
             fresh: false,
             geometry,
         } = &op
-            && let Some(queued) = self
-                .writes
-                .iter_mut()
-                .find(|write| write.op.is_plain_pull(*geometry))
+            && let Some(queued) = self.writes.back_mut()
+            && queued.op.is_plain_pull(*geometry)
         {
             queued.waiters.replies.push(reply);
             return;
@@ -778,6 +796,7 @@ impl FileSession {
         Carry {
             fresh: self.fresh.take(),
             writes: std::mem::take(&mut self.writes),
+            draining: self.draining,
         }
     }
 
@@ -785,6 +804,7 @@ impl FileSession {
     /// fresh pull first, then the queue.
     fn adopt(&mut self, carry: Carry) {
         self.writes = carry.writes;
+        self.draining = carry.draining;
         match carry.fresh {
             Some((prepared, waiters)) => self.run_write(WriteWork::Apply(prepared), waiters),
             None => self.start_write(),
@@ -856,9 +876,24 @@ impl FileSession {
         false
     }
 
+    /// Shutdown's drain (NWS-2963): answer every not-yet-started image
+    /// request and CLI write with an error instead of running it — a write
+    /// with [`WRITE_NOT_STARTED`], which its requester may safely retry —
+    /// and start no queued pull. Work already running (a write, its fresh
+    /// pull's reset and apply, a pull, an image request) still finishes and
+    /// publishes as [`Self::maintain`] processes its completion.
+    pub(crate) fn begin_drain(&mut self) {
+        self.draining = true;
+        self.abandon_queued_images();
+        let not_started = Err(WRITE_NOT_STARTED.to_string());
+        for write in std::mem::take(&mut self.writes) {
+            write.waiters.answer(&not_started);
+        }
+    }
+
     /// Shutdown: answer every not-yet-started image request with an error
     /// instead of running it. A running one still finishes.
-    pub(crate) fn abandon_queued_images(&mut self) {
+    fn abandon_queued_images(&mut self) {
         for job in std::mem::take(&mut self.image_queue) {
             (job.reply)(Err(
                 "figmog serve is shutting down; retry figmog_images".into()
@@ -1412,6 +1447,7 @@ fn open_session_inner(
         writes: VecDeque::new(),
         writing: None,
         fresh: None,
+        draining: false,
     })
 }
 
