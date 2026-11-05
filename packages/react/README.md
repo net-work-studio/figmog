@@ -43,6 +43,18 @@ The tests start a tiny `node:http` server over `test/fixtures/` (a synthetic
 card page plus a "wrong padding" variant) and drive real Chromium captures at
 1440 px and 390 px.
 
+`test/tokens.test.ts` checks `figmog tokens export` (NWS-2967) in a real
+browser: it compiles the Rust golden file `tests/fixtures/tokens/export.css`
+(repository root; kept current by `cargo test --test tokens`, so no cargo
+build is needed here) together with `@import "tailwindcss"` using Tailwind's
+own `compile` API, loads the result in Chromium and asserts the computed
+colours, padding and radius of `bg-brand`, `p-card`, `rounded-md`, ... in
+light mode, under `data-theme="dark"` on the root, and in a dark subtree.
+`tailwindcss` (pinned `4.3.4`, a dev dependency) is the compiler itself and
+has no dependencies of its own; `@tailwindcss/cli`/`@tailwindcss/node` would
+add native `lightningcss` binaries and a file-watcher stack this test does
+not need.
+
 ## Usage
 
 ```sh

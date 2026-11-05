@@ -279,6 +279,13 @@ file is rejected and the last good snapshot kept. `figmog vars --snapshot`
 and `figmog status` report the snapshot's state and provenance. See
 `docs/SPEC.md` §9.
 
+`figmog tokens export [--out tokens.css]` turns the imported snapshot into
+one CSS file: custom properties for the default modes, one collection's
+light/dark modes as `:root` and `[data-theme="dark"]`, and a Tailwind v4
+`@theme` (`@theme inline` for aliases), so `bg-brand` or `p-card` follow the
+theme. Names come from each variable's WEB code syntax, else its kebab-cased
+path; a name collision is an error. See `docs/SPEC.md` §9 "Token export".
+
 ### The tools
 
 `figmog serve` exposes 21 `figmog_*` tools: 17 reads of the local mirror,

@@ -812,7 +812,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "figmog_vars",
-            description: "Variables: the authoritative record (with code_syntax, hidden_from_publishing, remote) if imported via figmog import-variables or an Enterprise pull, else inferred from bindings — reads the local mirror (no Figma API cost).",
+            description: "Variables: the authoritative record (with default_mode, scopes, code_syntax, hidden_from_publishing, remote) if imported via figmog import-variables or an Enterprise pull, else inferred from bindings — reads the local mirror (no Figma API cost).",
             input_schema: json!({
                 "type": "object",
                 "properties": {

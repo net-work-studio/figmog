@@ -806,7 +806,19 @@ pub fn vars<R: Readable>(
                     "remote": code.map(|c| c.remote),
                     "name": var.name,
                     "resolved_type": var.resolved_type,
-                    "collection": collection.map(|c| c.name),
+                    "collection": collection.as_ref().map(|c| c.name.clone()),
+                    // The collection's default mode, by name (mode id when
+                    // the collection doesn't name it), and the variable's
+                    // Figma scopes — what `figmog tokens export` needs to
+                    // pick each value and unit (NWS-2967).
+                    "default_mode": collection.as_ref().map(|c| {
+                        c.modes
+                            .iter()
+                            .find(|(mid, _)| *mid == c.default_mode_id)
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_else(|| c.default_mode_id.clone())
+                    }),
+                    "scopes": var.scopes,
                     "values_by_mode": Value::Object(values_by_mode),
                     "sites": sites,
                     "observed": observed,

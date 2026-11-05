@@ -1177,14 +1177,106 @@ first successful pull (with `ready: false`), and socket-routed plain
 or imported) over inference whenever one exists for a given variable id.
 Authoritative rows also carry `code_syntax` (platform → name object),
 `hidden_from_publishing` and `remote` from the snapshot row — null for a
-legacy snapshot. Without `--snapshot`/`snapshot: true` the result stays
-the plain row array; with it, `{snapshot, variables}`.
+legacy snapshot — plus the variable's `scopes` and its collection's
+`default_mode` (by name, the mode id when unnamed; NWS-2967). Without
+`--snapshot`/`snapshot: true` the result stays the plain row array; with
+it, `{snapshot, variables}`.
+
+### Token export (NWS-2967)
+
+`figmog tokens export [--out <path>] [--collection <name>] [--light-mode
+<mode>] [--dark-mode <mode>]` renders the variable snapshot as one CSS
+file (`src/tokens.rs`, pure; the CLI half is `src/cli/tokens.rs`).
+
+**How it reads.** It is not a new read tool: the CLI maps it to the
+existing `figmog_vars {snapshot: true}` read (`ReadCommand::Vars`), so it
+is socket-routed to a running serve/background owner or opens the store
+directly exactly like `figmog vars --snapshot` (§10 "Socket-first
+routing"), and renders that JSON locally. A serving binary older than the
+`default_mode` field is reported as an error asking to restart it.
+
+**Snapshot.** Only state `current` exports; `none`, `legacy` (no
+provenance) and `empty` are exit-1 errors. Only authoritative rows are
+exported — an inferred-only variable (bound in the file, absent from the
+snapshot) is skipped and reported.
+
+**Output.** Deterministic, every block sorted by property name:
+
+1. a header comment with the snapshot's `source`, `format`,
+   `format_version`, `exported_at` and `digest` (null when absent) and the
+   theme choice;
+2. `:root { … }` — every exported variable's value in its collection's
+   default mode, except the theme collection, which uses its light mode;
+3. `[data-theme="dark"] { … }` — the theme collection's variables in the
+   dark mode (absent without a theme collection). Every theme-collection
+   variable, aliases included, is redeclared there, so `data-theme` works
+   on the root or on any subtree;
+4. `@theme { … }` and `@theme inline { … }` — the Tailwind v4 theme
+   (below). Empty blocks are omitted.
+
+**Theme collection and modes.** `--collection` names it; otherwise it is
+the one collection with a mode whose name contains "dark"
+(ASCII-case-insensitive) — none ⇒ no dark block (an error if
+`--light-mode`/`--dark-mode` was given), several ⇒ an error asking for
+`--collection`. The dark mode is `--dark-mode`, else the collection's one
+mode named like "dark"; the light mode is `--light-mode`, else its one mode
+named like "light", else its default mode. Unknown names, several
+matches and light = dark are errors. Other mode kinds and combining
+collections are out of scope.
+
+**Names.** `codeSyntax.WEB` (`--x` or `var(--x)`) when `x` is nonempty
+ASCII letters, digits, `-` and `_`; an invalid WEB value is reported and
+falls back to the name path: the variable name lower-cased, every run of
+non-alphanumerics (including the `/` group separators) one `-`, prefixed
+`--` (`Color/Brand Primary` → `--color-brand-primary`; no collection
+prefix). A name with no ASCII alphanumerics is skipped and reported. Two
+variables with one name are an error naming both (`token name collision:
+`a/b` (VariableID:…) and `a b` (VariableID:…) both export as `--a-b` …`).
+
+**Values.** COLOR → `#rrggbb`, or `#rrggbbaa` below full alpha (each
+channel `round(clamp(x, 0, 1) × 255)`). FLOAT → `<n>px` when its `scopes`
+include `GAP` or `WIDTH_HEIGHT` (spacing/size) or `CORNER_RADIUS`
+(radius); any other FLOAT is emitted unitless and reported. Numbers print
+in shortest round-trip form (`16`, `0.5`). An alias → `var(--target)`;
+CSS resolves chains. STRING, BOOLEAN and other types are skipped and
+reported, as is a variable missing a needed mode's value or aliasing a
+variable that isn't exported (transitively).
+
+**Tailwind namespaces.** COLOR → `--color-*`, spacing/size → `--spacing-*`,
+radius → `--radius-*`; unitless FLOATs get no theme entry. A name already
+in its namespace (`--color-brand`) is kept; otherwise the namespace is
+prefixed (`--surface` → `--color-surface`). Entries:
+
+- theme name ≠ token name ⇒ `@theme inline { --color-surface:
+  var(--surface) }`, so the utility reads the token where it is used;
+- theme name = token name and the value is the same alias in every
+  emitted mode ⇒ `@theme inline { --color-action-primary:
+  var(--color-brand) }` (the utility uses the alias target directly);
+- otherwise ⇒ `@theme { --color-brand: <root value> }`: the utility reads
+  `var(--color-brand)`, which the unlayered `:root`/`[data-theme]` blocks
+  override per mode.
+
+A theme name that collides with another theme name or another token's
+name is an error naming both variables.
+
+**Output and report.** Without `--out` the CSS goes to stdout and, when
+anything was reported, one `{"report": [...]}` JSON line to stderr. With
+`--out` the file is written and stdout gets `{out, tokens, theme,
+report}` JSON. Report entries are `{variable_id, name, reason}`, sorted.
+
+**Fixtures.** `tests/fixtures/tokens/variables.json` (synthetic: a
+Light/Dark `Theme` collection and an alias chain `action/primary → brand →
+ocean/500`) exports to the golden `tests/fixtures/tokens/export.css`
+(`tests/tokens.rs`; `FIGMOG_BLESS=1` regenerates it).
+`packages/react/test/tokens.test.ts` compiles that golden file with
+Tailwind v4 and asserts computed values in Chromium in both modes.
 
 ## 10. CLI surface
 
 JSON is the CLI's only output mode (there is no `--json` flag — there's
 nothing to select between). Every command prints pretty-printed JSON on
-stdout via one seam (`cli::write_json`); every failure prints
+stdout via one seam (`cli::write_json`) — the one exception is `tokens
+export` without `--out`, whose stdout is the CSS file itself (§9); every failure prints
 `{"error": "..."}` on stderr and exits 1 (a raw internal panic exits 101
 instead, still as one JSON stderr line — see `open_store_checked`'s doc
 comment in `src/cli/mod.rs`). A reader that vanishes mid-write (piped
@@ -1204,8 +1296,9 @@ mapping of the 17 read-only query commands onto `dispatch::ReadCommand`),
 (`tools`, `call`, `import-variables` — the desktop-proxy CLI parity
 surface, so every tool `figmog serve` would expose is reachable without
 an MCP client), `src/cli/images.rs` (`images`, §15),
-`src/cli/socket.rs` (the client half of the control plane, §6a), and
-`src/cli/migrate.rs` (`migrate`, §16).
+`src/cli/socket.rs` (the client half of the control plane, §6a),
+`src/cli/migrate.rs` (`migrate`, §16), and `src/cli/tokens.rs` (`tokens
+export`, §9 — mapped onto the `figmog_vars` read, then rendered as CSS).
 `src/cli/auth.rs` handles credential commands and hidden terminal input;
 `src/auth.rs` owns credential resolution and native storage.
 
