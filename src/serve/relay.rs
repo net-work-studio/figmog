@@ -402,15 +402,24 @@ impl Relay {
             return Ok(());
         }
         // `figmog_spec` names tokens as this project's token file does
-        // (NWS-2948): its `[tokens]` settings, unless the agent passed some.
+        // (NWS-2948): its `[tokens]` settings, unless the agent passed some;
+        // and shows the Tailwind class hint when `[stack] styling` is
+        // `tailwind` (NWS-2947), unless the agent said `tailwind`.
         if name == "figmog_spec" {
             let params = &mut frame["params"];
             if !params["arguments"].is_object() {
                 params["arguments"] = json!({});
             }
+            let settings = self.layout.settings();
             if params["arguments"].get("tokens").is_none_or(Value::is_null) {
-                params["arguments"]["tokens"] =
-                    self.layout.settings().tokens.export_options().to_json();
+                params["arguments"]["tokens"] = settings.tokens.export_options().to_json();
+            }
+            if params["arguments"]
+                .get("tailwind")
+                .is_none_or(Value::is_null)
+            {
+                params["arguments"]["tailwind"] =
+                    json!(settings.stack.styling == crate::project::Styling::Tailwind);
             }
         }
         let args = &frame["params"]["arguments"];

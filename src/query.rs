@@ -454,14 +454,18 @@ pub fn subtree<R: Readable>(
 /// [`subtree`] answer and the [`vars`] `{snapshot, variables}` answer,
 /// rendered by [`crate::spec::build`] with the project's token `tokens`
 /// options (NWS-2948).
+#[allow(clippy::too_many_arguments)]
 pub fn spec<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
+    components: &TableReader<'_, R, String, ComponentRec>,
+    component_sets: &TableReader<'_, R, String, ComponentSetRec>,
     variables: &TableReader<'_, R, String, VariableRec>,
     variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
     id: String,
     tokens: &crate::tokens::ExportOptions,
+    tailwind: bool,
 ) -> Result<Value, String> {
     let tree = subtree(
         nodes,
@@ -474,7 +478,33 @@ pub fn spec<R: Readable>(
         false,
     )?;
     let vars = vars(nodes, variables, variable_collections, snapshot, None, true)?;
-    Ok(crate::spec::build(&tree, &vars, tokens))
+    // The component records the subtree's instances name (NWS-2947), so
+    // the spec stays a pure function of its inputs.
+    let mut records = serde_json::Map::new();
+    for cid in crate::spec::component_ids(&tree) {
+        let Some(c) = components.get(&cid) else {
+            continue;
+        };
+        let set = c.component_set_id.as_ref().map(|sid| {
+            let s = component_sets.get(sid);
+            json!({
+                "id": sid,
+                "name": s.as_ref().map(|s| s.name.clone()),
+                "key": s.as_ref().map(|s| s.key.clone()),
+            })
+        });
+        records.insert(
+            cid,
+            json!({"name": c.name, "key": c.key, "remote": c.remote, "component_set": set}),
+        );
+    }
+    Ok(crate::spec::build(
+        &tree,
+        &vars,
+        &Value::Object(records),
+        tokens,
+        tailwind,
+    ))
 }
 
 /// Nodes by type, optionally within one page and/or scoped to `under`'s

@@ -285,10 +285,20 @@ enum Cmd {
         #[arg(long)]
         y: f64,
     },
-    /// Binding-aware spec of an auto-layout subtree: layout and values,
-    /// each value as its bound token (with the `tokens export` CSS name)
-    /// or flagged untokenized; out-of-scope cases listed as unsupported.
-    Spec { id: String },
+    /// Code-ready spec of a subtree: per node the recorded design layout
+    /// and figmog's CSS interpretation, each value as its bound token
+    /// (with the `tokens export` CSS name) or flagged untokenized, text,
+    /// instances and assets; untranslatable cases listed as unsupported.
+    Spec {
+        id: String,
+        /// Add a Tailwind class hint per node (default in a project: on
+        /// when `[stack] styling` is `tailwind`; with --db: off).
+        #[arg(long, conflicts_with = "no_tailwind")]
+        tailwind: bool,
+        /// Leave the Tailwind class hint out.
+        #[arg(long)]
+        no_tailwind: bool,
+    },
     /// Download node renders and/or fill images to --out, caching by file version.
     ///
     /// With --db, export cached images only: stores do not record a file key.
@@ -533,7 +543,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 return write_json(&result?);
             }
         } else if let Some(read) = read_command(&cli.cmd) {
-            let (tool, tool_args) = with_project_tokens(read, Some(layout)).to_tool_call();
+            let (tool, tool_args) = with_project_settings(read, Some(layout)).to_tool_call();
             let tool_args = with_current_file(tool_args, layout)?;
             if let Some(route) = route_for(root, layout, &tool_args, true)
                 && let Some(result) = socket::try_call(&route, tool, tool_args.clone())
@@ -618,7 +628,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let Some(read) = read_command(&other) else {
                 unreachable!("every non-read command is handled above")
             };
-            let read = with_project_tokens(read, db.layout.as_ref());
+            let read = with_project_settings(read, db.layout.as_ref());
             // `open_store!`'s pipeline type contains fn items and can't be
             // named, so the store must be opened at this concrete call
             // site; the reader tuple itself is nameable (`RootReaders`), so
@@ -634,13 +644,27 @@ fn dispatch(cli: Cli) -> Result<(), String> {
 
 /// `figmog spec` names tokens exactly as the project's token file does:
 /// the project's `[tokens]` settings ride along as `figmog_spec`'s
-/// `tokens` argument (NWS-2948). With `--db` (no project): the defaults.
-fn with_project_tokens(read: ReadCommand, layout: Option<&Layout>) -> ReadCommand {
+/// `tokens` argument (NWS-2948), and its `[stack] styling` turns on the
+/// Tailwind class hint (NWS-2947) unless `--tailwind`/`--no-tailwind`
+/// said otherwise. With `--db` (no project): the defaults, no hint.
+fn with_project_settings(read: ReadCommand, layout: Option<&Layout>) -> ReadCommand {
     match read {
-        ReadCommand::Spec { id, tokens: None } => ReadCommand::Spec {
+        ReadCommand::Spec {
             id,
-            tokens: layout.map(|l| l.settings().tokens.export_options()),
-        },
+            tokens,
+            tailwind,
+        } => {
+            let settings = layout.map(Layout::settings);
+            ReadCommand::Spec {
+                id,
+                tokens: tokens.or_else(|| settings.as_ref().map(|s| s.tokens.export_options())),
+                tailwind: tailwind.or_else(|| {
+                    settings
+                        .as_ref()
+                        .map(|s| s.stack.styling == crate::project::Styling::Tailwind)
+                }),
+            }
+        }
         other => other,
     }
 }
@@ -880,9 +904,18 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
             under: under.clone(),
         },
         Cmd::At { x, y } => ReadCommand::At { x: *x, y: *y },
-        Cmd::Spec { id } => ReadCommand::Spec {
+        Cmd::Spec {
+            id,
+            tailwind,
+            no_tailwind,
+        } => ReadCommand::Spec {
             id: id.clone(),
             tokens: None,
+            tailwind: match (tailwind, no_tailwind) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
         },
         Cmd::Tokens { .. } => tokens::read(),
         Cmd::Version
@@ -1396,6 +1429,16 @@ mod tests {
                 json!({"x": 1.5, "y": 2.0}),
             ),
             (&["spec", "1:1"], "figmog_spec", json!({"id": "1:1"})),
+            (
+                &["spec", "1:1", "--tailwind"],
+                "figmog_spec",
+                json!({"id": "1:1", "tailwind": true}),
+            ),
+            (
+                &["spec", "1:1", "--no-tailwind"],
+                "figmog_spec",
+                json!({"id": "1:1", "tailwind": false}),
+            ),
         ];
         for (argv, tool, want) in cases {
             let cli =

@@ -55,6 +55,14 @@ independent Brand × Theme × Density collections), checking `bg-button-hover`
 (a semantic alias chain through Theme into Brand), `pt-card-gap` and
 `pl-space-inset` with the theme, brand and density modes nested either way
 or set on one element.
+`test/spec.test.ts` checks `figmog spec`'s CSS translation (NWS-2947) the
+same way: it renders the Rust golden file `tests/fixtures/spec/edge.spec.json`
+(the edge-case fixture: negative spacing, wrap, grid, min/max, constraints,
+clipping, text auto-resize and truncation, mixed runs, an instance) as nested
+elements — once with each node's `css` inline, once with its Tailwind class
+hint compiled against `tests/fixtures/spec/tokens.css` — and asserts at
+1440 px and 390 px that every node's box equals the design's recorded
+bounding box, and that bound tokens and text rules resolve.
 `tailwindcss` (pinned `4.3.4`, a dev dependency) is the compiler itself and
 has no dependencies of its own; `@tailwindcss/cli`/`@tailwindcss/node` would
 add native `lightningcss` binaries and a file-watcher stack this test does

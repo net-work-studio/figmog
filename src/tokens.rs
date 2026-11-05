@@ -237,6 +237,11 @@ pub struct Export {
     /// every emitted variable — what `figmog spec` (NWS-2968) shows as a
     /// bound token's `css`, so the two can't drift.
     pub names: BTreeMap<String, String>,
+    /// Variable id → its Tailwind theme name (`--color-*`, `--spacing-*`,
+    /// `--radius-*`) in the `tailwind` format; empty in `css`. What
+    /// `figmog spec`'s Tailwind hint (NWS-2947) turns into a utility
+    /// (`--color-brand` → `bg-brand`).
+    pub theme_names: BTreeMap<String, String>,
     /// Every property the file declares (token and Tailwind theme names)
     /// → its variable id, for `tokens diff`.
     pub ids: BTreeMap<String, String>,
@@ -617,6 +622,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         .iter()
         .map(|(id, t)| (t.name.clone(), id.clone()))
         .collect();
+    let mut theme_by_id: BTreeMap<String, String> = BTreeMap::new();
     let mut theme_plain: BTreeMap<String, String> = BTreeMap::new();
     let mut theme_inline: BTreeMap<String, String> = BTreeMap::new();
     if opts.format == Format::Tailwind {
@@ -643,6 +649,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
                 ));
             }
             theme_names.insert(theme_name.clone(), id);
+            theme_by_id.insert(id.clone(), theme_name.clone());
             ids.insert(theme_name.clone(), id.clone());
             let root = &t.vals[ROOT];
             let same_alias = root.target().is_some() && t.vals.values().all(|v| v == root);
@@ -833,6 +840,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             .map(|c| (c.name.clone(), c.root.clone()))
             .collect(),
         report: report.into_iter().collect(),
+        theme_names: theme_by_id,
         names: tokens
             .iter()
             .map(|(id, t)| (id.clone(), t.name.clone()))

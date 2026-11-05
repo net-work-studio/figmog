@@ -149,6 +149,20 @@ pub(crate) fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
     }
 }
 
+/// Optional boolean whose absence means something else than `false` —
+/// `figmog_spec`'s `tailwind` (absent: the project's default). Absent or
+/// `null` ⇒ `Ok(None)`; any other non-boolean is an error.
+pub(crate) fn arg_bool_opt(args: &Value, key: &str) -> Result<Option<bool>, String> {
+    match optional_arg(args, key) {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(other) => Err(format!(
+            "expected boolean for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
+}
+
 /// Optional numeric field — [`require_f64`]'s absent-is-`None` sibling,
 /// used by `figmog_images`'s optional `scale` (v0.0.2 spec §5). Absent or
 /// `null` ⇒ `Ok(None)`; any other non-number is an error (NWS-2944).
@@ -329,6 +343,10 @@ pub(crate) enum ReadCommand {
         /// `[tokens]` settings (NWS-2948), injected by the CLI and the
         /// stdio relay; `None` is the default mapping.
         tokens: Option<crate::tokens::ExportOptions>,
+        /// Add the per-node Tailwind class hint (NWS-2947). `None`: the
+        /// CLI and the stdio relay fill it from the project's `[stack]
+        /// styling`; left `None`, no hint.
+        tailwind: Option<bool>,
     },
 }
 
@@ -410,6 +428,7 @@ impl ReadCommand {
                     None | Some(Value::Null) => None,
                     Some(v) => Some(crate::tokens::ExportOptions::from_json(v)?),
                 },
+                tailwind: arg_bool_opt(args, "tailwind")?,
             },
             _ => return Ok(None),
         }))
@@ -522,11 +541,16 @@ impl ReadCommand {
                 args = json!({"x": x, "y": y});
                 "figmog_at"
             }
-            Self::Spec { id, tokens } => {
+            Self::Spec {
+                id,
+                tokens,
+                tailwind,
+            } => {
                 args = json!({"id": id});
                 if let Some(tokens) = tokens {
                     args["tokens"] = tokens.to_json();
                 }
+                put(&mut args, "tailwind", *tailwind);
                 "figmog_spec"
             }
         };
@@ -656,14 +680,21 @@ impl ReadCommand {
                 under,
             } => query::where_(nodes, children, &pointer, equals, page, under),
             Self::At { x, y } => query::at(nodes, x, y),
-            Self::Spec { id, tokens } => query::spec(
+            Self::Spec {
+                id,
+                tokens,
+                tailwind,
+            } => query::spec(
                 nodes,
                 children,
+                components,
+                component_sets,
                 variables,
                 variable_collections,
                 variable_snapshot,
                 id,
                 &tokens.unwrap_or_default(),
+                tailwind.unwrap_or(false),
             ),
         }
     }
@@ -927,7 +958,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "figmog_spec",
-            description: "Binding-aware spec of an auto-layout subtree: per node, layout (direction, gap, padding, alignment, hug/fill/fixed sizing) and values (fill, stroke, radius, typography), each shown as its bound variable token (name plus the CSS name `figmog tokens export` emits) with the raw value, or flagged untokenized (with any token of equal default/light value under `matches`). Grid/wrap layout, absolute children, constraints frames, mixed text runs, non-solid paints, effects and the like are listed under `unsupported`, never approximated — reads the local mirror (no Figma API cost).",
+            description: "Code-ready spec of a subtree. Per node, two layers: `design` (the layout Figma recorded: auto layout, grid, sizing, constraints, min/max, clipping, text auto-resize, verbatim) and figmog's interpretation — `layout`/`values` (gap, padding, alignment, hug/fill/fixed, grid tracks, fill, stroke, radius, effects, opacity, typography), each value shown as its bound variable token (name plus the CSS name `figmog tokens export` emits) with the raw value, or flagged untokenized (a token of equal value is only ever named under `matches`); `css` (the declarations: flex or CSS grid, constraints as absolute offsets, tokens as var()); `content` (text, mixed runs, image/vector assets by node id and imageRef); `instance` (component, variant properties; `code_component` is null until a mapping exists); and, with `tailwind`, a Tailwind class hint. Whatever has no exact CSS is listed under `unsupported`, never approximated — reads the local mirror (no Figma API cost).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -939,6 +970,10 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                             "format": {"type": "string", "enum": ["tailwind", "css"]},
                             "modes": {"type": "object", "additionalProperties": {"type": "string"}}
                         }
+                    },
+                    "tailwind": {
+                        "type": "boolean",
+                        "description": "Add a Tailwind class hint per node (theme utilities for bound tokens, arbitrary values otherwise). The figmog CLI and stdio relay turn it on when the project's [stack] styling is tailwind; omit for none."
                     }
                 },
                 "required": ["id"]
