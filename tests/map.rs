@@ -111,9 +111,10 @@ fn spec_emits_the_mapped_component_with_mapped_props() {
             "unknown_props": [],
         })
     );
-    // The price text was overridden by hand: no property carries it, so
-    // the mapping is partial and says why (the hidden badge is its
-    // property's doing).
+    // The price text was overridden and the icon swapped (to Badge) by
+    // hand: no property carries either, so the mapping is partial and says
+    // why (the hidden badge is its property's doing). The other card's
+    // icon is the main component's, so it is not listed there.
     assert_eq!(
         child(&spec, "1:3")["instance"]["code_component"],
         json!({
@@ -124,7 +125,10 @@ fn spec_emits_the_mapped_component_with_mapped_props() {
             "jsx": "<PricingCard badge={false} tier=\"free\" title=\"Free\" />",
             "coverage": "partial",
             "unmapped_properties": [],
-            "unmapped_overrides": [{"id": "I1:3;10:6", "name": "Price", "field": "characters"}],
+            "unmapped_overrides": [
+                {"id": "I1:3;10:11", "name": "Icon", "field": "componentId", "reason": "swap"},
+                {"id": "I1:3;10:6", "name": "Price", "field": "characters", "reason": "override"},
+            ],
             "unknown_props": [],
         })
     );
