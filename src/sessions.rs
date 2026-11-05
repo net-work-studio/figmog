@@ -595,26 +595,40 @@ pub(crate) fn open_session_with_hooks(
                             }));
                         }
                         phase(PullPhase::Applying);
-                        let prior_version =
-                            st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _, _))| {
-                                meta.get(&0).map(|meta| meta.version.clone())
-                            });
-                        let churn = store::sync(&mut st, &prior, &flattened, now_ms());
+                        let prior_meta =
+                            st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _, _))| meta.get(&0));
                         let version = flattened.file.version.clone();
-                        // Match direct pulls: unchanged versions avoid decoding
-                        // potentially large image blobs merely to evict none.
-                        if prior_version.as_deref() != Some(version.as_str()) {
-                            let mut stale =
-                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, pins, _))| {
-                                    let mut ids = store::stale_cache_ids(&cache, &version);
-                                    ids.extend(store::stale_image_ids(&images, &pins, &version));
-                                    ids
-                                });
-                            if !stale.is_empty() {
-                                stale.sort();
-                                store::evict_stale_cache(&mut st, &stale);
-                            }
-                        }
+                        let version_changed = prior_meta.as_ref().map(|meta| meta.version.as_str())
+                            != Some(version.as_str());
+                        // Publish file state and invalidate images atomically,
+                        // matching direct pulls even if the worker is interrupted.
+                        let churn = store::sync_with_cache_eviction(
+                            &mut st,
+                            &prior,
+                            &flattened,
+                            now_ms(),
+                            |tx, churn| {
+                                let snapshot_changed = prior_meta.as_ref().is_some_and(|meta| {
+                                    meta.last_modified != flattened.file.last_modified
+                                }) || churn.added > 0
+                                    || churn.changed > 0
+                                    || churn.removed > 0;
+                                if !version_changed && !snapshot_changed {
+                                    return Vec::new();
+                                }
+                                tx.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, pins, _))| {
+                                    if version_changed {
+                                        let mut ids = store::stale_cache_ids(&cache, &version);
+                                        ids.extend(store::stale_image_ids(
+                                            &images, &pins, &version,
+                                        ));
+                                        ids
+                                    } else {
+                                        store::all_image_ids(&images, &pins)
+                                    }
+                                })
+                            },
+                        );
                         store::upsert_mirror_config(&mut st, geometry);
                         phase(PullPhase::Publishing);
                         let view = make_view(st.rtx(|(snapshot, _)| snapshot.clone()));

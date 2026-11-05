@@ -153,10 +153,12 @@ proxied responses.
 `ImagePinRec` (§15): `generation: u32` and `file_version`, keyed by the
 same image key as the render row it marks. A render row is a hit only
 with a marker whose `generation` equals `images::RENDER_PIN_GENERATION`
-(currently 1, meaning "requested with `version=<file_version>`") and
-whose `file_version` equals the row's. It is a separate record kind
+(currently 2, meaning version-pinned requests with same-version snapshot
+invalidation) and whose `file_version` equals the row's. It is a separate record kind
 rather than a new `ImageBlobRec` field for the same reason as
-`MirrorConfig`. Fill rows carry no marker.
+`MirrorConfig`. Generation-1 pins are treated as misses because those
+builds could retain stale images across same-version edits. Fill rows
+carry no marker.
 
 `VariableSnapshotRec` (§9): `source` (`"file"` for `import-variables`,
 `"enterprise_rest"` for a pull's `variables/local` fetch), `format`
@@ -258,15 +260,16 @@ whole pipeline — `unchanged` increments, no index writes happen. A
 spurious watch trigger or a repeated `pull` therefore costs exactly one
 Tier-1 fetch and nothing else downstream.
 
-**Version-keyed cache eviction** is a separate pass, not folded into
-`sync`'s sweep (its churn accounting stays untouched by this feature):
-after a sync whose file *version* actually moved, every `proxy_cache` row
-(`store::stale_cache_ids`) and every `images` row
-(`store::stale_image_ids`, which also yields each row's `image_pins`
-marker) tagged with the old version is removed through
-the one `store::evict_stale_cache` function. This runs after every
-`pull`/`figmog_sync`/watch-tick pull that changes the version, and is
-bundled into `pull --fresh`'s whole-store wipe too.
+**Cache eviction** is selected separately from the file-record sweep and
+does not contribute to churn. Direct, explicit-sync and watch pulls use
+`store::sync_with_cache_eviction` to apply the file and evict cache rows
+in the same write transaction. If the version moved, `stale_cache_ids`
+and `stale_image_ids` select mismatched proxy/image rows and orphan pins.
+If the version stayed the same but metadata or records changed, all
+images and pins are invalidated. Identical snapshots skip both cache
+scans. Interruption rolls back the snapshot and eviction together, so a
+retry cannot mistake a partially updated mirror for an unchanged one.
+`pull --fresh` also removes caches through its whole-store wipe.
 
 **Tree validation:** the shared flattener rejects document roots that are
 not objects with a non-empty string `id` and `type: "DOCUMENT"`. Every
@@ -327,13 +330,16 @@ One `figmog serve` process owns every mirrored file's store via a
 [`SessionManager`](../src/sessions.rs). Each `FileSession` has one background
 worker owning its only writer and watch watermarks. Dispatch reads an owning
 fold snapshot, independently of the writer. A new snapshot is published only
-after the whole fetch → flatten → atomic sync → cache eviction → geometry
+after the whole fetch → flatten → atomic sync and cache eviction → geometry
 persistence cycle succeeds. During every stage, existing readers see the
 previous complete mirror, including for the file being pulled. Other files
 have independent workers. No on-disk records or sink names change.
-An unchanged stored version skips both stale proxy-cache and image-cache
-scans, avoiding decoding cached image blobs. Initial or version-changing
-pulls still scan both tables and evict mismatched rows before publication.
+An unchanged version, modification timestamp and record set skip both
+stale proxy-cache and image-cache scans, avoiding decoding cached image
+blobs. Initial or version-changing pulls scan both tables and evict
+mismatched rows before publication. When the version stays the same but
+the modification timestamp or stored records change, all image rows and
+pins are invalidated; Figma can reuse a version ID across live edits.
 
 **Asynchronous pulls (NWS-2919):** `figmog_open {file, geometry?}` and
 `figmog_sync {file?}` acknowledge accepted work immediately:
@@ -1017,15 +1023,17 @@ agent asks for one.
 /v1/images/:key?ids=…&format=…&scale=…&version=…`, which returns per-node
 URLs that are then downloaded. `version` is the mirror's current
 `FileMeta.version` (percent-encoded), read once before the request and
-reused as the cached row's `file_version`, so a render matches the
-mirrored design even after the file is edited upstream, and a pull that
-lands mid-request can't relabel it. A node deleted upstream but still in
-the mirror is requested from that version too. A rejected pinned request
+reused as the cached row's `file_version`, so a pull that lands mid-request
+can't relabel it. **This does not freeze live edits.** A live check against
+an owned test file found different node contents and modification times
+under the same returned version ID. A cache miss can therefore reflect
+later upstream edits, and a node deleted upstream may no longer render
+even while it remains in the mirror. A rejected pinned request
 fails without an unpinned retry; HTTP 400/404 errors identify the file and
 mirrored version and advise re-pulling. Saved exports must belong to the
-selected file and reference a version Figma can still render. Live
-edit/delete behavior has not been verified against an owned test file;
-the request contract follows Figma's [image endpoint documentation](https://developers.figma.com/docs/rest-api/file-endpoints/#get-image).
+selected file and reference a version Figma can still render. The
+request parameter follows Figma's [image endpoint documentation](https://developers.figma.com/docs/rest-api/file-endpoints/#get-image);
+an immutable historical-render guarantee remains unresolved (NWS-2997).
 Fills come from the `fills` of the requested nodes:
 every `imageRef` hash found there is resolved through `GET
 /v1/files/:key/images` (fetched at most once per invocation) and
@@ -1037,14 +1045,22 @@ requests.
 **Cache.** Bytes land in `images` as `Rec::ImageBlob` rows keyed by a
 hash of kind, subject, format and scale (§3). A hit requires the stored
 row's identity fields to match the request and its `file_version` to
-equal the mirror's current version, so a repeat request against an
-unedited file spends nothing. A render hit additionally requires its
-`image_pins` marker (§3), written in the same transaction as the row.
+equal the mirror's current version. Pulls that change metadata or records
+without changing the version invalidate all cached images and pins, so
+repeated requests against an unchanged mirror spend nothing. A render hit
+additionally requires its `image_pins` marker (§3), written in the same
+transaction as the row.
 Renders saved by builds that requested them without `version` have no
 marker — their bytes may show a newer design than their label — so they
-read as misses. With a file identity they are refetched and overwritten;
-an explicit offline store cannot refresh them. Fill rows need no
-marker: fills are addressed by content hash, and the fills endpoint
+read as misses. With a file identity and credentials they are refetched
+and overwritten, spending API budget again on that first request.
+Without either, they return a distinct upgrade error and retain the
+existing bytes. For a file-keyed mirror without credentials, the error
+explains how to restore the token, restart any running `figmog serve`,
+and retry the image request. When using `FIGMA_TOKEN`, the restarted
+server must receive the updated environment. An
+explicit offline store instead needs a file-keyed mirror to refresh them.
+Fill rows need no marker: fills are addressed by content hash, and the fills endpoint
 takes no version. Rows tagged with an older version, and their markers,
 are evicted by the same version-change pass that evicts `proxy_cache`
 (§5).
