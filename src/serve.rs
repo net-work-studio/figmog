@@ -14,6 +14,9 @@
 //! progress. Each file's worker owns its writer and metadata polling.
 //! Requests use its last published committed snapshot while the worker
 //! fetches, flattens, applies indexes and evicts caches.
+//! `figmog_images` and desktop proxy calls are answered later: their
+//! network work runs on the file's worker or the desktop worker, and the
+//! loop writes each response to its requester when it completes (NWS-2955).
 //!
 //! **Desktop context:** the upstream answers for the file active in Figma,
 //! independently of the mirrors. It supplies no authoritative file/revision
@@ -32,12 +35,12 @@
 //! re-probe: an unreachable upstream at startup means local-only tools
 //! for the life of the process.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,7 +49,7 @@ use serde_json::{Value, json};
 
 use crate::dispatch;
 use crate::ident::parse_file_ref;
-use crate::mcp::{self, FnHandler, ToolOutput};
+use crate::mcp::{self, FnHandler, PendingCall, Reply, ToolErrorMode, ToolOutput};
 use crate::proxy;
 use crate::sessions::{self, SessionManager};
 use crate::upstream::{HttpUpstream, UpstreamMcp};
@@ -567,7 +570,7 @@ fn serve_loop(
     let first_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
     serve_loop_with_output(
         manager,
-        upstream,
+        upstream.map(DesktopWorker::spawn),
         upstream_status,
         no_watch,
         track_current,
@@ -582,10 +585,214 @@ fn serve_loop(
     )
 }
 
+// ---- off-loop work (NWS-2955) ----
+//
+// Image requests run on their file's worker and desktop proxy calls on one
+// desktop worker thread. A handler that hands work off answers
+// `ToolOutput::Deferred(token)`; the loop parks the call's `PendingCall`
+// with where to answer it (stdio or a socket connection id) and writes the
+// response when the token's `Done` arrives on the completion channel, which
+// it drains every iteration exactly like session completions. JSON-RPC
+// matches responses by id, so a deferred response may overtake or trail
+// other responses on the same stream; the CLI's socket client sends one
+// request per connection, so it never sees reordering. Two connections may
+// reuse the same id: routing is by token, never by JSON-RPC id.
+
+/// A deferred tool call's result, sent to the main loop's completion
+/// channel.
+struct Done {
+    token: u64,
+    output: Result<ToolOutput, String>,
+    /// A successful likely-write desktop call (spec §8): expedite every
+    /// session's metadata poll on delivery.
+    expedite_polls: bool,
+}
+
+/// Answers one deferred call exactly once. Dropping it unsent — a worker
+/// that died mid-request, or queued work discarded at shutdown — still
+/// answers, with an error, so no caller waits for a response that never
+/// comes. A send after the loop exited is silently dropped.
+struct DeferredReply {
+    token: u64,
+    done: Option<mpsc::Sender<Done>>,
+}
+
+impl DeferredReply {
+    fn send(mut self, output: Result<ToolOutput, String>, expedite_polls: bool) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(Done {
+                token: self.token,
+                output,
+                expedite_polls,
+            });
+        }
+    }
+}
+
+impl Drop for DeferredReply {
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(Done {
+                token: self.token,
+                output: Err("request abandoned: its worker stopped before answering".into()),
+                expedite_polls: false,
+            });
+        }
+    }
+}
+
+/// Where a deferred call's response is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyTo {
+    Stdio,
+    Socket(u64),
+}
+
+/// The main loop's side of off-loop work: the completion channel, token
+/// allocation, and the desktop worker (if an upstream is attached).
+struct Offload {
+    done_tx: mpsc::Sender<Done>,
+    done_rx: mpsc::Receiver<Done>,
+    next_token: u64,
+    desktop: Option<DesktopWorker>,
+}
+
+impl Offload {
+    fn new(desktop: Option<DesktopWorker>) -> Self {
+        let (done_tx, done_rx) = mpsc::channel();
+        Self {
+            done_tx,
+            done_rx,
+            next_token: 0,
+            desktop,
+        }
+    }
+
+    /// A fresh token (never reused, so a stale result can't match a later
+    /// call) and the reply handle that answers it.
+    fn reply(&mut self) -> (u64, DeferredReply) {
+        let token = self.next_token;
+        self.next_token += 1;
+        (
+            token,
+            DeferredReply {
+                token,
+                done: Some(self.done_tx.clone()),
+            },
+        )
+    }
+}
+
+/// One job for the desktop worker. An enum so later work on the same
+/// upstream connection (e.g. a desktop re-probe) can join the same queue.
+enum DesktopJob {
+    /// Forward one `tools/call` verbatim and uncached (spec §8).
+    Call {
+        name: String,
+        args: Value,
+        reply: DeferredReply,
+    },
+}
+
+/// The thread that owns the desktop upstream connection. Jobs run one at a
+/// time, in arrival order, so the upstream session handshake state is
+/// never shared. Dropping it detaches the thread: a call already in flight
+/// finishes within the upstream's own timeout and its result is dropped;
+/// queued calls are discarded unanswered (the loop has exited).
+struct DesktopWorker {
+    jobs: mpsc::Sender<DesktopJob>,
+    stop: Arc<AtomicBool>,
+    tools: Vec<Value>,
+}
+
+impl DesktopWorker {
+    fn spawn<U: UpstreamMcp + Send + 'static>(mut upstream: U) -> Self {
+        let tools = upstream.tools().to_vec();
+        let (jobs, work) = mpsc::channel::<DesktopJob>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        std::thread::spawn(move || {
+            while let Ok(job) = work.recv() {
+                if stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                match job {
+                    DesktopJob::Call { name, args, reply } => {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            proxy::proxy_call(&mut upstream, &name, &args)
+                        }));
+                        match result {
+                            // A proxied result is already a complete MCP
+                            // `CallToolResult` from the upstream — emit it
+                            // verbatim (spec §11/§12; see
+                            // `mcp::ToolOutput::Raw`'s doc comment) rather
+                            // than re-wrapping it as figmog's own text-block
+                            // shape.
+                            Ok(Ok((value, write))) => reply.send(Ok(ToolOutput::Raw(value)), write),
+                            Ok(Err(error)) => reply.send(Err(error), false),
+                            Err(_) => reply.send(
+                                Err(format!(
+                                    "desktop proxy worker panicked during {name}; inspect server stderr"
+                                )),
+                                false,
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+        Self { jobs, stop, tools }
+    }
+
+    fn submit(&self, job: DesktopJob) {
+        // A dead worker hands the job back; dropping it answers the
+        // caller with an error.
+        let _ = self.jobs.send(job);
+    }
+}
+
+impl Drop for DesktopWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Apply a deferred result's loop-side effects and return its tool output.
+fn apply_done(
+    manager: &mut SessionManager,
+    no_watch: bool,
+    interval: Duration,
+    next_deadline: &mut Instant,
+    done: Done,
+) -> Result<ToolOutput, String> {
+    if done.expedite_polls && !no_watch {
+        manager.expedite_polls(interval);
+        *next_deadline = Instant::now();
+    }
+    done.output
+}
+
+/// Write one response to its requester. `false` means the stdio reader is
+/// gone, which shuts the server down cleanly.
+fn deliver(
+    to: ReplyTo,
+    response: &Value,
+    registry: &ConnRegistry,
+    write_stdio: &mut impl FnMut(&Value) -> bool,
+) -> bool {
+    match to {
+        ReplyTo::Stdio => write_stdio(response),
+        ReplyTo::Socket(conn_id) => {
+            write_socket_response(registry, conn_id, response);
+            true
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_loop_with_output(
     mut manager: SessionManager,
-    mut upstream: Option<HttpUpstream>,
+    desktop: Option<DesktopWorker>,
     upstream_status: &'static str,
     no_watch: bool,
     track_current: bool,
@@ -595,8 +802,8 @@ fn serve_loop_with_output(
     registry: ConnRegistry,
     mut write_stdio: impl FnMut(&Value) -> bool,
 ) -> Result<(), String> {
-    let (tools, dropped) = match &upstream {
-        Some(u) => proxy::merge_registry(dispatch::tool_registry(), u.tools()),
+    let (tools, dropped) = match &desktop {
+        Some(d) => proxy::merge_registry(dispatch::tool_registry(), &d.tools),
         None => (dispatch::tool_registry(), Vec::new()),
     };
     for name in &dropped {
@@ -604,6 +811,10 @@ fn serve_loop_with_output(
     }
 
     let mut watch = WatchScheduler::new(first_deadline);
+    let mut offload = Offload::new(desktop);
+    // Deferred calls awaiting their `Done`, by token. Ordered map: nothing
+    // here ever iterates a `HashMap` toward output.
+    let mut pending: BTreeMap<u64, (ReplyTo, PendingCall)> = BTreeMap::new();
 
     loop {
         // Completions and due watch work run even under continuous traffic.
@@ -616,6 +827,24 @@ fn serve_loop_with_output(
         }
         for key in published {
             refresh_current(&manager, track_current, &key);
+        }
+        // Deferred results go back to whoever asked. A token with no
+        // pending entry was never parked (its call failed before
+        // deferring), so its result has no requester.
+        while let Ok(done) = offload.done_rx.try_recv() {
+            let Some((to, call)) = pending.remove(&done.token) else {
+                continue;
+            };
+            let output = apply_done(
+                &mut manager,
+                no_watch,
+                interval_dur,
+                &mut watch.next_round,
+                done,
+            );
+            if !deliver(to, &call.finish(output), &registry, &mut write_stdio) {
+                return Ok(());
+            }
         }
         if !no_watch {
             watch.service_at(&mut manager, interval_dur, Instant::now());
@@ -633,49 +862,33 @@ fn serve_loop_with_output(
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         };
 
-        let line = match msg {
+        let (to, line, mode) = match msg {
             Incoming::StdinClosed => return Ok(()),
-            Incoming::Stdio(l) => l,
-            Incoming::Socket(conn_id, l) => {
-                let mut handler =
-                    FnHandler(|name: &str, args: &Value| -> Result<ToolOutput, String> {
-                        handle_tool_call(
-                            &mut manager,
-                            &mut upstream,
-                            upstream_status,
-                            no_watch,
-                            interval_dur,
-                            &mut watch.next_round,
-                            name,
-                            args,
-                        )
-                    });
-                if let Some(resp) = mcp::handle_socket_message(&l, &tools, &mut handler) {
-                    write_socket_response(&registry, conn_id, &resp);
-                }
-                continue;
-            }
+            Incoming::Stdio(l) => (ReplyTo::Stdio, l, ToolErrorMode::McpContent),
+            Incoming::Socket(conn_id, l) => (ReplyTo::Socket(conn_id), l, ToolErrorMode::JsonRpc),
         };
 
         let mut handler = FnHandler(|name: &str, args: &Value| -> Result<ToolOutput, String> {
             handle_tool_call(
                 &mut manager,
-                &mut upstream,
+                &mut offload,
                 upstream_status,
-                no_watch,
                 interval_dur,
-                &mut watch.next_round,
                 name,
                 args,
             )
         });
-
-        if let Some(response) = mcp::handle_message(&line, &tools, &mut handler)
-            && !write_stdio(&response)
-        {
+        match mcp::dispatch_message(&line, &tools, &mut handler, mode) {
+            None => {}
+            Some(Reply::Later(call)) => {
+                pending.insert(call.token(), (to, call));
+            }
             // A vanished stdio reader is a clean shutdown; accepted
             // running pulls drain through FileSession's drop handler.
-            return Ok(());
+            Some(Reply::Now(response)) if !deliver(to, &response, &registry, &mut write_stdio) => {
+                return Ok(());
+            }
+            Some(Reply::Now(_)) => {}
         }
     }
 }
@@ -907,14 +1120,15 @@ fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
 /// proxied — see this module's doc comment for the cache-routing choice.
 /// Open/sync and implicit first reads schedule workers; they never perform
 /// a pull on the request thread. Status and files report job completion.
-#[allow(clippy::too_many_arguments)]
-fn handle_tool_call<U: UpstreamMcp>(
+///
+/// Images and desktop calls answer [`ToolOutput::Deferred`]: their network
+/// work runs off the loop (on the file's worker and the desktop worker) and
+/// their result arrives later through `offload`'s completion channel.
+fn handle_tool_call(
     manager: &mut SessionManager,
-    upstream: &mut Option<U>,
+    offload: &mut Offload,
     upstream_status: &'static str,
-    no_watch: bool,
     interval: Duration,
-    next_deadline: &mut Instant,
     name: &str,
     args: &Value,
 ) -> Result<ToolOutput, String> {
@@ -972,14 +1186,24 @@ fn handle_tool_call<U: UpstreamMcp>(
         }
         if name == "figmog_images" {
             // Failed first mirrors share the data-read retry path above.
-            // Once ready, image fetching retains its own synchronous
-            // networking/cache contract, separate from pull scheduling.
+            // Once ready, the file's worker scans, fetches and caches;
+            // the response is delivered when it finishes.
             let ids = dispatch::require_str_array(args, "ids")?;
             let format = dispatch::arg_str(args, "format")?;
             let format = format.as_deref().unwrap_or("png");
             let scale = dispatch::arg_f64(args, "scale")?;
-            let items = session.images(&ids, format, scale)?;
-            return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
+            let (token, reply) = offload.reply();
+            session.images(
+                &ids,
+                format,
+                scale,
+                Box::new(move |result| {
+                    let output =
+                        result.map(|items| ToolOutput::Raw(crate::images::to_mcp_content(&items)));
+                    reply.send(output, false);
+                }),
+            )?;
+            return Ok(ToolOutput::Deferred(token));
         }
 
         let result = session.dispatch(name, &call_args).map_err(|msg| {
@@ -1010,20 +1234,21 @@ fn handle_tool_call<U: UpstreamMcp>(
     }
 
     // Desktop context is independent of every mirror. Never route its
-    // responses through a session's version-keyed cache.
-    let up = upstream
-        .as_mut()
-        .ok_or_else(|| format!("upstream not attached: {name}"))?;
-    let (value, trigger_poll) = proxy::proxy_call(up, name, args)?;
-    if trigger_poll && !no_watch {
-        manager.expedite_polls(interval);
-        *next_deadline = Instant::now();
+    // responses through a session's version-keyed cache. The desktop
+    // worker forwards it; a likely write's poll expedite is applied when
+    // the result is delivered (see `apply_done`).
+    if offload.desktop.is_none() {
+        return Err(format!("upstream not attached: {name}"));
     }
-    // A proxied result is already a complete MCP `CallToolResult` from the
-    // upstream — emit it verbatim (spec §11/§12; see `mcp::ToolOutput::Raw`'s
-    // doc comment) rather than re-wrapping it as figmog's own text-block
-    // shape.
-    Ok(ToolOutput::Raw(value))
+    let (token, reply) = offload.reply();
+    if let Some(desktop) = &offload.desktop {
+        desktop.submit(DesktopJob::Call {
+            name: name.to_string(),
+            args: args.clone(),
+            reply,
+        });
+    }
+    Ok(ToolOutput::Deferred(token))
 }
 
 #[cfg(test)]

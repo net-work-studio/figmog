@@ -18,6 +18,8 @@ struct Api {
     release: Arc<Mutex<mpsc::Receiver<()>>>,
     block_meta: AtomicBool,
     metadata_error: Mutex<Option<ApiError>>,
+    /// Gate every render request (a slow image cache miss).
+    block_images: AtomicBool,
 }
 
 impl FigmaApi for Api {
@@ -48,6 +50,63 @@ impl FigmaApi for Api {
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
         std::mem::replace(&mut *self.response.lock().unwrap(), Ok(fixture("2")))
+    }
+    fn images_render(
+        &self,
+        _: &str,
+        _: &[String],
+        _: &str,
+        _: Option<f64>,
+        _: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        if self.block_images.load(Ordering::Relaxed) {
+            self.entered.send("render").unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+        Ok(json!({"images": {}}))
+    }
+}
+
+/// Dispatch one stdio frame through `handle_tool_call` and, when the call
+/// is deferred, wait for its result and apply it exactly as the serve loop
+/// does.
+fn call_and_wait(
+    manager: &mut SessionManager,
+    offload: &mut Offload,
+    upstream_status: &'static str,
+    no_watch: bool,
+    interval: Duration,
+    tools: &[mcp::ToolDef],
+    message: &Value,
+) -> Value {
+    let mut handler = FnHandler(|name: &str, args: &Value| {
+        handle_tool_call(manager, offload, upstream_status, interval, name, args)
+    });
+    let reply = mcp::dispatch_message(
+        &message.to_string(),
+        tools,
+        &mut handler,
+        ToolErrorMode::McpContent,
+    )
+    .unwrap();
+    let call = match reply {
+        Reply::Now(response) => return response,
+        Reply::Later(call) => call,
+    };
+    let mut deadline = Instant::now();
+    loop {
+        let done = offload
+            .done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deferred call answers");
+        if done.token == call.token() {
+            let output = apply_done(manager, no_watch, interval, &mut deadline, done);
+            return call.finish(output);
+        }
     }
 }
 
@@ -101,6 +160,7 @@ impl Harness {
             release: gate,
             block_meta: AtomicBool::new(false),
             metadata_error: Mutex::new(None),
+            block_images: AtomicBool::new(false),
         });
         let session = sessions::open_session_with_hooks(
             dir.path().join("ABC1234567890/db"),
@@ -133,27 +193,17 @@ impl Harness {
         for session in &mut self.manager.sessions {
             session.maintain();
         }
-        let mut upstream: Option<HttpUpstream> = None;
-        let mut deadline = Instant::now();
-        let mut handler = FnHandler(|name: &str, args: &Value| {
-            handle_tool_call(
-                &mut self.manager,
-                &mut upstream,
-                "disabled",
-                true,
-                Duration::ZERO,
-                &mut deadline,
-                name,
-                args,
-            )
-        });
+        let mut offload = Offload::new(None);
         let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
-        mcp::handle_message(
-            &message.to_string(),
+        call_and_wait(
+            &mut self.manager,
+            &mut offload,
+            "disabled",
+            true,
+            Duration::ZERO,
             &dispatch::tool_registry(),
-            &mut handler,
+            &message,
         )
-        .unwrap()
     }
 
     fn value(&mut self, name: &str, args: Value) -> Value {
@@ -875,28 +925,17 @@ impl Harness {
         })]);
         desktop.push_result(Ok(json!({"content":[], "isError":false})));
         let (tools, _) = proxy::merge_registry(dispatch::tool_registry(), desktop.tools());
-        let mut upstream = Some(desktop);
-        let mut deadline = Instant::now() + Duration::from_secs(3600);
-        let mut handler = FnHandler(|name: &str, args: &Value| {
-            handle_tool_call(
-                &mut self.manager,
-                &mut upstream,
-                "connected",
-                no_watch,
-                Duration::from_secs(3600),
-                &mut deadline,
-                name,
-                args,
-            )
-        });
-        let response = mcp::handle_message(
-            &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
-            "params":{"name":"set_node_name", "arguments":{}}})
-            .to_string(),
+        let mut offload = Offload::new(Some(DesktopWorker::spawn(desktop)));
+        let response = call_and_wait(
+            &mut self.manager,
+            &mut offload,
+            "connected",
+            no_watch,
+            Duration::from_secs(3600),
             &tools,
-            &mut handler,
-        )
-        .unwrap();
+            &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"set_node_name", "arguments":{}}}),
+        );
         assert_eq!(response["result"]["isError"], false, "{response}");
     }
 
@@ -1176,6 +1215,7 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 4);
 }
 
+mod offload;
 mod watch_and_cache;
 
 #[test]

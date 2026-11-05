@@ -144,7 +144,7 @@ fn tools_list_over(stream: UnixStream) -> Result<Vec<Value>, String> {
 /// One newline-delimited JSON-RPC frame out, one line back — the wire
 /// mechanics every call in this module shares. `initialize` is
 /// deliberately skipped: spec §1 makes it optional for socket clients, and
-/// `mcp::handle_socket_message` treats every frame independently regardless of
+/// `mcp::dispatch_message` treats every frame independently regardless of
 /// handshake state (verified by `serve.rs`'s socket-loop tests), so a bare
 /// `tools/call`/`tools/list` is answered exactly as if a handshake had
 /// happened first.

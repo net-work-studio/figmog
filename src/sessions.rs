@@ -5,7 +5,7 @@
 //! finish. Workers also own watch watermarks, so a metadata observation
 //! cannot acknowledge a fetch that preceded it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -28,25 +28,35 @@ use crate::watch::{BACKOFF_START, Tick, Watcher};
 
 type SessionApi = Arc<dyn FigmaApi + Send + Sync>;
 
+/// Delivers one `figmog_images` result from the file's worker thread back
+/// to whoever asked (NWS-2955: `serve` turns it into a deferred response).
+/// Dropping it uncalled — a discarded queue on shutdown, or a worker that
+/// died mid-request — is the deliverer's to report.
+pub(crate) type ImageReply = Box<dyn FnOnce(Result<Vec<crate::images::ImageItem>, String>) + Send>;
+
+/// One accepted image request, waiting for (or running on) the worker.
+struct ImageJob {
+    ids: Vec<String>,
+    format: String,
+    scale: Option<f64>,
+    reply: ImageReply,
+}
+
 enum Command {
-    Pull {
-        geometry: bool,
-    },
-    Poll {
-        expedited: bool,
-    },
-    Images {
-        ids: Vec<String>,
-        format: String,
-        scale: Option<f64>,
-        reply: mpsc::SyncSender<Result<Vec<crate::images::ImageItem>, String>>,
-    },
+    Pull { geometry: bool },
+    Poll { expedited: bool },
+    Images(ImageJob),
 }
 
 enum Completion {
     Pull(Result<(PullOutcome, Arc<SessionView>), PullError>),
     Phase(PullPhase),
-    Poll { tick: Tick, expedited: bool },
+    Poll {
+        tick: Tick,
+        expedited: bool,
+    },
+    /// An image request finished (its reply already went to the caller).
+    Images,
 }
 
 #[derive(Debug)]
@@ -101,8 +111,8 @@ impl Job {
 }
 
 /// A session's control plane. No local read waits for the worker or locks
-/// its pipeline. Only image operations (outside the pull scheduling scope)
-/// synchronously await their worker reply.
+/// its pipeline, and nothing here awaits a worker reply: image requests run
+/// on the worker too and answer through their [`ImageReply`].
 pub(crate) struct FileSession {
     pub(crate) key: String,
     pub(crate) mirrored: bool,
@@ -112,6 +122,10 @@ pub(crate) struct FileSession {
     worker: Option<JoinHandle<()>>,
     busy: bool,
     polling: bool,
+    /// The worker is busy with an image request (not a pull or poll).
+    imaging: bool,
+    /// Image requests accepted while another one runs, in arrival order.
+    image_queue: VecDeque<ImageJob>,
     job: Option<Job>,
     queued: Option<Job>,
     last_completed: Option<Value>,
@@ -155,7 +169,9 @@ impl FileSession {
         let mut value = if self.mirrored {
             match self.dispatch("figmog_status", &json!({}))? {
                 ToolOutput::Json(value) => value,
-                ToolOutput::Raw(_) => unreachable!("local read tools return JSON"),
+                ToolOutput::Raw(_) | ToolOutput::Deferred(_) => {
+                    unreachable!("local read tools return JSON")
+                }
             }
         } else {
             json!({"name": null, "version": null, "last_modified": null,
@@ -276,6 +292,7 @@ impl FileSession {
             self.busy = false;
             match completion {
                 Completion::Phase(_) => unreachable!("handled above"),
+                Completion::Images => self.imaging = false,
                 Completion::Poll { tick, expedited } => {
                     self.polling = false;
                     match tick {
@@ -332,6 +349,17 @@ impl FileSession {
         self.start_if_ready_at(now);
         if self.expedited_poll {
             self.poll_at(self.interval, now);
+        }
+        if self.busy && !self.imaging {
+            // A pull or poll took the worker: queued image requests get the
+            // prompt busy answer a new one would, instead of waiting.
+            for job in std::mem::take(&mut self.image_queue) {
+                (job.reply)(Err(self.busy_message()));
+            }
+        } else if !self.busy
+            && let Some(job) = self.image_queue.pop_front()
+        {
+            self.start_images(job);
         }
         published
     }
@@ -398,39 +426,60 @@ impl FileSession {
         false
     }
 
+    fn busy_message(&self) -> String {
+        format!(
+            "mirror {} has a pull or metadata poll in progress; retry figmog_images after figmog_status reports it complete",
+            self.key
+        )
+    }
+
+    /// Accept one image request; `reply` receives its result later, from
+    /// the worker. Never waits on the worker: an idle worker starts it
+    /// now, an image request already running queues it behind (FIFO), and a
+    /// running pull or metadata poll refuses it with a prompt busy error
+    /// (spec §6), even for a cache hit. A pull or poll that becomes due
+    /// while images run takes the worker next and answers every still
+    /// queued image request with that same busy error. Cache writes stay
+    /// on the worker, the file's only writer.
     pub(crate) fn images(
         &mut self,
         ids: &[String],
         format: &str,
         scale: Option<f64>,
-    ) -> Result<Vec<crate::images::ImageItem>, String> {
+        reply: ImageReply,
+    ) -> Result<(), String> {
         if !self.mirrored {
             return Err(format!(
                 "mirror {} is not ready; inspect figmog_status",
                 self.key
             ));
         }
-        // Never wait behind a pull/poll, even for an image cache hit.
-        // Cache-miss networking keeps its existing synchronous contract
-        // when the worker is idle, independently of pull scheduling.
-        if self.busy {
-            return Err(format!(
-                "mirror {} has a pull or metadata poll in progress; retry figmog_images after figmog_status reports it complete",
-                self.key
-            ));
+        if self.busy && !self.imaging {
+            return Err(self.busy_message());
         }
-        let (reply, result) = mpsc::sync_channel(1);
+        let job = ImageJob {
+            ids: ids.to_vec(),
+            format: format.to_string(),
+            scale,
+            reply,
+        };
+        if self.busy {
+            self.image_queue.push_back(job);
+        } else {
+            self.start_images(job);
+        }
+        Ok(())
+    }
+
+    fn start_images(&mut self, job: ImageJob) {
+        // The bounded command slot is free whenever `busy` is false.
         self.commands
             .as_ref()
             .unwrap()
-            .send(Command::Images {
-                ids: ids.to_vec(),
-                format: format.to_string(),
-                scale,
-                reply,
-            })
-            .map_err(|e| e.to_string())?;
-        result.recv().map_err(|e| e.to_string())?
+            .send(Command::Images(job))
+            .unwrap();
+        self.busy = true;
+        self.imaging = true;
     }
 }
 
@@ -607,37 +656,49 @@ pub(crate) fn open_session_with_hooks(
                         break;
                     }
                 }
-                Command::Images {
+                Command::Images(ImageJob {
                     ids,
                     format,
                     scale,
                     reply,
-                } => {
-                    let node_ids = crate::images::normalize_ids(&ids);
-                    let scanned = st.rtx(
-                        |(_, ((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _))| {
-                            crate::images::scan(
-                                &nodes,
-                                &meta,
-                                &images,
-                                &pins,
-                                &node_ids,
-                                &format,
-                                crate::images::scale_milli(scale),
-                            )
-                        },
-                    );
-                    let items = crate::images::resolve(
-                        &mut st,
-                        scanned,
-                        api.as_deref().map(|a| a as &dyn FigmaApi),
-                        &crate::api::download_bytes,
-                        network_key.as_deref(),
-                        &node_ids,
-                        &format,
-                        scale,
-                    );
-                    let _ = reply.send(Ok(items));
+                }) => {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let node_ids = crate::images::normalize_ids(&ids);
+                        let scanned = st.rtx(
+                            |(_, ((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _))| {
+                                crate::images::scan(
+                                    &nodes,
+                                    &meta,
+                                    &images,
+                                    &pins,
+                                    &node_ids,
+                                    &format,
+                                    crate::images::scale_milli(scale),
+                                )
+                            },
+                        );
+                        crate::images::resolve(
+                            &mut st,
+                            scanned,
+                            api.as_deref().map(|a| a as &dyn FigmaApi),
+                            &crate::api::download_bytes,
+                            network_key.as_deref(),
+                            &node_ids,
+                            &format,
+                            scale,
+                        )
+                    }))
+                    .map_err(|_| {
+                        "image worker panicked; retry figmog_images and inspect server stderr"
+                            .to_string()
+                    });
+                    // Free the worker before answering, so a follow-up
+                    // request is never refused by a stale busy flag.
+                    let stop = done.send(Completion::Images).is_err();
+                    reply(result);
+                    if stop {
+                        break;
+                    }
                 }
             }
         }
@@ -651,6 +712,8 @@ pub(crate) fn open_session_with_hooks(
         worker: Some(worker),
         busy: false,
         polling: false,
+        imaging: false,
+        image_queue: VecDeque::new(),
         job: None,
         queued: None,
         last_completed: None,

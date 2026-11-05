@@ -83,7 +83,8 @@ These are per-request bounds, not a deadline for a whole pull
 or multi-image tool call; ureq's blocking DNS lookup cannot be interrupted
 by its HTTP deadline. Pull and metadata requests run on per-file workers
 in `serve`, so stalled peers do not delay local/control-plane dispatch.
-Image cache misses and desktop proxy calls retain their synchronous path.
+Image requests (NWS-2955) run on the same per-file workers and desktop
+proxy calls on a dedicated desktop worker, so neither delays dispatch.
 
 `webpki-roots` and `url`, already transitive ureq dependencies, are direct
 dependencies for this transport: the TLS wrapper uses the same Mozilla
@@ -396,11 +397,32 @@ one `mpsc` channel. The main loop handles due watch work and completions
 before each request, even under continuous traffic. It wakes at most 20ms
 later to consume worker completions, including under `--no-watch`.
 Stdout writes are manual (`writeln!` + flush), so a vanished stdio reader
-causes clean shutdown instead of a panic. Desktop proxy calls and image
-cache-miss networking retain their existing synchronous behavior; they are
-outside this pull-scheduling change. When a file's worker is occupied by a
-pull or metadata poll, `figmog_images` returns a prompt busy error (including
-for cache hits), rather than waiting behind that operation.
+causes clean shutdown instead of a panic.
+
+**Off-loop images and desktop calls (NWS-2955):** `figmog_images` and
+proxied desktop calls are answered later instead of on the loop, so a slow
+image download (up to the two-minute HTTP budget per request) or desktop
+call (10-second timeout) never delays other requests. `figmog_images` runs
+on its file's worker, which owns the cache writes; desktop calls run one at
+a time, in arrival order, on a single desktop worker that owns the upstream
+connection (results stay verbatim and uncached, §8). The loop parks each
+deferred call with its requester (stdio, or the socket connection id) and
+its JSON-RPC id, drains a completion channel every iteration (at most 20ms
+latency), and writes the response to that requester, framed exactly as an
+immediate one. Responses may therefore arrive out of request order on one
+stream, which JSON-RPC permits (match by id); the CLI's socket client sends
+one request per connection. Routing never uses the JSON-RPC id, so
+connections may reuse ids. A response for a connection that has closed is
+dropped. A worker that stops before answering still answers with an error.
+When a file's worker is occupied by a pull or metadata poll,
+`figmog_images` returns a prompt busy error (including for cache hits),
+rather than waiting behind that operation. While it is busy with another
+image request, a new one queues behind it (FIFO); if a pull or poll takes
+the worker first, queued image requests get the same busy error. A desktop
+write's expedited polls (§8) are recorded when its result is delivered. On
+shutdown, a running image request drains with the file's worker like a
+running pull; the desktop worker is detached, its in-flight call bounded by
+the upstream timeout and its queued calls discarded.
 
 **Watch/poll loop:** normal rounds visit one session every
 `max(--interval / session_count, 2s)`. Ordinary polls and retries share a
@@ -545,7 +567,8 @@ timeout, so a client that stops reading is disconnected and dropped from
 the registry rather than stalling the single-threaded loop; a vanished
 client is a silent no-op. The store stays single-threaded throughout:
 socket traffic interleaves with MCP frames and watch ticks like any other
-request.
+request. Image and desktop responses are written when their off-loop work
+finishes (§6), to the connection that asked.
 
 Socket `tools/call` registry and handler failures (including upstream
 protocol/transport failures) use a top-level JSON-RPC `error` with code
