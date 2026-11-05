@@ -398,10 +398,14 @@ Each instance of a mapped component then carries `code_component` in
 `figmog spec`: the import path, export, mapped props and a JSX rendering.
 The mapping is marked `partial`, with the reasons listed, whenever the
 instance has something the map can't express — a property without a
-prop, a hand-made text override, an instance swap, slot content.
-`figmog map check` validates the file; `figmog map coverage` lists Figma
-components with no entry, entries whose component is no longer in the
-mirror, and mapped code files that don't exist. See `docs/SPEC.md` §18.
+prop, a hand-made text override, a nested instance swapped by hand or to
+a component that isn't mapped (a swap to a mapped component renders as
+that component, e.g. `icon={<StarIcon />}`), slot content.
+`figmog map check` validates the file; `figmog map coverage` compares it
+with the project's default mirror (the same one `figmog components`
+reads) and lists Figma components with no entry, entries whose component
+isn't in that mirror, and mapped code files that don't exist. See
+`docs/SPEC.md` §18.
 
 ### The vertical slice example
 

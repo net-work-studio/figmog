@@ -494,10 +494,26 @@ pub fn spec<R: Readable>(
                 "key": s.as_ref().map(|s| s.key.clone()),
             })
         });
-        records.insert(
-            cid,
-            json!({"name": c.name, "key": c.key, "remote": c.remote, "component_set": set}),
-        );
+        let mut record =
+            json!({"name": c.name, "key": c.key, "remote": c.remote, "component_set": set});
+        // With a map (NWS-2949): the main component's nested instances,
+        // node id → component id, so a hand-swapped nested instance shows;
+        // null when the main component isn't in this mirror.
+        if map.is_some() {
+            record["main"] = match nodes.get(&cid) {
+                None => Value::Null,
+                Some(_) => scope_ids(children, &cid)
+                    .into_iter()
+                    .filter(|id| *id != cid)
+                    .filter_map(|id| {
+                        let n = nodes.get(&id)?;
+                        (n.node_type == "INSTANCE").then_some((id, json!(n.component_id?)))
+                    })
+                    .collect::<serde_json::Map<_, _>>()
+                    .into(),
+            };
+        }
+        records.insert(cid, record);
     }
     Ok(crate::spec::build(
         &tree,

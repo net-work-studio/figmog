@@ -2494,7 +2494,7 @@ gets `instance.code_component`:
   "jsx": "<PricingCard badge tier=\"pro\" title=\"Pro\" />",
   "coverage": "full" | "partial",
   "unmapped_properties": [{name, type, value, reason}],   // by name
-  "unmapped_overrides": [{id, name, field}],              // by id, field
+  "unmapped_overrides": [{id, name, field, reason}],      // by id, field
   "unknown_props": ["<map key>"]                          // sorted
 }
 ```
@@ -2510,17 +2510,41 @@ instance it can't express:
   value not listed in `values`; an instance swap to a component with no
   entry; a property bound to a variable (the map would pass a literal);
   an ambiguous suffix match.
-- `unmapped_overrides`: every `overrides[].overriddenFields` entry, on the
-  instance and on every nested instance, that a mapped property doesn't
-  explain — explained means the overridden node's
-  `componentPropertyReferences` names, for that field (`characters`,
-  `visible`, `mainComponent` for `componentId`), a property of this
-  instance that the map expressed. Text overrides, swaps and style
-  changes made by hand are therefore listed; so is every override on a
-  nested instance (figmog can't tell whether the main component or this
-  instance made it, so it errs towards partial), and slot content (a
-  `SLOT` descendant with children, field `slot`). The instance's own
-  `componentProperties` override is covered by the property check.
+- A **`component` entry** names one variant, so its identity already
+  expresses every VARIANT property (`Tier=Pro` needs no prop); a
+  `component_set` entry has to map them. Other properties need a prop
+  either way.
+- `unmapped_overrides` (`reason` says which kind):
+  - `override` — every `overrides[].overriddenFields` entry, on the
+    instance and on every nested instance, that a mapped property doesn't
+    explain. Explained means the overridden node's
+    `componentPropertyReferences` names, for that field (`characters`,
+    `visible`, `mainComponent` for `componentId`), a property of this
+    instance that the map expressed. Text overrides and style changes
+    made by hand are therefore listed; so is every override on a nested
+    instance (figmog can't tell whether the main component or this
+    instance made it, so it errs towards partial). The instance's own
+    `componentProperties` override is covered by the property check.
+  - `swap` (field `componentId`) — a nested instance whose component
+    differs from the one at the same place in the main component, unless
+    its `componentPropertyReferences.mainComponent` names a mapped
+    property of this instance. This doesn't rely on Figma listing the
+    swap in `overrides`. "The same place" uses Figma's id convention for
+    instance children: `I<instance>;<node>` copies main-component node
+    `<node>` (`I1:2;10:7` ↔ `10:7`; deeper, `I1:2;10:7;30:1` ↔
+    `I10:7;30:1`), checked against the main component's nested instances
+    in the mirror (`query::spec` passes them, node id → component id, as
+    the component record's `main`). Only nested instances that match are
+    descended into.
+  - `unverifiable_swap` (field `componentId`) — a nested instance that
+    can't be checked: the main component isn't in this mirror (a library
+    component; each outermost nested instance is listed), or it has no node at that place. Conservatively partial.
+  - `unverified_slot_shape` (field `slot`) — a `SLOT` descendant with
+    children. **Slot detection rests on an assumed REST shape** (slots
+    as `type: "SLOT"` nodes whose children are the content), not yet
+    verified against real Figma files; it also flags default slot
+    content. Kept conservative (partial) until verified with real Figma
+    access.
 - `unknown_props` (map keys naming no property of the instance — a stale
   entry) is a warning only and doesn't make the mapping partial.
 
@@ -2552,9 +2576,14 @@ and each standalone component without an entry. `not_in_mirror` lists
 entries whose key this mirror doesn't have (a removed component, or one
 from another file of the project). `unknown_props` checks the map's
 property names against the set's `componentPropertyDefinitions` (for a
-set or a variant entry); it is null for a standalone component, whose
-definitions `figmog_components` doesn't report. Both `map` commands read
-the project's map, so neither takes `--db`. Listing code components with
+set or a variant entry). It is null when there are no definitions to
+check against: for a standalone component (`figmog_components` doesn't
+report its definitions), and for a set whose node isn't in the mirror (a
+library component set used here: `figmog_components` reports its
+`property_definitions` as null). Both `map` commands read the project's
+map, so neither takes `--db`, and `coverage` reads the project's default
+mirror (figmog.toml's `[files] default`, else `.figmog/current`) — the
+same one `figmog components` reads; it takes no file argument. Listing code components with
 no Figma counterpart (scanning the code), `map suggest` and Code Connect
 import come later.
 

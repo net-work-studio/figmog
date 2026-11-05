@@ -35,11 +35,13 @@
 //!
 //! **Honest coverage.** [`code_component`] never claims an instance is
 //! covered while it carries something the map can't express: an instance
-//! property the map doesn't name (or whose value it doesn't list), a
-//! property bound to a variable, an override (text, swap, visibility,
-//! style — on the instance or on any nested instance) that no mapped
-//! property explains, or slot content. Each is listed and the mapping is
-//! `"partial"`.
+//! property the map doesn't name (or whose value it doesn't list; a
+//! `component` entry's identity expresses its variant properties), a
+//! property bound to a variable, an override (text, visibility, style —
+//! on the instance or on any nested instance) or a nested instance swap
+//! (checked against the main component) that no mapped property
+//! explains, a nested instance that can't be checked, or slot content.
+//! Each is listed and the mapping is `"partial"`.
 //!
 //! Determinism: every object is a `serde_json::Map` or a `BTreeMap`
 //! (sorted keys); every list is sorted.
@@ -462,9 +464,78 @@ fn is_bound(instance: &Value, name: &str, p: &Value) -> bool {
         )
 }
 
+/// `unmapped_overrides` reasons: an `overrides` entry no mapped property
+/// explains.
+const OVERRIDE: &str = "override";
+/// A nested instance whose component differs from the main component's
+/// at that place, and no mapped instance-swap property explains it.
+const SWAP: &str = "swap";
+/// A nested instance whose component can't be checked against the main
+/// component (not in the mirror, or no node at that place in it).
+const UNVERIFIABLE_SWAP: &str = "unverifiable_swap";
+/// A `SLOT` node with children: slot content, detected on an assumed REST
+/// shape not yet verified against real Figma files.
+const UNVERIFIED_SLOT: &str = "unverified_slot_shape";
+
+/// The id of the main component's node that the instance-child `id`
+/// stands for: Figma names a child of instance `I` after the main
+/// component's node it copies, `I<I>;<node>` (`I1:2;10:5` is node `10:5`;
+/// `I1:2;10:7;30:1` is node `I10:7;30:1`, a child of nested instance
+/// `10:7` in the main component).
+fn main_id(instance_id: &str, id: &str) -> Option<String> {
+    let rest = id
+        .strip_prefix('I')?
+        .strip_prefix(instance_id)?
+        .strip_prefix(';')?;
+    Some(if rest.contains(';') {
+        format!("I{rest}")
+    } else {
+        rest.to_string()
+    })
+}
+
+/// Check every nested instance under `n` (exclusive) against `main` (the
+/// main component's nested instances: node id → component id, or `null`
+/// when the main component isn't in the mirror): a different component is
+/// a `swap` unless `explained` (a mapped instance-swap property drives
+/// it); one that can't be checked is an `unverifiable_swap`. Only an
+/// instance that matches is descended into: a swapped one's children no
+/// longer follow the main component.
+fn swaps(
+    n: &Value,
+    own_id: &str,
+    main: &Value,
+    explained: &dyn Fn(&Value) -> bool,
+    out: &mut BTreeMap<(String, String), (Value, &'static str)>,
+) {
+    for child in n["children"].as_array().into_iter().flatten() {
+        if child["type"] != "INSTANCE" {
+            swaps(child, own_id, main, explained, out);
+            continue;
+        }
+        let id = child["id"].as_str().unwrap_or_default();
+        let expected = main_id(own_id, id).and_then(|m| main.get(&m)?.as_str());
+        let reason = match expected {
+            Some(c) if child["componentId"].as_str() == Some(c) => {
+                swaps(child, own_id, main, explained, out);
+                continue;
+            }
+            // Swapped by a mapped property: its content is the swapped-in
+            // component's, not the main component's.
+            _ if explained(child) => continue,
+            Some(_) => SWAP,
+            None => UNVERIFIABLE_SWAP,
+        };
+        out.entry((id.to_string(), "componentId".to_string()))
+            .or_insert((child["name"].clone(), reason));
+    }
+}
+
 /// The code component an INSTANCE maps to, or `null` when the map has no
 /// entry for its component (or its set). `component` is its component
-/// record (`{name, key, component_set: {key} | null}`), `records` every
+/// record (`{name, key, component_set: {key} | null, main}`, `main` the
+/// main component's nested instances, node id → component id, or `null`
+/// when the main component isn't in the mirror), `records` every
 /// component record by node id (for instance swaps).
 ///
 /// `{figma, path, export, props, jsx, coverage, unmapped_properties,
@@ -499,6 +570,12 @@ pub(crate) fn code_component(
         let unmapped = |reason: String| json!({"name": name, "type": p["type"], "value": p["value"], "reason": reason});
         let (key, pm) = match map_key(&entry.props, name, &names) {
             Ok(Some(found)) => found,
+            // A `component` entry names one variant: its identity already
+            // fixes every variant property.
+            Ok(None) if p["type"] == "VARIANT" && matches!(entry.figma, Target::Component(_)) => {
+                mapped.insert(name.as_str());
+                continue;
+            }
             Ok(None) => {
                 unmapped_properties.push(unmapped("no prop for it in the map".into()));
                 continue;
@@ -569,11 +646,17 @@ pub(crate) fn code_component(
         }
     }
 
-    // Overrides on the instance and on every nested instance, and slot
-    // content: explained only by a mapped property's reference.
+    // Overrides on the instance and on every nested instance, swapped
+    // nested instances and slot content: explained only by a mapped
+    // property's reference.
     let mut nodes = BTreeMap::new();
     index(instance, &mut nodes);
     let own_id = instance["id"].as_str().unwrap_or_default();
+    let explained_by = |node: &Value, field: &str| {
+        node["componentPropertyReferences"][reference_key(field)]
+            .as_str()
+            .is_some_and(|p| mapped.contains(p))
+    };
     let mut unmapped_overrides = BTreeMap::new();
     for (id, node) in &nodes {
         for o in node["overrides"].as_array().into_iter().flatten() {
@@ -584,26 +667,39 @@ pub(crate) fn code_component(
                 if *id == own_id && target == own_id && field == "componentProperties" {
                     continue;
                 }
-                let explained = nodes
-                    .get(target)
-                    .and_then(|t| t["componentPropertyReferences"][reference_key(field)].as_str())
-                    .is_some_and(|p| *id == own_id && mapped.contains(p));
+                let explained =
+                    *id == own_id && nodes.get(target).is_some_and(|t| explained_by(t, field));
                 if !explained {
                     let name = nodes.get(target).map_or(Value::Null, |t| t["name"].clone());
-                    unmapped_overrides.insert((target.to_string(), field.to_string()), name);
+                    unmapped_overrides
+                        .entry((target.to_string(), field.to_string()))
+                        .or_insert((name, OVERRIDE));
                 }
             }
         }
+    }
+    swaps(
+        instance,
+        own_id,
+        &component["main"],
+        &|n: &Value| explained_by(n, "mainComponent"),
+        &mut unmapped_overrides,
+    );
+    for (id, node) in &nodes {
         if *id != own_id
             && node["type"] == "SLOT"
             && node["children"].as_array().is_some_and(|c| !c.is_empty())
         {
-            unmapped_overrides.insert((id.to_string(), "slot".to_string()), node["name"].clone());
+            unmapped_overrides
+                .entry((id.to_string(), "slot".to_string()))
+                .or_insert((node["name"].clone(), UNVERIFIED_SLOT));
         }
     }
     let unmapped_overrides: Vec<Value> = unmapped_overrides
         .into_iter()
-        .map(|((id, field), name)| json!({"id": id, "name": name, "field": field}))
+        .map(|((id, field), (name, reason))| {
+            json!({"id": id, "name": name, "field": field, "reason": reason})
+        })
         .collect();
     let unknown_props: Vec<&String> = entry
         .props
@@ -645,7 +741,8 @@ fn code_file(project_root: &Path, path: &str) -> &'static str {
 /// - `mapped`: each entry whose target is in the mirror, with its code
 ///   file's state and `unknown_props` (map keys no property definition of
 ///   the target names; `null` when the mirror records no definitions to
-///   check against — a standalone component);
+///   check against — a standalone component, or a set whose node isn't
+///   in the mirror);
 /// - `unmapped`: each component set (unless it or every variant is
 ///   mapped) and standalone component with no entry;
 /// - `not_in_mirror`: entries whose target this mirror doesn't have (a
@@ -896,7 +993,8 @@ mod tests {
 
     fn records() -> Value {
         json!({
-            "10:1": {"name": "Tier=Pro", "key": "pro-key", "component_set": {"key": "set-key"}},
+            "10:1": {"name": "Tier=Pro", "key": "pro-key", "component_set": {"key": "set-key"},
+                     "main": {"3:1": "30:1", "I3:1;6:1": "31:1", "7:1": "20:1"}},
             "20:1": {"name": "Star", "key": "star-key", "component_set": null},
             "20:2": {"name": "Heart", "key": "heart-key", "component_set": null},
         })
@@ -980,8 +1078,8 @@ mod tests {
         assert_eq!(
             out["unmapped_overrides"],
             json!([
-                {"id": "I1:5;2:2", "name": "Price", "field": "characters"},
-                {"id": "I1:5;2:2", "name": "Price", "field": "fills"},
+                {"id": "I1:5;2:2", "name": "Price", "field": "characters", "reason": "override"},
+                {"id": "I1:5;2:2", "name": "Price", "field": "fills", "reason": "override"},
             ])
         );
         assert_eq!(out["unknown_props"], json!(["Badge", "Title"]));
@@ -1007,9 +1105,13 @@ mod tests {
             json!([]),
         );
         n["children"].as_array_mut().unwrap().extend([
-            json!({"id": "I1:5;3:1", "name": "Button", "type": "INSTANCE",
-                   "overrides": [{"id": "I1:5;3:1;4:1", "overriddenFields": ["characters"]}],
-                   "children": [{"id": "I1:5;3:1;4:1", "name": "Label", "type": "TEXT"}]}),
+            json!({"id": "I1:5;3:1", "name": "Button", "type": "INSTANCE", "componentId": "30:1",
+            "overrides": [{"id": "I1:5;3:1;4:1", "overriddenFields": ["characters"]}],
+            "children": [
+                {"id": "I1:5;3:1;4:1", "name": "Label", "type": "TEXT"},
+                // As in the main component (`I3:1;6:1`): not listed.
+                {"id": "I1:5;3:1;6:1", "name": "Glyph", "type": "INSTANCE", "componentId": "31:1"},
+            ]}),
             json!({"id": "I1:5;5:1", "name": "Body", "type": "SLOT",
                    "children": [{"id": "9:9", "name": "Extra", "type": "FRAME"}]}),
         ]);
@@ -1019,10 +1121,93 @@ mod tests {
         assert_eq!(
             out["unmapped_overrides"],
             json!([
-                {"id": "I1:5;3:1;4:1", "name": "Label", "field": "characters"},
-                {"id": "I1:5;5:1", "name": "Body", "field": "slot"},
+                {"id": "I1:5;3:1;4:1", "name": "Label", "field": "characters", "reason": "override"},
+                {"id": "I1:5;5:1", "name": "Body", "field": "slot", "reason": "unverified_slot_shape"},
             ])
         );
+    }
+
+    /// Nested instances are checked against the main component: a hand
+    /// swap is listed even when `overrides` doesn't name it, one driven by
+    /// a mapped instance-swap property is not, and without the main
+    /// component in the mirror nothing can be verified.
+    #[test]
+    fn nested_instances_are_checked_against_the_main_component() {
+        let mut m = pricing();
+        m["components"][0]["props"]["Icon"] = json!({"prop": "icon"});
+        m["components"].as_array_mut().unwrap().push(json!({
+            "figma": {"component": "star-key"},
+            "code": {"path": "src/Star.tsx", "export": "StarIcon"}
+        }));
+        let map = parse(m).unwrap();
+        let card = |icon: &str, refs: Value| {
+            let mut n = instance(
+                json!({"Tier": {"type": "VARIANT", "value": "Pro"},
+                       "Icon#1:2": {"type": "INSTANCE_SWAP", "value": "20:1"}}),
+                json!([]),
+            );
+            n["children"].as_array_mut().unwrap().push(json!({
+                "id": "I1:5;7:1", "name": "Icon", "type": "INSTANCE",
+                "componentId": icon, "componentPropertyReferences": refs,
+            }));
+            n
+        };
+        let recs = records();
+        let run = |n: &Value, rec: &Value| code_component(Some(&map), n, rec, &recs);
+        // As in the main component.
+        let out = run(&card("20:1", json!({})), &recs["10:1"]);
+        assert_eq!(out["coverage"], "full", "{out}");
+        // Swapped by hand.
+        let out = run(&card("20:2", json!({})), &recs["10:1"]);
+        assert_eq!(
+            out["unmapped_overrides"],
+            json!([{"id": "I1:5;7:1", "name": "Icon", "field": "componentId", "reason": "swap"}])
+        );
+        // Swapped by the mapped `Icon` property.
+        let out = run(
+            &card("20:2", json!({"mainComponent": "Icon#1:2"})),
+            &recs["10:1"],
+        );
+        assert_eq!(out["coverage"], "full", "{out}");
+        // The main component isn't in the mirror (a library component).
+        let mut library = recs["10:1"].clone();
+        library["main"] = Value::Null;
+        let out = run(&card("20:1", json!({})), &library);
+        assert_eq!(
+            out["unmapped_overrides"],
+            json!([{"id": "I1:5;7:1", "name": "Icon", "field": "componentId", "reason": "unverifiable_swap"}])
+        );
+        assert_eq!(out["coverage"], "partial");
+    }
+
+    /// A `component` entry names one variant: its variant properties are
+    /// expressed by identity, the other properties still need props.
+    #[test]
+    fn a_variant_entry_expresses_its_variant_properties() {
+        let map = parse(json!({"version": 1, "components": [{
+            "figma": {"component": "pro-key"},
+            "code": {"path": "src/ProCard.tsx", "export": "ProCard"},
+            "props": {"Title": {"prop": "title"}}
+        }]}))
+        .unwrap();
+        let recs = records();
+        let n = instance(
+            json!({"Tier": {"type": "VARIANT", "value": "Pro"},
+                   "Title#1:0": {"type": "TEXT", "value": "Pro"}}),
+            json!([]),
+        );
+        let out = code_component(Some(&map), &n, &recs["10:1"], &recs);
+        assert_eq!(out["coverage"], "full", "{out}");
+        assert_eq!(out["jsx"], "<ProCard title=\"Pro\" />");
+        // A set entry still has to map the variant.
+        let set = parse(json!({"version": 1, "components": [{
+            "figma": {"component_set": "set-key"},
+            "code": {"path": "src/Card.tsx", "export": "Card"},
+            "props": {"Title": {"prop": "title"}}
+        }]}))
+        .unwrap();
+        let out = code_component(Some(&set), &n, &recs["10:1"], &recs);
+        assert_eq!(out["unmapped_properties"][0]["name"], "Tier");
     }
 
     #[test]
