@@ -127,6 +127,21 @@
       "hiddenFromPublishing": false,
       "remote": false
     },
+    "VariableID:1:8": {
+      "id": "VariableID:1:8",
+      "name": "dimension/base",
+      "resolvedType": "FLOAT",
+      "variableCollectionId": "VariableCollectionId:1:0",
+      "valuesByMode": {
+        "1:0": 16
+      },
+      "description": "",
+      "scopes": [
+        "ALL_SCOPES"
+      ],
+      "hiddenFromPublishing": false,
+      "remote": false
+    },
     "VariableID:2:1": {
       "id": "VariableID:2:1",
       "name": "brand",
@@ -240,6 +255,45 @@
       "codeSyntax": {
         "WEB": "var(--color-action-primary)"
       }
+    },
+    "VariableID:3:2": {
+      "id": "VariableID:3:2",
+      "name": "spacing/inset",
+      "resolvedType": "FLOAT",
+      "variableCollectionId": "VariableCollectionId:3:0",
+      "valuesByMode": {
+        "3:0": {
+          "type": "VARIABLE_ALIAS",
+          "id": "VariableID:1:8"
+        }
+      },
+      "description": "",
+      "scopes": [
+        "GAP"
+      ],
+      "hiddenFromPublishing": false,
+      "remote": false,
+      "codeSyntax": {
+        "WEB": "--spacing-inset"
+      }
+    },
+    "VariableID:3:3": {
+      "id": "VariableID:3:3",
+      "name": "action/hover",
+      "resolvedType": "COLOR",
+      "variableCollectionId": "VariableCollectionId:3:0",
+      "valuesByMode": {
+        "3:0": {
+          "type": "VARIABLE_ALIAS",
+          "id": "VariableID:3:1"
+        }
+      },
+      "description": "",
+      "scopes": [
+        "ALL_FILLS"
+      ],
+      "hiddenFromPublishing": false,
+      "remote": false
     }
   },
   "variableCollections": {

@@ -3,7 +3,7 @@
 // packages/react, `npm ci` here, and the pinned Chromium
 // (PLAYWRIGHT_BROWSERS_PATH). Offline: no Figma access, no mirror root.
 import assert, { AssertionError } from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -13,6 +13,7 @@ import {
   captureCard,
   CARDS,
   EVIDENCE_DIR,
+  evidenceLink,
   FIGMA_FILE,
   mirror,
   REPO,
@@ -144,6 +145,32 @@ describe("evidence record", () => {
       assert.match(evidence.builds[name].tree.sha256, /^[0-9a-f]{64}$/);
     }
     assert.notEqual(evidence.builds.before.tree.sha256, evidence.builds.after.tree.sha256);
+  });
+
+  test("COMMENT.md image links resolve from its own directory", async () => {
+    const comment = await readFile(join(EVIDENCE_DIR, "COMMENT.md"), "utf8");
+    const links = [...comment.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)].map((m) => m[1]);
+    assert.equal(links.length, 12);
+    for (const link of links) {
+      assert.ok(!link.startsWith("/") && !link.startsWith("examples/"), link);
+      await access(join(EVIDENCE_DIR, link));
+    }
+    assert.ok(links.includes("correct/1440/composite.png"), links.join(", "));
+  });
+
+  test("with a link base, image links are absolute raw URLs", () => {
+    const image = join(EVIDENCE_DIR, "correct", "390", "figma.png");
+    assert.equal(evidenceLink(image), "correct/390/figma.png");
+    assert.equal(
+      evidenceLink(image, "https://github.com/o/r/blob/abc123/"),
+      "https://github.com/o/r/blob/abc123/examples/slice/evidence/correct/390/figma.png?raw=true",
+    );
+  });
+
+  test("the npm evidence script runs the slice", async () => {
+    const pkg = JSON.parse(await readFile(join(APP, "package.json"), "utf8"));
+    assert.equal(pkg.scripts.evidence, "node scripts/slice.mjs run");
+    await access(join(APP, "scripts", "slice.mjs"));
   });
 
   test("the broken card scores lower than the correct card at both viewports", () => {

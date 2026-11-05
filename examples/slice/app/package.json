@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "vite build",
-    "evidence": "node scripts/evidence.mjs",
+    "evidence": "node scripts/slice.mjs run",
     "test": "node --test --test-concurrency=1 \"test/**/*.test.mjs\""
   },
   "dependencies": {

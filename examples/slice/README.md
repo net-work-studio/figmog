@@ -109,8 +109,13 @@ which `tokens export` skips, so `Inter, sans-serif` is written directly.
   render (see `packages/react/README.md`); never a pass/fail gate.
 - Captured URLs are recorded as `http://127.0.0.1:<port>/`: the port is
   random per run and left out so records are stable.
-- `evidence/COMMENT.md` is the ready-to-post PR comment; it references the
-  images by repository-relative path.
+- `evidence/COMMENT.md` is the ready-to-post PR comment. By default its
+  image links are relative to `evidence/` itself (`correct/1440/composite.png`),
+  so they render when the file is viewed in the repository. To post it
+  elsewhere (a PR comment), regenerate with absolute links:
+  `node scripts/slice.mjs run --link-base https://github.com/<owner>/<repo>/blob/<sha>`
+  (or `npm run evidence -- --link-base <url>`) in `app/`, which links each
+  image as `<url>/<repository path>?raw=true`. Commit only the default form.
 
 ## Tests
 

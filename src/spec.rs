@@ -535,13 +535,15 @@ impl Cx<'_> {
                 self.unsupported(id, format!("{key}[{i}]: {ty} paint not specified"));
                 continue;
             };
+            // The node-level binding is a fallback only when the paint has
+            // none of its own: a mixed paint binding stays an error.
             let binding = match alias_id(paint.get("boundVariables").and_then(|b| b.get("color"))) {
-                Ok(Some(b)) => Ok(Some(b)),
-                _ => alias_id(
+                Ok(None) => alias_id(
                     n.get("boundVariables")
                         .and_then(|b| b.get(key))
                         .and_then(|b| b.get(i)),
                 ),
+                other => other,
             };
             let Ok(binding) = binding else {
                 self.unsupported(id, format!("{key}[{i}]: mixed variable bindings"));
@@ -757,6 +759,35 @@ mod tests {
         assert_eq!(alias_id(Some(&json!([a, a]))), Ok(Some("V:1".into())));
         assert_eq!(alias_id(Some(&json!([a, b]))), Err(()));
         assert_eq!(alias_id(None), Ok(None));
+    }
+
+    #[test]
+    fn a_mixed_paint_binding_is_unsupported_not_untokenized() {
+        // The paint's own binding is mixed; the node-level fallback must not
+        // paper over it (it would read as `Ok(None)` → untokenized).
+        let tree = json!({"id": "1:1", "name": "Box", "type": "RECTANGLE",
+            "fills": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0, "a": 1},
+                "boundVariables": {"color": [
+                    {"type": "VARIABLE_ALIAS", "id": "V:1"},
+                    {"type": "VARIABLE_ALIAS", "id": "V:2"}]}}],
+            "children": []});
+        let vars = json!({"snapshot": {"state": "none"}, "variables": []});
+        let spec = build(&tree, &vars);
+        assert!(spec["node"]["values"].get("fill").is_none(), "{spec}");
+        assert_eq!(
+            spec["unsupported"],
+            json!([{"id": "1:1", "reason": "fills[0]: mixed variable bindings"}])
+        );
+        // A paint without its own binding still falls back to the node's.
+        let mut tree = tree;
+        tree["fills"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("boundVariables");
+        tree["boundVariables"] = json!({"fills": [{"type": "VARIABLE_ALIAS", "id": "V:3"}]});
+        let spec = build(&tree, &vars);
+        assert_eq!(spec["node"]["values"]["fill"][0]["variable_id"], "V:3");
+        assert_eq!(spec["unsupported"], json!([]));
     }
 
     #[test]

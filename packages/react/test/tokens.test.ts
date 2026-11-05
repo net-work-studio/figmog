@@ -18,7 +18,7 @@ const GOLDEN = join(REPO, "tests", "fixtures", "tokens", "export.css");
 const require = createRequire(import.meta.url);
 
 /** The utilities the page uses; Tailwind only generates what it is asked for. */
-const CANDIDATES = ["bg-brand", "bg-action-primary", "bg-surface", "bg-overlay", "p-card", "rounded-md"];
+const CANDIDATES = ["bg-brand", "bg-action-primary", "bg-action-hover", "bg-surface", "bg-overlay", "p-card", "p-inset", "rounded-md"];
 
 /** Compile `@import "tailwindcss"` plus the exported tokens with Tailwind's own compiler. */
 async function compileTokens(tokens: string): Promise<string> {
@@ -37,7 +37,12 @@ const BODY = `
 <div id="action" class="bg-action-primary">action</div>
 <div id="surface" class="bg-surface">surface</div>
 <div id="overlay" class="bg-overlay">overlay</div>
-<section data-theme="dark"><div id="nested" class="bg-action-primary p-card">nested dark</div></section>
+<div id="inset" class="p-inset">inset</div>
+<section data-theme="dark">
+  <div id="nested" class="bg-action-primary p-card">nested dark</div>
+  <div id="nested-raw" style="background-color: var(--color-action-primary)">raw var</div>
+  <div id="nested-hover" class="bg-action-hover">fallback-named, two-level alias</div>
+</section>
 `;
 
 interface Styles {
@@ -46,6 +51,12 @@ interface Styles {
   surface: string;
   overlay: string;
   nested: { background: string; padding: string };
+  /** `var(--color-action-primary)` read directly in the dark subtree. */
+  nestedRaw: string;
+  /** `bg-action-hover`: `--action-hover → --color-action-primary → --color-brand`. */
+  nestedHover: string;
+  /** `p-inset`: a GAP alias of the unitless `--dimension-base: 16`. */
+  inset: string;
 }
 
 async function styles(page: Page): Promise<Styles> {
@@ -63,6 +74,9 @@ async function styles(page: Page): Promise<Styles> {
       surface: style("surface").backgroundColor,
       overlay: style("overlay").backgroundColor,
       nested: { background: nested.backgroundColor, padding: nested.paddingTop },
+      nestedRaw: style("nested-raw").backgroundColor,
+      nestedHover: style("nested-hover").backgroundColor,
+      inset: style("inset").paddingTop,
     };
   });
 }
@@ -99,8 +113,13 @@ describe("tokens export through Tailwind v4", () => {
       action: "rgb(0, 102, 204)",
       surface: "rgb(250, 250, 252)",
       overlay: "rgba(0, 0, 0, 0.5)",
-      // A dark subtree follows the dark mode even under a light root.
+      // A dark subtree follows the dark mode even under a light root —
+      // also through aliases declared outside the theme collection.
       nested: { background: "rgb(102, 179, 255)", padding: "24px" },
+      nestedRaw: "rgb(102, 179, 255)",
+      nestedHover: "rgb(102, 179, 255)",
+      // A px alias of a unitless FLOAT keeps its unit.
+      inset: "16px",
     });
   });
 
@@ -113,6 +132,9 @@ describe("tokens export through Tailwind v4", () => {
         surface: "rgb(26, 26, 31)",
         overlay: "rgba(255, 255, 255, 0.25)",
         nested: { background: "rgb(102, 179, 255)", padding: "24px" },
+        nestedRaw: "rgb(102, 179, 255)",
+        nestedHover: "rgb(102, 179, 255)",
+        inset: "16px",
       });
     } finally {
       await page.evaluate(() => document.documentElement.removeAttribute("data-theme"));

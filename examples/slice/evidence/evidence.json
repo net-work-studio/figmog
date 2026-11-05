@@ -2,29 +2,29 @@
   "builds": {
     "after": {
       "card": "examples/slice/app/src/Card.jsx",
-      "commit": "9cd08e1c2f728964938a3f749047601c62eacba7",
-      "dirty": false,
+      "commit": "95bf6bad701772638ac96ccd420ce8b831b565b6",
+      "dirty": true,
       "tree": {
         "files": 8,
-        "sha256": "5b2938741586c2b3109f0bb9f14bbf18189ccaa3174c4833908cb26710094afa"
+        "sha256": "78595d5aa820902a186a113cf7fbc34b7ff917eae4a24f7ae05b02396be5bdd5"
       }
     },
     "before": {
       "card": "examples/slice/app/baseline/Card.jsx",
-      "commit": "9cd08e1c2f728964938a3f749047601c62eacba7",
-      "dirty": false,
+      "commit": "95bf6bad701772638ac96ccd420ce8b831b565b6",
+      "dirty": true,
       "tree": {
         "files": 8,
-        "sha256": "0f8ff6ef968a4904c4d5314e2441e62ef9c682ae18d2f9cefbde44a1d7a3dcc6"
+        "sha256": "f61789bb6dcba66c74430cf069b7a5e61b2e47ab7478ec6ed0587bdf8767364c"
       }
     },
     "broken": {
       "card": "examples/slice/app/variants/Card.wrong-padding.jsx",
-      "commit": "9cd08e1c2f728964938a3f749047601c62eacba7",
-      "dirty": false,
+      "commit": "95bf6bad701772638ac96ccd420ce8b831b565b6",
+      "dirty": true,
       "tree": {
         "files": 8,
-        "sha256": "7f5bfb4bf52f300e970032cfc56f75220e308982be14774932fc2a4cf43a777f"
+        "sha256": "c81174f45258da41b5730052f32adc41d7e678b26da6bcd7cbbc0f266ed31a25"
       }
     }
   },

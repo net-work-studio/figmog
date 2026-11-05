@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // The vertical slice (NWS-2965), end to end, offline:
 //
-//   node scripts/slice.mjs          synthetic Figma file -> token CSS -> spec ->
+//   node scripts/slice.mjs [run] [--link-base <url>]
+//                                   synthetic Figma file -> token CSS -> spec ->
 //                                   before/after/broken builds -> evidence
+//                                   (--link-base: absolute COMMENT.md image links,
+//                                   e.g. https://github.com/<owner>/<repo>/blob/<sha>)
 //   node scripts/slice.mjs standin  re-render the committed Figma stand-in PNGs
 //
 // Run through ../run.sh, which builds figmog and packages/react first.
@@ -16,9 +19,11 @@ import {
   CARD_NODE,
   CARDS,
   EVIDENCE_DIR,
+  evidenceLink,
   FIGMA_FILE,
   gitIdentity,
   mirror,
+  REPO,
   repoPath,
   SELECTOR,
   serve,
@@ -89,8 +94,9 @@ function formatScore(n) {
   return n.toFixed(2);
 }
 
-function comment(evidence) {
+function comment(evidence, linkBase) {
   const lines = [];
+  const link = (image) => evidenceLink(join(REPO, image.path), linkBase);
   const { builds, figma, runs, tokens } = evidence;
   lines.push("## Vertical slice evidence (NWS-2965)", "");
   lines.push(
@@ -109,16 +115,17 @@ function comment(evidence) {
   lines.push("", "Score: advisory, `100 * (1 - mismatched / (W*H))` against the Figma render; never a pass/fail gate.", "");
   for (const width of ["1440", "390"]) {
     lines.push(`### ${width} px: Figma | before | after | difference`, "");
-    lines.push(`![composite ${width}](${runs.correct[width].images.composite.path})`, "");
+    const images = runs.correct[width].images;
+    lines.push(`![composite ${width}](${link(images.composite)})`, "");
     lines.push(
-      `Figma: ![figma](${runs.correct[width].images.figma.path}) before: ![before](${runs.correct[width].images.before.path}) ` +
-        `after: ![after](${runs.correct[width].images.after.path}) difference: ![diff](${runs.correct[width].images.diffAfter.path})`,
+      `Figma: ![figma](${link(images.figma)}) before: ![before](${link(images.before)}) ` +
+        `after: ![after](${link(images.after)}) difference: ![diff](${link(images.diffAfter)})`,
       "",
     );
   }
   lines.push("### Broken card (wrong padding), for contrast", "");
   for (const width of ["1440", "390"]) {
-    lines.push(`${width} px: ![broken composite ${width}](${runs.broken[width].images.composite.path})`, "");
+    lines.push(`${width} px: ![broken composite ${width}](${link(runs.broken[width].images.composite)})`, "");
   }
   lines.push("### Identity", "");
   lines.push(`- Figma file: \`${figma.file.path}\` "${figma.file.name}", version **${figma.file.version}** (mirrored with \`figmog pull --from-file\`)`);
@@ -141,7 +148,7 @@ function comment(evidence) {
 }
 
 /** The default command: the whole slice, writing the token CSS, spec and evidence/. */
-async function run() {
+async function run(linkBase) {
   const { compareToDir, stableJson } = await shot();
   const identity = gitIdentity();
 
@@ -246,7 +253,7 @@ async function run() {
       version: 1,
     };
     await writeFile(join(EVIDENCE_DIR, "evidence.json"), stableJson(evidence));
-    await writeFile(join(EVIDENCE_DIR, "COMMENT.md"), comment(evidence));
+    await writeFile(join(EVIDENCE_DIR, "COMMENT.md"), comment(evidence, linkBase));
     process.stdout.write(
       `${stableJson({
         broken: { 1440: runs.broken["1440"].score.after, 390: runs.broken["390"].score.after },
@@ -260,10 +267,26 @@ async function run() {
   }
 }
 
-const command = process.argv[2] ?? "run";
-const main = command === "standin" ? standin : command === "run" ? run : null;
+/** `[run|standin] [--link-base <url>]`; null on a usage error. */
+function parseArgs(argv) {
+  const args = [...argv];
+  let linkBase;
+  const at = args.indexOf("--link-base");
+  if (at !== -1) {
+    linkBase = args[at + 1];
+    if (!linkBase || linkBase.startsWith("-")) return null;
+    args.splice(at, 2);
+  }
+  const command = args[0] ?? "run";
+  if (args.length > 1) return null;
+  if (command === "run") return () => run(linkBase);
+  if (command === "standin" && linkBase === undefined) return standin;
+  return null;
+}
+
+const main = parseArgs(process.argv.slice(2));
 if (main === null) {
-  process.stderr.write("usage: node scripts/slice.mjs [run|standin]\n");
+  process.stderr.write("usage: node scripts/slice.mjs [run [--link-base <url>] | standin]\n");
   process.exit(2);
 }
 main().catch((error) => {

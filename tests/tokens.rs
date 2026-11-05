@@ -2,7 +2,8 @@
 
 //! `figmog tokens export` (NWS-2967) end to end: a synthetic variable
 //! snapshot (`fixtures/tokens/variables.json`: a Light/Dark theme
-//! collection, an alias chain `action/primary → brand → ocean/500`)
+//! collection, an alias chain `action/hover → action/primary → brand →
+//! ocean/500`, a GAP alias of a unitless FLOAT)
 //! imported into a fresh `--db` store and exported.
 //!
 //! `fixtures/tokens/export.css` is the golden output, also consumed by
@@ -53,7 +54,7 @@ fn fixture_exports_byte_identically_and_matches_the_golden_file() {
         .success();
     assert_eq!(std::fs::read(&out_path).unwrap(), first);
     let summary: serde_json::Value = serde_json::from_slice(&summary.get_output().stdout).unwrap();
-    assert_eq!(summary["tokens"], 11);
+    assert_eq!(summary["tokens"], 14);
     assert_eq!(
         summary["theme"],
         serde_json::json!({"collection": "Theme", "light_mode": "Light", "dark_mode": "Dark"})
@@ -64,7 +65,10 @@ fn fixture_exports_byte_identically_and_matches_the_golden_file() {
         .iter()
         .map(|r| r["variable_id"].as_str().unwrap())
         .collect();
-    assert_eq!(reported, ["VariableID:1:6", "VariableID:1:7"]);
+    assert_eq!(
+        reported,
+        ["VariableID:1:6", "VariableID:1:7", "VariableID:1:8"]
+    );
 
     let golden = fixtures().join("export.css");
     if std::env::var_os("FIGMOG_BLESS").is_some() {
@@ -150,5 +154,10 @@ fn explicit_modes_are_validated() {
         .assert()
         .success();
     let css = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    assert!(css.contains("[data-theme=\"dark\"] {\n  --color-brand: var(--ocean-500);"));
+    let dark = css.split("[data-theme=\"dark\"] {\n").nth(1).unwrap();
+    let dark = dark.split('}').next().unwrap();
+    assert!(
+        dark.contains("  --color-brand: var(--ocean-500);\n"),
+        "{css}"
+    );
 }

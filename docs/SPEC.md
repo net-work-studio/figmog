@@ -1226,7 +1226,12 @@ snapshot) is skipped and reported.
 3. `[data-theme="dark"] { … }` — the theme collection's variables in the
    dark mode (absent without a theme collection). Every theme-collection
    variable, aliases included, is redeclared there, so `data-theme` works
-   on the root or on any subtree;
+   on the root or on any subtree. A custom property's `var()` resolves
+   where the property is declared, so every variable outside the theme
+   collection that aliases a theme variable — directly or through a chain
+   — is also redeclared there, with its one value (otherwise
+   `var(--color-action-primary)` would keep its light value inside a dark
+   subtree);
 4. `@theme { … }` and `@theme inline { … }` — the Tailwind v4 theme
    (below). Empty blocks are omitted.
 
@@ -1254,7 +1259,12 @@ channel `round(clamp(x, 0, 1) × 255)`). FLOAT → `<n>px` when its `scopes`
 include `GAP` or `WIDTH_HEIGHT` (spacing/size) or `CORNER_RADIUS`
 (radius); any other FLOAT is emitted unitless and reported. Numbers print
 in shortest round-trip form (`16`, `0.5`). An alias → `var(--target)`;
-CSS resolves chains. STRING, BOOLEAN and other types are skipped and
+CSS resolves chains. Every emitted FLOAT carries its own unit, so a px
+FLOAT aliasing a unitless one → `calc(var(--target) * 1px)` (a bare
+`var()` would make `padding: 16` invalid, i.e. 0px), while a unitless
+FLOAT aliasing a px one is skipped and reported (CSS cannot strip a
+unit; emitting the resolved number would silently detach the alias), as
+is an alias between COLOR and FLOAT. STRING, BOOLEAN and other types are skipped and
 reported, as is a variable missing a needed mode's value or aliasing a
 variable that isn't exported (transitively).
 
@@ -1281,8 +1291,9 @@ anything was reported, one `{"report": [...]}` JSON line to stderr. With
 report}` JSON. Report entries are `{variable_id, name, reason}`, sorted.
 
 **Fixtures.** `tests/fixtures/tokens/variables.json` (synthetic: a
-Light/Dark `Theme` collection and an alias chain `action/primary → brand →
-ocean/500`) exports to the golden `tests/fixtures/tokens/export.css`
+Light/Dark `Theme` collection, an alias chain `action/hover →
+action/primary → brand → ocean/500` and a GAP alias of a unitless FLOAT)
+exports to the golden `tests/fixtures/tokens/export.css`
 (`tests/tokens.rs`; `FIGMOG_BLESS=1` regenerates it).
 `packages/react/test/tokens.test.ts` compiles that golden file with
 Tailwind v4 and asserts computed values in Chromium in both modes.

@@ -52,6 +52,18 @@ export function repoPath(path) {
   return relative(REPO, path).split("\\").join("/");
 }
 
+/**
+ * The link COMMENT.md uses for a repository file. With `linkBase` (e.g.
+ * `https://github.com/<owner>/<repo>/blob/<sha>`): `<linkBase>/<path>?raw=true`,
+ * which renders anywhere the comment is posted. Without: the path relative to
+ * COMMENT.md's own directory (`correct/1440/composite.png`), which renders
+ * when COMMENT.md is viewed in the repository.
+ */
+export function evidenceLink(path, linkBase) {
+  if (linkBase) return `${linkBase.replace(/\/+$/, "")}/${repoPath(path)}?raw=true`;
+  return relative(EVIDENCE_DIR, path).split("\\").join("/");
+}
+
 export function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }

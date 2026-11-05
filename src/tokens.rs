@@ -20,9 +20,16 @@
 //! - **Values.** COLOR → `#rrggbb`, or `#rrggbbaa` when alpha < 1 (each
 //!   channel `round(x * 255)`). FLOAT → `<n>px` when its scopes include a
 //!   spacing/size scope (`GAP`, `WIDTH_HEIGHT`) or `CORNER_RADIUS`, else a
-//!   unitless number (reported). An alias → `var(--target)`. STRING,
-//!   BOOLEAN and other types are skipped and reported, as is a variable
-//!   lacking a value for a mode it needs or aliasing a skipped variable.
+//!   unitless number (reported). An alias → `var(--target)`, except that
+//!   a px FLOAT aliasing a unitless one → `calc(var(--target) * 1px)`; a
+//!   unitless FLOAT aliasing a px one, or an alias across types, is
+//!   skipped and reported (CSS cannot strip a unit). STRING, BOOLEAN and
+//!   other types are skipped and reported, as is a variable lacking a
+//!   value for a mode it needs or aliasing a skipped variable.
+//! - **Dark subtrees.** `var()` in a custom property resolves where the
+//!   property is declared, so `[data-theme="dark"]` redeclares — with its
+//!   one value — every variable that aliases, directly or through a chain,
+//!   a variable the dark mode overrides.
 //! - **Tailwind namespaces.** COLOR → `--color-*`, spacing/size scopes →
 //!   `--spacing-*`, `CORNER_RADIUS` → `--radius-*`; a name already in its
 //!   namespace is kept, otherwise the namespace is prefixed
@@ -110,6 +117,19 @@ impl Kind {
 enum Val {
     Literal(String),
     Alias(String),
+    /// An alias from a px FLOAT to a unitless one, emitted as
+    /// `calc(var(--target) * 1px)` so the alias keeps its unit.
+    AliasPx(String),
+}
+
+impl Val {
+    /// The aliased variable id, if this is an alias.
+    fn target(&self) -> Option<&str> {
+        match self {
+            Val::Literal(_) => None,
+            Val::Alias(t) | Val::AliasPx(t) => Some(t),
+        }
+    }
 }
 
 /// Render `vars` (`{snapshot, variables}`, as `figmog vars --snapshot`
@@ -265,15 +285,49 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         }
         tokens.insert(v.id.clone(), Token { name, kind, vals });
     }
+    // Units across aliases. Every emitted FLOAT carries its own kind's
+    // unit (px for spacing/size/radius, none for the rest): a px alias to
+    // a unitless FLOAT scales it (`calc(var(--t) * 1px)`); a unitless alias
+    // to a px FLOAT can't drop the unit in CSS, so it is skipped, as is an
+    // alias across types. A target's kind is fixed, so this holds through
+    // any alias chain.
+    let kinds: BTreeMap<String, Kind> = tokens.iter().map(|(id, t)| (id.clone(), t.kind)).collect();
+    let mut mismatched = Vec::new();
+    for (id, t) in tokens.iter_mut() {
+        for val in &mut t.vals {
+            let Val::Alias(target) = val else { continue };
+            let Some(&to) = kinds.get(target.as_str()) else {
+                continue;
+            };
+            let px = |k: Kind| matches!(k, Kind::Spacing | Kind::Radius);
+            if (t.kind == Kind::Color) != (to == Kind::Color) {
+                mismatched.push((
+                    id.clone(),
+                    format!("aliases {target}, a variable of another type: skipped"),
+                ));
+                break;
+            } else if px(t.kind) && to == Kind::Number {
+                *val = Val::AliasPx(target.clone());
+            } else if t.kind == Kind::Number && px(to) {
+                mismatched.push((id.clone(), format!("unitless FLOAT aliases {target}, a px FLOAT: skipped (CSS cannot drop its unit)")));
+                break;
+            }
+        }
+    }
+    for (id, why) in mismatched {
+        tokens.remove(&id);
+        let name = all.get(&id).map(|v| v.name.as_str()).unwrap_or_default();
+        report.insert(entry(&id, name, &why));
+    }
     // Drop aliases to variables that aren't exported, until none remain
     // (an alias chain to a skipped variable drops as a whole).
     loop {
         let dangling: Vec<(String, String)> = tokens
             .iter()
             .filter_map(|(id, t)| {
-                t.vals.iter().find_map(|val| match val {
-                    Val::Alias(target) if !tokens.contains_key(target) => {
-                        Some((id.clone(), target.clone()))
+                t.vals.iter().find_map(|val| match val.target() {
+                    Some(target) if !tokens.contains_key(target) => {
+                        Some((id.clone(), target.to_string()))
                     }
                     _ => None,
                 })
@@ -313,6 +367,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
     let ref_of = |val: &Val| match val {
         Val::Literal(s) => s.clone(),
         Val::Alias(target) => format!("var({})", tokens[target].name),
+        Val::AliasPx(target) => format!("calc(var({}) * 1px)", tokens[target].name),
     };
     let mut theme_plain: BTreeMap<String, String> = BTreeMap::new();
     let mut theme_inline: BTreeMap<String, String> = BTreeMap::new();
@@ -340,7 +395,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         }
         theme_names.insert(theme_name.clone(), id);
         let same_alias = match t.vals.first() {
-            Some(first @ Val::Alias(_)) => t.vals.iter().all(|v| v == first),
+            Some(first) if first.target().is_some() => t.vals.iter().all(|v| v == first),
             _ => false,
         };
         if theme_name != t.name {
@@ -354,13 +409,39 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         }
     }
 
-    // Emit.
+    // Emit. A custom property's `var()` resolves where it is declared, so
+    // an alias declared only in `:root` keeps its light value inside a dark
+    // subtree. The dark block therefore also redeclares, unchanged, every
+    // variable that reaches a dark-overridden one through aliases.
     let mut root: BTreeMap<&str, String> = BTreeMap::new();
     let mut dark: BTreeMap<&str, String> = BTreeMap::new();
     for t in tokens.values() {
         root.insert(&t.name, ref_of(&t.vals[0]));
         if let Some(val) = t.vals.get(1) {
             dark.insert(&t.name, ref_of(val));
+        }
+    }
+    let mut themed: BTreeSet<&str> = tokens
+        .iter()
+        .filter(|(_, t)| t.vals.len() > 1)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    loop {
+        let more: Vec<&str> = tokens
+            .iter()
+            .filter(|(id, t)| {
+                !themed.contains(id.as_str())
+                    && t.vals[0].target().is_some_and(|x| themed.contains(x))
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        for id in more {
+            let t = &tokens[id];
+            dark.insert(&t.name, ref_of(&t.vals[0]));
+            themed.insert(id);
         }
     }
     let field = |k: &str| snapshot[k].as_str().map(comment_safe);
@@ -757,6 +838,132 @@ mod tests {
             ok.css.contains("[data-theme=\"dark\"] {\n  --b: 2px;\n}"),
             "{}",
             ok.css
+        );
+    }
+
+    #[test]
+    fn float_aliases_keep_their_unit() {
+        let alias = |id: &str| json!({"light": {"type": "VARIABLE_ALIAS", "id": id}});
+        let v = snap(vec![
+            row(
+                "V:1",
+                "dimension/base",
+                "FLOAT",
+                json!({"light": 16}),
+                json!(["ALL_SCOPES"]),
+                None,
+            ),
+            row(
+                "V:2",
+                "card",
+                "FLOAT",
+                alias("V:1"),
+                json!(["GAP"]),
+                Some("--spacing-card"),
+            ),
+            row(
+                "V:3",
+                "gap/px",
+                "FLOAT",
+                json!({"light": 8}),
+                json!(["GAP"]),
+                None,
+            ),
+            row(
+                "V:4",
+                "scale",
+                "FLOAT",
+                alias("V:3"),
+                json!(["OPACITY"]),
+                None,
+            ),
+            // Aliasing the skipped V:4 drops too.
+            row(
+                "V:5",
+                "scale/2",
+                "FLOAT",
+                alias("V:4"),
+                json!(["OPACITY"]),
+                None,
+            ),
+            row("V:6", "ink", "COLOR", alias("V:1"), json!([]), None),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        assert!(
+            out.css
+                .contains("  --spacing-card: calc(var(--dimension-base) * 1px);\n"),
+            "{}",
+            out.css
+        );
+        assert!(
+            !out.css.contains("--scale") && !out.css.contains("--ink"),
+            "{}",
+            out.css
+        );
+        let reasons: Vec<(&str, &str)> = out
+            .report
+            .iter()
+            .map(|r| (r.variable_id.as_str(), r.reason.as_str()))
+            .collect();
+        assert!(
+            reasons.contains(&(
+                "V:4",
+                "unitless FLOAT aliases V:3, a px FLOAT: skipped (CSS cannot drop its unit)"
+            )),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.contains(&("V:5", "aliases V:4, which is not exported: skipped")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons.contains(&("V:6", "aliases V:1, a variable of another type: skipped")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn dark_block_redeclares_aliases_of_themed_variables() {
+        let alias = |id: &str| json!({"default": {"type": "VARIABLE_ALIAS", "id": id}});
+        let sem = |id: &str, name: &str, to: &str| {
+            let mut r = row(id, name, "COLOR", alias(to), json!([]), None);
+            r["collection"] = json!("semantic");
+            r["default_mode"] = json!("default");
+            r
+        };
+        let v = snap(vec![
+            row(
+                "V:1",
+                "brand",
+                "COLOR",
+                json!({"light": {"r":0,"g":0,"b":0,"a":1}, "dark": {"r":1,"g":1,"b":1,"a":1}}),
+                json!([]),
+                None,
+            ),
+            sem("V:2", "action", "V:1"),
+            sem("V:3", "hover", "V:2"),
+            {
+                let mut r = row(
+                    "V:4",
+                    "plain",
+                    "COLOR",
+                    json!({"default": {"r":0,"g":0,"b":0,"a":1}}),
+                    json!([]),
+                    None,
+                );
+                r["collection"] = json!("semantic");
+                r["default_mode"] = json!("default");
+                r
+            },
+            sem("V:5", "plain/alias", "V:4"),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        assert!(
+            out.css.contains(
+                "[data-theme=\"dark\"] {\n  --action: var(--brand);\n  --brand: #ffffff;\n  --hover: var(--action);\n}"
+            ),
+            "{}",
+            out.css
         );
     }
 
