@@ -1,0 +1,216 @@
+{
+  "images": {
+    "composite": {
+      "file": "composite.png",
+      "height": 158,
+      "sha256": "b684ef8bae81d9f634d3e11e7a53c095ca60101497c24b278a0d81db6a7fd19a",
+      "width": 5520
+    },
+    "diffAfter": {
+      "file": "diff-after.png",
+      "height": 100,
+      "sha256": "b2ab3eece943c9ef52c00f14d531c356b983fff021cf75c076f28cfbb758128a",
+      "width": 320
+    },
+    "diffBefore": {
+      "file": "diff-before.png",
+      "height": 100,
+      "sha256": "debab757d5655468313742c50cc3301d73367ed05b999777d79a27b19b519af1",
+      "width": 1360
+    }
+  },
+  "inputs": {
+    "after": {
+      "capture": {
+        "image": {
+          "file": "broken.png",
+          "height": 84,
+          "sha256": "883bc611054fb32d1aa8d49ed132374828a5f1ac35f8c95745c2f253e27fbfb4",
+          "width": 320
+        },
+        "kind": "figmog-shot/capture",
+        "selector": "[data-testid=\"slice-card\"]",
+        "settings": {
+          "animations": "disabled",
+          "browser": {
+            "args": [
+              "--disable-lcd-text",
+              "--font-render-hinting=none",
+              "--force-color-profile=srgb"
+            ],
+            "name": "chromium",
+            "version": "153.0.8010.12"
+          },
+          "caret": "hidden",
+          "colorScheme": "light",
+          "deviceScaleFactor": 1,
+          "disableMotionCss": "*, *::before, *::after {\n  animation-delay: 0s !important;\n  animation-duration: 0s !important;\n  animation-iteration-count: 1 !important;\n  animation-play-state: paused !important;\n  caret-color: transparent !important;\n  scroll-behavior: auto !important;\n  transition-delay: 0s !important;\n  transition-duration: 0s !important;\n}",
+          "fontsReady": true,
+          "headless": true,
+          "locale": "en-US",
+          "playwright": "1.63.0",
+          "reducedMotion": "reduce",
+          "timezoneId": "UTC"
+        },
+        "url": "http://127.0.0.1:<port>/",
+        "version": 1,
+        "viewport": {
+          "height": 900,
+          "width": 1440
+        }
+      },
+      "file": "after.png",
+      "height": 84,
+      "sha256": "883bc611054fb32d1aa8d49ed132374828a5f1ac35f8c95745c2f253e27fbfb4",
+      "width": 320
+    },
+    "before": {
+      "capture": {
+        "image": {
+          "file": "before.png",
+          "height": 48,
+          "sha256": "c26ba93f5efa32a0466835250e1d89eb7acb79ab122d9bae0d9bb726cb50e4da",
+          "width": 1360
+        },
+        "kind": "figmog-shot/capture",
+        "selector": "[data-testid=\"slice-card\"]",
+        "settings": {
+          "animations": "disabled",
+          "browser": {
+            "args": [
+              "--disable-lcd-text",
+              "--font-render-hinting=none",
+              "--force-color-profile=srgb"
+            ],
+            "name": "chromium",
+            "version": "153.0.8010.12"
+          },
+          "caret": "hidden",
+          "colorScheme": "light",
+          "deviceScaleFactor": 1,
+          "disableMotionCss": "*, *::before, *::after {\n  animation-delay: 0s !important;\n  animation-duration: 0s !important;\n  animation-iteration-count: 1 !important;\n  animation-play-state: paused !important;\n  caret-color: transparent !important;\n  scroll-behavior: auto !important;\n  transition-delay: 0s !important;\n  transition-duration: 0s !important;\n}",
+          "fontsReady": true,
+          "headless": true,
+          "locale": "en-US",
+          "playwright": "1.63.0",
+          "reducedMotion": "reduce",
+          "timezoneId": "UTC"
+        },
+        "url": "http://127.0.0.1:<port>/",
+        "version": 1,
+        "viewport": {
+          "height": 900,
+          "width": 1440
+        }
+      },
+      "file": "before.png",
+      "height": 48,
+      "sha256": "c26ba93f5efa32a0466835250e1d89eb7acb79ab122d9bae0d9bb726cb50e4da",
+      "width": 1360
+    },
+    "figma": {
+      "capture": {
+        "image": {
+          "file": "card-render-1440.png",
+          "height": 100,
+          "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf",
+          "width": 320
+        },
+        "kind": "figmog-shot/capture",
+        "selector": "[data-testid=\"slice-card\"]",
+        "settings": {
+          "animations": "disabled",
+          "browser": {
+            "args": [
+              "--disable-lcd-text",
+              "--font-render-hinting=none",
+              "--force-color-profile=srgb"
+            ],
+            "name": "chromium",
+            "version": "153.0.8010.12"
+          },
+          "caret": "hidden",
+          "colorScheme": "light",
+          "deviceScaleFactor": 1,
+          "disableMotionCss": "*, *::before, *::after {\n  animation-delay: 0s !important;\n  animation-duration: 0s !important;\n  animation-iteration-count: 1 !important;\n  animation-play-state: paused !important;\n  caret-color: transparent !important;\n  scroll-behavior: auto !important;\n  transition-delay: 0s !important;\n  transition-duration: 0s !important;\n}",
+          "fontsReady": true,
+          "headless": true,
+          "locale": "en-US",
+          "playwright": "1.63.0",
+          "reducedMotion": "reduce",
+          "timezoneId": "UTC"
+        },
+        "url": "http://127.0.0.1:<port>/",
+        "version": 1,
+        "viewport": {
+          "height": 900,
+          "width": 1440
+        }
+      },
+      "file": "figma.png",
+      "height": 100,
+      "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf",
+      "width": 320
+    }
+  },
+  "kind": "figmog-shot/compare",
+  "legend": {
+    "colors": {
+      "antiAliasing": [
+        255,
+        255,
+        0,
+        255
+      ],
+      "diff": [
+        255,
+        0,
+        0,
+        255
+      ],
+      "panelPadding": [
+        204,
+        204,
+        204,
+        255
+      ],
+      "sizeMismatch": [
+        255,
+        0,
+        255,
+        255
+      ]
+    },
+    "compositeOrder": [
+      "figma",
+      "before",
+      "after",
+      "difference"
+    ],
+    "differencePanel": "after vs figma (diff-after.png)"
+  },
+  "score": {
+    "advisory": true,
+    "after": {
+      "mismatched": 7923,
+      "score": 75.24,
+      "total": 32000
+    },
+    "before": {
+      "mismatched": 122433,
+      "score": 9.98,
+      "total": 136000
+    },
+    "formula": "score = round2(100 * (1 - mismatched / (W * H))), where W x H is the larger width x the larger height of the two images, mismatched counts pixels pixelmatch (threshold 0.1, anti-aliasing ignored) finds different inside the area both images cover, plus every pixel only one image covers (or neither does); round2 rounds to two decimals; 100 means pixel-identical. Advisory only."
+  },
+  "settings": {
+    "includeAA": false,
+    "sizeRule": "images are aligned top-left and padded to the larger width and height; padded pixels count as mismatched",
+    "threshold": 0.1
+  },
+  "version": 1,
+  "viewport": {
+    "height": 900,
+    "width": 1440
+  }
+}
