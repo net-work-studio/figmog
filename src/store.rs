@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::flatten::Flattened;
 use crate::model::{
     FileMeta, Id, ImageBlobRec, ImagePinRec, MirrorConfigRec, NodeRec, ProxyCacheRec, Rec,
-    VariableSnapshotRec,
+    RenderBlobRec, RenderIndexRec, VariableSnapshotRec,
 };
 
 // ---- pipeline branch functions (pure; fold requires determinism) ----
@@ -171,6 +171,24 @@ pub fn variable_snapshot_only(d: &Keyed<Id, Rec>) -> Option<Keyed<u8, VariableSn
     }
 }
 
+/// Feeds the `render_index` table: keep only `Rec::RenderIndex` rows,
+/// keyed by their render fingerprint (NWS-2958).
+pub fn render_index_only(d: &Keyed<Id, Rec>) -> Option<Keyed<String, RenderIndexRec>> {
+    match (&d.key, &d.val) {
+        (Id::RenderIndex(k), Rec::RenderIndex(r)) => Some(Keyed::new(k.clone(), r.clone())),
+        _ => None,
+    }
+}
+
+/// Feeds the `render_blobs` table: keep only `Rec::RenderBlob` rows,
+/// keyed by the SHA-256 hex of their bytes (NWS-2958).
+pub fn render_blob_only(d: &Keyed<Id, Rec>) -> Option<Keyed<String, RenderBlobRec>> {
+    match (&d.key, &d.val) {
+        (Id::RenderBlob(k), Rec::RenderBlob(r)) => Some(Keyed::new(k.clone(), r.clone())),
+        _ => None,
+    }
+}
+
 /// The full figmog pipeline. Sink names are frozen on-disk schema.
 #[macro_export]
 macro_rules! figmog_pipeline {
@@ -238,6 +256,14 @@ macro_rules! figmog_pipeline {
             FilterMap::new(
                 $crate::store::variable_snapshot_only,
                 terminal::Table::new("variable_snapshot"),
+            ),
+            FilterMap::new(
+                $crate::store::render_index_only,
+                terminal::Table::new("render_index"),
+            ),
+            FilterMap::new(
+                $crate::store::render_blob_only,
+                terminal::Table::new("render_blobs"),
             ),
         )
     }};
@@ -471,6 +497,11 @@ pub fn stale_cache_ids<R: fold::stream::Readable>(
 /// Each stale key yields both its `ImageBlob` row and its `ImagePin`
 /// marker id (NWS-2960) so markers never outlive the row they mark;
 /// removing an absent marker (fill rows, legacy renders) is a no-op.
+///
+/// Fingerprint-indexed renders (NWS-2958) live in the separate
+/// `render_index`/`render_blobs` tables, which this never reads: they are
+/// valid across versions by construction and leave only through
+/// `images`'s orphan cleanup and byte quota.
 pub fn stale_image_ids<R: fold::stream::Readable>(
     images: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImageBlobRec>,
     current_version: &str,
@@ -576,11 +607,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut st = crate::open_store!(&dir.path().join("db"));
 
-        let absent = st.rtx(|(.., mirror_config, _, _, _)| read_geometry(&mirror_config));
+        let absent = st.rtx(|(.., mirror_config, _, _, _, _, _)| read_geometry(&mirror_config));
         assert!(!absent, "no row upserted yet ⇒ geometry defaults false");
 
         upsert_mirror_config(&mut st, true);
-        let now_true = st.rtx(|(.., mirror_config, _, _, _)| read_geometry(&mirror_config));
+        let now_true = st.rtx(|(.., mirror_config, _, _, _, _, _)| read_geometry(&mirror_config));
         assert!(now_true, "the upserted flag must be what a later read sees");
 
         // Sweep-exempt: `mirror_config` isn't among `collect_sweepable`'s
@@ -598,7 +629,7 @@ mod tests {
             collect_sweepable(&nodes, &components, &component_sets, &styles)
         });
         sync(&mut st, &prior, &flattened, 0);
-        let still_true = st.rtx(|(.., mirror_config, _, _, _)| read_geometry(&mirror_config));
+        let still_true = st.rtx(|(.., mirror_config, _, _, _, _, _)| read_geometry(&mirror_config));
         assert!(still_true, "mirror_config must survive an unrelated sweep");
     }
 }

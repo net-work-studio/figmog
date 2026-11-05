@@ -45,6 +45,8 @@ struct ImageJob {
     scale: Option<f64>,
     /// Render `ids` (`false`: only fetch their fill images, NWS-2952).
     renders: bool,
+    /// How cached renders are treated (NWS-2958).
+    policy: crate::images::RenderPolicy,
     reply: ImageReply,
 }
 
@@ -929,6 +931,7 @@ impl FileSession {
         format: &str,
         scale: Option<f64>,
         renders: bool,
+        policy: crate::images::RenderPolicy,
         reply: ImageReply,
     ) -> Result<(), String> {
         if !self.mirrored {
@@ -948,6 +951,7 @@ impl FileSession {
             format: format.to_string(),
             scale,
             renders,
+            policy,
             reply,
         };
         if self.busy {
@@ -1139,9 +1143,10 @@ fn open_session_inner(
         ))
     };
     let view = make_view(st.rtx(|(snapshot, _)| snapshot.clone()), None);
-    let mirrored =
-        view.with_dependent(|_, (_, _, _, _, _, _, meta, _, _, _, _, _)| meta.get(&0).is_some());
-    let geometry = view.with_dependent(|_, (.., config, _, _, _)| store::read_geometry(config));
+    let mirrored = view
+        .with_dependent(|_, (_, _, _, _, _, _, meta, _, _, _, _, _, _, _)| meta.get(&0).is_some());
+    let geometry =
+        view.with_dependent(|_, (.., config, _, _, _, _, _)| store::read_geometry(config));
     let (commands, work) = mpsc::sync_channel(1);
     let (done, completions) = mpsc::channel();
     let opened = view.clone();
@@ -1175,25 +1180,22 @@ fn open_session_inner(
                     format,
                     scale,
                     renders,
+                    policy,
                     reply,
                 }) => {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let node_ids = crate::images::normalize_ids(&ids);
                         let render_ids: &[String] = if renders { &node_ids } else { &[] };
-                        let scanned = st.rtx(
-                            |(_, ((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _))| {
-                                crate::images::scan_split(
-                                    &nodes,
-                                    &meta,
-                                    &images,
-                                    &pins,
-                                    render_ids,
-                                    &node_ids,
-                                    &format,
-                                    crate::images::scale_milli(scale),
-                                )
-                            },
-                        );
+                        let scanned = st.rtx(|(_, readers)| {
+                            crate::with_scan_readers!(readers, |r| crate::images::scan_split(
+                                &r,
+                                render_ids,
+                                &node_ids,
+                                &format,
+                                crate::images::scale_milli(scale),
+                                policy,
+                            ))
+                        });
                         crate::images::resolve(
                             &mut st,
                             scanned,
@@ -1268,10 +1270,11 @@ fn open_session_inner(
                                 .iter()
                                 .filter(|(id, _)| matches!(id, Id::Variable(_)))
                                 .count();
-                            let (mirrored, geometry) =
-                                st.rtx(|(_, (_, _, _, _, _, _, meta, _, config, _, _, _))| {
+                            let (mirrored, geometry) = st.rtx(
+                                |(_, (_, _, _, _, _, _, meta, _, config, _, _, _, _, _))| {
                                     (meta.get(&0).is_some(), store::read_geometry(&config))
-                                });
+                                },
+                            );
                             let view = make_view(
                                 st.rtx(|(snapshot, _)| snapshot.clone()),
                                 Some(node_count),
@@ -1293,7 +1296,7 @@ fn open_session_inner(
                             // A fresh pull ignores the stored config (the
                             // documented way to turn geometry back off).
                             let stored = !fresh
-                                && st.rtx(|(_, (.., config, _, _, _))| {
+                                && st.rtx(|(_, (.., config, _, _, _, _, _))| {
                                     store::read_geometry(&config)
                                 });
                             let geometry = store::effective_geometry(geometry, stored);
@@ -1354,9 +1357,10 @@ fn open_session_inner(
                             collect_variable_ids(&vars, &collections)
                         }));
                     }
-                    let prior_version = st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _, _))| {
-                        meta.get(&0).map(|meta| meta.version.clone())
-                    });
+                    let prior_version =
+                        st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _, _, _, _))| {
+                            meta.get(&0).map(|meta| meta.version.clone())
+                        });
                     let churn = store::sync(&mut st, &prior, &flattened, now_ms());
                     // After a sync the `nodes` table holds exactly the
                     // flattened nodes, so the new view's count is known
@@ -1367,7 +1371,7 @@ fn open_session_inner(
                     // potentially large image blobs merely to evict none.
                     if prior_version.as_deref() != Some(version.as_str()) {
                         let mut stale =
-                            st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, _, _))| {
+                            st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, _, _, _, _))| {
                                 let mut ids = store::stale_cache_ids(&cache, &version);
                                 ids.extend(store::stale_image_ids(&images, &version));
                                 ids
@@ -1380,7 +1384,7 @@ fn open_session_inner(
                     // Sticky geometry (spec §4): this pull's flag OR what
                     // the store already holds (nothing, after a fresh reset).
                     let stored_now =
-                        st.rtx(|(_, (.., config, _, _, _))| store::read_geometry(&config));
+                        st.rtx(|(_, (.., config, _, _, _, _, _))| store::read_geometry(&config));
                     let geometry = store::effective_geometry(geometry, stored_now);
                     store::upsert_mirror_config(&mut st, geometry);
                     phase(PullPhase::Publishing);

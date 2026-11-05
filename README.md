@@ -307,6 +307,12 @@ again for an unedited file spends nothing. Nothing in figmog fetches images
 on its own, because Figma's images endpoints are its most rate-limited. See
 `docs/SPEC.md` §15.
 
+`--reuse-renders` (opt-in, off by default) keeps a cached render valid
+across file versions for as long as the node's own subtree and the render
+settings are unchanged, so editing one frame no longer refetches every
+other frame's render. `--refresh` ignores cached renders and fetches them
+again. The reuse cache is bounded (256 MiB, oldest first).
+
 `figmog --db <store> images <node-id>...` exports matching cached renders
 and fills offline. The store does not record its Figma file key, so cache
 misses produce per-item errors. To fetch missing images, run

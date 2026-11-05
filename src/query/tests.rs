@@ -388,6 +388,8 @@ fn stats_vars_and_components_are_byte_identical_to_the_quadratic_versions() {
             _,
             _,
             snapshot,
+            _,
+            _,
         )| {
             let got = components(&nodes, &components_t, &sets).unwrap();
             let want = reference::components(&nodes, &components_t, &sets);
@@ -479,6 +481,8 @@ fn nws_2942_scale() {
             _,
             _,
             snapshot,
+            _,
+            _,
         )| {
             let n = nodes.iter().count();
             eprintln!("nodes={n} components={}", components_t.iter().count());
