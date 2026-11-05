@@ -370,9 +370,14 @@ impl Relay {
             return self.forward(&line);
         };
         let method = frame["method"].as_str().unwrap_or_default().to_string();
+        // Every id-bearing frame but a notification is answered by the
+        // owner — also one with an empty, missing or non-string method
+        // ("method not found") — so it gets an owner-link id like any
+        // request: its answer must never be matched against another
+        // pending request whose owner-link id it happens to share. Only
+        // notifications (and unparseable frames, above) pass unchanged.
         let id = frame.get("id").cloned();
-        let Some(id) = id.filter(|_| !method.is_empty() && !method.starts_with("notifications/"))
-        else {
+        let Some(id) = id.filter(|_| !method.starts_with("notifications/")) else {
             return self.forward(&line);
         };
         if method == "initialize" {

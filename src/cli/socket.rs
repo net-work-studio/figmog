@@ -74,13 +74,20 @@ impl Route {
 pub(crate) struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// Whether this is the shared background owner (a "not accepted" from
+    /// it may be followed by a new owner) rather than an in-process serve's
+    /// local socket (whose "not accepted" means that very process is
+    /// exiting and will never answer a retry, NWS-2963).
+    owner: bool,
 }
 
 impl Client {
+    /// A connection to an in-process serve's local socket.
     fn new(stream: UnixStream) -> std::io::Result<Self> {
         Ok(Self {
             writer: stream.try_clone()?,
             reader: BufReader::new(stream),
+            owner: false,
         })
     }
 }
@@ -121,6 +128,7 @@ pub(super) fn connect(route: &Route) -> Option<Result<Client, String>> {
                 return Some(Ok(Client {
                     reader: conn.reader,
                     writer: conn.writer,
+                    owner: true,
                 }));
             }
             Ok(Probe::Absent | Probe::Closing) => {}
@@ -236,10 +244,15 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// was published. A serve-side failure is that failure's error (nothing was
 /// applied). If the connection ends first (serve killed or stopped), the
 /// write is reported as **outcome unknown**, naming the operation id serve
-/// announced when it accepted the write; it is never retried. Only a write
-/// serve explicitly did not accept or start (a background owner shutting
-/// down, NWS-2953, or any serve draining with the write still queued,
-/// NWS-2963) is sent again, on a new connection from `route`.
+/// announced when it accepted the write; it is never retried. A write
+/// serve explicitly did not accept or start (a serve shutting down or
+/// draining with the write still queued, NWS-2953/NWS-2963) is known not
+/// applied, and stays reported that way: only the shared background owner's
+/// refusal is sent again, on a new connection from `route` (a new owner may
+/// have been elected); an in-process serve's refusal is never retried
+/// against the same, exiting process, which would leave the retry
+/// unanswered. A reconnect that fails after a refusal reports "nothing was
+/// applied", never "outcome unknown".
 pub(crate) fn write_over(
     route: &Route,
     client: Client,
@@ -260,21 +273,20 @@ pub(crate) fn write_over(
             crate::serve::MAX_FRAME_BYTES / (1024 * 1024)
         ));
     }
+    const NOT_APPLIED: &str = "figmog serve shut down before accepting this write; nothing was applied — rerun the command";
     let mut client = client;
     for _ in 0..MAX_RECONNECTS {
+        let from_owner = client.owner;
         match write_once(client, tool, &frame) {
-            Err(Failure::NotAccepted) => {}
+            Err(Failure::NotAccepted) if from_owner => {}
+            Err(Failure::NotAccepted) => return Err(NOT_APPLIED.into()),
             Err(Failure::Error(error)) => return Err(error),
             Ok(value) => return Ok(value),
         }
         client = match connect(route) {
             Some(Ok(client)) => client,
-            Some(Err(error)) => return Err(error),
-            None => {
-                return Err(
-                    "figmog serve shut down before accepting this write; nothing was applied — rerun the command".into(),
-                );
-            }
+            Some(Err(error)) => return Err(format!("{NOT_APPLIED} ({error})")),
+            None => return Err(NOT_APPLIED.into()),
         };
     }
     Err("the background figmog kept refusing new requests while shutting down; nothing was applied — rerun the command".into())
@@ -293,7 +305,26 @@ pub(crate) fn write_over_stream(
         local_root: PathBuf::from("/nonexistent/figmog-test-route"),
         owner: true,
     };
-    let client = Client::new(stream).map_err(|e| e.to_string())?;
+    let mut client = Client::new(stream).map_err(|e| e.to_string())?;
+    client.owner = true;
+    write_over(&route, client, tool, args)
+}
+
+/// [`write_over`] exactly as the CLI runs it against an in-process serve:
+/// connected through a local-only route at `local_root` (its
+/// `serve.sock`), reconnecting through that same route.
+#[cfg(test)]
+pub(crate) fn write_over_local(
+    local_root: &std::path::Path,
+    tool: &str,
+    args: Value,
+) -> Result<Value, String> {
+    let route = Route {
+        mirror_root: PathBuf::from("/nonexistent/figmog-test-route"),
+        local_root: local_root.to_path_buf(),
+        owner: false,
+    };
+    let client = connect(&route).expect("a local serve is listening")?;
     write_over(&route, client, tool, args)
 }
 
@@ -301,6 +332,7 @@ fn write_once(client: Client, tool: &str, frame: &str) -> Result<Value, Failure>
     let Client {
         mut reader,
         mut writer,
+        ..
     } = client;
     writer
         .set_write_timeout(Some(SOCKET_TIMEOUT))
@@ -403,6 +435,7 @@ fn send_and_recv(client: Client, frame: &Value) -> Result<Value, Failure> {
     let Client {
         mut reader,
         mut writer,
+        ..
     } = client;
     writer
         .set_read_timeout(Some(SOCKET_TIMEOUT))
@@ -631,6 +664,78 @@ mod tests {
             "{error}"
         );
         owner.join().unwrap();
+    }
+
+    /// After the background owner refused a write, a reconnect that fails
+    /// (here: the next owner refuses the handshake) still reports the
+    /// write not applied — the refusal proved it — never "outcome unknown"
+    /// or a bare connection error (NWS-2953).
+    #[test]
+    fn a_failed_reconnect_after_an_owner_refusal_reports_not_applied() {
+        let dir = tempfile::Builder::new()
+            .prefix("fr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let socket = dir.path().join("o.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        owner::write_discovery(
+            &paths,
+            &owner::Discovery {
+                socket,
+                pid: std::process::id(),
+                generation: "g".into(),
+                version: owner::version().to_string(),
+                protocol: owner::PROTOCOL,
+            },
+        )
+        .unwrap();
+        let next_owner = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut hello = String::new();
+            reader.read_line(&mut hello).unwrap();
+            let mut out = stream;
+            writeln!(
+                out,
+                "{}",
+                json!({"jsonrpc": "2.0", "id": owner::HELLO_ID,
+                       "error": {"code": owner::HANDSHAKE_REFUSED, "message": "refused"}})
+            )
+            .unwrap();
+        });
+        let (client, server) = UnixStream::pair().unwrap();
+        let first_owner = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            let mut out = server;
+            writeln!(
+                out,
+                "{}",
+                json!({"jsonrpc": "2.0", "id": request["id"],
+                       "error": {"code": owner::NOT_ACCEPTED, "message": "not accepted"}})
+            )
+            .unwrap();
+        });
+        let route = Route {
+            mirror_root: dir.path().to_path_buf(),
+            local_root: PathBuf::from("/nonexistent/figmog-test-route"),
+            owner: true,
+        };
+        let mut client = Client::new(client).unwrap();
+        client.owner = true;
+        let error =
+            write_over(&route, client, "figmog_internal_pull", json!({"file": "k"})).unwrap_err();
+        assert!(
+            error.contains("nothing was applied")
+                && error.contains("refused")
+                && !error.contains("outcome unknown"),
+            "{error}"
+        );
+        first_owner.join().unwrap();
+        next_owner.join().unwrap();
     }
 
     #[test]

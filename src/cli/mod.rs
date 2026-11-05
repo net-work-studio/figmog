@@ -34,7 +34,7 @@ use store_lock::{OwnedStore, StoreOwner};
 pub(crate) use pull::apply_pull_at;
 pub(crate) use pull::{PullError, now_ms, pull_failure_wait, write_current};
 #[cfg(test)]
-pub(crate) use socket::write_over_stream;
+pub(crate) use socket::{write_over_local, write_over_stream};
 
 #[derive(Parser)]
 #[command(
@@ -466,16 +466,18 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             } else {
                 parsed_args
             };
-            let route = route_for(root, layout, &parsed_args, is_per_file_local_tool(tool));
-            if let Some(result) = socket::try_call(&route, tool, parsed_args.clone()) {
+            if let Some(route) = route_for(root, layout, &parsed_args, is_per_file_local_tool(tool))
+                && let Some(result) = socket::try_call(&route, tool, parsed_args.clone())
+            {
                 note_ignored_upstream_flags(upstream, *no_upstream);
                 return write_json(&result?);
             }
         } else if let Some(read) = read_command(&cli.cmd) {
             let (tool, tool_args) = read.to_tool_call();
             let tool_args = with_current_file(tool_args, layout)?;
-            let route = route_for(root, layout, &tool_args, true);
-            if let Some(result) = socket::try_call(&route, tool, tool_args.clone()) {
+            if let Some(route) = route_for(root, layout, &tool_args, true)
+                && let Some(result) = socket::try_call(&route, tool, tool_args.clone())
+            {
                 let result = result?;
                 // Not ready is an error, except for an import-only store
                 // (SPEC §9): its stored variable snapshot still answers.
@@ -648,30 +650,39 @@ fn with_current_file(mut args: Value, layout: &Layout) -> Result<Value, String> 
 
 /// Where a routed call may go. The shared background owner (NWS-2953)
 /// is skipped — leaving only an in-process serve's local socket, else the
-/// direct path — when the call's file mirror is still in this checkout's
+/// direct path — when the call's file mirror resolves to this checkout's
 /// old per-checkout location (the owner never serves it), and when a
 /// per-file call names no file this worktree resolves: the owner holds
 /// every worktree's files and has no default, so the call must not land on
 /// another worktree's; the direct path reports this worktree's "no mirror
 /// here" instead. Management and desktop calls (`per_file` false) without
 /// a file route anywhere.
-fn route_for(root: &socket::Route, layout: &Layout, args: &Value, per_file: bool) -> socket::Route {
+///
+/// `None` — no socket at all — when the file's mirror does not resolve
+/// ([`Layout::active_store`] errs, e.g. two mirrors or an interrupted
+/// migrate): no serve may answer for a store the direct path refuses, so
+/// the caller falls through to it and it reports that error, exactly as
+/// with `--no-socket` (NWS-2953, NWS-2964).
+fn route_for(
+    root: &socket::Route,
+    layout: &Layout,
+    args: &Value,
+    per_file: bool,
+) -> Option<socket::Route> {
     let key = args
         .get("file")
         .and_then(Value::as_str)
         .and_then(parse_file_ref)
         .or_else(|| crate::dispatch::infer_file_from_node_ref(args));
     let shared = match key {
-        Some(key) => layout
-            .active_store(&key)
-            .is_ok_and(|store| !store.migration_pending),
+        Some(key) => !layout.active_store(&key).ok()?.migration_pending,
         None => !per_file,
     };
-    if shared {
+    Some(if shared {
         root.clone()
     } else {
         root.local_only()
-    }
+    })
 }
 
 /// Whether a status result carries a variable snapshot summary with

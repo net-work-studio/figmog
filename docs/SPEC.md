@@ -605,6 +605,12 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   not started: it is answered JSON-RPC error `-32001` `not accepted: ...
   reconnect and retry` even though its operation id was announced, and
   the CLI treats it like any "not accepted" answer (nothing was applied).
+  Only the shared background owner's refusal is retried on a new
+  connection (a new owner may take over, §16); an in-process serve's
+  refusal is not sent again to that exiting process — the CLI reports
+  `figmog serve shut down before accepting this write; nothing was
+  applied — rerun the command` (exit 1). A reconnect that fails after a
+  refusal reports the same "nothing was applied", never `outcome unknown`.
 - *Store owner records.* A serve writes `figmog serve (pid N, socket
   <path>)` (or `no socket`) into each store lock (`.figmog-lock`) it
   takes; every other opener clears it. A command finding a store held
@@ -823,7 +829,9 @@ writes the responses it owes, to stdio and to still-open sockets, for up to
 '<request>\n' | figmog serve` gets its image or desktop response. Image
 requests still queued (not started) are answered with a shutting-down
 error, CLI writes still queued with "not accepted" (§6 "CLI writers through
-serve"), and queued watch/sync pulls are not started; running work —
+serve"), and no pull or watch poll is started from then on — neither a
+queued watch/sync pull nor one a metadata poll still in flight asks for
+when it completes `Changed`; running work —
 including a routed write and its fresh-pull reset — keeps being serviced
 (no watch polls) until it publishes and answers. The desktop worker stops taking queued calls (and skips queued
 desktop checks) at once: its
@@ -926,13 +934,18 @@ mirror in this worktree is still in the old per-checkout location (§16) is
 refused with a pointer at `figmog migrate` (and a startup file fails the
 relay's start), never shadowed by a new shared mirror; the CLI likewise
 never routes such a mirror to the owner (an in-process serve's local socket
-still answers it, else it is opened directly). Nor does the CLI route a
+still answers it, else it is opened directly). A file whose mirror does
+not resolve at all (two mirrors, an interrupted `figmog migrate`) is
+routed to no socket: the CLI reports the same error as with `--no-socket`,
+even while an in-process serve holds one of the two. Nor does the CLI route a
 per-file call to the owner when the invoking worktree resolves no file
 (no explicit `file`, node URL or project default): it reports that
 worktree's "no mirror here" rather than another worktree's file. The owner
 itself never treats its one open session as a default. Desktop and
 management calls pass through unchanged. Every request a relay forwards
-goes to the owner under a relay-assigned id, mapped back to the agent's own
+— any frame with an `id` that is not a `notifications/` method, including
+one whose method is empty, missing or not a string (the owner answers it
+"method not found") — goes to the owner under a relay-assigned id, mapped back to the agent's own
 id on the answer, so no agent id is ever mistaken for the relay's own
 (its replayed `initialize`).
 
@@ -961,7 +974,9 @@ exited is closed unanswered; clients treat that like "not accepted".
 the relay reconnects — launching a new owner if none is left — and re-sends
 it (at most 5 times); the CLI reconnects and retries (reads and writes
 alike: nothing was started), waiting up to 60 s for the closing owner to go
-away, then falls back to a direct open if no new owner appeared. A write
+away, then falls back to a direct open if no new owner appeared — except a
+write, which then reports "nothing was applied" (§6 "CLI writers through
+serve"). A write
 the owner accepted is never retried: NWS-2963's `outcome unknown` stands.
 If the owner connection drops with requests unanswered (the owner crashed
 or was killed), the relay answers each with an `outcome unknown` tool error

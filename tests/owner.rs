@@ -107,13 +107,15 @@ fn owners_in_proc(cwd: &Path) -> Vec<u32> {
 
 /// [`owners_in`] without `/proc` (macOS): `ps` lists the live
 /// `serve --background` processes, `lsof` gives each one's working
-/// directory.
+/// directory. Never used on Linux, so the Linux tests need neither tool;
+/// where it is used, a missing or failing `ps`/`lsof` fails the test
+/// loudly instead of counting zero owners.
 fn owners_in_ps(cwd: &Path) -> Vec<u32> {
     let cwd = std::fs::canonicalize(cwd).unwrap();
     let ps = Command::new("ps")
         .args(["-Ao", "pid=,stat=,command="])
         .output()
-        .unwrap();
+        .expect("`ps` is required to count owner processes on this platform");
     assert!(ps.status.success(), "ps failed");
     let mut pids = Vec::new();
     for line in String::from_utf8_lossy(&ps.stdout).lines() {
@@ -128,12 +130,10 @@ fn owners_in_ps(cwd: &Path) -> Vec<u32> {
         if stat.starts_with('Z') || !args.contains(&"serve") || !args.contains(&"--background") {
             continue;
         }
-        let Ok(lsof) = Command::new("lsof")
+        let lsof = Command::new("lsof")
             .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
             .output()
-        else {
-            continue;
-        };
+            .expect("`lsof` is required to count owner processes on this platform");
         // Gone since `ps`: no output.
         let dir = String::from_utf8_lossy(&lsof.stdout)
             .lines()
@@ -372,10 +372,6 @@ fn concurrent_relays_elect_exactly_one_owner() {
             vec![record["pid"].as_u64().unwrap() as u32],
             "exactly one background owner process"
         );
-        if cfg!(target_os = "linux") {
-            // The `ps`/`lsof` count other platforms use agrees.
-            assert_eq!(owners_in_ps(repo.path()), owners_in(repo.path()));
-        }
         let socket = PathBuf::from(record["socket"].as_str().unwrap());
         assert!(socket.as_os_str().len() < 104, "{}", socket.display());
         assert!(socket.starts_with("/tmp"), "{}", socket.display());
@@ -785,6 +781,67 @@ fn a_relay_answers_agent_ids_shaped_like_its_own() {
     wait_owner_gone(repo.path());
 }
 
+/// Requests without a usable method (empty, missing or not a string) are
+/// still answered by the owner, so they get owner-link ids too: one whose
+/// id looks like the relay's own never takes over the answer to another
+/// in-flight request, and each answer reaches the agent under its own id.
+#[test]
+fn a_relay_remaps_ids_of_requests_without_a_method() {
+    let repo = repo();
+    let mut relay = spawn_relay(&mut relay_command(
+        repo.path(),
+        &["--no-watch", "--no-upstream"],
+    ));
+    relay.initialize();
+    let ids: Vec<Value> = (0..6).map(|n| json!(format!("figmog-relay-{n}"))).collect();
+    let mut batch = String::new();
+    for (n, id) in ids.iter().enumerate() {
+        let frame = match n % 3 {
+            0 => json!({"jsonrpc": "2.0", "id": id, "method": ""}),
+            1 => json!({"jsonrpc": "2.0", "id": id}),
+            _ => json!({"jsonrpc": "2.0", "id": id, "method": 5}),
+        };
+        batch.push_str(&format!("{frame}\n"));
+    }
+    for n in 0..3 {
+        batch.push_str(&format!(
+            "{}\n",
+            json!({"jsonrpc": "2.0", "id": 70 + n, "method": "ping"})
+        ));
+    }
+    {
+        let stdin = relay.stdin.as_mut().unwrap();
+        stdin.write_all(batch.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    }
+    let mut answers = std::collections::BTreeMap::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while answers.len() < ids.len() + 3 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = relay.rx.recv_timeout(left).expect("every request answered");
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        if frame.get("method").is_some() {
+            continue;
+        }
+        assert!(
+            answers
+                .insert(frame["id"].to_string(), frame.clone())
+                .is_none(),
+            "answered twice: {frame}"
+        );
+    }
+    for id in &ids {
+        let answer = &answers[&id.to_string()];
+        assert_eq!(answer["error"]["code"], -32601, "{answer}");
+    }
+    for n in 0..3 {
+        let answer = &answers[&json!(70 + n).to_string()];
+        assert_eq!(answer["result"], json!({}), "{answer}");
+    }
+    relay.finish();
+    wait_owner_gone(repo.path());
+}
+
 /// A mirror still in the checkout's old `.figmog/<key>/db` is never the
 /// shared owner's, but an in-process serve holding it (`serve --db`) still
 /// answers the CLI over its local socket instead of a lock error.
@@ -825,6 +882,58 @@ fn the_cli_reaches_an_in_process_serve_of_a_legacy_mirror() {
         assert!(out.status.success(), "{args:?}: {out:?}");
         let status: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(status["name"], "Fixture", "{args:?}");
+    }
+    assert!(discovery(repo.path()).is_none(), "no owner was involved");
+    serve.finish();
+}
+
+/// An in-process serve holding the old `.figmog/<key>/db` never answers
+/// for it once a shared copy exists too: the CLI does not route a store it
+/// cannot resolve, so the two-mirror error is reported over the socket
+/// exactly as with `--no-socket`, never answered by that serve.
+#[test]
+fn the_cli_reports_two_mirrors_even_with_an_in_process_serve_of_the_old_one() {
+    let repo = repo();
+    let db = repo.path().join(".figmog").join(KEY).join("db");
+    let response = repo.path().join("v1.json");
+    std::fs::write(&response, common::fixture_v1().to_string()).unwrap();
+    common::command()
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    std::fs::write(repo.path().join(".figmog/current"), KEY).unwrap();
+    let mut serve = spawn_relay(&mut relay_command(
+        repo.path(),
+        &[
+            "--no-watch",
+            "--no-upstream",
+            "--db",
+            db.to_str().unwrap(),
+            KEY,
+        ],
+    ));
+    serve.initialize();
+    wait_until("the in-process serve's socket", || {
+        repo.path().join(".figmog/serve.sock").exists()
+    });
+    std::fs::create_dir_all(repo.path().join(".git/figmog").join(KEY).join("db")).unwrap();
+    for args in [
+        &["status"][..],
+        &["--no-socket", "status"],
+        &["call", "figmog_status"],
+        &["pages"],
+    ] {
+        let out = common::command()
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("two mirrors exist"), "{args:?}: {stderr}");
     }
     assert!(discovery(repo.path()).is_none(), "no owner was involved");
     serve.finish();
