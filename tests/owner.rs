@@ -332,8 +332,14 @@ fn seed(cwd: &Path, key: &str, fixture: &Value) {
     std::fs::remove_file(response).unwrap();
 }
 
+/// Wait for `repo`'s owner to idle out *and exit*. Its discovery record
+/// disappearing is not enough: an idling-out owner removes the record
+/// (and its socket) first, then releases the lock and exits, so under
+/// load its process can still be alive for a while after the record is
+/// gone.
 fn wait_owner_gone(repo: &Path) {
     wait_until("the owner to idle out", || discovery(repo).is_none());
+    wait_until("the owner process to exit", || owners_in(repo).is_empty());
 }
 
 /// Ten relays started at once in one repository elect exactly one owner
@@ -376,10 +382,10 @@ fn concurrent_relays_elect_exactly_one_owner() {
         for relay in relays {
             relay.finish();
         }
+        // Waits for the owner process itself to exit, not just its record.
         wait_owner_gone(repo.path());
         assert!(!socket.exists(), "the owner removed its socket");
         assert!(mirror_root(repo.path()).join("owner.lock").exists());
-        assert!(owners_in(repo.path()).is_empty());
     }
 }
 
