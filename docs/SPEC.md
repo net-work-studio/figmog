@@ -1042,9 +1042,13 @@ unedited file spends nothing. A render hit additionally requires its
 `image_pins` marker (§3), written in the same transaction as the row.
 Renders saved by builds that requested them without `version` have no
 marker — their bytes may show a newer design than their label — so they
-read as misses. With a file identity they are refetched and overwritten;
-an explicit offline store cannot refresh them. Fill rows need no
-marker: fills are addressed by content hash, and the fills endpoint
+read as misses. With a file identity and credentials they are refetched
+and overwritten, spending API budget again on that first request.
+Without either, they return a distinct upgrade error and retain the
+existing bytes. For a file-keyed mirror without credentials, the error
+explains how to restore the token and retry the image request; an
+explicit offline store instead needs a file-keyed mirror to refresh them.
+Fill rows need no marker: fills are addressed by content hash, and the fills endpoint
 takes no version. Rows tagged with an older version, and their markers,
 are evicted by the same version-change pass that evicts `proxy_cache`
 (§5).
