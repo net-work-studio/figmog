@@ -242,6 +242,11 @@ pub struct Export {
     /// `figmog spec`'s Tailwind hint (NWS-2947) turns into a utility
     /// (`--color-brand` → `bg-brand`).
     pub theme_names: BTreeMap<String, String>,
+    /// Variable id → the unit its FLOAT value is emitted with (`px`, `%`,
+    /// or `None`: unitless), for every emitted non-COLOR variable — what
+    /// `figmog spec` (NWS-2947) needs to use a token where CSS wants a
+    /// length (`calc(var(--x) * 1px)` for a unitless one).
+    pub units: BTreeMap<String, Option<&'static str>>,
     /// Every property the file declares (token and Tailwind theme names)
     /// → its variable id, for `tokens diff`.
     pub ids: BTreeMap<String, String>,
@@ -841,6 +846,11 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             .collect(),
         report: report.into_iter().collect(),
         theme_names: theme_by_id,
+        units: tokens
+            .iter()
+            .filter(|(_, t)| t.kind != Kind::Color)
+            .map(|(id, t)| (id.clone(), t.kind.unit()))
+            .collect(),
         names: tokens
             .iter()
             .map(|(id, t)| (id.clone(), t.name.clone()))
