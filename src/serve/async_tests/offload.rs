@@ -367,3 +367,141 @@ fn a_pull_taking_the_worker_answers_queued_images_busy() {
     h.release.send(()).unwrap();
     h.wait_for("succeeded");
 }
+
+/// Spawn a serve loop over `manager` whose stdout frames land on the
+/// returned receiver.
+fn spawn_stdio_loop(
+    manager: SessionManager,
+    desktop: Option<DesktopWorker>,
+) -> (
+    mpsc::Sender<Incoming>,
+    mpsc::Receiver<Value>,
+    std::thread::JoinHandle<Result<(), String>>,
+) {
+    let (tx, rx) = mpsc::channel();
+    let (stdout_tx, stdout) = mpsc::channel::<Value>();
+    let server = std::thread::spawn(move || {
+        serve_loop_with_output(
+            manager,
+            desktop,
+            "connected",
+            true,
+            false,
+            Duration::from_secs(3600),
+            Instant::now() + Duration::from_secs(3600),
+            rx,
+            Arc::default(),
+            move |response| stdout_tx.send(response.clone()).is_ok(),
+        )
+    });
+    (tx, stdout, server)
+}
+
+#[test]
+fn stdin_eof_still_delivers_an_in_flight_desktop_response() {
+    let h = Harness::new();
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let result = json!({"content":[{"type":"text","text":"late"}], "isError": false});
+    let desktop = DesktopWorker::spawn(GatedUpstream {
+        tools: vec![json!({"name":"get_screenshot", "inputSchema":{"type":"object"}})],
+        results: [result.clone()].into(),
+        entered: entered_tx,
+        release: gate,
+    });
+    let Harness {
+        release: _r,
+        entered: _e,
+        manager,
+        _dir: _dir_guard,
+        ..
+    } = h;
+    let (tx, stdout, server) = spawn_stdio_loop(manager, Some(desktop));
+    tx.send(Incoming::Stdio(frame(
+        json!("d"),
+        "get_screenshot",
+        json!({}),
+    )))
+    .unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    tx.send(Incoming::StdinClosed).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(
+        stdout.recv_timeout(Duration::from_secs(5)).unwrap(),
+        json!({"jsonrpc":"2.0", "id":"d", "result": result})
+    );
+    server.join().unwrap().unwrap();
+}
+
+#[test]
+fn stdin_eof_still_delivers_an_in_flight_image_response() {
+    let h = mirrored_harness();
+    h.api.block_images.store(true, Ordering::Relaxed);
+    let Harness {
+        release,
+        entered,
+        manager,
+        _dir: _dir_guard,
+        ..
+    } = h;
+    let (tx, stdout, server) = spawn_stdio_loop(manager, None);
+    tx.send(Incoming::Stdio(frame(
+        json!(4),
+        "figmog_images",
+        json!({"ids": ["0:0"]}),
+    )))
+    .unwrap();
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "render"
+    );
+    tx.send(Incoming::StdinClosed).unwrap();
+    release.send(()).unwrap();
+    let response = stdout.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(response["id"], 4);
+    assert!(response["result"]["content"].is_array(), "{response}");
+    server.join().unwrap().unwrap();
+}
+
+#[test]
+fn a_poll_due_during_images_gets_the_worker_before_queued_images() {
+    // Mirrored by watch, so the next metadata poll observes no change.
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    h.api.block_images.store(true, Ordering::Relaxed);
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    let (answers_tx, answers) = mpsc::channel();
+    let reply = |tag: &'static str| -> sessions::ImageReply {
+        let answers = answers_tx.clone();
+        Box::new(move |result| answers.send((tag, result.is_ok())).unwrap())
+    };
+    let hour = Duration::from_secs(3600);
+    let ids = vec!["0:0".to_string()];
+    let session = &mut h.manager.sessions[0];
+    session.images(&ids, "png", None, reply("first")).unwrap();
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "render"
+    );
+    // The scheduler's visit finds the worker busy with images...
+    assert!(!session.poll_at(hour, Instant::now()));
+    session.images(&ids, "png", None, reply("second")).unwrap();
+    h.release.send(()).unwrap();
+    assert_eq!(
+        answers.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ("first", true)
+    );
+    // ...so the owed poll runs before the queued image request.
+    h.wait_for_event_at(Instant::now(), "metadata");
+    assert!(
+        answers.try_recv().is_err(),
+        "queued image waits for the poll"
+    );
+    h.release.send(()).unwrap();
+    h.wait_for_event_at(Instant::now(), "render");
+    h.release.send(()).unwrap();
+    assert_eq!(
+        answers.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ("second", true)
+    );
+}

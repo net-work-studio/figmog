@@ -789,6 +789,43 @@ fn deliver(
     }
 }
 
+/// How long stdin EOF waits for deferred responses still owed. Covers a
+/// desktop call (10s upstream timeout) with margin; an image request that
+/// runs longer loses its response (its file's worker still finishes it
+/// before exit, like a running pull).
+const EXIT_DRAIN: Duration = Duration::from_secs(15);
+
+/// Shutdown: answer the deferred calls already accepted before exiting, so
+/// `printf '<request>\n' | figmog serve` still gets its response. Accepts
+/// no new requests and starts no new work (queued image requests are
+/// answered with an error); waits at most [`EXIT_DRAIN`]. A vanished
+/// stdout or closed socket just drops that response.
+fn drain_on_exit(
+    manager: &mut SessionManager,
+    offload: &Offload,
+    pending: &mut BTreeMap<u64, (ReplyTo, PendingCall)>,
+    registry: &ConnRegistry,
+    write_stdio: &mut impl FnMut(&Value) -> bool,
+) {
+    for session in &mut manager.sessions {
+        session.abandon_queued_images();
+    }
+    let deadline = Instant::now() + EXIT_DRAIN;
+    while !pending.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(done) = offload.done_rx.recv_timeout(left) else {
+            return;
+        };
+        let Some((to, call)) = pending.remove(&done.token) else {
+            continue;
+        };
+        // No poll expedite: the server is exiting.
+        if !deliver(to, &call.finish(done.output), registry, write_stdio) {
+            return;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_loop_with_output(
     mut manager: SessionManager,
@@ -859,11 +896,29 @@ fn serve_loop_with_output(
         let msg = match rx.recv_timeout(wait) {
             Ok(msg) => msg,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drain_on_exit(
+                    &mut manager,
+                    &offload,
+                    &mut pending,
+                    &registry,
+                    &mut write_stdio,
+                );
+                return Ok(());
+            }
         };
 
         let (to, line, mode) = match msg {
-            Incoming::StdinClosed => return Ok(()),
+            Incoming::StdinClosed => {
+                drain_on_exit(
+                    &mut manager,
+                    &offload,
+                    &mut pending,
+                    &registry,
+                    &mut write_stdio,
+                );
+                return Ok(());
+            }
             Incoming::Stdio(l) => (ReplyTo::Stdio, l, ToolErrorMode::McpContent),
             Incoming::Socket(conn_id, l) => (ReplyTo::Socket(conn_id), l, ToolErrorMode::JsonRpc),
         };

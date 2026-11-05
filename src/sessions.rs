@@ -28,6 +28,9 @@ use crate::watch::{BACKOFF_START, Tick, Watcher};
 
 type SessionApi = Arc<dyn FigmaApi + Send + Sync>;
 
+const WORKER_GONE: &str =
+    "this file's worker stopped unexpectedly; inspect server stderr and restart figmog serve";
+
 /// Delivers one `figmog_images` result from the file's worker thread back
 /// to whoever asked (NWS-2955: `serve` turns it into a deferred response).
 /// Dropping it uncalled — a discarded queue on shutdown, or a worker that
@@ -126,6 +129,8 @@ pub(crate) struct FileSession {
     imaging: bool,
     /// Image requests accepted while another one runs, in arrival order.
     image_queue: VecDeque<ImageJob>,
+    /// A watch poll came due while an image request held the worker.
+    poll_owed: bool,
     job: Option<Job>,
     queued: Option<Job>,
     last_completed: Option<Value>,
@@ -258,18 +263,36 @@ impl FileSession {
         if self.busy || now < self.retry_at {
             return;
         }
-        if let Some(job) = &mut self.job
-            && job.state == JobState::Queued
-        {
-            self.commands
-                .as_ref()
-                .unwrap()
-                .send(Command::Pull {
-                    geometry: job.geometry,
-                })
-                .unwrap();
+        let Some(geometry) = self
+            .job
+            .as_ref()
+            .filter(|job| job.state == JobState::Queued)
+            .map(|job| job.geometry)
+        else {
+            return;
+        };
+        let sent = self.send(Command::Pull { geometry }).is_ok();
+        let job = self.job.as_mut().expect("checked above");
+        if sent {
             job.state = JobState::Running;
             self.busy = true;
+        } else {
+            job.state = JobState::Failed;
+            job.error = Some(WORKER_GONE.to_string());
+            self.last_completed = Some(job.json());
+            if let Some(queued) = self.queued.take() {
+                self.job = Some(queued);
+            }
+        }
+    }
+
+    /// Hand one command to the worker. The bounded slot is free whenever
+    /// `busy` is false, so this never blocks; it fails only if the worker
+    /// thread is gone, and hands the command back.
+    fn send(&self, command: Command) -> Result<(), Command> {
+        match &self.commands {
+            Some(commands) => commands.send(command).map_err(|e| e.0),
+            None => Err(command),
         }
     }
 
@@ -350,9 +373,23 @@ impl FileSession {
         if self.expedited_poll {
             self.poll_at(self.interval, now);
         }
-        if self.busy && !self.imaging {
-            // A pull or poll took the worker: queued image requests get the
-            // prompt busy answer a new one would, instead of waiting.
+        // Fairness with queued images: a watch poll the scheduler could not
+        // dispatch because images held the worker, or a due watch retry
+        // (which the scheduler skips while the worker is busy), gets the
+        // worker before the next queued image request.
+        if !self.busy && self.poll_owed {
+            self.poll_at(self.interval, now);
+        }
+        if !self.busy
+            && !self.image_queue.is_empty()
+            && self.watch_retry_deadline().is_some_and(|due| due <= now)
+        {
+            self.retry_poll_at(self.interval, now);
+        }
+        if self.busy && !self.imaging && !self.polling {
+            // A pull took the worker: queued image requests get the prompt
+            // busy answer a new one would, instead of waiting behind it.
+            // A (short) metadata poll keeps them queued.
             for job in std::mem::take(&mut self.image_queue) {
                 (job.reply)(Err(self.busy_message()));
             }
@@ -401,21 +438,24 @@ impl FileSession {
 
     pub(crate) fn poll_at(&mut self, interval: Duration, now: Instant) -> bool {
         self.interval = interval;
-        if !self.busy
-            && (self.expedited_poll || now >= self.next_poll)
+        let eligible = (self.expedited_poll || now >= self.next_poll)
             && now >= self.retry_at
             && self.poll_retry_at.is_none_or(|retry| now >= retry)
             && self
                 .job
                 .as_ref()
-                .is_none_or(|j| j.state != JobState::Queued)
-        {
+                .is_none_or(|j| j.state != JobState::Queued);
+        if eligible && self.busy && self.imaging {
+            // Owed: dispatched by `maintain_at` as soon as the running
+            // image request finishes, ahead of any queued one.
+            self.poll_owed = true;
+        }
+        if !self.busy && eligible {
             let expedited = std::mem::take(&mut self.expedited_poll);
-            self.commands
-                .as_ref()
-                .unwrap()
-                .send(Command::Poll { expedited })
-                .unwrap();
+            if self.send(Command::Poll { expedited }).is_err() {
+                return false;
+            }
+            self.poll_owed = false;
             self.next_poll = now + interval;
             self.poll_retry_at = None;
             self.watch_retry_at = None;
@@ -424,6 +464,16 @@ impl FileSession {
             return true;
         }
         false
+    }
+
+    /// Shutdown: answer every not-yet-started image request with an error
+    /// instead of running it. A running one still finishes.
+    pub(crate) fn abandon_queued_images(&mut self) {
+        for job in std::mem::take(&mut self.image_queue) {
+            (job.reply)(Err(
+                "figmog serve is shutting down; retry figmog_images".into()
+            ));
+        }
     }
 
     fn busy_message(&self) -> String {
@@ -437,10 +487,11 @@ impl FileSession {
     /// the worker. Never waits on the worker: an idle worker starts it
     /// now, an image request already running queues it behind (FIFO), and a
     /// running pull or metadata poll refuses it with a prompt busy error
-    /// (spec §6), even for a cache hit. A pull or poll that becomes due
-    /// while images run takes the worker next and answers every still
-    /// queued image request with that same busy error. Cache writes stay
-    /// on the worker, the file's only writer.
+    /// (spec §6), even for a cache hit. A watch poll or retry that comes due
+    /// while images run gets the worker before the next queued image; a
+    /// pull that takes the worker answers every still queued image request
+    /// with that same busy error. Cache writes stay on the worker, the
+    /// file's only writer.
     pub(crate) fn images(
         &mut self,
         ids: &[String],
@@ -472,14 +523,14 @@ impl FileSession {
     }
 
     fn start_images(&mut self, job: ImageJob) {
-        // The bounded command slot is free whenever `busy` is false.
-        self.commands
-            .as_ref()
-            .unwrap()
-            .send(Command::Images(job))
-            .unwrap();
-        self.busy = true;
-        self.imaging = true;
+        match self.send(Command::Images(job)) {
+            Ok(()) => {
+                self.busy = true;
+                self.imaging = true;
+            }
+            Err(Command::Images(job)) => (job.reply)(Err(WORKER_GONE.to_string())),
+            Err(_) => unreachable!("send hands back the command it was given"),
+        }
     }
 }
 
@@ -714,6 +765,7 @@ pub(crate) fn open_session_with_hooks(
         polling: false,
         imaging: false,
         image_queue: VecDeque::new(),
+        poll_owed: false,
         job: None,
         queued: None,
         last_completed: None,

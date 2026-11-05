@@ -417,12 +417,15 @@ dropped. A worker that stops before answering still answers with an error.
 When a file's worker is occupied by a pull or metadata poll,
 `figmog_images` returns a prompt busy error (including for cache hits),
 rather than waiting behind that operation. While it is busy with another
-image request, a new one queues behind it (FIFO); if a pull or poll takes
-the worker first, queued image requests get the same busy error. A desktop
-write's expedited polls (§8) are recorded when its result is delivered. On
-shutdown, a running image request drains with the file's worker like a
-running pull; the desktop worker is detached, its in-flight call bounded by
-the upstream timeout and its queued calls discarded.
+image request, a new one queues behind it (FIFO). A watch poll that came
+due meanwhile, or a due watch retry, gets the worker before the next queued
+image request (outside the global two-second dispatch floor, at most once
+per due poll), so continuous image traffic cannot starve watch; queued
+image requests wait for that poll. If a pull takes the worker instead,
+queued image requests get the busy error. If a file's worker thread is
+gone, its requests fail with an error rather than crashing the loop. A
+desktop write's expedited polls (§8) are recorded when its result is
+delivered.
 
 **Watch/poll loop:** normal rounds visit one session every
 `max(--interval / session_count, 2s)`. Ordinary polls and retries share a
@@ -569,6 +572,17 @@ client is a silent no-op. The store stays single-threaded throughout:
 socket traffic interleaves with MCP frames and watch ticks like any other
 request. Image and desktop responses are written when their off-loop work
 finishes (§6), to the connection that asked.
+
+**Shutdown with deferred work:** on stdin EOF (or the request channel
+closing) serve stops accepting requests and starts no new work, but still
+writes the responses it owes, to stdio and to still-open sockets, for up to
+15 seconds (covering the desktop's 10-second timeout), so `printf
+'<request>\n' | figmog serve` gets its image or desktop response. Image
+requests still queued (not started) are answered with a shutting-down
+error. Responses not ready by then are dropped. A running image request
+still finishes before exit with its file's worker, like a running pull; the
+desktop worker is detached, its in-flight call bounded by the upstream
+timeout and its queued calls discarded.
 
 Socket `tools/call` registry and handler failures (including upstream
 protocol/transport failures) use a top-level JSON-RPC `error` with code
