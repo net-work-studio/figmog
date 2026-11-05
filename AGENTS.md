@@ -50,6 +50,18 @@ removed) verbatim, for provenance only — don't treat them as current.
   wording change upstream would silently turn every "store is locked"
   case into `internal panic: ...` + exit 101 instead of the intended
   clean exit-1 message.
+- **Pin-bump checklist: store compaction.** `src/compact.rs` (NWS-2941)
+  drives fjall directly: `SingleWriterTxKeyspace::inner()` and
+  `Keyspace::rotate_memtable_and_wait()` are `#[doc(hidden)]` in fjall
+  3.1.9 (public, undocumented), and the journal retirement it relies on
+  — fjall seals the active journal during a flush only once the journal
+  writer's position passes 64,000,000 bytes, then deletes it once every
+  keyspace has persisted past it — is fjall-internal behavior. On any
+  fjall *or* `fold` bump, re-verify those calls still exist with the same
+  meaning, re-read fjall's `worker_pool.rs`/`journal` sealing logic, and
+  run `cargo test --lib compact` (`journal_shrinks_after_compaction`
+  fails if the journal stops shrinking) plus the ignored
+  `cargo test --test compact -- --ignored --nocapture` benchmark.
 - **The empty `[workspace]` table in `Cargo.toml` is deliberate, not
   leftover.** It guards against Cargo silently treating figmog as a
   member of some *enclosing* workspace if this repo is ever checked out

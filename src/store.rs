@@ -265,6 +265,13 @@ pub struct Churn {
     pub unchanged: usize,
 }
 
+impl Churn {
+    /// Whether any record was added, changed or removed.
+    pub fn wrote(&self) -> bool {
+        self.added + self.changed + self.removed > 0
+    }
+}
+
 /// How many rows [`sync`] leaves in the `nodes` table for `flattened`:
 /// its distinct node ids (the table is keyed by node id, and `sync` sweeps
 /// every node the pull no longer carries).

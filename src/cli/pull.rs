@@ -283,6 +283,13 @@ fn apply_pull(
         write_current(&layout.local_root, key)?;
     }
 
+    // Move what this pull wrote out of fjall's journal (NWS-2941), so the
+    // next cold open doesn't replay it. A zero-churn pull wrote nothing
+    // worth it (just its meta/config rows).
+    if fresh || churn.wrote() {
+        st.close_and_compact();
+    }
+
     Ok((
         churn,
         flattened.file.name.clone(),

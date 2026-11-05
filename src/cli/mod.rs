@@ -27,6 +27,7 @@ mod pull;
 mod socket;
 mod store_lock;
 
+pub(crate) use store_lock::Compaction;
 use store_lock::{OwnedStore, StoreOwner};
 
 pub(crate) use pull::{PullError, now_ms, pull_failure_wait, write_current};

@@ -970,6 +970,9 @@ fn serve_loop_with_offload(
     manager.close_reads(deadline);
     registry.finish(deadline);
     stdio.finish(deadline);
+    // Clients have their answers; now move each store's writes out of
+    // fjall's journal so the next cold open skips it (NWS-2941).
+    manager.close_and_compact();
     Ok(())
 }
 

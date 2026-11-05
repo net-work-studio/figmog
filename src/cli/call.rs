@@ -28,6 +28,10 @@ pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String>
     });
     let churn =
         crate::store::replace_variable_snapshot(&mut st, &prior, &parsed.recs, parsed.snapshot);
+    // NWS-2941: a large import leaves its rows in fjall's journal too.
+    if churn.wrote() {
+        st.close_and_compact();
+    }
 
     let imported = parsed
         .recs

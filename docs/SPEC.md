@@ -223,6 +223,94 @@ inverted index: `InvertedIndex` is set-semantic, so duplicate `(node,
 var)` edges (a variable bound at multiple property paths on the same
 node) collapse harmlessly to the same membership.
 
+### Maintenance keyspace and post-write compaction (NWS-2941)
+
+fold opens fjall with its default configuration and never flushes a
+memtable itself, so everything a large pull writes stays in fjall's
+journal, and every later open of the store replays the whole journal
+before it can answer anything. On a synthetic 100,001-node mirror that
+is a 93 MB journal and ~1.33 s for even `figmog path 0:1`.
+
+figmog therefore compacts a store after large writes (`src/compact.rs`),
+with fold's handle closed and the store's `.figmog-lock` ownership
+anchor (§5, fresh replacement) held for the whole pass. It reopens the
+same directory with fjall's own API — the default builder, exactly as
+fold opens it — and:
+
+1. flushes every keyspace's memtable into tables
+   (`rotate_memtable_and_wait` on each of `list_keyspace_names()`);
+2. commits one tiny constant row (`compacted` → `1`) to the
+   **`figmog_maintenance`** keyspace. After a reopen fjall's
+   append-mode journal writer reports stream position 0 until something
+   is written, and fjall seals the active journal only during a flush
+   that finds that position past 64,000,000 bytes;
+3. flushes that keyspace: fjall seals the old journal and, every
+   keyspace having persisted past it, deletes it (figmog waits on
+   `journal_count()` for the deletion);
+4. persists (`PersistMode::SyncAll`) and closes.
+
+`figmog_maintenance` is not a pipeline sink — fold names those
+`sink_<name>` and never opens anything else — so the frozen sink table
+above is unchanged, and a binary without compaction opens a compacted
+store as ordinary fjall data (it just never looks at that keyspace).
+Outputs are byte-identical with and without compaction.
+
+**When.** A journal smaller than fjall's 64 MB sealing threshold can't be
+retired this way and is left alone (checked first from the journal files'
+allocated size, without opening the store, then again after fjall's
+recovery truncates its preallocated tail); its replay costs in proportion.
+Otherwise compaction runs:
+
+- after a CLI `pull` (direct, including `figmog call figmog_sync`) that
+  added, changed or removed records, or was `--fresh` — never after a
+  zero-churn re-pull;
+- after a CLI `import-variables` that changed the snapshot;
+- at `figmog serve` shutdown, per store, after the close barrier
+  (`close_reads`) and after clients have their answers: each session is
+  closed (its worker joined, its published view dropped) while its
+  ownership anchor is kept, then compacted. A store that a detached read
+  still holds a view of keeps fjall's own lock, so compaction's open fails
+  and that store is left untouched (one stderr line). Serve never compacts
+  under live views: not after an individual write job, and not during a
+  reset-barrier reopen (which releases the store unchanged).
+
+Compaction is best effort over already-committed data: a failure prints
+`figmog: store compaction skipped: …` on stderr and never fails the
+command that wrote. `FIGMOG_NO_COMPACT=1` (any value but empty or `0`)
+disables it.
+
+**Crash safety.** Every step is an ordinary fjall operation with fjall's
+own crash safety (table writes and version swaps, journal sealing and
+deletion after the data is persisted). A process killed at any point
+leaves a store fjall recovers normally — at worst with the old journal
+still in place, replayed as before — and the next compaction finishes the
+job. `compact::tests::a_crash_during_compaction_leaves_a_readable_store`
+aborts a child process after each step and re-reads every row.
+
+**Measured** (synthetic 100,001-node file, `figmog pull --from-file`,
+best of 3 cold CLI processes, 4-core Linux; `cargo test --test compact --
+--ignored --nocapture`):
+
+| command | journal replayed | compacted |
+|---|---|---|
+| journal on disk | 93.2 MB | 0 B |
+| `path 0:1` | 1.328 s | 0.004 s |
+| `get 500:3` | 1.327 s | 0.004 s |
+| `status` | 1.347 s | 0.084 s |
+| `search "copy number 7"` | 1.334 s | 0.076 s |
+| `vars` | 1.478 s | 0.220 s |
+
+The pull itself pays one more replay plus the flush (6.5 s → 8.7 s here).
+An unchanged re-pull of the compacted store is still zero churn.
+
+**Pin bumps.** `rotate_memtable_and_wait` (`Keyspace`) and the
+`SingleWriterTxKeyspace::inner()` accessor are `#[doc(hidden)]` in fjall
+3.1.9 — public but undocumented — and the 64 MB sealing rule is
+fjall-internal behavior. fjall is pinned `=3.1.9`; `AGENTS.md`'s
+pin-bump checklist requires re-verifying both on any fjall or fold bump
+(`compact::tests::journal_shrinks_after_compaction` fails if the journal
+stops being retired).
+
 ## 5. Sync, churn, and sweep
 
 `store::sync` applies one flattened file in a single write transaction:

@@ -266,7 +266,8 @@ pub(crate) struct FileSession {
     view: Arc<SessionView>,
     commands: Option<mpsc::SyncSender<Command>>,
     completions: mpsc::Receiver<Completion>,
-    worker: Option<JoinHandle<()>>,
+    /// Returns the closed store, still owned, for shutdown's compaction.
+    worker: Option<JoinHandle<crate::cli::Compaction>>,
     busy: bool,
     polling: bool,
     /// The worker is busy with an image request (not a pull or poll).
@@ -420,6 +421,14 @@ impl Drop for FileSession {
 }
 
 impl FileSession {
+    /// Drain and close this session (as dropping it does), returning its
+    /// closed but still-owned store once the session — and its published
+    /// view — is gone. `None` if the worker panicked.
+    fn close(mut self) -> Option<crate::cli::Compaction> {
+        self.commands.take();
+        self.worker.take()?.join().ok()
+    }
+
     pub(crate) fn lifecycle(&self) -> Value {
         json!({
             "job": self.job.as_ref().map(Job::json),
@@ -1366,6 +1375,9 @@ fn open_session_inner(
                 break;
             }
         }
+        // Closed with ownership kept: shutdown compacts the store once
+        // every view is gone (NWS-2941); a reset just releases it.
+        st.close_for_compaction()
     });
     Ok(FileSession {
         key,
@@ -1560,6 +1572,21 @@ impl SessionManager {
             }
         }
         finished
+    }
+
+    /// Shutdown's last step, after [`close_reads`](Self::close_reads):
+    /// close every session, then compact each store (NWS-2941) while its
+    /// ownership is still held. A store a detached read still holds a view
+    /// of fails fjall's own lock check and is left as it is.
+    pub(crate) fn close_and_compact(&mut self) {
+        let closed: Vec<_> = self
+            .sessions
+            .drain(..)
+            .filter_map(FileSession::close)
+            .collect();
+        for compaction in closed {
+            compaction.run();
+        }
     }
 
     /// Shutdown's close barrier: stop admitting reads on every store and

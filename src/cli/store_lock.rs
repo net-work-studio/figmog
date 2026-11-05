@@ -188,6 +188,23 @@ impl<T> OwnedStore<T> {
         owner
     }
 
+    /// Close the store but keep ownership until the returned
+    /// [`Compaction`] runs or drops (NWS-2941): `figmog serve`'s workers
+    /// close their store this way and compact it only at shutdown.
+    pub(crate) fn close_for_compaction(self) -> Compaction {
+        Compaction {
+            owner: self.into_owner(),
+        }
+    }
+
+    /// Close the store and compact it ([`crate::compact`]) while still
+    /// holding its ownership anchor, then release it. Compaction is a
+    /// best-effort optimization over committed data: a failure is reported
+    /// on stderr and never fails the command that wrote.
+    pub(crate) fn close_and_compact(self) {
+        self.close_for_compaction().run();
+    }
+
     /// The initial open already checked fjall's own lock, including stores
     /// owned by older figmog binaries that don't acquire the anchor lock.
     /// Close the store, clear its contents except the ownership anchor,
@@ -200,6 +217,24 @@ impl<T> OwnedStore<T> {
         drop(store);
         owner.clear_contents()?;
         super::open_store_owned(owner, open)
+    }
+}
+
+/// A closed store whose ownership is kept for a pending compaction
+/// ([`OwnedStore::close_for_compaction`]). Dropping it unrun just releases
+/// the store.
+pub(crate) struct Compaction {
+    owner: StoreOwner,
+}
+
+impl Compaction {
+    /// Compact the closed store, then release its ownership. Any fjall
+    /// handle still open on it (a detached reader's view) makes fjall's own
+    /// open fail with its lock error: nothing is touched then.
+    pub(crate) fn run(self) {
+        if let Err(e) = crate::compact::compact(&self.owner.path) {
+            eprintln!("figmog: store compaction skipped: {e}");
+        }
     }
 }
 

@@ -291,6 +291,23 @@ Figma's Tier-1 budget of ~10 requests a minute, those 5,000 calls take about
 The harness itself was retired from the binary in v0.0.1's slim-down and
 lives in the repo history: `docs/history/2026-08-16-figmog-bench.md`.
 
+**Cold CLI reads** (NWS-2941). Every CLI command is a fresh process that
+opens the store. After a large pull figmog compacts the store (moves its
+writes out of fjall's journal), so that open no longer replays the whole
+journal. Synthetic 100,001-node file, best of 3 cold processes, 4-core
+Linux, `cargo test --test compact -- --ignored --nocapture`:
+
+| command | before compaction | after |
+|---|---|---|
+| `figmog path 0:1` | 1.328s | 0.004s |
+| `figmog get 500:3` | 1.327s | 0.004s |
+| `figmog status` | 1.347s | 0.084s |
+| `figmog search "copy number 7"` | 1.334s | 0.076s |
+| `figmog vars` | 1.478s | 0.220s |
+
+The journal goes from 93.2 MB to nothing; outputs are byte-identical.
+`FIGMOG_NO_COMPACT=1` turns compaction off (`docs/SPEC.md` §4).
+
 </details>
 
 ## Install
