@@ -13,7 +13,8 @@
           "font-family": "\"Inter\"",
           "font-size": "var(--font-size-title)",
           "font-weight": "var(--font-weight-bold)",
-          "line-height": "28px"
+          "line-height": "28px",
+          "white-space": "pre-wrap"
         },
         "design": {
           "absoluteBoundingBox": {
@@ -44,6 +45,9 @@
         "values": {
           "fill": [
             {
+              "bound_at": [
+                "/boundVariables/fills/0"
+              ],
               "css": "--color-text-primary",
               "raw": "#1a1a1f",
               "token": "text/primary",
@@ -52,18 +56,27 @@
           ],
           "typography": {
             "font_family": {
+              "bound_at": [
+                "/boundVariables/fontFamily"
+              ],
               "css": null,
               "raw": "Inter",
               "token": "font/family/sans",
               "variable_id": "VariableID:1:14"
             },
             "font_size": {
+              "bound_at": [
+                "/boundVariables/fontSize"
+              ],
               "css": "--font-size-title",
               "raw": 20,
               "token": "font/size/title",
               "variable_id": "VariableID:1:11"
             },
             "font_weight": {
+              "bound_at": [
+                "/boundVariables/fontWeight"
+              ],
               "css": "--font-weight-bold",
               "raw": 700,
               "token": "font/weight/bold",
@@ -93,7 +106,9 @@
               "font-family": "\"Inter\"",
               "font-size": "var(--font-size-body)",
               "font-weight": "400",
-              "line-height": "var(--font-line-body)"
+              "line-height": "var(--font-line-body)",
+              "min-width": "0",
+              "white-space": "pre-wrap"
             },
             "design": {
               "absoluteBoundingBox": {
@@ -152,6 +167,9 @@
                   "untokenized": true
                 },
                 "font_size": {
+                  "bound_at": [
+                    "/boundVariables/fontSize"
+                  ],
                   "css": "--font-size-body",
                   "raw": 16,
                   "token": "font/size/body",
@@ -166,6 +184,9 @@
                   "untokenized": true
                 },
                 "line_height": {
+                  "bound_at": [
+                    "/boundVariables/lineHeight"
+                  ],
                   "css": "--font-line-body",
                   "raw": 24,
                   "token": "font/line/body",
@@ -217,6 +238,9 @@
             "values": {
               "fill": [
                 {
+                  "bound_at": [
+                    "/fills/0/boundVariables/color"
+                  ],
                   "css": "--color-brand",
                   "raw": "#0066cc",
                   "token": "brand",
@@ -362,6 +386,9 @@
       },
       "direction": "vertical",
       "gap": {
+        "bound_at": [
+          "/boundVariables/itemSpacing"
+        ],
         "css": "--spacing-4",
         "raw": 16,
         "token": "space/4",
@@ -369,6 +396,9 @@
       },
       "padding": {
         "bottom": {
+          "bound_at": [
+            "/boundVariables/paddingBottom"
+          ],
           "css": "--spacing-4",
           "raw": 16,
           "token": "space/4",
@@ -383,6 +413,9 @@
           "untokenized": true
         },
         "top": {
+          "bound_at": [
+            "/boundVariables/paddingTop"
+          ],
           "css": "--spacing-4",
           "raw": 16,
           "token": "space/4",
@@ -407,6 +440,9 @@
     "values": {
       "fill": [
         {
+          "bound_at": [
+            "/fills/0/boundVariables/color"
+          ],
           "css": "--surface",
           "raw": "#fafafc",
           "token": "surface",
@@ -415,24 +451,36 @@
       ],
       "radius": {
         "bottom_left": {
+          "bound_at": [
+            "/boundVariables/bottomLeftRadius"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
           "variable_id": "VariableID:1:6"
         },
         "bottom_right": {
+          "bound_at": [
+            "/boundVariables/bottomRightRadius"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
           "variable_id": "VariableID:1:6"
         },
         "top_left": {
+          "bound_at": [
+            "/boundVariables/topLeftRadius"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
           "variable_id": "VariableID:1:6"
         },
         "top_right": {
+          "bound_at": [
+            "/boundVariables/topRightRadius"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
@@ -441,6 +489,9 @@
       },
       "stroke": [
         {
+          "bound_at": [
+            "/strokes/0/boundVariables/color"
+          ],
           "css": "--border-subtle",
           "raw": "#e0e3e6",
           "token": "border/subtle",
@@ -448,6 +499,9 @@
         }
       ],
       "stroke_weight": {
+        "bound_at": [
+          "/boundVariables/strokeWeight"
+        ],
         "css": "--stroke-thin",
         "raw": 1,
         "token": "stroke/thin",
