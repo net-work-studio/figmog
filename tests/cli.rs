@@ -1115,6 +1115,13 @@ fn call_rejects_wrong_typed_optional_args() {
             serde_json::json!({"id": "1:2", "file": 12}),
             "expected string for `file`, got number",
         ),
+        // The direct `--db` sync path validates `file` too, before
+        // `do_pull` could report a missing file key.
+        (
+            "figmog_sync",
+            serde_json::json!({"file": 12}),
+            "expected string for `file`, got number",
+        ),
         (
             "figmog_subtree",
             serde_json::json!({"id": "1:1", "fields": "name"}),

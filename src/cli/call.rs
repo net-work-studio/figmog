@@ -133,6 +133,13 @@ pub(super) fn cmd_call(
     no_upstream: bool,
 ) -> Result<(), String> {
     let args = parse_args(args.as_deref())?;
+    // `file` is routing (already resolved into `db`), so neither dispatch
+    // nor `do_pull` reads it; still reject a wrong-typed one as serve does
+    // (NWS-2944) — before the `figmog_sync` early return and before any
+    // store is opened.
+    if proxy::is_local_tool(&tool) {
+        dispatch::arg_str(&args, "file")?;
+    }
 
     // `figmog_sync` delegates entirely to `do_pull`, which opens its own
     // `open_store!` handle at `db.path`. fjall allows only one open handle
@@ -158,9 +165,6 @@ pub(super) fn cmd_call(
     let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
 
     let result: Result<Value, String> = if proxy::is_local_tool(&tool) {
-        // `file` is routing (already resolved into `db`), so dispatch never
-        // reads it; still reject a wrong-typed one as serve does (NWS-2944).
-        dispatch::arg_str(&args, "file")?;
         match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, &r, None)) {
             Some(r) => r,
             None => Err(format!("unknown tool: {tool}")),
