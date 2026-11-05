@@ -559,7 +559,7 @@ pub(crate) fn open_session_with_hooks(
                             st.rtx(|(_, (.., config, _, _, _))| store::read_geometry(&config));
                         let geometry = store::effective_geometry(geometry, stored);
                         phase(PullPhase::Fetching);
-                        let response = api.file(key, geometry)?;
+                        let response = crate::deep_json::OwnedValue(api.file(key, geometry)?);
                         let vars = api.variables_local(key)?;
                         phase(PullPhase::Flattening);
                         let mut flattened =

@@ -166,5 +166,5 @@ pub(super) fn parse_args(raw: Option<&str>) -> Result<Value, String> {
 /// propagates the error so `run`'s top-level handler emits `{"error": ...}`
 /// on stderr and exits 1, same as every other command.
 fn print_call_result(result: Result<Value, String>) -> Result<(), String> {
-    write_json(&result?)
+    write_json(&crate::deep_json::OwnedValue(result?))
 }

@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+#[cfg(test)]
+mod deep_tests;
 mod http;
 #[cfg(test)]
 pub(crate) mod test_http;
@@ -232,30 +234,34 @@ impl UreqApi {
         self
     }
 
-    fn get_json(&self, path: &str) -> Result<Value, ApiError> {
+    fn get_json(&self, path: &str, deep: bool) -> Result<Value, ApiError> {
         let url = format!("{}{}", self.base_url, path);
-        self.http
-            .get(&url, Some(&self.token))?
-            .into_json()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::TimedOut {
-                    ApiError::Network(e.to_string())
-                } else {
-                    ApiError::Parse(e.to_string())
-                }
-            })
+        let response = self.http.get(&url, Some(&self.token))?;
+        let reader = response.into_reader();
+        let parsed = if deep {
+            crate::deep_json::from_reader(reader).map(crate::deep_json::OwnedValue::into_inner)
+        } else {
+            serde_json::from_reader(reader)
+        };
+        parsed.map_err(|e| {
+            if e.io_error_kind() == Some(std::io::ErrorKind::TimedOut) {
+                ApiError::Network(e.to_string())
+            } else {
+                ApiError::Parse(e.to_string())
+            }
+        })
     }
 }
 
 impl FigmaApi for UreqApi {
     fn file_meta(&self, key: &str) -> Result<FileMetaResp, ApiError> {
-        parse_meta_response(&self.get_json(&format!("/v1/files/{key}/meta"))?)
+        parse_meta_response(&self.get_json(&format!("/v1/files/{key}/meta"), false)?)
     }
     fn file(&self, key: &str, geometry: bool) -> Result<Value, ApiError> {
-        self.get_json(&file_url(key, geometry))
+        self.get_json(&file_url(key, geometry), true)
     }
     fn variables_local(&self, key: &str) -> Result<Option<Value>, ApiError> {
-        match self.get_json(&format!("/v1/files/{key}/variables/local")) {
+        match self.get_json(&format!("/v1/files/{key}/variables/local"), false) {
             Ok(v) => Ok(Some(v)),
             Err(e) if variables_local_is_gated(&e) => Ok(None),
             Err(e) => Err(e),
@@ -269,10 +275,10 @@ impl FigmaApi for UreqApi {
         scale: Option<f64>,
         version: Option<&str>,
     ) -> Result<Value, ApiError> {
-        self.get_json(&images_render_url(key, ids, format, scale, version))
+        self.get_json(&images_render_url(key, ids, format, scale, version), false)
     }
     fn file_image_fills(&self, key: &str) -> Result<Value, ApiError> {
-        self.get_json(&file_image_fills_url(key))
+        self.get_json(&file_image_fills_url(key), false)
     }
 }
 

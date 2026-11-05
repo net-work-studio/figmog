@@ -267,6 +267,27 @@ return an error with the node's location, before an ordinary CLI import,
 fresh replacement, or server pull can sync a partial tree or sweep existing
 subtrees. Other fields remain unknown-field-preserving.
 
+**Deep trees:** saved-file and REST file imports support 500 nested frames
+(and are not subject to serde_json's default 128-container parsing limit).
+Node walks, variable-binding scans, and tree/subtree reconstruction use
+explicit work stacks. File responses and emitted trees are drained
+iteratively on cleanup; JSON parsing and printing use `serde_stacker`.
+Deserialization guards partial arrays/maps and replaced duplicate-key values,
+so malformed deep input returns an error instead of overflowing during cleanup.
+Stored raw JSON and component definitions use this same guarded parser across
+variable inference, styles, image-fill scanning, and inventory reads. `where`
+moves matched values and compares containers iteratively; pending results and
+subtree frames retain guards until response handoff, including error paths.
+
+**Dependency justification:** `serde_stacker` is needed because disabling
+serde_json's recursion limit alone exposes the CLI and the server's ordinary
+worker stacks to overflow during deserialization and serialization. Its
+adapters grow the stack while retaining serde_json's validation and sorted
+object semantics; it avoids introducing a separate JSON parser or changing
+the persisted record schema. `serde_json/unbounded_depth` enables these
+adapters to accept full Figma trees beyond the default limit. The regression
+fixtures are generated synthetically as JSON text.
+
 **Fresh replacement:** file and optional variables responses are validated
 before opening or resetting the mirror. Every direct CLI and server-session
 store handle holds a lock on the permanent `.figmog-lock` file inside the
@@ -791,6 +812,20 @@ Ignore-update failures emit a JSON warning on stderr without failing an
 already successful pull. This does not untrack committed files or share
 mirror data between worktrees.
 
+**Point lookup.** `figmog at --page <page-id-or-url> --x X --y Y`
+(and `figmog_at` with required `page`, `x`, `y`) searches one CANVAS's
+coordinate space. `page` must identify an existing CANVAS; a missing,
+unknown, or non-page reference is an error. Page references accept bare
+ids, hyphenated ids, and Figma page URLs. `--under <node-id-or-url>`
+intersects the page with that subtree, including its root; an unknown
+scope is an error. Hidden nodes and descendants of hidden nodes are
+excluded. Bounds use inclusive left/top and exclusive right/bottom
+edges. Matches retain the array shape `[{id, name, type, page_id, area}]`,
+sorted by area ascending then id, and are truncated after filtering and
+sorting. `--limit N` (MCP `limit`) defaults to 100; zero returns an empty
+array. Hit testing traverses the requested page's children with cycle
+protection; no store schema change is needed.
+
 **Socket-first routing (§6a).** When neither `--no-socket` nor `--db` is
 given, every read command, plus `tools`, `call` and `images`, first tries
 `<.figmog>/serve.sock`. Reachable ⇒ the command becomes a client of the
@@ -807,7 +842,7 @@ absent `equals` key from `"equals": null` the same way (`figmog call`'s own
 `--args` payload is passed through untouched). Both direct
 and socket reads for per-file local tools select an explicit `call`
 argument `file` first (key or Figma URL), then the file inferred from a
-node URL in `id`, `under`, or `target`, then `.figmog/current`.
+node URL in `id`, `under`, `target`, or `page`, then `.figmog/current`.
 An explicit `--db` takes precedence
 over all of these. Current is injected as a routed `file` argument only
 for per-file local tools, when no explicit non-null `file` was supplied
@@ -878,7 +913,7 @@ id" wrapper the query layer calls, falling back to the raw input.
 Every node-id-shaped argument accepts both forms: the CLI's `id`,
 `target`, `--under` and `--page` arguments, and the tools' `id`, `under`,
 `target` and `page` properties. In `serve`, when a tool call omits `file`
-and one of `id`/`under`/`target` is a URL that names a file,
+and one of `id`/`under`/`target`/`page` is a URL that names a file,
 `dispatch::infer_file_from_node_ref` routes the call at that file and
 auto-opens it. An explicit `file` always wins; a disagreement between the
 two is named in the error text if the node isn't found, comparing
@@ -897,7 +932,7 @@ size is the caller's business: the tool description says so and points at
 `depth`/`fields`.
 
 **Subtree scoping** (`query::resolve_under` + `query::scope_ids`;
-`--under <id>` on `text`/`find`/`search`/`where` and the matching tool
+`--under <id>` on `text`/`find`/`search`/`where`/`at` and the matching tool
 argument): one BFS over the `children` index from the scope root
 (inclusive, cycle-safe via a visited set) collects the descendant id set,
 and results are filtered against it. It composes with `page` by

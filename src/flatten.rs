@@ -4,8 +4,10 @@
 //! byte-identical records (postcard), because `KeyedStream::upsert` uses
 //! byte equality as its change detector.
 
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use crate::model::{ComponentRec, ComponentSetRec, Id, NodeRec, Rec, StyleRec};
 
@@ -47,7 +49,7 @@ pub fn flatten_file(resp: &Value) -> Result<Flattened, FlattenError> {
         .ok_or(FlattenError::Missing("document"))?;
 
     let mut recs = Vec::new();
-    walk(document, "document", None, 0, None, &mut recs)?;
+    walk(document, &mut recs)?;
 
     // Borrowed, not cloned: every entry is read once here (a handful of
     // `str_field`/`get` lookups) and dropped, so there's no reason to clone
@@ -107,98 +109,116 @@ fn str_field(v: &Value, k: &str) -> Option<String> {
 
 /// Depth-first walk. `page_id` is the nearest CANVAS ancestor (None above
 /// pages — the record then carries the node's own id).
-fn walk(
-    node: &Value,
-    path: &str,
-    parent_id: Option<&str>,
-    child_index: u32,
-    page_id: Option<&str>,
-    out: &mut Vec<(Id, Rec)>,
-) -> Result<(), FlattenError> {
-    let invalid = |reason| FlattenError::InvalidNode {
-        path: path.to_string(),
-        reason,
-    };
-    let object = node
-        .as_object()
-        .ok_or_else(|| invalid("expected an object"))?;
-    let id = node
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| invalid("expected a non-empty string id"))?;
-    let node_type = node
-        .get("type")
-        .and_then(Value::as_str)
-        .filter(|node_type| !node_type.is_empty())
-        .ok_or_else(|| invalid("expected a non-empty string type"))?
-        .to_string();
-    if parent_id.is_none() && node_type != "DOCUMENT" {
-        return Err(invalid("root type must be DOCUMENT"));
-    }
-    let own_page = matches!(node_type.as_str(), "DOCUMENT" | "CANVAS");
-    let page = if own_page { id } else { page_id.unwrap_or(id) };
+fn walk(document: &Value, out: &mut Vec<(Id, Rec)>) -> Result<(), FlattenError> {
+    let mut paths = Vec::new();
+    let mut pending = vec![(document, None, None, 0, None)];
+    while let Some((node, path, parent_id, child_index, page_id)) = pending.pop() {
+        let invalid = |reason| FlattenError::InvalidNode {
+            path: node_path(&paths, path),
+            reason,
+        };
+        let object = node
+            .as_object()
+            .ok_or_else(|| invalid("expected an object"))?;
+        let id = node
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid("expected a non-empty string id"))?;
+        let node_type = node
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|node_type| !node_type.is_empty())
+            .ok_or_else(|| invalid("expected a non-empty string type"))?
+            .to_string();
+        if parent_id.is_none() && node_type != "DOCUMENT" {
+            return Err(invalid("root type must be DOCUMENT"));
+        }
+        let own_page = matches!(node_type.as_str(), "DOCUMENT" | "CANVAS");
+        let page = if own_page { id } else { page_id.unwrap_or(id) };
 
-    // Filter before cloning: cloning the whole node would copy every
-    // descendant subtree just to discard it, repeating that work per ancestor.
-    // The validated object map stays sorted.
-    let raw = Value::Object(
-        object
-            .iter()
-            .filter(|(key, _)| key.as_str() != "children")
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-    );
+        // Serialize a borrowed map: neither cloning nor dropping a raw node
+        // should recurse through arbitrary unknown properties (or descendants).
+        let raw = NodeFields(object);
+        let mut bound_variables = Vec::new();
+        for (key, value) in object {
+            if key == "boundVariables" {
+                collect_aliases(value, "", &mut bound_variables);
+            } else if key != "children" {
+                let key = escape_json_pointer_component(key);
+                scan_bv(value, &format!("/{key}"), &mut bound_variables);
+            }
+        }
+        bound_variables.sort();
+        bound_variables.dedup();
 
-    let bound_variables = scan_bound_variables(&raw);
+        let rec = NodeRec {
+            id: id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            child_index,
+            page_id: page.to_string(),
+            node_type,
+            name: str_field(node, "name").unwrap_or_default(),
+            visible: node.get("visible").and_then(Value::as_bool).unwrap_or(true),
+            text: str_field(node, "characters"),
+            component_id: str_field(node, "componentId"),
+            component_properties: sorted_map(node.get("componentProperties"), |v| {
+                v.get("value")
+                    .map(|val| crate::deep_json::to_string(val).expect("Value serializes"))
+            }),
+            property_definitions: node
+                .get("componentPropertyDefinitions")
+                .map(|v| crate::deep_json::to_string(v).expect("Value serializes")),
+            style_refs: sorted_map(node.get("styles"), |v| v.as_str().map(str::to_string)),
+            bound_variables,
+            abs_bounds: node.get("absoluteBoundingBox").and_then(|b| {
+                Some([
+                    b.get("x")?.as_f64()?,
+                    b.get("y")?.as_f64()?,
+                    b.get("width")?.as_f64()?,
+                    b.get("height")?.as_f64()?,
+                ])
+            }),
+            raw: crate::deep_json::to_string(&raw).expect("serde_json::Value serializes"),
+        };
+        out.push((Id::Node(id.to_string()), Rec::Node(rec)));
 
-    let rec = NodeRec {
-        id: id.to_string(),
-        parent_id: parent_id.map(str::to_string),
-        child_index,
-        page_id: page.to_string(),
-        node_type,
-        name: str_field(node, "name").unwrap_or_default(),
-        visible: node.get("visible").and_then(Value::as_bool).unwrap_or(true),
-        text: str_field(node, "characters"),
-        component_id: str_field(node, "componentId"),
-        component_properties: sorted_map(node.get("componentProperties"), |v| {
-            v.get("value")
-                .map(|val| serde_json::to_string(val).expect("Value serializes"))
-        }),
-        property_definitions: node
-            .get("componentPropertyDefinitions")
-            .map(|v| serde_json::to_string(v).expect("Value serializes")),
-        style_refs: sorted_map(node.get("styles"), |v| v.as_str().map(str::to_string)),
-        bound_variables,
-        abs_bounds: node.get("absoluteBoundingBox").and_then(|b| {
-            Some([
-                b.get("x")?.as_f64()?,
-                b.get("y")?.as_f64()?,
-                b.get("width")?.as_f64()?,
-                b.get("height")?.as_f64()?,
-            ])
-        }),
-        raw: serde_json::to_string(&raw).expect("serde_json::Value serializes"),
-    };
-    out.push((Id::Node(id.to_string()), Rec::Node(rec)));
-
-    if let Some(children) = node.get("children") {
-        let children = children
-            .as_array()
-            .ok_or_else(|| invalid("children must be an array when present"))?;
-        for (i, child) in children.iter().enumerate() {
-            walk(
-                child,
-                &format!("{path}.children[{i}]"),
-                Some(id),
-                i as u32,
-                Some(page),
-                out,
-            )?;
+        if let Some(children) = node.get("children") {
+            let children = children
+                .as_array()
+                .ok_or_else(|| invalid("children must be an array when present"))?;
+            // Reverse the pending stack to retain document/child-index order.
+            for (i, child) in children.iter().enumerate().rev() {
+                let child_path = paths.len();
+                paths.push(NodePath {
+                    parent: path,
+                    child_index: i,
+                });
+                pending.push((child, Some(child_path), Some(id), i as u32, Some(page)));
+            }
         }
     }
     Ok(())
+}
+
+/// Arena links avoid copying ancestor paths and recursively dropping them.
+struct NodePath {
+    parent: Option<usize>,
+    child_index: usize,
+}
+
+fn node_path(paths: &[NodePath], mut path: Option<usize>) -> String {
+    let mut indices = Vec::new();
+    while let Some(index) = path {
+        let segment = &paths[index];
+        indices.push(segment.child_index);
+        path = segment.parent;
+    }
+    let mut path = "document".to_string();
+    for index in indices.into_iter().rev() {
+        write!(path, ".children[{index}]").expect("writing a String cannot fail");
+    }
+    path
 }
 
 /// Turn a JSON object into sorted (key, f(value)) pairs; absent/None entries drop.
@@ -215,63 +235,72 @@ fn sorted_map(obj: Option<&Value>, f: impl Fn(&Value) -> Option<String>) -> Vec<
     out
 }
 
-/// Recursively find every `boundVariables` object and emit
-/// (pointer-to-resolved-value, variable id) pairs. The binding
-/// `…/boundVariables/<prop> = {type: VARIABLE_ALIAS, id}` resolves at the
-/// sibling `…/<prop>`, which is where Figma bakes the concrete value.
-fn scan_bound_variables(node_raw: &Value) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    scan_bv(node_raw, "", &mut out);
-    out.sort();
-    out.dedup();
-    out
+/// Borrow only a node's non-children fields, preserving sorted map order.
+struct NodeFields<'a>(&'a serde_json::Map<String, Value>);
+
+impl Serialize for NodeFields<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (key, value) in self.0 {
+            if key != "children" {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
 }
 
 fn escape_json_pointer_component(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 
+/// Find binding objects without recursing through unknown node properties.
 fn scan_bv(v: &Value, path: &str, out: &mut Vec<(String, String)>) {
-    match v {
-        Value::Object(map) => {
-            for (k, child) in map {
-                if k == "boundVariables" {
-                    collect_aliases(child, path, out);
-                } else {
-                    let key = escape_json_pointer_component(k);
-                    scan_bv(child, &format!("{path}/{key}"), out);
+    let mut pending = vec![(v, path.to_string())];
+    while let Some((v, path)) = pending.pop() {
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map {
+                    if k == "boundVariables" {
+                        collect_aliases(child, &path, out);
+                    } else {
+                        let key = escape_json_pointer_component(k);
+                        pending.push((child, format!("{path}/{key}")));
+                    }
                 }
             }
-        }
-        Value::Array(items) => {
-            for (i, child) in items.iter().enumerate() {
-                scan_bv(child, &format!("{path}/{i}"), out);
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    pending.push((child, format!("{path}/{i}")));
+                }
             }
+            _ => {}
         }
-        _ => {}
     }
 }
 
-/// Walk the *inside* of a `boundVariables` object: values are aliases,
-/// arrays of aliases, or nested objects of them.
+/// Walk the inside of a binding object, including nested objects/arrays.
 fn collect_aliases(v: &Value, prop_path: &str, out: &mut Vec<(String, String)>) {
-    match v {
-        Value::Object(map) => {
-            let alias = map.get("type").and_then(Value::as_str) == Some("VARIABLE_ALIAS");
-            if alias && let Some(id) = map.get("id").and_then(Value::as_str) {
-                out.push((prop_path.to_string(), id.to_string()));
-                return;
+    let mut pending = vec![(v, prop_path.to_string())];
+    while let Some((v, path)) = pending.pop() {
+        match v {
+            Value::Object(map) => {
+                let alias = map.get("type").and_then(Value::as_str) == Some("VARIABLE_ALIAS");
+                if alias && let Some(id) = map.get("id").and_then(Value::as_str) {
+                    out.push((path, id.to_string()));
+                    continue;
+                }
+                for (k, child) in map {
+                    let key = escape_json_pointer_component(k);
+                    pending.push((child, format!("{path}/{key}")));
+                }
             }
-            for (k, child) in map {
-                let key = escape_json_pointer_component(k);
-                collect_aliases(child, &format!("{prop_path}/{key}"), out);
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    pending.push((child, format!("{path}/{i}")));
+                }
             }
+            _ => {}
         }
-        Value::Array(items) => {
-            for (i, child) in items.iter().enumerate() {
-                collect_aliases(child, &format!("{prop_path}/{i}"), out);
-            }
-        }
-        _ => {}
     }
 }

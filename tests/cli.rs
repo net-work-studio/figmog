@@ -615,7 +615,7 @@ fn stats_path_text_where_at() {
         .collect();
     assert_eq!(ids, vec!["1:2"]);
 
-    let at = run(&["at", "--x", "10", "--y", "10"]);
+    let at = run(&["at", "--x", "10", "--y", "10", "--page", "0:1"]);
     let ids: Vec<&str> = at
         .as_array()
         .unwrap()
@@ -626,6 +626,138 @@ fn stats_path_text_where_at() {
     // nodes without abs_bounds (e.g. the DOCUMENT/CANVAS/TEXT nodes here)
     // never appear.
     assert!(!ids.contains(&"1:2"), "ids={ids:?}");
+}
+
+#[test]
+fn at_requires_a_page_and_never_mixes_coordinate_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = common::fixture_v1();
+    fixture["document"]["children"][1]["children"][0]["absoluteBoundingBox"] =
+        serde_json::json!({"x": 0, "y": 0, "width": 20, "height": 20});
+    let response = dir.path().join("resp.json");
+    std::fs::write(&response, fixture.to_string()).unwrap();
+    let db = dir.path().join("db");
+    common::command()
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    let run = |page: &str| {
+        let out = common::command()
+            .args(["at", "--x", "10", "--y", "10", "--page", page, "--db"])
+            .arg(&db)
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+    assert_eq!(run("0:1")[0]["id"], "1:1");
+    let second = run("0-2");
+    assert_eq!(second.as_array().unwrap().len(), 1);
+    assert_eq!(second[0]["id"], "2:1");
+    assert_eq!(run("0:3"), serde_json::json!([]));
+    assert_eq!(
+        run("https://www.figma.com/design/figmogpointlookup01/Fixture?node-id=0-2"),
+        second
+    );
+    let missing = common::command()
+        .args(["at", "--x", "10", "--y", "10", "--db"])
+        .arg(&db)
+        .assert()
+        .failure();
+    assert!(String::from_utf8_lossy(&missing.get_output().stderr).contains("--page"));
+    for page in ["99:99", "1:1"] {
+        let out = common::command()
+            .args(["at", "--x", "10", "--y", "10", "--page", page, "--db"])
+            .arg(&db)
+            .assert()
+            .failure()
+            .code(1);
+        let error: serde_json::Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
+        assert!(error["error"].as_str().unwrap().contains(page));
+    }
+}
+
+#[test]
+fn at_filters_hidden_branches_and_subtrees_before_sorting_and_limiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(&response, common::fixture_at().to_string()).unwrap();
+    let db = dir.path().join("db");
+    common::command()
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    let run = |args: &[&str]| {
+        let out = common::command()
+            .args(["at", "--x", "0", "--y", "0", "--db"])
+            .arg(&db)
+            .args(args)
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+    let default = run(&["--page", "0:1"]);
+    assert_eq!(default.as_array().unwrap().len(), 100);
+    assert_eq!(default[0]["id"], "1:2");
+    assert_eq!(default[1]["id"], "1:3");
+    assert_eq!(default[2]["id"], "4:000");
+    assert_eq!(default[99]["id"], "4:097");
+
+    let all = run(&["--page", "0:1", "--limit", "1000"]);
+    let rows = all.as_array().unwrap();
+    assert_eq!(rows.len(), 108);
+    assert_eq!(rows.last().unwrap()["id"], "1:1");
+    assert!(rows.iter().all(|row| row["page_id"] == "0:1"));
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["id"] == "1:9" || row["id"] == "1:10")
+    );
+
+    let scoped = run(&["--page", "0:1", "--under", "1-1", "--limit", "3"]);
+    let ids: Vec<_> = scoped
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["1:2", "1:3", "1:1"]);
+    assert_eq!(
+        run(&["--page", "0:1", "--under", "1:3", "--limit", "1"])[0]["id"],
+        "1:3"
+    );
+    for args in [
+        vec!["--page", "0:1", "--limit", "0"],
+        vec!["--page", "0:2", "--under", "1:1"],
+        vec!["--page", "0:1", "--under", "1:9"],
+        vec!["--page", "0:1", "--under", "1:10"],
+    ] {
+        assert_eq!(run(&args), serde_json::json!([]), "{args:?}");
+    }
+    let out = common::command()
+        .args([
+            "at", "--page", "0:1", "--x", "0", "--y", "0", "--under", "99:99", "--db",
+        ])
+        .arg(&db)
+        .assert()
+        .failure()
+        .code(1);
+    let error: serde_json::Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
+    assert!(error["error"].as_str().unwrap().contains("99:99"));
+
+    let edge = common::command()
+        .args(["at", "--page", "0:1", "--x", "10", "--y", "0", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let edge: serde_json::Value = serde_json::from_slice(&edge.get_output().stdout).unwrap();
+    assert_eq!(edge.as_array().unwrap().len(), 1);
+    assert_eq!(edge[0]["id"], "1:1");
 }
 
 /// A corrupted store with a `parent_id` cycle must not hang `path` or
