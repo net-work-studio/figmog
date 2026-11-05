@@ -376,8 +376,8 @@ fn find_config_dir(cwd: &Path, boundary: Option<&Path>) -> Option<PathBuf> {
 
 /// `figmog.toml`, then `figmog.local.toml` (if present) on top of it.
 fn load_config(dir: &Path) -> Result<ProjectConfig, String> {
-    let mut config = read_config_file(&dir.join(CONFIG_FILE), CONFIG_FILE)?
-        .expect("find_config_dir saw this file");
+    // Removed since `find_config_dir` saw it: treat as empty, not a panic.
+    let mut config = read_config_file(&dir.join(CONFIG_FILE), CONFIG_FILE)?.unwrap_or_default();
     if let Some(local) = read_config_file(&dir.join(LOCAL_CONFIG_FILE), LOCAL_CONFIG_FILE)? {
         config.merge(local);
     }
