@@ -385,10 +385,14 @@ fn spawn_socket_acceptor(
 /// are being round-robin polled: the full `interval` split evenly across
 /// them (so each file gets, on average, one Tier-3 poll per `interval`),
 /// floored at [`MIN_TICK_DEADLINE`] so total poll spend stays bounded even
-/// with many mirrored files. Zero sessions: idle at the full interval.
+/// with many mirrored files. Zero sessions: idle at the full interval,
+/// still floored at [`MIN_TICK_DEADLINE`] — `--interval 0` is accepted,
+/// and an unfloored zero idle wait would hand the request loop's
+/// `recv_timeout` a zero timeout forever, busy-looping an empty server
+/// (NWS-2938).
 fn tick_deadline(interval: Duration, session_count: usize) -> Duration {
     if session_count == 0 {
-        return interval;
+        return interval.max(MIN_TICK_DEADLINE);
     }
     (interval / session_count as u32).max(MIN_TICK_DEADLINE)
 }
@@ -1348,7 +1352,7 @@ fn watch_tick_at(
     now: Instant,
 ) -> (Instant, bool) {
     if manager.sessions.is_empty() {
-        return (now + interval, false);
+        return (now + tick_deadline(interval, 0), false);
     }
     let count = manager.sessions.len();
     let idx = *next_idx % count;
@@ -1835,6 +1839,39 @@ mod tests {
             tick_deadline(Duration::from_secs(10), 100),
             Duration::from_secs(2)
         );
+        // `--interval 0` is floored too, with or without sessions
+        // (NWS-2938: an unfloored idle wait busy-looped the server).
+        for sessions in [0, 1, 5] {
+            assert_eq!(tick_deadline(Duration::ZERO, sessions), MIN_TICK_DEADLINE);
+        }
+    }
+
+    #[test]
+    fn empty_server_with_zero_interval_never_schedules_a_zero_wait() {
+        // NWS-2938: with no sessions and `--interval 0`, every idle watch
+        // round used to land at `now`, so the request loop's
+        // `recv_timeout` got a zero wait and spun. The idle wakeup must
+        // stay at least the two-second floor away, every round.
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = SessionManager {
+            sessions: Vec::new(),
+            root: dir.path().to_path_buf().into(),
+            token: None,
+            default_key: None,
+            api: None,
+        };
+        let mut watch = WatchScheduler::new(Instant::now());
+        let mut now = Instant::now();
+        for _ in 0..3 {
+            watch.service_at(&mut manager, Duration::ZERO, now);
+            let deadline = watch.next_deadline(&manager);
+            assert!(
+                deadline >= now + MIN_TICK_DEADLINE,
+                "idle wakeup scheduled {:?} after now",
+                deadline.saturating_duration_since(now)
+            );
+            now = deadline;
+        }
     }
 
     // ---- unix-socket control plane (v0.0.2 spec §1) ----

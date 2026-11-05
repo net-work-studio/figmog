@@ -488,7 +488,9 @@ two-second global dispatch floor (≤ 30 requests/min). The session's
 worker performs the blocking HTTP call. Busy files are skipped, and each
 file retains its own retry/poll deadline, so a delayed poll or rate-limited
 file never pauses other files' reads or polling. `--interval` is clamped
-to a one-day maximum. On `Tick::Changed`, completion queues a pull through
+to a one-day maximum; `0` is accepted and means "as fast as the floors
+allow". With no sessions the idle watch wakeup is also floored at 2 s, so
+an empty `--interval 0` server never busy-waits. On `Tick::Changed`, completion queues a pull through
 the same lifecycle as explicit open/sync. Failure leaves the observation
 pending for retry; Retry-After or exponential backoff (capped at 5 minutes)
 is per file. Outstanding metadata and pull failures wake the scheduler at
