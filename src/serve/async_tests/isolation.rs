@@ -136,7 +136,6 @@ impl Server {
             serve_loop_with_offload(
                 manager,
                 offload,
-                "disabled",
                 true,
                 false,
                 Duration::from_secs(10),

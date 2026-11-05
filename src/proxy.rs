@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 
 use crate::mcp::ToolDef;
-use crate::upstream::UpstreamMcp;
+use crate::upstream::{UpstreamError, UpstreamMcp};
 
 /// The namespace rule (spec §12, §11 point 3): `figmog_*` tools are always
 /// local; every other name is proxied to the upstream (when attached).
@@ -52,19 +52,32 @@ pub(crate) fn merge_registry(
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| json!({"type": "object"}));
-        // Upstream tool names/descriptions are only known once, at startup
-        // (no mid-session re-probe in v3 — spec §12), and figmog serves for
-        // the life of the process: leaking these few dozen strings to get
-        // the `&'static str` `ToolDef` needs is bounded and never repeats.
-        let leaked_name: &'static str = Box::leak(name.to_string().into_boxed_str());
-        seen_names.insert(leaked_name);
+        let name = intern(name.to_string());
+        seen_names.insert(name);
         local.push(ToolDef {
-            name: leaked_name,
-            description: Box::leak(format!("[via Figma desktop] {description}").into_boxed_str()),
+            name,
+            description: intern(format!("[via Figma desktop] {description}")),
             input_schema,
         });
     }
     (local, dropped)
+}
+
+/// A `&'static str` for `text`, as `ToolDef` needs. `figmog serve`
+/// re-merges whenever the desktop app appears, disappears or changes its
+/// tool list (NWS-2959), so each distinct string is leaked once and reused
+/// by every later merge: memory stays bounded by the distinct upstream
+/// names and descriptions seen, however often the desktop comes and goes.
+fn intern(text: String) -> &'static str {
+    static INTERNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut interned = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = interned.get(text.as_str()) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(text.into_boxed_str());
+    interned.insert(leaked);
+    leaked
 }
 
 /// Execute one desktop `tools/call` without consulting a mirror's cache.
@@ -79,8 +92,8 @@ pub(crate) fn proxy_call<U: UpstreamMcp>(
     upstream: &mut U,
     name: &str,
     args: &Value,
-) -> Result<(Value, bool), String> {
-    let result = upstream.call(name, args).map_err(|e| e.to_string())?;
+) -> Result<(Value, bool), UpstreamError> {
+    let result = upstream.call(name, args)?;
     Ok((result, !is_read_tool(name)))
 }
 
@@ -192,6 +205,15 @@ mod tests {
     }
 
     #[test]
+    fn repeated_merges_reuse_interned_upstream_strings() {
+        let upstream = vec![json!({"name": "get_code", "description": "d"})];
+        let (first, _) = merge_registry(vec![], &upstream);
+        let (second, _) = merge_registry(vec![], &upstream);
+        assert!(std::ptr::eq(first[0].name, second[0].name));
+        assert!(std::ptr::eq(first[0].description, second[0].description));
+    }
+
+    #[test]
     fn desktop_reads_always_reach_upstream_without_triggering_a_poll() {
         for (name, args) in [
             ("get_code", json!({"nodeId": "1:2"})),
@@ -240,6 +262,6 @@ mod tests {
         let mut upstream = FakeUpstream::new(vec![]);
         upstream.push_result(Err(UpstreamError::Protocol("boom".into())));
         let err = proxy_call(&mut upstream, "get_code", &json!({})).unwrap_err();
-        assert!(err.contains("boom"));
+        assert!(err.to_string().contains("boom"));
     }
 }

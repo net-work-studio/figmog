@@ -193,7 +193,6 @@ fn overdue_watch_is_not_starved_by_prequeued_stdio_and_socket_traffic() {
         serve_loop_with_output(
             manager,
             None,
-            "disabled",
             false,
             false,
             Duration::from_secs(3600),
@@ -273,7 +272,6 @@ fn no_watch_answers_prequeued_requests_without_polling_an_overdue_deadline() {
     serve_loop_with_output(
         manager,
         None,
-        "disabled",
         true,
         false,
         Duration::from_secs(10),

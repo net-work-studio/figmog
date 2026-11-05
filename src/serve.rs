@@ -35,9 +35,11 @@
 //! `tools/call` routes by the namespace rule (`proxy::is_local_tool`).
 //! Upstream routing is global, not per-session: the desktop server serves
 //! whatever file is open in the Figma app, independent of any mirror this
-//! process manages — spec §14's documented caveat. No mid-session
-//! re-probe: an unreachable upstream at startup means local-only tools
-//! for the life of the process.
+//! process manages — spec §14's documented caveat. The desktop is
+//! re-detected after startup (NWS-2959): the desktop worker keeps probing
+//! it, and when its tools appear or disappear the registry is re-merged
+//! and clients that sent `initialize` get `notifications/tools/list_changed`
+//! (see `desktop.rs`).
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -53,14 +55,18 @@ use serde_json::Value;
 
 use crate::dispatch;
 use crate::ident::parse_file_ref;
-use crate::mcp::{self, FnHandler, PendingCall, Reply, ToolErrorMode, ToolOutput};
+#[cfg(test)]
+use crate::mcp::FnHandler;
+use crate::mcp::{self, PendingCall, Reply, ToolErrorMode, ToolOutput};
 use crate::proxy;
 use crate::sessions::{self, SessionManager};
 
+mod desktop;
 mod output;
 mod reads;
 
 use crate::upstream::{HttpUpstream, UpstreamMcp};
+use desktop::{DesktopJob, DesktopWorker, ProbeCadence};
 use output::{ConnRegistry, StdioWriter};
 use reads::{ReadPool, ReadTask, StagedRead};
 
@@ -459,29 +465,31 @@ pub(crate) fn run_serve(
         interval_dur,
     )?;
 
-    // Upstream probe: no mid-session re-probe in v3 — an unreachable
-    // desktop server at startup means local-only tools for the process's
-    // whole life (build design §12). Global, not per-session (see this
-    // module's doc comment).
-    let upstream: Option<HttpUpstream> = if no_upstream {
+    // Upstream probe: once here, so the first `tools/list` already has the
+    // desktop's tools when it is running; the desktop worker re-checks it
+    // from then on (NWS-2959). Global, not per-session (see this module's
+    // doc comment). `--no-upstream` starts no worker and never probes.
+    let desktop: Option<DesktopWorker> = if no_upstream {
         None
     } else {
         let mut client = HttpUpstream::new(upstream_url);
-        match client.initialize() {
-            Ok(()) => Some(client),
+        let connected = match client.initialize() {
+            Ok(()) => true,
             Err(e) => {
-                eprintln!("figmog: upstream unreachable, serving local tools only: {e}");
-                None
+                eprintln!(
+                    "figmog: upstream unreachable, serving local tools only (re-checking every {}s): {e}",
+                    ProbeCadence::default().missing.as_secs()
+                );
+                false
             }
-        }
+        };
+        Some(DesktopWorker::spawn_with(
+            client,
+            connected,
+            ProbeCadence::default(),
+        ))
     };
-    let upstream_status: &'static str = if no_upstream {
-        "disabled"
-    } else if upstream.is_some() {
-        "connected"
-    } else {
-        "unreachable"
-    };
+    let upstream_status = desktop.as_ref().map_or("disabled", DesktopWorker::status);
 
     eprintln!(
         "{} serving {} file(s) (watch {}, upstream {upstream_status}, socket {})",
@@ -493,8 +501,7 @@ pub(crate) fn run_serve(
 
     serve_loop(
         manager,
-        upstream,
-        upstream_status,
+        desktop,
         no_watch,
         track_current,
         interval_dur,
@@ -509,8 +516,7 @@ pub(crate) fn run_serve(
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(
     manager: SessionManager,
-    upstream: Option<HttpUpstream>,
-    upstream_status: &'static str,
+    desktop: Option<DesktopWorker>,
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
@@ -520,8 +526,7 @@ fn serve_loop(
     let first_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
     serve_loop_with_output(
         manager,
-        upstream.map(DesktopWorker::spawn),
-        upstream_status,
+        desktop,
         no_watch,
         track_current,
         interval_dur,
@@ -744,99 +749,6 @@ impl Offload {
     }
 }
 
-/// One job for the desktop worker. An enum so later work on the same
-/// upstream connection (e.g. a desktop re-probe) can join the same queue.
-enum DesktopJob {
-    /// Forward one `tools/call` verbatim and uncached (spec §8).
-    Call {
-        name: String,
-        args: Value,
-        reply: DeferredReply,
-    },
-}
-
-/// The thread that owns the desktop upstream connection. Jobs run one at a
-/// time, in arrival order, so the upstream session handshake state is
-/// never shared. Dropping it (or [`DesktopWorker::stop_taking_jobs`])
-/// stops it taking jobs: a call already in flight finishes within the
-/// upstream's own timeout and answers; queued calls are answered with a
-/// shutdown error without being sent (dropped if the loop has exited).
-struct DesktopWorker {
-    jobs: mpsc::Sender<DesktopJob>,
-    stop: Arc<AtomicBool>,
-    tools: Vec<Value>,
-}
-
-impl DesktopWorker {
-    fn spawn<U: UpstreamMcp + Send + 'static>(mut upstream: U) -> Self {
-        let tools = upstream.tools().to_vec();
-        let (jobs, work) = mpsc::channel::<DesktopJob>();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
-        std::thread::spawn(move || {
-            while let Ok(job) = work.recv() {
-                if stopped.load(Ordering::Relaxed) {
-                    // Shutdown (spec §6a): a queued call is never sent
-                    // upstream — it may be a write — and its caller gets
-                    // an error instead of silence.
-                    match job {
-                        DesktopJob::Call { reply, .. } => {
-                            reply.send(Err(DESKTOP_SHUTDOWN.into()), false)
-                        }
-                    }
-                    continue;
-                }
-                match job {
-                    DesktopJob::Call { name, args, reply } => {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            proxy::proxy_call(&mut upstream, &name, &args)
-                        }));
-                        match result {
-                            // A proxied result is already a complete MCP
-                            // `CallToolResult` from the upstream — emit it
-                            // verbatim (spec §11/§12; see
-                            // `mcp::ToolOutput::Raw`'s doc comment) rather
-                            // than re-wrapping it as figmog's own text-block
-                            // shape.
-                            Ok(Ok((value, write))) => reply.send(Ok(ToolOutput::Raw(value)), write),
-                            Ok(Err(error)) => reply.send(Err(error), false),
-                            Err(_) => reply.send(
-                                Err(format!(
-                                    "desktop proxy worker panicked during {name}; inspect server stderr"
-                                )),
-                                false,
-                            ),
-                        }
-                    }
-                }
-            }
-        });
-        Self { jobs, stop, tools }
-    }
-
-    /// Shutdown: stop taking queued jobs. A call already in flight still
-    /// finishes and answers; every queued one is answered with an error
-    /// without reaching the upstream.
-    fn stop_taking_jobs(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-
-    fn submit(&self, job: DesktopJob) {
-        // A dead worker hands the job back; dropping it answers the
-        // caller with an error.
-        let _ = self.jobs.send(job);
-    }
-}
-
-impl Drop for DesktopWorker {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-}
-
-const DESKTOP_SHUTDOWN: &str =
-    "figmog serve is shutting down; the desktop call was not sent upstream";
-
 /// Apply a deferred result's loop-side effects and return its answer.
 fn apply_done(
     manager: &mut SessionManager,
@@ -935,7 +847,6 @@ enum LoopExit {
 fn serve_loop_with_output(
     manager: SessionManager,
     desktop: Option<DesktopWorker>,
-    upstream_status: &'static str,
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
@@ -947,7 +858,6 @@ fn serve_loop_with_output(
     serve_loop_with_offload(
         manager,
         Offload::new(desktop),
-        upstream_status,
         no_watch,
         track_current,
         interval_dur,
@@ -964,7 +874,6 @@ fn serve_loop_with_output(
 fn serve_loop_with_offload(
     mut manager: SessionManager,
     mut offload: Offload,
-    upstream_status: &'static str,
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
@@ -979,7 +888,6 @@ fn serve_loop_with_offload(
         &mut manager,
         &mut offload,
         &mut pending,
-        upstream_status,
         no_watch,
         track_current,
         interval_dur,
@@ -1016,7 +924,6 @@ fn request_loop(
     manager: &mut SessionManager,
     offload: &mut Offload,
     pending: &mut Pending,
-    upstream_status: &'static str,
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
@@ -1025,17 +932,12 @@ fn request_loop(
     registry: &ConnRegistry,
     stdio: &StdioWriter,
 ) -> LoopExit {
-    let (tools, dropped) = match &offload.desktop {
-        Some(d) => proxy::merge_registry(dispatch::tool_registry(), &d.tools),
-        None => (dispatch::tool_registry(), Vec::new()),
-    };
-    for name in &dropped {
-        eprintln!("figmog: dropping upstream tool named like a local tool: {name}");
-    }
-
+    let mut tools = merged_registry(offload.desktop.as_ref());
     let mut watch = WatchScheduler::new(first_deadline);
     // Stdio is never cancelled: it is the only client of its stream.
     let stdio_live = Arc::new(AtomicBool::new(false));
+    // Stdio sent `initialize`, so it gets notifications (NWS-2959).
+    let mut stdio_subscribed = false;
 
     loop {
         // A vanished stdio reader is a clean shutdown; accepted running
@@ -1076,6 +978,19 @@ fn request_loop(
         if !no_watch {
             watch.service_at(manager, interval_dur, Instant::now());
         }
+        // Desktop re-detection (NWS-2959): probes run on the desktop
+        // worker; only a change in the exposed tool list re-merges and is
+        // announced, queued behind every response already sent.
+        if let Some(desktop) = &mut offload.desktop
+            && desktop.maintain(Instant::now())
+        {
+            tools = merged_registry(Some(desktop));
+            let note = frame(&mcp::tools_list_changed());
+            registry.broadcast(&note);
+            if stdio_subscribed && !stdio.send(note) {
+                return LoopExit::StdoutGone;
+            }
+        }
         let poll = if offload.reads_in_flight.is_empty() {
             Duration::from_millis(20)
         } else {
@@ -1112,23 +1027,52 @@ fn request_loop(
 
         let over_limit = pending.count(to) >= MAX_PENDING_PER_REQUESTER;
         offload.staged = None;
-        let mut handler = FnHandler(|name: &str, args: &Value| -> Result<ToolOutput, String> {
-            if over_limit {
-                return Err(format!(
-                    "too many pending requests on this connection (limit {MAX_PENDING_PER_REQUESTER}); wait for responses before sending more"
-                ));
+        let upstream_status = offload
+            .desktop
+            .as_ref()
+            .map_or("disabled", DesktopWorker::status);
+        let mut handler = LoopHandler::new(
+            |name: &str, args: &Value| -> Result<ToolOutput, String> {
+                if over_limit {
+                    return Err(format!(
+                        "too many pending requests on this connection (limit {MAX_PENDING_PER_REQUESTER}); wait for responses before sending more"
+                    ));
+                }
+                handle_tool_call(
+                    manager,
+                    offload,
+                    &cancel,
+                    upstream_status,
+                    interval_dur,
+                    name,
+                    args,
+                )
+            },
+        );
+        let reply = mcp::dispatch_message(&line, &tools, &mut handler, mode);
+        let LoopHandler {
+            initialized,
+            unknown_tool,
+            ..
+        } = handler;
+        if initialized {
+            match to {
+                ReplyTo::Stdio => stdio_subscribed = true,
+                ReplyTo::Socket(conn_id) => registry.subscribe(conn_id),
             }
-            handle_tool_call(
-                manager,
-                offload,
-                &cancel,
-                upstream_status,
-                interval_dur,
-                name,
-                args,
-            )
-        });
-        match mcp::dispatch_message(&line, &tools, &mut handler, mode) {
+        }
+        // A desktop tool called while the desktop is missing: re-check now.
+        // The call itself is refused as an unknown tool, not held for the
+        // probe; a client that sent `initialize` hears about the tools
+        // through `tools/list_changed` and can retry.
+        if let Some(name) = unknown_tool
+            && !proxy::is_local_tool(&name)
+            && let Some(desktop) = &mut offload.desktop
+            && !desktop.connected()
+        {
+            desktop.request_probe(Instant::now());
+        }
+        match reply {
             None => {}
             Some(Reply::Later(call)) => {
                 offload.park(&call);
@@ -1139,6 +1083,54 @@ fn request_loop(
             }
             Some(Reply::Now(_)) => {}
         }
+    }
+}
+
+/// The local registry merged with the desktop's current tools (none when
+/// it is missing or disabled). Collisions are dropped and logged on every
+/// merge (spec §8); the order is local tools, then the desktop's own order.
+fn merged_registry(desktop: Option<&DesktopWorker>) -> Vec<mcp::ToolDef> {
+    let (tools, dropped) = match desktop {
+        Some(desktop) => proxy::merge_registry(dispatch::tool_registry(), desktop.tools()),
+        None => (dispatch::tool_registry(), Vec::new()),
+    };
+    for name in &dropped {
+        eprintln!("figmog: dropping upstream tool named like a local tool: {name}");
+    }
+    tools
+}
+
+/// The loop's tool handler: runs calls through `call`, and records the
+/// protocol events the loop acts on after dispatch (NWS-2959).
+struct LoopHandler<F> {
+    call: F,
+    /// The client sent `initialize`.
+    initialized: bool,
+    /// A `tools/call` was refused as an unknown tool.
+    unknown_tool: Option<String>,
+}
+
+impl<F> LoopHandler<F> {
+    fn new(call: F) -> Self {
+        Self {
+            call,
+            initialized: false,
+            unknown_tool: None,
+        }
+    }
+}
+
+impl<F: FnMut(&str, &Value) -> Result<ToolOutput, String>> mcp::ToolHandler for LoopHandler<F> {
+    fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String> {
+        (self.call)(name, args)
+    }
+
+    fn initialized(&mut self) {
+        self.initialized = true;
+    }
+
+    fn unknown_tool(&mut self, name: &str) {
+        self.unknown_tool = Some(name.to_string());
     }
 }
 
@@ -1690,7 +1682,6 @@ mod tests {
             serve_loop(
                 manager,
                 None,
-                "disabled",
                 false,
                 false,
                 Duration::from_secs(2),

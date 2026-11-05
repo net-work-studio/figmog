@@ -46,7 +46,20 @@ pub trait UpstreamMcp {
     /// value (the same shape the MCP spec gives a client: typically
     /// `{"content": [...], "isError": bool}`).
     fn call(&mut self, name: &str, args: &Value) -> Result<Value, UpstreamError>;
+    /// Liveness check on the current session (`figmog serve`'s periodic
+    /// re-detection, NWS-2959). The default re-runs the handshake, which
+    /// proves liveness just as well; [`HttpUpstream`] sends MCP's `ping`
+    /// instead so a live session is not re-created every check.
+    fn ping(&mut self) -> Result<(), UpstreamError> {
+        self.initialize()
+    }
 }
+
+/// Connect timeout for the desktop server. It is on the loopback
+/// interface, so a refused or silent connect is answered quickly; serve's
+/// periodic re-detection (NWS-2959) must not sit on a dead address for the
+/// whole request timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// MCP protocol version figmog's `initialize` request declares.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -75,6 +88,7 @@ impl HttpUpstream {
     pub fn new(url: String) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(10))
+            .timeout_connect(CONNECT_TIMEOUT)
             .build();
         HttpUpstream {
             url,
@@ -150,6 +164,10 @@ impl HttpUpstream {
 
 impl UpstreamMcp for HttpUpstream {
     fn initialize(&mut self) -> Result<(), UpstreamError> {
+        // A re-handshake (serve's re-detection) starts a fresh session: a
+        // restarted desktop app does not know the old session id.
+        self.session_id = None;
+        self.protocol_version = None;
         let id = self.next_request_id();
         let init_req = json!({
             "jsonrpc": "2.0",
@@ -207,6 +225,15 @@ impl UpstreamMcp for HttpUpstream {
         });
         let resp = self.send_request(&req)?;
         extract_result(resp)
+    }
+
+    fn ping(&mut self) -> Result<(), UpstreamError> {
+        if self.session_id.is_none() && self.protocol_version.is_none() {
+            return self.initialize();
+        }
+        let id = self.next_request_id();
+        let resp = self.send_request(&json!({"jsonrpc": "2.0", "id": id, "method": "ping"}))?;
+        extract_result(resp).map(|_| ())
     }
 }
 

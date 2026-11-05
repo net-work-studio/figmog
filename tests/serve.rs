@@ -1064,6 +1064,35 @@ fn desktop_proxy_cli_unknown_and_unavailable_tools_fail_on_both_transports() {
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
 
+/// `--no-upstream` disables desktop re-detection too (NWS-2959): neither
+/// startup nor a call to a desktop tool name ever contacts the desktop
+/// address, and status stays `disabled`.
+#[test]
+fn no_upstream_serve_never_probes_the_desktop() {
+    let (_dir, db) = common::fixture_db();
+    let desktop = TcpListener::bind("127.0.0.1:0").unwrap();
+    desktop.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/mcp", desktop.local_addr().unwrap());
+    let (mut guard, mut stdin, rx) =
+        spawn_serve_with_args(&db, &["--no-upstream", "--upstream", &url]);
+    handshake(&mut stdin, &rx);
+    let resp = call(&mut stdin, &rx, 2, "get_code", json!({}));
+    assert_eq!(
+        resp["result"]["content"][0]["text"],
+        "unknown tool: get_code"
+    );
+    let resp = call(&mut stdin, &rx, 3, "figmog_status", json!({}));
+    assert_eq!(result_json(&resp)["upstream"], "disabled");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        desktop.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "--no-upstream must never connect to the desktop"
+    );
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
 // ---- multi-file serve e2e (spec §14) ----
 //
 // Two pre-built stores under a temp `--figmog-root` (built via `pull

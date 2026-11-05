@@ -55,16 +55,36 @@ pub enum ToolOutput {
 /// on stdio or a JSON-RPC error on the socket control plane.
 pub trait ToolHandler {
     fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String>;
+
+    /// The client sent `initialize`: it speaks MCP and may be sent
+    /// notifications such as `notifications/tools/list_changed`.
+    fn initialized(&mut self) {}
+
+    /// A `tools/call` named `name`, which is not in the registry, was
+    /// refused with `unknown tool`.
+    fn unknown_tool(&mut self, name: &str) {
+        let _ = name;
+    }
 }
 
-/// Adapts a closure to [`ToolHandler`]. `figmog serve`'s store handle has
+/// The notification `figmog serve` sends to clients that sent `initialize`
+/// when its merged tool list changes (the desktop app appeared or went
+/// away, NWS-2959).
+pub(crate) fn tools_list_changed() -> Value {
+    json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+}
+
+/// Adapts a closure to [`ToolHandler`] (tests; the serve loop records
+/// protocol events with its own handler). `figmog serve`'s store handle has
 /// an unnameable type (the `open_store!` pipeline contains fn items), so
 /// it can't be held in a named struct field generic over the store's
 /// pipeline type; wrapping a closure that captures the store by unique
 /// reference sidesteps that entirely — the closure's environment can hold
 /// whatever concrete type it was defined against.
+#[cfg(test)]
 pub struct FnHandler<F>(pub F);
 
+#[cfg(test)]
 impl<F: FnMut(&str, &Value) -> Result<ToolOutput, String>> ToolHandler for FnHandler<F> {
     fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String> {
         (self.0)(name, args)
@@ -178,7 +198,10 @@ pub(crate) fn dispatch_message(
     let id = id.unwrap();
 
     let result = match method {
-        "initialize" => Some(initialize_result(&params)),
+        "initialize" => {
+            handler.initialized();
+            Some(initialize_result(&params))
+        }
         "ping" => Some(json!({})),
         "tools/list" => Some(tools_list_result(tools)),
         "tools/call" => {
@@ -234,7 +257,7 @@ fn initialize_result(params: &Value) -> Value {
         .unwrap_or(DEFAULT_PROTOCOL_VERSION);
     json!({
         "protocolVersion": protocol_version,
-        "capabilities": {"tools": {}},
+        "capabilities": {"tools": {"listChanged": true}},
         "serverInfo": {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION"),
@@ -277,6 +300,7 @@ fn tools_call_result(
     };
 
     if !tools.iter().any(|t| t.name == name) {
+        handler.unknown_tool(name);
         return Err(format!("unknown tool: {name}"));
     }
 
@@ -390,7 +414,7 @@ mod tests {
                 "id": 1,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {"listChanged": true}},
                     "serverInfo": {"name": "figmog", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": "figmog is your Figma server: a local, instant mirror of one Figma file plus a proxy to Figma's native capabilities. Call figmog for everything Figma-related. figmog_* tools answer from the local mirror at zero API cost; native-named tools (get_*, …) go live to Figma desktop and are forwarded uncached. Pass the Figma file URL as the `file` argument to figmog_* tools when you have one; figmog queues a background pull on first reference. Open/sync return a job acknowledgement; poll figmog_status or figmog_files for ready, progress, version/churn and errors.",
                 },

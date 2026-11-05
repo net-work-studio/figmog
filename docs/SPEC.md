@@ -552,8 +552,8 @@ per-file (`figmog_open`, `figmog_files`). Every tool but
 zero Figma API cost; `figmog_sync` and `figmog_open` schedule pulls, and `figmog_images` fetches renders and fills, so
 those three are the local tools that spend Figma's rate budget.
 `figmog_status`'s result also carries
-`upstream: "connected" | "unreachable" | "disabled"`, spliced in at the
-call site that knows it (never inside `query::status` itself), and the
+`upstream: "connected" | "unreachable" | "disabled"` (current as of the
+request, §8 "Re-detection"), spliced in at the call site that knows it (never inside `query::status` itself), and the
 variable snapshot summary under `variables` (§9).
 `figmog_open` also takes an optional `geometry` boolean (§14).
 
@@ -615,6 +615,13 @@ skips binding.
 Frames on the socket are the same newline-delimited JSON-RPC the stdio
 loop reads. `initialize` is optional for socket clients: `tools/call` is
 accepted directly, since dispatch treats every frame independently.
+Sending `initialize` is also how a connection opts in to notifications
+(`notifications/tools/list_changed`, §8); stdio gets them once its client
+has sent `initialize`, as every MCP client does. The CLI never sends
+`initialize`, so it gets none, and its reader still skips any frame that
+carries a `method` and matches its reply by JSON-RPC id. A notification
+is queued on the connection's writer like a response, so it is ordered
+after every response already queued.
 An acceptor thread gives each connection its own reader
 thread, which tags frames with a connection id and forwards them into the
 same `mpsc` channel stdin feeds; the connection's write half is
@@ -645,7 +652,8 @@ writes the responses it owes, to stdio and to still-open sockets, for up to
 15 seconds (covering the desktop's 10-second timeout), so `printf
 '<request>\n' | figmog serve` gets its image or desktop response. Image
 requests still queued (not started) are answered with a shutting-down
-error, and the desktop worker stops taking queued calls at once: its
+error, and the desktop worker stops taking queued calls (and skips queued
+desktop checks) at once: its
 in-flight call still finishes and is answered, while each queued one is
 answered with a shutting-down error without being sent upstream (it may be
 a write). Responses not ready by then are dropped. Worker reads still owed
@@ -679,12 +687,38 @@ Unless `--no-upstream`, `figmog serve` (and CLI parity via `figmog
 tools`/`figmog call`, §10) probes Figma's native desktop app's Dev Mode
 MCP server (`http://127.0.0.1:3845/mcp` by default, streamable HTTP) at
 startup. This requires a **paid Dev/Full seat** and the desktop app
-running with Dev Mode MCP enabled. On success, `tools/list` merges
-figmog's 21 local tools with every upstream tool verbatim (description
-prefixed `"[via Figma desktop] "`); on failure, one stderr line and
-local-only tools for the rest of the process — **no mid-session
-re-probe**, so a server that starts before the desktop app is reachable
-stays local-only until restarted.
+running with Dev Mode MCP enabled. While it is connected, `tools/list`
+merges figmog's 21 local tools with every upstream tool verbatim
+(description prefixed `"[via Figma desktop] "`); while it is missing,
+local-only tools. A failed startup probe prints one stderr line.
+
+**Re-detection (NWS-2959).** `serve` keeps checking after startup, so
+opening the desktop app after the agent started, or quitting it, needs no
+restart. Every check runs on the desktop worker (§6), never on the loop,
+with a 2 s connect timeout:
+
+- while the desktop is missing, a full handshake every 30 s;
+- while it is connected, an MCP `ping` on the current session every 60 s,
+  falling back to a fresh handshake if the ping fails (a restarted
+  desktop app does not know the old session);
+- immediately (at most once a second) when a desktop call fails below
+  the tool level (transport or protocol error), and when a `tools/call`
+  names a non-`figmog_*` tool that is not in the registry while the
+  desktop is missing.
+
+The desktop counts as gone only when a check fails: one failed or timed
+out call just triggers a check, and a tool-level `isError` result never
+does. A call to a desktop tool while it is missing is still refused at
+once with `unknown tool: <name>`; it is not held for the check it
+triggers. When a check changes the exposed upstream tool list, the
+registry is re-merged under the namespace rule below and every client that
+sent `initialize` gets `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`
+(`initialize` advertises `capabilities.tools.listChanged: true`). A check
+that confirms the current state, or a reconnect with the same tools, sends
+nothing. `figmog_status`'s `upstream` follows the current state
+(`connected` / `unreachable`). `--no-upstream` starts no desktop worker,
+never probes, and reports `disabled`. Relaying serves do not forward
+these notifications yet (NWS-2953).
 
 **Namespace rule:** `figmog_*` names are always local; every other name
 is proxied. `merge_registry` drops (and logs) any upstream tool whose

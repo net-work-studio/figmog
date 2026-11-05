@@ -70,6 +70,9 @@ struct Conn {
     /// Set when the connection closes or is dropped: its pending reads are
     /// not worth computing.
     cancelled: Arc<AtomicBool>,
+    /// The client sent `initialize`, so it gets notifications such as
+    /// `notifications/tools/list_changed` (NWS-2959). The CLI never does.
+    notify: AtomicBool,
     stream: UnixStream,
 }
 
@@ -176,6 +179,7 @@ impl Connections {
             queue: Mutex::default(),
             wake: Condvar::new(),
             cancelled: Arc::default(),
+            notify: AtomicBool::new(false),
             stream,
         });
         {
@@ -220,6 +224,31 @@ impl Connections {
         let conn = self.state.lock().unwrap().conns.get(&conn_id).cloned();
         if let Some(conn) = conn {
             conn.enqueue(frame);
+        }
+    }
+
+    /// `conn_id` sent `initialize`: send it notifications from now on.
+    pub(crate) fn subscribe(&self, conn_id: u64) {
+        if let Some(conn) = self.state.lock().unwrap().conns.get(&conn_id) {
+            conn.notify.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Queue a notification frame for every subscribed connection, in
+    /// connection-id order. Each takes its place in that connection's
+    /// queue, behind responses already queued and ahead of later ones.
+    pub(crate) fn broadcast(&self, frame: &str) {
+        let subscribed: Vec<Arc<Conn>> = {
+            let state = self.state.lock().unwrap();
+            state
+                .conns
+                .values()
+                .filter(|conn| conn.notify.load(Ordering::Relaxed))
+                .cloned()
+                .collect()
+        };
+        for conn in subscribed {
+            conn.enqueue(frame.to_string());
         }
     }
 

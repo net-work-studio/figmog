@@ -635,7 +635,6 @@ fn async_socket_cli_acknowledges_open_and_sync_before_worker_release() {
         serve_loop(
             manager,
             None,
-            "disabled",
             true,
             false,
             Duration::from_secs(10),
@@ -726,7 +725,6 @@ fn async_stdio_open_acknowledges_and_accepts_requests_while_fetch_is_gated() {
         serve_loop_with_output(
             manager,
             None,
-            "disabled",
             true,
             false,
             Duration::from_secs(10),
@@ -1231,6 +1229,7 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 4);
 }
 
+mod desktop;
 mod isolation;
 mod offload;
 mod watch_and_cache;

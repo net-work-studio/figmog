@@ -144,7 +144,7 @@ pub(super) fn cmd_call(
         let up = upstream
             .as_mut()
             .ok_or_else(|| format!("upstream not attached: {tool}"))?;
-        proxy::proxy_call(up, &tool, &args).map(|(value, trigger_poll)| {
+        proxy::proxy_call(up, &tool, &args).map_err(|e| e.to_string()).map(|(value, trigger_poll)| {
             if trigger_poll {
                 eprintln!(
                     "figmog: {tool} may have changed the file — run `figmog pull` (or `figmog serve`, which polls automatically) to refresh the mirror"

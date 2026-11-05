@@ -117,7 +117,6 @@ fn slow_desktop_call_does_not_delay_local_reads_and_answers_its_requester() {
         serve_loop_with_output(
             manager,
             Some(desktop),
-            "connected",
             true,
             false,
             Duration::from_secs(3600),
@@ -248,7 +247,6 @@ fn slow_image_download_does_not_delay_local_reads_and_answers_its_requester() {
         serve_loop_with_output(
             manager,
             None,
-            "disabled",
             true,
             false,
             Duration::from_secs(3600),
@@ -392,7 +390,6 @@ fn spawn_stdio_loop(
         serve_loop_with_output(
             manager,
             desktop,
-            "connected",
             true,
             false,
             Duration::from_secs(3600),
