@@ -1457,6 +1457,11 @@ pub(crate) struct SessionManager {
     pub(crate) root: StoreRoot,
     pub(crate) token: Option<String>,
     pub(crate) default_key: Option<String>,
+    /// Whether the one open session is the default when `default_key` is
+    /// `None` — an in-process serve's rule. Never the shared background
+    /// owner's (NWS-2953): its sessions are every worktree's files, so a
+    /// request without a file must not inherit another worktree's.
+    pub(crate) sole_default: bool,
     #[cfg(test)]
     pub(crate) api: Option<SessionApi>,
 }
@@ -1488,7 +1493,7 @@ impl SessionManager {
 
     pub(crate) fn effective_default_key(&self) -> Option<String> {
         self.default_key.clone().or_else(|| {
-            if self.sessions.len() == 1 {
+            if self.sole_default && self.sessions.len() == 1 {
                 Some(self.sessions[0].key.clone())
             } else {
                 None

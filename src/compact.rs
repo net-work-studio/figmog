@@ -235,6 +235,7 @@ mod tests {
             root: dir.to_path_buf().into(),
             token: None,
             default_key: Some(key),
+            sole_default: true,
             api: None,
         }
     }

@@ -4,8 +4,8 @@
 //! (NWS-2953): every `figmog serve` is a stdio relay to one detached owner
 //! per mirror root. Drives real relays (the compiled binary) in synthetic
 //! Git repositories and worktrees, and a synthetic Figma REST server for
-//! the one-pull-per-edit acceptance test. Linux process inspection
-//! (`/proc`) is used to count owners.
+//! the one-pull-per-edit acceptance test. Owners are counted by process
+//! inspection: `/proc` on Linux, `ps` and `lsof` elsewhere (macOS).
 
 mod common;
 
@@ -72,8 +72,17 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 /// Running `figmog serve --background` processes whose working directory
-/// is `cwd` (Linux `/proc`).
+/// is `cwd`.
 fn owners_in(cwd: &Path) -> Vec<u32> {
+    if cfg!(target_os = "linux") {
+        owners_in_proc(cwd)
+    } else {
+        owners_in_ps(cwd)
+    }
+}
+
+/// [`owners_in`] through Linux's `/proc`.
+fn owners_in_proc(cwd: &Path) -> Vec<u32> {
     let cwd = std::fs::canonicalize(cwd).unwrap();
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc").unwrap().flatten() {
@@ -89,6 +98,51 @@ fn owners_in(cwd: &Path) -> Vec<u32> {
         }
         // A zombie has no cmdline; a live owner has its cwd.
         if std::fs::read_link(entry.path().join("cwd")).is_ok_and(|link| link == cwd) {
+            pids.push(pid);
+        }
+    }
+    pids.sort();
+    pids
+}
+
+/// [`owners_in`] without `/proc` (macOS): `ps` lists the live
+/// `serve --background` processes, `lsof` gives each one's working
+/// directory.
+fn owners_in_ps(cwd: &Path) -> Vec<u32> {
+    let cwd = std::fs::canonicalize(cwd).unwrap();
+    let ps = Command::new("ps")
+        .args(["-Ao", "pid=,stat=,command="])
+        .output()
+        .unwrap();
+    assert!(ps.status.success(), "ps failed");
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&ps.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(stat)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        let args: Vec<&str> = fields.collect();
+        if stat.starts_with('Z') || !args.contains(&"serve") || !args.contains(&"--background") {
+            continue;
+        }
+        let Ok(lsof) = Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+            .output()
+        else {
+            continue;
+        };
+        // Gone since `ps`: no output.
+        let dir = String::from_utf8_lossy(&lsof.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix('n').map(PathBuf::from));
+        if dir
+            .and_then(|dir| std::fs::canonicalize(dir).ok())
+            .as_deref()
+            == Some(&cwd)
+        {
             pids.push(pid);
         }
     }
@@ -175,6 +229,11 @@ impl Relay {
 
     /// The response to `id`, skipping notifications.
     fn response(&mut self, id: u64) -> Value {
+        self.response_to(&json!(id))
+    }
+
+    /// The response to the request with JSON-RPC id `id`.
+    fn response_to(&mut self, id: &Value) -> Value {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -185,7 +244,7 @@ impl Relay {
                 )
             });
             let frame: Value = serde_json::from_str(&line).unwrap();
-            if frame["id"] == json!(id) {
+            if frame["id"] == *id {
                 return frame;
             }
         }
@@ -307,6 +366,10 @@ fn concurrent_relays_elect_exactly_one_owner() {
             vec![record["pid"].as_u64().unwrap() as u32],
             "exactly one background owner process"
         );
+        if cfg!(target_os = "linux") {
+            // The `ps`/`lsof` count other platforms use agrees.
+            assert_eq!(owners_in_ps(repo.path()), owners_in(repo.path()));
+        }
         let socket = PathBuf::from(record["socket"].as_str().unwrap());
         assert!(socket.as_os_str().len() < 104, "{}", socket.display());
         assert!(socket.starts_with("/tmp"), "{}", socket.display());
@@ -661,6 +724,165 @@ fn a_relay_refuses_a_mirror_awaiting_migration() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("figmog migrate"), "{error}");
     assert!(!repo.path().join(".git/figmog").join(KEY).exists());
+}
+
+/// Agent ids are the agent's, whatever they look like: one shaped like
+/// the relay's own owner-link ids is answered under that exact id, never
+/// swallowed as the relay's — also after a reconnect, whose replayed
+/// `initialize` answer the agent never sees.
+#[test]
+fn a_relay_answers_agent_ids_shaped_like_its_own() {
+    let repo = repo();
+    let mut relay = spawn_relay(&mut relay_command(
+        repo.path(),
+        &["--no-watch", "--no-upstream"],
+    ));
+    relay.initialize();
+    let ask = |relay: &mut Relay, id: &str| {
+        let id = json!(id);
+        relay.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "figmog_files", "arguments": {}}}));
+        let response = relay.response_to(&id);
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        relay.send(&json!({"jsonrpc": "2.0", "id": id, "method": "ping"}));
+        let response = relay.response_to(&id);
+        assert_eq!(response["result"], json!({}), "{response}");
+    };
+    for id in ["figmog-relay-x", "figmog-relay-0", "figmog-relay-1"] {
+        ask(&mut relay, id);
+    }
+    // A new owner after a crash: the relay replays `initialize` under its
+    // own id; the agent's look-alike ids still get their answers.
+    kill(relay.owner_pid());
+    wait_until("the crashed owner's record to go stale", || {
+        relay.call("figmog_files", json!({})).is_ok()
+    });
+    for id in ["figmog-relay-x", "figmog-relay-2", "figmog-relay-3"] {
+        ask(&mut relay, id);
+    }
+    // Nothing but answers to the agent's own requests reached it.
+    relay.send(&json!({"jsonrpc": "2.0", "id": 99, "method": "ping"}));
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = relay.rx.recv_timeout(left).expect("an answer to 99");
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert!(
+            frame.get("method").is_some() || frame["id"] == 99,
+            "{frame}"
+        );
+        if frame["id"] == 99 {
+            break;
+        }
+    }
+    relay.finish();
+    wait_owner_gone(repo.path());
+}
+
+/// A mirror still in the checkout's old `.figmog/<key>/db` is never the
+/// shared owner's, but an in-process serve holding it (`serve --db`) still
+/// answers the CLI over its local socket instead of a lock error.
+#[test]
+fn the_cli_reaches_an_in_process_serve_of_a_legacy_mirror() {
+    let repo = repo();
+    let db = repo.path().join(".figmog").join(KEY).join("db");
+    let response = repo.path().join("v1.json");
+    std::fs::write(&response, common::fixture_v1().to_string()).unwrap();
+    common::command()
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    std::fs::write(repo.path().join(".figmog/current"), KEY).unwrap();
+    let mut serve = spawn_relay(&mut relay_command(
+        repo.path(),
+        &[
+            "--no-watch",
+            "--no-upstream",
+            "--db",
+            db.to_str().unwrap(),
+            KEY,
+        ],
+    ));
+    serve.initialize();
+    wait_until("the in-process serve's socket", || {
+        repo.path().join(".figmog/serve.sock").exists()
+    });
+    for args in [&["status"][..], &["call", "figmog_status"]] {
+        let out = common::command()
+            .args(args)
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(status["name"], "Fixture", "{args:?}");
+    }
+    assert!(discovery(repo.path()).is_none(), "no owner was involved");
+    serve.finish();
+}
+
+/// A linked worktree with no default file of its own never gets the main
+/// checkout's file from the shared owner, though that is the one file the
+/// owner has open: the CLI reports this worktree's "no mirror here", the
+/// same as without the owner.
+#[test]
+fn a_worktree_without_a_default_does_not_inherit_the_owners_file() {
+    let repo = repo();
+    let wt = repo.path().join("wt");
+    git(
+        repo.path(),
+        &["worktree", "add", "-q", wt.to_str().unwrap()],
+    );
+    seed(repo.path(), KEY, &common::fixture_v1());
+    let mut main = spawn_relay(&mut relay_command(
+        repo.path(),
+        &["--no-watch", "--no-upstream", KEY],
+    ));
+    main.initialize();
+    assert_eq!(
+        main.call("figmog_status", json!({})).unwrap()["name"],
+        "Fixture"
+    );
+    for args in [&["status"][..], &["call", "figmog_status"], &["pages"]] {
+        let out = common::command()
+            .args(args)
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("no mirror here"), "{args:?}: {error}");
+    }
+    // Naming the file, or a management call, still reaches the owner.
+    let out = common::command()
+        .args(["call", "figmog_status", "--args"])
+        .arg(json!({"file": KEY}).to_string())
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["name"], "Fixture");
+    let out = common::command()
+        .args(["call", "figmog_files"])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let files: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(files[0]["key"], KEY);
+    // The main checkout's own default still routes.
+    let out = common::command()
+        .arg("status")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    main.finish();
+    wait_owner_gone(repo.path());
 }
 
 // ---- acceptance: three worktrees, one mirror, one pull per edit ----

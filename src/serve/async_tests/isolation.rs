@@ -83,6 +83,7 @@ fn mirrored(dir: &std::path::Path, key: &str, nodes: usize) -> FileSession {
 fn manager_of(dir: &std::path::Path, sessions: Vec<FileSession>) -> SessionManager {
     SessionManager {
         default_key: Some(sessions[0].key.clone()),
+        sole_default: true,
         sessions,
         root: dir.to_path_buf().into(),
         token: None,

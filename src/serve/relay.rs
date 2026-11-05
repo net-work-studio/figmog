@@ -39,8 +39,12 @@ use crate::project::Layout;
 
 /// How often one request is re-sent after "not accepted" answers.
 const MAX_RESENDS: u32 = 5;
-/// Prefix of the relay's own JSON-RPC ids (its replayed `initialize`).
-const INTERNAL_ID: &str = "figmog-relay-";
+/// Prefix of the JSON-RPC ids the relay uses on the owner link. Every
+/// request it sends there — the agent's (whose own id is mapped back on
+/// the answer) and its own replayed `initialize` — gets a fresh one, so an
+/// agent id can never be mistaken for an internal one, whatever it looks
+/// like.
+const OWNER_ID: &str = "figmog-relay-";
 
 enum Msg {
     Stdin(String),
@@ -51,9 +55,14 @@ enum Msg {
     OwnerGone(u64),
 }
 
-/// A forwarded request awaiting its answer.
+/// A forwarded request awaiting its answer, keyed by its owner-link id.
 struct Sent {
-    /// The frame as sent (re-sent after "not accepted").
+    /// The agent's own id for it; `None` for the relay's own requests,
+    /// whose answers are not the agent's.
+    agent_id: Option<Value>,
+    method: String,
+    /// The frame as sent, with its owner-link id (re-sent after "not
+    /// accepted").
     frame: String,
     /// The connection it was sent on.
     epoch: u64,
@@ -75,7 +84,8 @@ struct Relay {
     epoch: u64,
     pending: BTreeMap<String, Sent>,
     tx: mpsc::Sender<Msg>,
-    next_internal: u64,
+    /// The next owner-link request id's number.
+    next_id: u64,
 }
 
 /// Run `figmog serve` as a relay. `files` are its startup files; the
@@ -118,7 +128,7 @@ pub(crate) fn run_relay(
         epoch: 0,
         pending: BTreeMap::new(),
         tx: tx.clone(),
-        next_internal: 0,
+        next_id: 0,
     };
     let info = relay.connect()?;
     if !info.attach_errors.is_empty() {
@@ -174,11 +184,6 @@ fn to_agent(frame: &str) -> bool {
     writeln!(stdout, "{frame}").is_ok() && stdout.flush().is_ok()
 }
 
-/// A request's id as a map key.
-fn id_key(id: &Value) -> String {
-    id.to_string()
-}
-
 /// The answer to `id` when the relay cannot forward it: a tool error as
 /// MCP content (like stdio always got) for `tools/call`, else a JSON-RPC
 /// error.
@@ -230,12 +235,30 @@ impl Relay {
         });
         self.writer = Some(writer);
         if let Some(initialize) = self.initialize.clone() {
+            let owner_id = self.owner_id();
             let mut replay = initialize;
-            replay["id"] = json!(format!("{INTERNAL_ID}{}", self.next_internal));
-            self.next_internal += 1;
-            let _ = self.write_owner(&replay.to_string());
+            replay["id"] = json!(owner_id);
+            let frame = replay.to_string();
+            self.pending.insert(
+                owner_id,
+                Sent {
+                    agent_id: None,
+                    method: "initialize".into(),
+                    frame: frame.clone(),
+                    epoch: self.epoch,
+                    resends: 0,
+                },
+            );
+            let _ = self.write_owner(&frame);
         }
         Ok(info)
+    }
+
+    /// A fresh owner-link request id.
+    fn owner_id(&mut self) -> String {
+        let id = format!("{OWNER_ID}{}", self.next_id);
+        self.next_id += 1;
+        id
     }
 
     fn write_owner(&mut self, frame: &str) -> bool {
@@ -251,28 +274,50 @@ impl Relay {
         ok
     }
 
-    /// Send `frame` (a request with `id`, or a notification when `None`),
-    /// reconnecting first if the owner connection is gone.
-    fn forward(&mut self, frame: String, request: Option<(Value, String)>, resends: u32) -> bool {
-        if self.writer.is_none()
-            && let Err(error) = self.connect()
-        {
-            eprintln!("figmog: {error}");
-            return match request {
-                Some((id, method)) => to_agent(&local_error(id, &method, &error).to_string()),
+    /// Reconnect if the owner connection is gone. `Err`: no owner.
+    fn ensure_connected(&mut self) -> Result<(), String> {
+        if self.writer.is_none() {
+            self.connect().map_err(|error| {
+                eprintln!("figmog: {error}");
+                error
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Send a notification (or a frame the owner must reject) as is.
+    fn forward(&mut self, frame: &str) -> bool {
+        if self.ensure_connected().is_ok() {
+            let _ = self.write_owner(frame);
+        }
+        true
+    }
+
+    /// Send the agent's request `frame` under a fresh owner-link id.
+    fn forward_request(&mut self, mut frame: Value, agent_id: Value, method: String) -> bool {
+        let owner_id = self.owner_id();
+        frame["id"] = json!(owner_id);
+        let sent = Sent {
+            agent_id: Some(agent_id),
+            method,
+            frame: frame.to_string(),
+            epoch: 0,
+            resends: 0,
+        };
+        self.send(owner_id, sent)
+    }
+
+    /// Send (or re-send) a pending request on the current connection.
+    fn send(&mut self, owner_id: String, mut sent: Sent) -> bool {
+        if let Err(error) = self.ensure_connected() {
+            return match sent.agent_id {
+                Some(id) => to_agent(&local_error(id, &sent.method, &error).to_string()),
                 None => true,
             };
         }
-        if let Some((id, _)) = &request {
-            self.pending.insert(
-                id_key(id),
-                Sent {
-                    frame: frame.clone(),
-                    epoch: self.epoch,
-                    resends,
-                },
-            );
-        }
+        sent.epoch = self.epoch;
+        let frame = sent.frame.clone();
+        self.pending.insert(owner_id, sent);
         // On a failed write the reader reports the lost connection, and
         // its pending requests (this one included) are answered then.
         let _ = self.write_owner(&frame);
@@ -283,7 +328,8 @@ impl Relay {
         let mut drain_until: Option<Instant> = None;
         loop {
             if let Some(deadline) = drain_until
-                && (self.pending.is_empty() || Instant::now() >= deadline)
+                && (!self.pending.values().any(|sent| sent.agent_id.is_some())
+                    || Instant::now() >= deadline)
             {
                 return;
             }
@@ -321,13 +367,13 @@ impl Relay {
     fn on_agent(&mut self, line: String) -> bool {
         let Ok(mut frame) = serde_json::from_str::<Value>(&line) else {
             // The owner answers the parse error.
-            return self.forward(line, None, 0);
+            return self.forward(&line);
         };
         let method = frame["method"].as_str().unwrap_or_default().to_string();
         let id = frame.get("id").cloned();
         let Some(id) = id.filter(|_| !method.is_empty() && !method.starts_with("notifications/"))
         else {
-            return self.forward(line, None, 0);
+            return self.forward(&line);
         };
         if method == "initialize" {
             self.initialize = Some(frame.clone());
@@ -337,7 +383,7 @@ impl Relay {
         {
             return to_agent(&local_error(id, &method, &message).to_string());
         }
-        self.forward(frame.to_string(), Some((id, method)), 0)
+        self.forward_request(frame, id, method)
     }
 
     /// Give a per-file local tool call this worktree's file, and refuse
@@ -398,10 +444,11 @@ impl Relay {
         Ok(())
     }
 
-    /// One owner frame: forward notifications and answers; re-send a
+    /// One owner frame: forward notifications, and answers under the
+    /// agent's own id; drop answers to the relay's own requests; re-send a
     /// request the owner did not accept.
     fn on_owner(&mut self, epoch: u64, line: &str) -> bool {
-        let Ok(frame) = serde_json::from_str::<Value>(line) else {
+        let Ok(mut frame) = serde_json::from_str::<Value>(line) else {
             return true;
         };
         if frame.get("method").is_some() {
@@ -409,29 +456,33 @@ impl Relay {
             // connection's would be duplicates or stale).
             return epoch != self.epoch || to_agent(line);
         }
-        let id = frame.get("id").cloned().unwrap_or(Value::Null);
-        if id.as_str().is_some_and(|id| id.starts_with(INTERNAL_ID)) {
+        let Some(owner_id) = frame["id"].as_str().map(str::to_string) else {
+            // An answer to no request of ours (a frame the owner could not
+            // parse): the agent's, as is.
+            return to_agent(line);
+        };
+        let Some(sent) = self.pending.remove(&owner_id) else {
+            return to_agent(line);
+        };
+        let Some(agent_id) = sent.agent_id.clone() else {
+            // The relay's own request (its replayed `initialize`).
             return true;
-        }
-        let key = id_key(&id);
+        };
         if frame["error"]["code"].as_i64() == Some(owner::NOT_ACCEPTED)
-            && let Some(sent) = self.pending.remove(&key)
+            && sent.resends < MAX_RESENDS
         {
-            if sent.resends >= MAX_RESENDS {
-                return to_agent(line);
-            }
             // That owner is shutting down: stop writing to it.
             if sent.epoch == self.epoch {
                 self.writer = None;
             }
-            let method = serde_json::from_str::<Value>(&sent.frame)
-                .ok()
-                .and_then(|f| f["method"].as_str().map(str::to_string))
-                .unwrap_or_default();
-            return self.forward(sent.frame, Some((id, method)), sent.resends + 1);
+            let resent = Sent {
+                resends: sent.resends + 1,
+                ..sent
+            };
+            return self.send(owner_id, resent);
         }
-        self.pending.remove(&key);
-        to_agent(line)
+        frame["id"] = agent_id;
+        to_agent(&frame.to_string())
     }
 
     /// The owner connection of `epoch` ended: answer what it owed, then
@@ -444,16 +495,17 @@ impl Relay {
             .map(|(key, _)| key.clone())
             .collect();
         for key in lost {
-            let Some(sent) = self.pending.remove(&key) else {
-                continue;
-            };
-            let Ok(frame) = serde_json::from_str::<Value>(&sent.frame) else {
-                continue;
-            };
-            let method = frame["method"].as_str().unwrap_or_default();
-            let answer = local_error(
-                frame["id"].clone(),
+            let Some(Sent {
+                agent_id: Some(agent_id),
                 method,
+                ..
+            }) = self.pending.remove(&key)
+            else {
+                continue;
+            };
+            let answer = local_error(
+                agent_id,
+                &method,
                 "outcome unknown: the background figmog exited before answering; check \
                  figmog_status or figmog_files before retrying",
             );

@@ -43,6 +43,8 @@ use crate::project::Layout;
 pub(super) struct Route {
     mirror_root: PathBuf,
     local_root: PathBuf,
+    /// Whether the shared background owner is tried first.
+    owner: bool,
 }
 
 impl Route {
@@ -50,6 +52,20 @@ impl Route {
         Self {
             mirror_root: layout.mirror_root.clone(),
             local_root: layout.local_root.clone(),
+            owner: true,
+        }
+    }
+
+    /// This route without the shared background owner: only an
+    /// in-process serve's `<local root>/serve.sock`. For a mirror the owner
+    /// never serves (one still in this checkout's old location), and for a
+    /// per-file request naming no file this worktree can resolve (the
+    /// owner serves every worktree's files, so it has no default to fall
+    /// back on) — an in-process serve still answers either.
+    pub(super) fn local_only(&self) -> Self {
+        Self {
+            owner: false,
+            ..self.clone()
         }
     }
 }
@@ -97,7 +113,9 @@ fn socket_path(root: &std::path::Path) -> PathBuf {
 /// `None` means none is running. An owner that refuses the handshake (a
 /// different figmog build) is an error, never a silent direct open.
 pub(super) fn connect(route: &Route) -> Option<Result<Client, String>> {
-    if let Some(paths) = OwnerPaths::existing(&route.mirror_root) {
+    if route.owner
+        && let Some(paths) = OwnerPaths::existing(&route.mirror_root)
+    {
         match owner::probe_after_close(&paths, None, owner::START_TIMEOUT) {
             Ok(Probe::Ready(conn)) => {
                 return Some(Ok(Client {
@@ -273,6 +291,7 @@ pub(crate) fn write_over_stream(
     let route = Route {
         mirror_root: PathBuf::from("/nonexistent/figmog-test-route"),
         local_root: PathBuf::from("/nonexistent/figmog-test-route"),
+        owner: true,
     };
     let client = Client::new(stream).map_err(|e| e.to_string())?;
     write_over(&route, client, tool, args)
