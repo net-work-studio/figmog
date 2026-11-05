@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 use crate::mcp::ToolDef;
 use crate::model::{
-    ComponentRec, ComponentSetRec, FileMeta, ImageBlobRec, MirrorConfigRec, NodeRec, ProxyCacheRec,
-    StyleRec, VariableCollectionRec, VariableRec,
+    ComponentRec, ComponentSetRec, FileMeta, ImageBlobRec, ImagePinRec, MirrorConfigRec, NodeRec,
+    ProxyCacheRec, StyleRec, VariableCollectionRec, VariableRec, VariableSnapshotRec,
 };
 use crate::query;
 
@@ -36,10 +36,11 @@ pub(crate) type NodeReaders<'a, R> = (
 );
 
 /// Read handles for the whole pipeline, in `figmog_pipeline!`'s top-level
-/// order — the exact tuple `st.rtx`'s closure receives. 10 elements: the
+/// order — the exact tuple `st.rtx`'s closure receives. 12 elements: the
 /// `nodes` branch bundle, then `components`, `component_sets`, `styles`,
 /// `variables`, `variable_collections`, `meta`, `proxy_cache`,
-/// `mirror_config` (v0.0.2 spec §4), `images` (v0.0.2 spec §5 — appended
+/// `mirror_config` (v0.0.2 spec §4), `images` (v0.0.2 spec §5),
+/// `image_pins` (NWS-2960), `variable_snapshot` (NWS-2961 — appended
 /// last, non-breaking).
 pub(crate) type RootReaders<'a, R> = (
     NodeReaders<'a, R>,
@@ -52,6 +53,8 @@ pub(crate) type RootReaders<'a, R> = (
     TableReader<'a, R, String, ProxyCacheRec>,
     TableReader<'a, R, u8, MirrorConfigRec>,
     TableReader<'a, R, String, ImageBlobRec>,
+    TableReader<'a, R, String, ImagePinRec>,
+    TableReader<'a, R, u8, VariableSnapshotRec>,
 );
 
 // ---- arg extraction ----
@@ -202,15 +205,26 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         _cache,
         _mirror_config,
         _images,
+        _image_pins,
+        variable_snapshot,
     ) = r;
 
     match name {
-        "figmog_status" => Some(query::status(nodes, meta).map(|mut v| {
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("upstream".to_string(), json!(upstream_status));
-            }
-            v
-        })),
+        "figmog_status" => Some(
+            query::status(
+                nodes,
+                meta,
+                variables,
+                variable_collections,
+                variable_snapshot,
+            )
+            .map(|mut v| {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("upstream".to_string(), json!(upstream_status));
+                }
+                v
+            }),
+        ),
         "figmog_pages" => Some(query::pages(nodes, by_type)),
         "figmog_tree" => {
             let id = arg_str(args, "id");
@@ -290,7 +304,15 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         })()),
         "figmog_vars" => {
             let id = arg_str(args, "id");
-            Some(query::vars(nodes, variables, variable_collections, id))
+            let with_snapshot = arg_bool(args, "snapshot");
+            Some(query::vars(
+                nodes,
+                variables,
+                variable_collections,
+                variable_snapshot,
+                id,
+                with_snapshot,
+            ))
         }
         "figmog_stats" => Some(query::stats(
             nodes,
@@ -478,10 +500,13 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "figmog_vars",
-            description: "Variables: the authoritative record if imported via figmog import-variables, else inferred from bindings — reads the local mirror (no Figma API cost).",
+            description: "Variables: the authoritative record (with code_syntax, hidden_from_publishing, remote) if imported via figmog import-variables or an Enterprise pull, else inferred from bindings — reads the local mirror (no Figma API cost).",
             input_schema: json!({
                 "type": "object",
-                "properties": {"id": {"type": "string", "description": "Variable id filter; omitted means all variables."}}
+                "properties": {
+                    "id": {"type": "string", "description": "Variable id filter; omitted means all variables."},
+                    "snapshot": {"type": "boolean", "description": "Return {snapshot, variables}: the variable snapshot's state (none, legacy, empty, current) and provenance next to the rows."}
+                }
             }),
         },
         ToolDef {

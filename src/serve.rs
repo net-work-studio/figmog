@@ -958,7 +958,7 @@ fn handle_tool_call<U: UpstreamMcp>(
             return Ok(ToolOutput::Json(status));
         }
 
-        if !session.mirrored {
+        if !(session.mirrored || name == "figmog_vars" && session.has_variable_state()) {
             session.request_pull(false, interval);
         }
         if name == "figmog_images" {

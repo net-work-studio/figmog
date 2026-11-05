@@ -123,9 +123,19 @@ fn fetch_direct(
     let node_ids = images::normalize_ids(ids);
     let scale_m = images::scale_milli(scale);
     let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
-    let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images_table)| {
-        images::scan(&nodes, &meta, &images_table, &node_ids, format, scale_m)
-    });
+    let scanned = st.rtx(
+        |((nodes, ..), _, _, _, _, _, meta, _, _, images_table, pins, _)| {
+            images::scan(
+                &nodes,
+                &meta,
+                &images_table,
+                &pins,
+                &node_ids,
+                format,
+                scale_m,
+            )
+        },
+    );
     // An explicit store has no network identity. Cache extraction needs
     // neither that identity nor credentials, even for a mixed hit/miss batch.
     let token = match db.key {

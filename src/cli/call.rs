@@ -14,25 +14,72 @@ use crate::upstream::{HttpUpstream, UpstreamMcp};
 use super::pull::do_pull;
 use super::{Db, open_store_checked, write_json};
 
-pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String> {
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let v: Value =
-        serde_json::from_str(&content).map_err(|e| format!("parsing {}: {e}", path.display()))?;
-    let recs = crate::vars::parse_variables_export(&v).map_err(|e| e.to_string())?;
+/// `figmog import-variables <export.json>`: replace the stored variable
+/// snapshot (NWS-2961). The file is read, parsed and validated before the
+/// store is opened, so an unreadable or invalid file is rejected with the
+/// previous snapshot untouched; a valid one replaces it atomically
+/// (`store::replace_variable_snapshot`), removing variables and
+/// collections absent from the new export.
+pub(super) fn cmd_import_variables(
+    db: &Db,
+    path: PathBuf,
+    allow_empty: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    let invalid = |e: String| format!("invalid variables file {}: {e}", path.display());
+    let bytes = std::fs::read(&path).map_err(|e| invalid(e.to_string()))?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    crate::vars::check_import_entries(&v).map_err(|e| invalid(e.to_string()))?;
+    let parsed = crate::vars::parse_variables_snapshot(
+        &v,
+        crate::vars::SOURCE_FILE,
+        crate::vars::snapshot_digest(&bytes),
+    )
+    .map_err(|e| invalid(e.to_string()))?;
 
-    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
-    st.wtx(|tx| {
-        for (id, rec) in &recs {
-            tx.upsert(id, rec);
-        }
-    });
-
-    let imported = recs
+    let imported = parsed
+        .recs
         .iter()
         .filter(|(id, _)| matches!(id, Id::Variable(_)))
         .count();
-    write_json(&json!({"imported": imported}))
+    // A destination can exist without holding a store. Previewing a missing
+    // or empty directory must not initialize a database to discover no variables.
+    if dry_run {
+        let reading = |e| format!("reading store directory {}: {e}", db.path.display());
+        let empty = match std::fs::read_dir(&db.path) {
+            Ok(mut entries) => entries.next().transpose().map_err(reading)?.is_none(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => return Err(reading(e)),
+        };
+        if empty {
+            return write_json(&json!({"imported": imported, "removed": 0, "removed_ids": []}));
+        }
+    }
+    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let prior = st.rtx(|(_, _, _, _, variables, collections, ..)| {
+        crate::store::collect_variable_ids(&variables, &collections)
+    });
+    let live: std::collections::BTreeSet<_> = parsed.recs.iter().map(|(id, _)| id).collect();
+    let removed_ids: Vec<_> = prior
+        .iter()
+        .filter_map(|id| match id {
+            Id::Variable(id_string) if !live.contains(id) => Some(id_string.clone()),
+            _ => None,
+        })
+        .collect();
+    if dry_run {
+        return write_json(
+            &json!({"imported": imported, "removed": removed_ids.len(), "removed_ids": removed_ids}),
+        );
+    }
+    if imported == 0 && !allow_empty && prior.iter().any(|id| matches!(id, Id::Variable(_))) {
+        return Err(invalid(
+            "empty export would remove stored variables; pass --allow-empty to replace them"
+                .to_string(),
+        ));
+    }
+    crate::store::replace_variable_snapshot(&mut st, &prior, &parsed.recs, parsed.snapshot);
+    write_json(&json!({"imported": imported, "removed": removed_ids.len()}))
 }
 
 /// Probe `upstream_url` unless `no_upstream`, matching `figmog serve`'s own

@@ -16,7 +16,7 @@ removed) verbatim, for provenance only — don't treat them as current.
   `text`, `instances_of`, `styled_by`, `bound_to`, `by_type`,
   `components`, `component_sets`, `styles`, `variables`,
   `variable_collections`, `meta`, `proxy_cache`, `mirror_config`,
-  `images`) are on-disk schema — renaming one changes what store
+  `images`, `image_pins`, `variable_snapshot`) are on-disk schema — renaming one changes what store
   directory an unmodified binary can open. `Id`/`Rec` are append-only
   enums: postcard encodes variant indices positionally, so a new variant
   goes at the end of each enum, never inserted or reordered.

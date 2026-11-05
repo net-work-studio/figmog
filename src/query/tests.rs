@@ -1,6 +1,56 @@
 use super::*;
 
 #[test]
+fn older_binary_variable_writes_invalidate_snapshot_provenance() {
+    use crate::model::{Id, Rec};
+
+    let export = json!({
+        "variables": {
+            "V:10": {"name":"One", "variableCollectionId":"C:1", "codeSyntax":{"WEB":"one"}},
+            "V:2": {"name":"Two", "variableCollectionId":"C:1"}
+        },
+        "variableCollections": {"C:1":{"name":"Collection"}}
+    });
+    let parsed = crate::vars::parse_variables_snapshot(&export, "file", "digest".into()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = crate::open_store!(&dir.path().join("db"));
+    store.wtx(|tx| {
+        for (id, rec) in &parsed.recs {
+            tx.upsert(id, rec);
+        }
+        tx.upsert(
+            &Id::VariableSnapshot,
+            &Rec::VariableSnapshot(parsed.snapshot),
+        );
+    });
+    macro_rules! summary {
+        () => {
+            store.rtx(
+                |(_, _, _, _, variables, collections, _, _, _, _, _, snapshot)| {
+                    variable_snapshot(&variables, &collections, &snapshot)
+                },
+            )
+        };
+    }
+    assert_eq!(summary!()["state"], "current");
+    // Simulate an old binary changing variables while leaving the new row alone.
+    store.wtx(|tx| tx.remove(&Id::Variable("V:2".into())));
+    let stale = summary!();
+    assert_eq!(stale["state"], "legacy");
+    assert_eq!(stale["digest"], Value::Null);
+    assert_eq!(stale["source"], Value::Null);
+    store.rtx(
+        |((nodes, ..), _, _, _, variables, collections, _, _, _, _, _, snapshot)| {
+            let rows = vars(&nodes, &variables, &collections, &snapshot, None, false).unwrap();
+            assert_eq!(rows[0]["code_syntax"], Value::Null);
+        },
+    );
+    // Even deletion of every variable must not mislabel a stale row as empty.
+    store.wtx(|tx| tx.remove(&Id::Variable("V:10".into())));
+    assert_eq!(summary!()["state"], "legacy");
+}
+
+#[test]
 fn tree_builders_skip_cycles_but_keep_repeated_noncyclic_paths() {
     use fold::pipeline::{FilterMap, FlatMap, Keyed, Map, terminal};
 
@@ -234,6 +284,8 @@ fn deep_raw_record_features_remain_available() {
                 _,
                 _,
                 images,
+                pins,
+                _,
             )| {
                 let annotated = OwnedValue(
                     node(
@@ -291,7 +343,15 @@ fn deep_raw_record_features_remain_available() {
                     crate::deep_json::to_string(&style_values[0]["value"][0]["payload"]).unwrap(),
                     payload
                 );
-                crate::images::scan(&nodes, &meta, &images, &["0:0".to_string()], "png", 1000)
+                crate::images::scan(
+                    &nodes,
+                    &meta,
+                    &images,
+                    &pins,
+                    &["0:0".to_string()],
+                    "png",
+                    1000,
+                )
             },
         );
         let items = crate::images::resolve(

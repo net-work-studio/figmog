@@ -196,9 +196,24 @@ enum Cmd {
     /// Nodes using a style id or bound to a variable id.
     Uses { id: String },
     /// Variables: authoritative if imported, else inferred from bindings.
-    Vars { id: Option<String> },
-    /// Import a variables export (REST or plugin-console shape).
-    ImportVariables { path: PathBuf },
+    Vars {
+        id: Option<String>,
+        /// Return `{snapshot, variables}`: the variable snapshot's state
+        /// and provenance next to the rows.
+        #[arg(long)]
+        snapshot: bool,
+    },
+    /// Import a variables export (REST or plugin-console shape), replacing
+    /// the previous variable snapshot.
+    ImportVariables {
+        path: PathBuf,
+        /// Permit an empty export to replace the stored variable snapshot.
+        #[arg(long)]
+        allow_empty: bool,
+        /// Validate and report the replacement without changing the store.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Node counts by type and page, table totals, text-node count, max tree depth.
     Stats,
     /// Ancestor chain root→node for one id.
@@ -405,7 +420,18 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let tool_args = with_current_file(strip_null_options(tool_args))?;
             if let Some(result) = socket::try_call(root, tool, tool_args) {
                 let result = result?;
-                if tool == "figmog_status" && result["ready"] == false {
+                // Not ready is an error, except for an import-only store
+                // (SPEC §9) with no pull attempted. Once a pull is in
+                // progress or failed, report its lifecycle before stripping it.
+                if tool == "figmog_status"
+                    && result["ready"] == false
+                    && (!has_variable_state(&result) || !result["pull"]["job"].is_null())
+                {
+                    if let Some(error) = result["pull"]["last_completed"]["error"].as_str() {
+                        return Err(format!(
+                            "mirror is not ready — pull failed: {error}; inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors"
+                        ));
+                    }
                     return Err("mirror is not ready — inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors".to_string());
                 }
                 let result = if tool == "figmog_status" {
@@ -428,7 +454,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             fresh,
             geometry,
         } => pull::cmd_pull(&db, file, from_file, fresh, geometry),
-        Cmd::ImportVariables { path } => call::cmd_import_variables(&db, path),
+        Cmd::ImportVariables {
+            path,
+            allow_empty,
+            dry_run,
+        } => call::cmd_import_variables(&db, path, allow_empty, dry_run),
         Cmd::Images {
             ids,
             format,
@@ -451,8 +481,27 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
             match other {
                 Cmd::Status => st.rtx(
-                    |((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _, _)| {
-                        read::cmd_status(&nodes, &meta)
+                    |(
+                        (nodes, _, _, _, _, _, _),
+                        _,
+                        _,
+                        _,
+                        variables,
+                        variable_collections,
+                        meta,
+                        _,
+                        _,
+                        _,
+                        _,
+                        snapshot,
+                    )| {
+                        read::cmd_status(
+                            &nodes,
+                            &meta,
+                            &variables,
+                            &variable_collections,
+                            &snapshot,
+                        )
                     },
                 ),
                 Cmd::Pages => st
@@ -555,9 +604,29 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 Cmd::Uses { id } => st.rtx(|((nodes, _, _, _, styled_by, bound_to, _), ..)| {
                     read::cmd_uses(&nodes, &styled_by, &bound_to, id)
                 }),
-                Cmd::Vars { id } => st.rtx(
-                    |((nodes, ..), _, _, _, variables, variable_collections, _, _, _, _)| {
-                        read::cmd_vars(&nodes, &variables, &variable_collections, id)
+                Cmd::Vars { id, snapshot } => st.rtx(
+                    |(
+                        (nodes, ..),
+                        _,
+                        _,
+                        _,
+                        variables,
+                        variable_collections,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        snap,
+                    )| {
+                        read::cmd_vars(
+                            &nodes,
+                            &variables,
+                            &variable_collections,
+                            &snap,
+                            id,
+                            snapshot,
+                        )
                     },
                 ),
                 Cmd::Stats => st.rtx(
@@ -705,6 +774,14 @@ fn strip_null_options(mut args: Value) -> Value {
     args
 }
 
+/// Whether a status result carries a variable snapshot summary with
+/// stored state (anything but `none`) — the import-only status case.
+fn has_variable_state(status: &Value) -> bool {
+    status["variables"]["state"]
+        .as_str()
+        .is_some_and(|state| state != "none")
+}
+
 /// Preserve the direct read command's JSON shape for an existing mirror.
 /// `figmog call figmog_status` keeps the full server lifecycle instead.
 fn strip_routed_status_fields(mut result: Value) -> Value {
@@ -775,7 +852,9 @@ fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
             json!({"type": style_type, "values": values, "resolve_vars": resolve_vars}),
         )),
         Cmd::Uses { id } => Some(("figmog_uses", json!({"id": id}))),
-        Cmd::Vars { id } => Some(("figmog_vars", json!({"id": id}))),
+        Cmd::Vars { id, snapshot } => {
+            Some(("figmog_vars", json!({"id": id, "snapshot": snapshot})))
+        }
         Cmd::Stats => Some(("figmog_stats", json!({}))),
         Cmd::Path { id } => Some(("figmog_path", json!({"id": id}))),
         Cmd::Text { page, under } => Some(("figmog_text", json!({"page": page, "under": under}))),

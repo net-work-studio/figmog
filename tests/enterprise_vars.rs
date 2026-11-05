@@ -71,6 +71,8 @@ fn enterprise_export_syncs_with_zero_churn_on_identical_repull() {
             _,
             _,
             _,
+            _,
+            _,
         )| {
             let mut p = collect_sweepable(&nodes, &components, &component_sets, &styles);
             p.extend(collect_variable_ids(&variables, &variable_collections));
@@ -103,7 +105,7 @@ fn variable_removed_upstream_is_swept_when_export_present() {
         collect_sweepable(&nodes, &components, &component_sets, &styles)
     });
     sync(&mut st, &prior, &flattened, 1_000);
-    st.rtx(|(_, _, _, _, variables, _, _, _, _, _)| {
+    st.rtx(|(_, _, _, _, variables, _, _, _, _, _, _, _)| {
         assert_eq!(variables.iter().count(), 3);
     });
 
@@ -132,6 +134,8 @@ fn variable_removed_upstream_is_swept_when_export_present() {
             _,
             _,
             _,
+            _,
+            _,
         )| {
             let mut p = collect_sweepable(&nodes, &components, &component_sets, &styles);
             p.extend(collect_variable_ids(&variables, &variable_collections));
@@ -141,7 +145,7 @@ fn variable_removed_upstream_is_swept_when_export_present() {
     let churn = sync(&mut st, &prior2, &flattened2, 2_000);
     assert_eq!(churn.removed, 1, "the dropped variable must be swept");
 
-    st.rtx(|(_, _, _, _, variables, collections, _, _, _, _)| {
+    st.rtx(|(_, _, _, _, variables, collections, _, _, _, _, _, _)| {
         assert!(
             variables.get(&"VariableID:200".to_string()).is_none(),
             "removed-upstream variable must be gone"
@@ -207,11 +211,44 @@ fn imported_variables_survive_pulls_with_no_export() {
     let churn = sync(&mut st, &prior, &flattened2, 2_000);
     assert_eq!(churn.removed, 0, "no export means nothing to sweep");
 
-    st.rtx(|(_, _, _, _, variables, collections, _, _, _, _)| {
+    st.rtx(|(_, _, _, _, variables, collections, _, _, _, _, _, _)| {
         assert!(
             variables.get(&"VariableID:100".to_string()).is_some(),
             "v1 behavior intact: imported variables survive a pull with no Enterprise export"
         );
         assert!(collections.get(&"VC:1".to_string()).is_some());
+    });
+}
+
+/// NWS-2961: an Enterprise pull's variables carry an `enterprise_rest`
+/// provenance row, folded into the same sync and stable across identical
+/// re-pulls (the digest is over canonical JSON).
+#[test]
+fn enterprise_pull_records_enterprise_rest_provenance() {
+    let recs = figmog::vars::enterprise_snapshot_recs(&export()).unwrap();
+    assert_eq!(
+        recs.len(),
+        6,
+        "5 variable/collection recs + the snapshot row"
+    );
+    let (id, Rec::VariableSnapshot(snap)) = recs.last().unwrap() else {
+        panic!("snapshot row last")
+    };
+    assert_eq!(*id, Id::VariableSnapshot);
+    assert_eq!(snap.source, "enterprise_rest");
+    assert_eq!(snap.format, "rest");
+    assert!(snap.digest.starts_with("fnv1a64:"));
+    assert_eq!(
+        postcard::to_allocvec(&recs).unwrap(),
+        postcard::to_allocvec(&figmog::vars::enterprise_snapshot_recs(&export()).unwrap()).unwrap()
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = figmog::open_store!(dir.path().join("db"));
+    let mut flattened = figmog::flatten::flatten_file(&common::fixture_v1()).unwrap();
+    flattened.recs.extend(recs);
+    sync(&mut st, &BTreeSet::new(), &flattened, 1_000);
+    st.rtx(|(_, _, _, _, _, _, _, _, _, _, _, snapshot)| {
+        assert_eq!(snapshot.get(&0).unwrap().source, "enterprise_rest");
     });
 }

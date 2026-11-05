@@ -42,18 +42,32 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiError, FigmaApi};
 use crate::ident::normalize_node_ref;
-use crate::model::{FileMeta, Id, ImageBlobRec, NodeRec, Rec};
+use crate::model::{FileMeta, Id, ImageBlobRec, ImagePinRec, NodeRec, Rec};
 
 /// [`ImageItem::kind`] for a node render.
 pub const RENDER: &str = "render";
 /// [`ImageItem::kind`] for a fill image.
 pub const FILL: &str = "fill";
 
+/// Current render cache generation (NWS-2960). A render row is a cache
+/// hit only when its [`ImagePinRec`] marker carries this generation:
+/// generation 1 means "requested with `version=<the row's file_version>`",
+/// so the bytes really are that version's render. Render rows an older
+/// binary stored (requested unpinned — possibly showing a newer design
+/// than their label) have no marker and read as misses, so they get
+/// refetched and overwritten when the file key and credentials are
+/// available. Explicit stores cannot refresh these unverified renders;
+/// they return an upgrade-specific error. Fill rows never need a marker.
+pub const RENDER_PIN_GENERATION: u32 = 1;
+
 /// A caller with no Figma API token still gets every cache hit for free
 /// (spec §5: "a repeat request on an unchanged file spends zero budget");
 /// every miss gets this exact per-item manifest error instead of a wasted
 /// (guaranteed-401) network attempt.
 const NO_TOKEN_MSG: &str = "FIGMA_TOKEN is unset or empty and no saved token is available — required for image downloads; an empty FIGMA_TOKEN disables saved credentials, so unset it to use saved credentials; run `figmog auth login` or set FIGMA_TOKEN";
+
+/// Distinguish an upgrade's unverified bytes from a genuinely absent row.
+const UNVERIFIED_RENDER_MSG: &str = "cached render bytes lack a valid version pin (for example, cached before this upgrade), so their mirrored version cannot be verified; --db cannot refresh them without a file key. Run `figmog pull <file-key-or-url>`, then `figmog images <node-id>...` without --db to fetch a verified render; the existing bytes remain on disk";
 
 /// An explicit store can serve cached bytes, but its records do not
 /// establish the file key needed to fetch a miss safely.
@@ -177,6 +191,7 @@ impl ImageItem {
 pub struct Scanned {
     version: String,
     render_hits: BTreeMap<String, ImageItem>,
+    unverified_renders: BTreeSet<String>,
     fill_refs: BTreeSet<String>,
     fill_hits: BTreeMap<String, ImageItem>,
 }
@@ -209,10 +224,16 @@ fn matches_identity(
 /// detection, against already-open table readers — call inside
 /// `st.rtx(|tuple| images::scan(..))` at a concrete `open_store!` site.
 /// `node_ids` must already be normalized/deduped ([`normalize_ids`]).
+///
+/// The mirrored version read here is captured in [`Scanned`] and is the
+/// only version [`resolve`] uses — both as the render request's
+/// `version` parameter and as the stored rows' `file_version` — so a
+/// pull landing between the two halves can't relabel a fetch.
 pub fn scan<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     meta: &TableReader<'_, R, u8, FileMeta>,
     images: &TableReader<'_, R, String, ImageBlobRec>,
+    pins: &TableReader<'_, R, String, ImagePinRec>,
     node_ids: &[String],
     format: &str,
     scale_milli: u32,
@@ -220,12 +241,19 @@ pub fn scan<R: Readable>(
     let version = meta.get(&0).map(|m| m.version.clone()).unwrap_or_default();
 
     let mut render_hits: BTreeMap<String, ImageItem> = BTreeMap::new();
+    let mut unverified_renders = BTreeSet::new();
     for id in node_ids {
         let key = image_key(RENDER, id, format, scale_milli);
         if let Some(rec) = images.get(&key)
             && rec.file_version == version
             && matches_identity(&rec, RENDER, id, format, scale_milli)
         {
+            if !pins.get(&key).is_some_and(|pin| {
+                pin.generation == RENDER_PIN_GENERATION && pin.file_version == rec.file_version
+            }) {
+                unverified_renders.insert(id.clone());
+                continue;
+            }
             render_hits.insert(
                 id.clone(),
                 ImageItem {
@@ -273,6 +301,7 @@ pub fn scan<R: Readable>(
     Scanned {
         version,
         render_hits,
+        unverified_renders,
         fill_refs,
         fill_hits,
     }
@@ -302,6 +331,7 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
     let Scanned {
         version,
         mut render_hits,
+        unverified_renders,
         fill_refs,
         mut fill_hits,
     } = scanned;
@@ -312,6 +342,9 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
         NO_TOKEN_MSG
     };
     let api = api.zip(file_key);
+    // NWS-2960: pin every render request to the version captured by
+    // `scan` — the same value stored as each fetched row's `file_version`.
+    let pinned_version = (!version.is_empty()).then_some(version.as_str());
 
     let render_misses: Vec<String> = node_ids
         .iter()
@@ -328,54 +361,90 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
                             RENDER,
                             id,
                             format.to_string(),
-                            unavailable_reason.to_string(),
+                            if file_key.is_none() && unverified_renders.contains(id) {
+                                UNVERIFIED_RENDER_MSG
+                            } else {
+                                unavailable_reason
+                            }
+                            .to_string(),
                         ),
                     );
                 }
             }
-            Some((api, key)) => match api.images_render(key, &render_misses, format, scale) {
-                Ok(resp) => {
-                    let url_map = resp.get("images").and_then(Value::as_object);
-                    for id in &render_misses {
-                        let url = url_map.and_then(|m| m.get(id)).and_then(Value::as_str);
-                        let item = match url {
-                            None => error_item(
-                                RENDER,
-                                id,
-                                format.to_string(),
-                                "no render available for this node".to_string(),
-                            ),
-                            Some(url) => match download(url) {
-                                Ok(bytes) => {
-                                    let key = image_key(RENDER, id, format, scale_m);
-                                    store_image(
-                                        st, &key, RENDER, id, format, scale_m, &version, &bytes,
-                                    );
-                                    ImageItem {
-                                        subject: id.clone(),
-                                        kind: RENDER,
-                                        format: format.to_string(),
-                                        bytes,
-                                        cached: false,
-                                        error: None,
+            Some((api, key)) => {
+                match api.images_render(key, &render_misses, format, scale, pinned_version) {
+                    Ok(resp) => {
+                        let url_map = resp.get("images").and_then(Value::as_object);
+                        for id in &render_misses {
+                            let url = url_map.and_then(|m| m.get(id)).and_then(Value::as_str);
+                            let item = match url {
+                                None => error_item(
+                                    RENDER,
+                                    id,
+                                    format.to_string(),
+                                    "no render available for this node".to_string(),
+                                ),
+                                Some(url) => match download(url) {
+                                    Ok(bytes) => {
+                                        let key = image_key(RENDER, id, format, scale_m);
+                                        store_image(
+                                            st,
+                                            &key,
+                                            RENDER,
+                                            id,
+                                            format,
+                                            scale_m,
+                                            &version,
+                                            &bytes,
+                                            pinned_version.is_some(),
+                                        );
+                                        ImageItem {
+                                            subject: id.clone(),
+                                            kind: RENDER,
+                                            format: format.to_string(),
+                                            bytes,
+                                            cached: false,
+                                            error: None,
+                                        }
                                     }
+                                    Err(e) => {
+                                        error_item(RENDER, id, format.to_string(), e.to_string())
+                                    }
+                                },
+                            };
+                            render_hits.insert(id.clone(), item);
+                        }
+                    }
+                    Err(e) => {
+                        let msg = match pinned_version {
+                            Some(version) => {
+                                let mut message = format!(
+                                    "render request for file {key:?} at mirrored version {version:?} failed: {e}"
+                                );
+                                if matches!(
+                                    &e,
+                                    ApiError::Http {
+                                        status: 400 | 404,
+                                        ..
+                                    }
+                                ) {
+                                    message.push_str(&format!(
+                                        "; no unpinned fallback is attempted. Check that this version belongs to the file and is still available, or run `figmog pull {key}` before retrying"
+                                    ));
                                 }
-                                Err(e) => error_item(RENDER, id, format.to_string(), e.to_string()),
-                            },
+                                message
+                            }
+                            None => e.to_string(),
                         };
-                        render_hits.insert(id.clone(), item);
+                        for id in &render_misses {
+                            render_hits.insert(
+                                id.clone(),
+                                error_item(RENDER, id, format.to_string(), msg.clone()),
+                            );
+                        }
                     }
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    for id in &render_misses {
-                        render_hits.insert(
-                            id.clone(),
-                            error_item(RENDER, id, format.to_string(), msg.clone()),
-                        );
-                    }
-                }
-            },
+            }
         }
     }
 
@@ -417,7 +486,9 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
                                 Ok(bytes) => {
                                     let fmt = infer_fill_format(url);
                                     let key = image_key(FILL, r, "", 1000);
-                                    store_image(st, &key, FILL, r, &fmt, 1000, &version, &bytes);
+                                    store_image(
+                                        st, &key, FILL, r, &fmt, 1000, &version, &bytes, false,
+                                    );
                                     ImageItem {
                                         subject: r.clone(),
                                         kind: FILL,
@@ -479,6 +550,7 @@ fn store_image<P: Push<Keyed<Id, Rec>>>(
     scale_milli: u32,
     file_version: &str,
     bytes: &[u8],
+    pinned: bool,
 ) {
     let rec = ImageBlobRec {
         key_hash: key.to_string(),
@@ -494,6 +566,20 @@ fn store_image<P: Push<Keyed<Id, Rec>>>(
             &Id::ImageBlob(key.to_string()),
             &Rec::ImageBlob(rec.clone()),
         );
+        // The marker is written (or cleared) in the same transaction as
+        // the row it describes, so the two can never disagree.
+        let pin_id = Id::ImagePin(key.to_string());
+        if pinned {
+            tx.upsert(
+                &pin_id,
+                &Rec::ImagePin(ImagePinRec {
+                    generation: RENDER_PIN_GENERATION,
+                    file_version: file_version.to_string(),
+                }),
+            );
+        } else {
+            tx.remove(&pin_id);
+        }
     });
 }
 
@@ -974,6 +1060,7 @@ mod tests {
         render_responses: RefCell<Vec<Result<Value, ApiError>>>,
         fills_responses: RefCell<Vec<Result<Value, ApiError>>>,
         render_calls: RefCell<Vec<Vec<String>>>,
+        render_versions: RefCell<Vec<Option<String>>>,
         fills_calls: RefCell<u32>,
     }
     impl Script {
@@ -982,6 +1069,7 @@ mod tests {
                 render_responses: RefCell::new(Vec::new()),
                 fills_responses: RefCell::new(Vec::new()),
                 render_calls: RefCell::new(Vec::new()),
+                render_versions: RefCell::new(Vec::new()),
                 fills_calls: RefCell::new(0),
             }
         }
@@ -999,8 +1087,12 @@ mod tests {
             ids: &[String],
             _format: &str,
             _scale: Option<f64>,
+            version: Option<&str>,
         ) -> Result<Value, ApiError> {
             self.render_calls.borrow_mut().push(ids.to_vec());
+            self.render_versions
+                .borrow_mut()
+                .push(version.map(str::to_string));
             self.render_responses.borrow_mut().remove(0)
         }
         fn file_image_fills(&self, _key: &str) -> Result<Value, ApiError> {
@@ -1071,6 +1163,26 @@ mod tests {
         });
     }
 
+    /// Seed `rec` under `key` together with a valid render pin marker
+    /// (current generation, matching `file_version`), so the marker check
+    /// passes and only `rec`'s own identity fields can reject a hit.
+    fn seed_pinned_row<P: Push<Keyed<Id, Rec>>>(
+        st: &mut KeyedStream<Id, Rec, P>,
+        key: String,
+        rec: ImageBlobRec,
+    ) {
+        st.wtx(|tx| {
+            tx.upsert(
+                &Id::ImagePin(key.clone()),
+                &Rec::ImagePin(ImagePinRec {
+                    generation: RENDER_PIN_GENERATION,
+                    file_version: rec.file_version.clone(),
+                }),
+            );
+            tx.upsert(&Id::ImageBlob(key), &Rec::ImageBlob(rec));
+        });
+    }
+
     // ---- I-3-style collision safety (mirrors cache.rs's own test) ----
 
     /// A row that collides on `image_key`'s hash but actually belongs to a
@@ -1098,14 +1210,14 @@ mod tests {
             file_version: "100".to_string(),
             bytes: vec![9, 9, 9],
         };
-        st.wtx(|tx| {
-            tx.upsert(&Id::ImageBlob(key), &Rec::ImageBlob(colliding));
-        });
+        seed_pinned_row(&mut st, key, colliding);
 
         let ids = vec![requested_id.clone()];
-        let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images)| {
-            scan(&nodes, &meta, &images, &ids, "png", 1000)
-        });
+        let scanned = st.rtx(
+            |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
+                scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
+            },
+        );
         assert!(
             !scanned.render_hits.contains_key(&requested_id),
             "a key-hash collision must never be served as a cache hit"
@@ -1134,18 +1246,54 @@ mod tests {
             file_version: "100".to_string(),
             bytes: vec![9, 9, 9],
         };
-        st.wtx(|tx| {
-            tx.upsert(&Id::ImageBlob(key), &Rec::ImageBlob(colliding));
-        });
+        seed_pinned_row(&mut st, key, colliding);
 
         let ids = vec![requested_id.clone()];
-        let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images)| {
-            scan(&nodes, &meta, &images, &ids, "png", 1000)
-        });
+        let scanned = st.rtx(
+            |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
+                scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
+            },
+        );
         assert!(
             !scanned.render_hits.contains_key(&requested_id),
             "a format/scale mismatch under the same key must never be served"
         );
+    }
+
+    #[test]
+    fn scan_rejects_wrong_pin_generation_and_version_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        insert_meta(&mut st, "100");
+        let ids = vec!["1:2".to_string()];
+        let key = image_key(RENDER, "1:2", "png", 1000);
+        store_image(&mut st, &key, RENDER, "1:2", "png", 1000, "100", &[1], true);
+
+        for (generation, version, expect_hit) in [
+            (RENDER_PIN_GENERATION, "100", true),
+            (RENDER_PIN_GENERATION + 1, "100", false),
+            (RENDER_PIN_GENERATION, "99", false),
+        ] {
+            st.wtx(|tx| {
+                tx.upsert(
+                    &Id::ImagePin(key.clone()),
+                    &Rec::ImagePin(ImagePinRec {
+                        generation,
+                        file_version: version.to_string(),
+                    }),
+                );
+            });
+            let scanned = st.rtx(
+                |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
+                    scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
+                },
+            );
+            assert_eq!(
+                scanned.render_hits.contains_key("1:2"),
+                expect_hit,
+                "pin generation={generation}, version={version}"
+            );
+        }
     }
 
     /// `scan` then `resolve`, exactly the two-step call every production
@@ -1153,9 +1301,19 @@ mod tests {
     /// this test suite proves end to end.
     macro_rules! scan_and_resolve {
         ($st:expr, $api:expr, $download:expr, $ids:expr, $format:expr, $scale:expr) => {{
-            let scanned = $st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images)| {
-                scan(&nodes, &meta, &images, $ids, $format, scale_milli($scale))
-            });
+            let scanned = $st.rtx(
+                |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
+                    scan(
+                        &nodes,
+                        &meta,
+                        &images,
+                        &pins,
+                        $ids,
+                        $format,
+                        scale_milli($scale),
+                    )
+                },
+            );
             resolve(
                 &mut $st,
                 scanned,
@@ -1291,7 +1449,17 @@ mod tests {
         // Pre-seed a cache hit for 1:2 directly (as if fetched earlier).
         {
             let key = image_key(RENDER, "1:2", "png", 1000);
-            store_image(&mut st, &key, RENDER, "1:2", "png", 1000, "100", &[1, 1]);
+            store_image(
+                &mut st,
+                &key,
+                RENDER,
+                "1:2",
+                "png",
+                1000,
+                "100",
+                &[1, 1],
+                true,
+            );
         }
         let (download, download_calls) = downloader(HashMap::new());
 
@@ -1309,6 +1477,206 @@ mod tests {
         assert!(message.contains("figmog auth login"));
         assert!(message.contains("set FIGMA_TOKEN"));
         assert_eq!(*download_calls.borrow(), 0);
+    }
+
+    /// NWS-2960: a render requested while the mirror is at "100" asks
+    /// Figma for version "100" — even if Figma's latest has since moved on
+    /// — and the cached row is labelled and marked with that same version.
+    #[test]
+    fn resolve_pins_the_render_request_to_the_mirrored_version_and_marks_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        insert_node(&mut st, "1:2", json!({}));
+        insert_meta(&mut st, "100");
+
+        let script = Script::new();
+        script
+            .render_responses
+            .borrow_mut()
+            .push(Ok(json!({"images": {"1:2": "https://s3/v100.png"}})));
+        let (download, _calls) = downloader(HashMap::from([(
+            "https://s3/v100.png".to_string(),
+            vec![1, 0, 0],
+        )]));
+
+        let ids = vec!["1:2".to_string()];
+        let items = scan_and_resolve!(st, Some(&script), &download, &ids, "png", None);
+        assert_eq!(items[0].bytes, vec![1, 0, 0]);
+        assert_eq!(
+            *script.render_versions.borrow(),
+            vec![Some("100".to_string())],
+            "the render request must carry the mirrored version"
+        );
+
+        let key = image_key(RENDER, "1:2", "png", 1000);
+        let (row, pin) = st
+            .rtx(|(_, _, _, _, _, _, _, _, _, images, pins, _)| (images.get(&key), pins.get(&key)));
+        assert_eq!(row.unwrap().file_version, "100");
+        assert_eq!(
+            pin,
+            Some(ImagePinRec {
+                generation: RENDER_PIN_GENERATION,
+                file_version: "100".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_without_a_mirrored_version_never_writes_a_pin_or_reuses_the_render() {
+        for has_meta in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut st = crate::open_store!(dir.path().join("db"));
+            if has_meta {
+                insert_meta(&mut st, "");
+            }
+            let key = image_key(RENDER, "1:2", "png", 1000);
+            // A previous marker must be cleared when an unpinned fetch
+            // overwrites its row, as well as not being created afresh.
+            st.wtx(|tx| {
+                tx.upsert(
+                    &Id::ImagePin(key.clone()),
+                    &Rec::ImagePin(ImagePinRec {
+                        generation: RENDER_PIN_GENERATION,
+                        file_version: "100".to_string(),
+                    }),
+                );
+            });
+            let script = Script::new();
+            for _ in 0..2 {
+                script
+                    .render_responses
+                    .borrow_mut()
+                    .push(Ok(json!({"images": {"1:2": "https://s3/latest.png"}})));
+            }
+            let (download, calls) = downloader(HashMap::from([(
+                "https://s3/latest.png".to_string(),
+                vec![9],
+            )]));
+            let ids = vec!["1:2".to_string()];
+            for _ in 0..2 {
+                let items = scan_and_resolve!(st, Some(&script), &download, &ids, "png", None);
+                assert_eq!(items[0].bytes, vec![9]);
+                assert!(!items[0].cached);
+                let (row, pin) = st.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, _)| {
+                    (images.get(&key), pins.get(&key))
+                });
+                assert_eq!(row.unwrap().file_version, "");
+                assert_eq!(pin, None, "an unpinned response cannot gain a valid pin");
+            }
+            assert_eq!(*script.render_versions.borrow(), vec![None, None]);
+            assert_eq!(*calls.borrow(), 2);
+        }
+    }
+
+    #[test]
+    fn a_rejected_pinned_render_reports_the_version_without_retrying_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        insert_meta(&mut st, "unavailable-version");
+        let script = Script::new();
+        script
+            .render_responses
+            .borrow_mut()
+            .push(Err(ApiError::Http {
+                status: 400,
+                msg: "version not found".to_string(),
+            }));
+        let (download, calls) = downloader(HashMap::new());
+        let ids = vec!["1:2".to_string()];
+        let items = scan_and_resolve!(st, Some(&script), &download, &ids, "png", None);
+        let error = items[0].error.as_deref().unwrap();
+        assert!(error.contains("file \"FILE\""), "{error}");
+        assert!(error.contains("unavailable-version"), "{error}");
+        assert!(error.contains("version not found"), "{error}");
+        assert!(error.contains("no unpinned fallback"), "{error}");
+        assert!(error.contains("figmog pull FILE"), "{error}");
+        assert!(items[0].bytes.is_empty());
+        assert_eq!(*calls.borrow(), 0);
+        assert_eq!(
+            *script.render_versions.borrow(),
+            vec![Some("unavailable-version".to_string())]
+        );
+        let key = image_key(RENDER, "1:2", "png", 1000);
+        assert!(st.get(&Id::ImageBlob(key.clone())).is_none());
+        assert!(st.get(&Id::ImagePin(key)).is_none());
+    }
+
+    /// NWS-2960 upgrade path: a render row an older binary stored (fetched
+    /// unpinned, so possibly showing a newer design than its "100" label)
+    /// carries no pin marker. It must be refetched, not served — and the
+    /// refetched row is marked, so the next request is a normal hit.
+    #[test]
+    fn an_unmarked_legacy_render_row_is_refetched_instead_of_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        insert_node(
+            &mut st,
+            "1:2",
+            json!({"fills": [{"type": "IMAGE", "imageRef": "hash1"}]}),
+        );
+        insert_meta(&mut st, "100");
+        let render_key = image_key(RENDER, "1:2", "png", 1000);
+        let fill_key = image_key(FILL, "hash1", "", 1000);
+        st.wtx(|tx| {
+            // Falsely labelled legacy render: same version, no marker.
+            tx.upsert(
+                &Id::ImageBlob(render_key.clone()),
+                &Rec::ImageBlob(ImageBlobRec {
+                    key_hash: render_key.clone(),
+                    kind: RENDER.to_string(),
+                    subject: "1:2".to_string(),
+                    format: "png".to_string(),
+                    scale_milli: 1000,
+                    file_version: "100".to_string(),
+                    bytes: vec![6, 6, 6],
+                }),
+            );
+            // Legacy fill row: content-addressed, stays valid unmarked.
+            tx.upsert(
+                &Id::ImageBlob(fill_key.clone()),
+                &Rec::ImageBlob(ImageBlobRec {
+                    key_hash: fill_key.clone(),
+                    kind: FILL.to_string(),
+                    subject: "hash1".to_string(),
+                    format: "jpg".to_string(),
+                    scale_milli: 1000,
+                    file_version: "100".to_string(),
+                    bytes: vec![5, 5],
+                }),
+            );
+        });
+
+        let script = Script::new();
+        script
+            .render_responses
+            .borrow_mut()
+            .push(Ok(json!({"images": {"1:2": "https://s3/v100.png"}})));
+        let (download, download_calls) = downloader(HashMap::from([(
+            "https://s3/v100.png".to_string(),
+            vec![1, 0, 0],
+        )]));
+
+        let ids = vec!["1:2".to_string()];
+        let items = scan_and_resolve!(st, Some(&script), &download, &ids, "png", None);
+        let render = items.iter().find(|i| i.kind == RENDER).unwrap();
+        assert!(!render.cached, "an unmarked legacy render must be a miss");
+        assert_eq!(render.bytes, vec![1, 0, 0]);
+        assert_eq!(
+            *script.render_versions.borrow(),
+            vec![Some("100".to_string())]
+        );
+        let fill = items.iter().find(|i| i.kind == FILL).unwrap();
+        assert!(fill.cached, "an unmarked fill row is still a hit");
+        assert_eq!(fill.bytes, vec![5, 5]);
+        assert_eq!(*script.fills_calls.borrow(), 0);
+
+        // Repeat: the refetched row is marked, so it's a hit with zero
+        // API calls (`render_responses` is empty — a call would panic).
+        let items2 = scan_and_resolve!(st, Some(&script), &download, &ids, "png", None);
+        let render2 = items2.iter().find(|i| i.kind == RENDER).unwrap();
+        assert!(render2.cached);
+        assert_eq!(render2.bytes, vec![1, 0, 0]);
+        assert_eq!(*download_calls.borrow(), 1);
     }
 
     #[test]

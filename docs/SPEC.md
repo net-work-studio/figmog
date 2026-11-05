@@ -43,7 +43,7 @@ Two commands spend Figma's API budget deliberately and explicitly: `pull`
                          │  store.rs                │  figmog_pipeline! (fold)
                          │  sync() — upsert + sweep │  KeyedStream<Id, Rec, _>
                          └────────────┬─────────────┘
-                                      │ 16 materialized sinks (frozen names)
+                                      │ 18 materialized sinks (frozen names)
                                       ▼
                          ┌─────────────────────────┐
                          │  query.rs                 │  one source of truth for
@@ -108,12 +108,14 @@ matching [`Rec`](../src/model.rs) variant:
 | `ProxyCache(String)` | `ProxyCacheRec` | legacy proxied-tool responses (§8) |
 | `MirrorConfig` | `MirrorConfigRec` | one row: this mirror's sticky pull settings (§14) |
 | `ImageBlob(String)` | `ImageBlobRec` | cached render and fill bytes (§15) |
+| `ImagePin(String)` | `ImagePinRec` | version-pin marker for one cached render row (§15) |
+| `VariableSnapshot` | `VariableSnapshotRec` | one row: provenance and code names of the stored variable snapshot (§9) |
 
 `Id`/`Rec` are **append-only enums** — postcard encodes variant indices
 positionally, so inserting a new variant anywhere but the end would
-silently corrupt every existing on-disk store. `ImageBlob` is the most
-recent addition and sits last in both enums (`MirrorConfig` immediately
-before it); the next new record kind goes after `ImageBlob`, never
+silently corrupt every existing on-disk store. `VariableSnapshot` is the
+most recent addition and sits last in both enums (`ImagePin` immediately
+before it); the next new record kind goes after `VariableSnapshot`, never
 between existing variants. The same rule is why a new setting arrives as
 a new record kind rather than a new field on an existing `Rec` struct:
 struct fields are positional too, so widening `FileMeta` would break
@@ -148,6 +150,36 @@ hash for a fill), `format`, `scale_milli` (requested scale × 1000, always
 trusting the key hash, the same identity check `cache::lookup` makes for
 proxied responses.
 
+`ImagePinRec` (§15): `generation: u32` and `file_version`, keyed by the
+same image key as the render row it marks. A render row is a hit only
+with a marker whose `generation` equals `images::RENDER_PIN_GENERATION`
+(currently 1, meaning "requested with `version=<file_version>`") and
+whose `file_version` equals the row's. It is a separate record kind
+rather than a new `ImageBlobRec` field for the same reason as
+`MirrorConfig`. Fill rows carry no marker.
+
+`VariableSnapshotRec` (§9): `source` (`"file"` for `import-variables`,
+`"enterprise_rest"` for a pull's `variables/local` fetch), `format`
+(detected export shape: `"rest"` for `{meta: …}`, `"bare"` for the
+plugin-console object), `format_version` and `exported_at` (the export's
+top-level `formatVersion`/`exportedAt`, `None` when absent — no current
+exporter emits them), `digest` (`fnv1a64:<hex>` over the raw file bytes,
+or over a pulled response's canonical JSON — a change detector, not an
+integrity proof), and `variables`: one `VariableCodeRec { id,
+code_syntax, hidden_from_publishing, remote }` per variable, sorted by
+id, with `code_syntax` as sorted `(platform, name)` pairs from
+`codeSyntax`. It is written in the same transaction as the snapshot it
+describes. A separate record kind rather than new `VariableRec` fields
+for the same reason as `MirrorConfig`.
+
+Older builds can open these stores but do not maintain `variable_snapshot`
+or `image_pins`. Their writes can leave provenance from an earlier import
+or orphan pin markers. Markers without matching image rows are ignored
+and swept on a version-changing pull. A variable-id mismatch reports
+`legacy` with null provenance; changes to existing ids or collections
+alone cannot be detected. Re-import or an Enterprise pull refreshes the
+snapshot; avoid writing to the same store with mixed build versions.
+
 **Determinism contract:** every map-shaped field is a sorted `Vec` of
 pairs; every canonical-JSON string comes from `serde_json` without
 `preserve_order` (`serde_json::Value` is `BTreeMap`-backed here, so
@@ -158,7 +190,7 @@ detector. No `HashMap` iteration ever reaches an output boundary.
 
 ## 4. Pipeline and sinks
 
-`store::figmog_pipeline!()` wires the flattened records into 16
+`store::figmog_pipeline!()` wires the flattened records into 18
 `fold` terminal sinks, keyed off `store.rs`'s pure branch functions
 (`node_only`, `child_edge`, `text_doc`, `instance_edge`, `style_edges`,
 `variable_edges`, `type_edge`, plus one `rec_branch!`-generated filter per
@@ -183,11 +215,15 @@ is a breaking store-format change:
 | `proxy_cache` | Table | cache key hash | legacy proxied-tool cache (§8) |
 | `mirror_config` | Table | `0u8` (one row, like `meta`) | sticky pull settings (§14) |
 | `images` | Table | image cache key hash | render/fill byte caching (§15) |
+| `image_pins` | Table | image cache key hash | render version-pin markers (§15) |
+| `variable_snapshot` | Table | `0u8` (one row, like `meta`) | variable snapshot state and provenance (§9) |
 
-`mirror_config` and `images` are appended at the pipeline root's tail, so
-the reader tuple grows at the end and older stores keep decoding. Both
-sit outside `collect_sweepable` (§5): a file sync never removes a config
-row, and image rows are evicted by version instead.
+`mirror_config`, `images`, `image_pins` and `variable_snapshot` are
+appended at the pipeline root's tail, so the reader tuple grows at the
+end and older stores keep decoding (a store created before `image_pins`
+or `variable_snapshot` existed opens with that sink empty). All four sit
+outside `collect_sweepable` (§5): a file sync never removes a config or
+snapshot row, and image rows are evicted by version instead.
 
 `bound_to`'s edges are deliberately not deduped before feeding the
 inverted index: `InvertedIndex` is set-semantic, so duplicate `(node,
@@ -200,6 +236,9 @@ node) collapse harmlessly to the same membership.
 upsert every record and the meta row, then remove ids that were live
 before this sync but are absent from it now (the sweep). It returns a
 `Churn { added, changed, removed, unchanged }` count.
+The variable snapshot row contributes no added/unchanged count, but a
+change to an existing snapshot's per-variable code metadata contributes
+one `changed`; changes to provenance alone contribute nothing (§9).
 
 **What's sweepable:** nodes, components, component sets, and styles
 always are (`collect_sweepable`, read via `rtx` *before* `sync`, since
@@ -209,8 +248,10 @@ that cycle via `collect_variable_ids` — i.e. only on a pull that actually
 fetched an Enterprise `variables/local` export this time. On a
 non-Enterprise or `--from-file` pull, stored variables sit entirely
 outside `sync`'s live/sweep accounting: manually imported records persist
-across ordinary pulls indefinitely (§9). The meta row is never
-sweepable.
+across ordinary pulls until the next import replaces them (§9). The meta
+row is never sweepable. `import-variables` uses the same
+`collect_variable_ids` sweep set in its own transaction
+(`store::replace_variable_snapshot`).
 
 **Idempotence:** re-syncing byte-identical records is a no-op through the
 whole pipeline — `unchanged` increments, no index writes happen. A
@@ -221,7 +262,8 @@ Tier-1 fetch and nothing else downstream.
 `sync`'s sweep (its churn accounting stays untouched by this feature):
 after a sync whose file *version* actually moved, every `proxy_cache` row
 (`store::stale_cache_ids`) and every `images` row
-(`store::stale_image_ids`) tagged with the old version is removed through
+(`store::stale_image_ids`, which also yields each row's `image_pins`
+marker) tagged with the old version is removed through
 the one `store::evict_stale_cache` function. This runs after every
 `pull`/`figmog_sync`/watch-tick pull that changes the version, and is
 bundled into `pull --fresh`'s whole-store wipe too.
@@ -330,8 +372,11 @@ its persisted version/time; in-memory job history starts empty. A terminal
 `error` carries the actionable pull error (credentials, HTTP/Retry-After,
 parse error, etc.). Failure leaves the prior published snapshot readable.
 Before the first successful mirror, status/files remain available with
-`ready: false`, null metadata and zero nodes; data reads return a clear
-not-ready error pointing at these tools rather than an empty answer.
+`ready: false`, null metadata and zero nodes. Status always includes the
+`variables` summary (`state: "none"` without stored variable state).
+Data reads return a clear not-ready error pointing at these tools, except
+`figmog_vars` can read stored imports (§9 "Import-only stores"); `ready`
+stays false until a pull succeeds.
 
 Duplicate open/sync requests coalesce onto the active or queued job id.
 There is at most one worker operation and one queued pull per file. A
@@ -464,7 +509,8 @@ zero Figma API cost; `figmog_sync` and `figmog_open` schedule pulls, and `figmog
 those three are the local tools that spend Figma's rate budget.
 `figmog_status`'s result also carries
 `upstream: "connected" | "unreachable" | "disabled"`, spliced in at the
-call site that knows it (never inside `query::status` itself).
+call site that knows it (never inside `query::status` itself), and the
+variable snapshot summary under `variables` (§9).
 `figmog_open` also takes an optional `geometry` boolean (§14).
 
 The 19 per-file tools each carry the optional `file` property described
@@ -591,7 +637,17 @@ Three layers, each covering what the one above can't:
    records into the same sync, kept live (swept like any other file
    state, §5). `Ok(None)` (403/404 on a non-Enterprise plan) is not an
    error and is silently skipped, falling through to the two paths below.
-   `--from-file` pulls never call it (no network involved).
+   `--from-file` pulls never call it (no network involved). A `Some`
+   pull also writes the `VariableSnapshot` row (`source:
+   "enterprise_rest"`) in the same sync transaction, but — like the meta
+   row — `store::sync` excludes it from added/unchanged counts.
+   Comparing an existing snapshot's per-variable code names and flags
+   against the new ones adds one to `changed` when they differ, so
+   code-name-only edits are visible to token consumers. Provenance-only
+   changes (source, format, export time or digest) do not count. An
+   identical Enterprise re-pull reports zero churn, and the first
+   Enterprise pull onto a store that already holds those variables
+   without a snapshot row reports `added: 0`.
 2. **Mirrored bindings + inference (always on).** Every node's
    `bound_variables` plus Figma's own baked-in resolved value are scanned
    at read time (`vars::infer_from_nodes`) into per-variable usage
@@ -599,16 +655,81 @@ Three layers, each covering what the one above can't:
    default-mode value only; a non-default mode's value is visible only
    where a frame explicitly overrides that mode.
 3. **Manual import (optional).** `figmog import-variables <export.json>`
-   (`vars::parse_variables_export`) upserts the same full-fidelity
+   (`vars::parse_variables_snapshot`) writes the same full-fidelity
    records auto-sync would, from either the Enterprise REST shape or the
    bare object a Figma plugin-console export produces (any plan, via the
-   Plugin API run from Figma's own developer console). Unlike auto-synced
-   records, manually imported ones are **not** swept by a later pull with
-   no Enterprise export of its own — they persist until re-imported or
+   Plugin API run from Figma's own developer console). **An import is one
+   atomic snapshot that replaces the previous one:** in a single write
+   transaction it upserts every record and the `VariableSnapshot` row
+   (`source: "file"`) and removes every stored variable and collection
+   absent from the new export — whether it came from an earlier import,
+   an Enterprise pull, or a pre-snapshot store. It prints `{"imported":
+   <variables>, "removed": <variables swept>}`. Collections absent from
+   the export are swept too, but neither count includes collections.
+   A later pull with no Enterprise export of its own never sweeps imported
+   records; they persist until the next import, an Enterprise pull, or
    `pull --fresh` (which wipes the whole store, imports included).
+
+   **Invalid files are rejected whole.** The file is read, parsed and
+   validated (top-level `variables` and `variableCollections` objects,
+   non-empty variable names and resolved types, collection names and
+   defaults, valid collection/mode references, and correctly typed code
+   names and flags — `vars::check_import_entries`, which only
+   `import-variables` applies; an Enterprise pull's parse stays lenient
+   per entry, so one malformed `variables/local` entry never fails a
+   pull) before the store is opened; an unreadable,
+   non-JSON or wrongly shaped file exits 1 with `invalid variables file
+   …` and leaves the previous snapshot — records and provenance —
+   untouched. A rejected attempt is not persisted, so "invalid" is the
+   import command's error, never a stored state.
+
+   Replacing stored variables with an export containing zero variables
+   requires `--allow-empty`. `--dry-run` validates the file and reports
+   `{imported, removed, removed_ids}` with sorted removed variable ids
+   without changing records or provenance; it can preview an empty
+   replacement without `--allow-empty`.
+   Omitted `codeSyntax` becomes an empty map; omitted
+   `hiddenFromPublishing` and `remote` retain the parser's `false` defaults.
+   Duplicate JSON object keys follow JSON parsing's last-value-wins rule;
+   exporters must produce unique ids.
+
+**Snapshot states** (`query::variable_snapshot`), reported as
+`variables` in `figmog status`/`figmog_status` and as `snapshot` by
+`figmog vars --snapshot`/`figmog_vars {snapshot: true}`:
+
+| `state` | meaning |
+|---|---|
+| `none` | no snapshot row and no variables or collections stored |
+| `legacy` | variables or collections stored without a matching snapshot row (missing provenance or mismatched variable ids); provenance fields are null |
+| `empty` | a snapshot row whose export held no variables |
+| `current` | a snapshot row with at least one variable |
+
+Each summary also carries `source`, `format`, `format_version`,
+`exported_at`, `digest` (null without a snapshot row) and the stored
+`variables`/`collections` counts.
+
+**Import-only stores.** `figmog status`/`figmog_status` on a store that
+was never pulled (no `meta` row) but holds variable state (snapshot
+state other than `none` — e.g. `import-variables --db <new path>`)
+answers rather than erroring: `name`, `version`, `last_modified` and
+`synced_at_unix_ms` are null, `nodes` is the stored node count (0), and
+`variables` carries the snapshot summary as usual. Only a store with no
+`meta` row and state `none` keeps the "no mirror here" error. Through
+`figmog serve` the same summary appears in `figmog_status` before the
+first successful pull (with `ready: false`). `figmog_vars`, including
+`{snapshot: true}`, and routed `figmog vars` can read these stored imports.
+Before any pull attempt, socket-routed plain `figmog status` prints the
+same output as direct `figmog status --db`. Once a first pull is queued,
+running or failed, plain routed status exits 1 with the not-ready error
+and includes the pull failure when available; `figmog call figmog_status`
+retains the full lifecycle details.
 
 `figmog vars`/`figmog_vars` prefer an authoritative record (auto-synced
 or imported) over inference whenever one exists for a given variable id.
+Authoritative rows also carry `code_syntax` (platform → name object),
+`hidden_from_publishing` and `remote` from the snapshot row — null for a
+legacy snapshot. Without `--snapshot`/`snapshot: true` the result stays
+the plain row array; with it, `{snapshot, variables}`.
 
 ## 10. CLI surface
 
@@ -761,7 +882,8 @@ their management semantics: `file` names the file to open for the former,
 and the latter lists all sessions without a routing target. A routed
 `figmog_status` result drops the server-only `upstream`, `ready` and `pull`
 fields, keeping ordinary CLI output byte-identical for an existing mirror.
-Before a first successful mirror, plain `figmog status` returns a clear not-ready error;
+Before a first successful mirror, plain `figmog status` returns a clear not-ready error
+(unless the store holds imported variable state and no pull has been attempted — §9 "Import-only stores");
 `figmog call figmog_status` exposes the full lifecycle instead.
 
 Desktop-proxy calls do not interpret `file` or node URLs as mirror
@@ -892,27 +1014,55 @@ Figma's most rate-limited, so a fetch happens only when a person or an
 agent asks for one.
 
 **Two fetch kinds behind one command.** Renders come from `GET
-/v1/images/:key?ids=…&format=…&scale=…`, which returns per-node URLs that
-are then downloaded. Fills come from the `fills` of the requested nodes:
+/v1/images/:key?ids=…&format=…&scale=…&version=…`, which returns per-node
+URLs that are then downloaded. `version` is the mirror's current
+`FileMeta.version` (percent-encoded), read once before the request and
+reused as the cached row's `file_version`, so a render matches the
+mirrored design even after the file is edited upstream, and a pull that
+lands mid-request can't relabel it. A node deleted upstream but still in
+the mirror is requested from that version too. A rejected pinned request
+fails without an unpinned retry; HTTP 400/404 errors identify the file and
+mirrored version and advise re-pulling. Saved exports must belong to the
+selected file and reference a version Figma can still render. Live
+edit/delete behavior has not been verified against an owned test file;
+the request contract follows Figma's [image endpoint documentation](https://developers.figma.com/docs/rest-api/file-endpoints/#get-image).
+Fills come from the `fills` of the requested nodes:
 every `imageRef` hash found there is resolved through `GET
 /v1/files/:key/images` (fetched at most once per invocation) and
 downloaded. One invocation makes at most one call of each kind.
+If the mirror has no non-empty version, renders are requested unpinned
+and stored without a pin marker, so they remain cache misses on later
+requests.
 
 **Cache.** Bytes land in `images` as `Rec::ImageBlob` rows keyed by a
 hash of kind, subject, format and scale (§3). A hit requires the stored
 row's identity fields to match the request and its `file_version` to
 equal the mirror's current version, so a repeat request against an
-unedited file spends nothing. Rows tagged with an older version are
-evicted by the same version-change pass that evicts `proxy_cache` (§5).
+unedited file spends nothing. A render hit additionally requires its
+`image_pins` marker (§3), written in the same transaction as the row.
+Renders saved by builds that requested them without `version` have no
+marker — their bytes may show a newer design than their label — so they
+read as misses. With a file identity they are refetched and overwritten;
+an explicit offline store cannot refresh them. Fill rows need no
+marker: fills are addressed by content hash, and the fills endpoint
+takes no version. Rows tagged with an older version, and their markers,
+are evicted by the same version-change pass that evicts `proxy_cache`
+(§5).
 
 **Explicit stores.** `figmog --db <store> images <node-id>...` exports
-matching cached renders and fills without a token or file key. The store
-does not record its Figma file key, and neither `.figmog/current`, the
+matching cached fills and version-verified cached renders without a
+token or file key. The store does not record its Figma file key, and
+neither `.figmog/current`, the
 store's path nor a node URL supplies that identity for an explicit store.
 Each cache miss reports an actionable file-identity error in the manifest;
 cache hits still write successfully. Fetching missing images requires
 `figmog pull <file-key-or-url>` followed by `figmog images <node-id>...`
 without `--db`.
+
+Pre-upgrade render bytes without a valid pin remain on disk but cannot be
+verified against the mirrored version. They produce a distinct upgrade
+error rather than a cache hit; offline extraction of those renders with
+the new build requires first refreshing them through a file-keyed mirror.
 
 `figmog serve --db <store> --no-watch` without a file positional supports
 the same offline cache extraction through `figmog_images`. Matching renders

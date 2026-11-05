@@ -805,7 +805,7 @@ fn serve_desktop_proxy_observes_file_switches_and_edits_with_unchanged_mirror() 
         .join()
         .expect("every scripted desktop call should reach upstream");
     let st = figmog::open_store!(&db);
-    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
+    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _, _, _)| {
         assert_eq!(meta.get(&0).unwrap().version, "100");
         assert!(
             cache.iter().next().is_none(),
@@ -959,7 +959,7 @@ fn direct_cli_desktop_proxy_ignores_legacy_cache_and_observes_context_changes() 
         .join()
         .expect("every direct call should reach upstream");
     let st = figmog::open_store!(&db);
-    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
+    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _, _, _)| {
         assert_eq!(meta.get(&0).unwrap().version, "100");
         assert_eq!(
             figmog::cache::lookup(&cache, "get_code", args, "100"),
@@ -1523,7 +1523,7 @@ fn serve_e2e_db_override_with_no_file_figmog_sync_errors_no_file_key() {
 
 #[test]
 fn serve_e2e_db_images_preserve_cached_renders_and_fills_among_misses() {
-    use figmog::model::{Id, ImageBlobRec, Rec};
+    use figmog::model::{Id, ImageBlobRec, ImagePinRec, Rec};
 
     let (dir, db) = common::fixture_db();
     {
@@ -1546,6 +1546,15 @@ fn serve_e2e_db_images_preserve_cached_renders_and_fills_among_misses() {
             ] {
                 let format = if kind == "render" { "png" } else { "" };
                 let key = figmog::images::image_key(kind, subject, format, scale);
+                if kind == "render" {
+                    tx.upsert(
+                        &Id::ImagePin(key.clone()),
+                        &Rec::ImagePin(ImagePinRec {
+                            generation: figmog::images::RENDER_PIN_GENERATION,
+                            file_version: version.into(),
+                        }),
+                    );
+                }
                 tx.upsert(
                     &Id::ImageBlob(key.clone()),
                     &Rec::ImageBlob(ImageBlobRec {
@@ -1796,7 +1805,7 @@ fn assert_proxy_cli_preserves_args_and_current_mirror(args: Value, socket: bool)
     for key in [ROUTING_A, ROUTING_B] {
         let db = dir.path().join(".figmog").join(key).join("db");
         let store = figmog::open_store!(&db);
-        store.rtx(|(_, _, _, _, _, _, _, cache, _, _)| {
+        store.rtx(|(_, _, _, _, _, _, _, cache, _, _, _, _)| {
             assert!(cache.iter().next().is_none(), "desktop cache for {key}");
         });
     }
@@ -2937,6 +2946,173 @@ fn wait_for_pull(stdin: &mut ChildStdin, rx: &Receiver<String>, args: Value, sta
         assert!(Instant::now() < deadline, "waiting for {state}: {status}");
         std::thread::yield_now();
     }
+}
+
+/// NWS-2961: a store only ever `import-variables`'d into (no `meta` row)
+/// reports its stored snapshot through a real `figmog serve` — over stdio
+/// MCP and via socket-routed plain `figmog status` — while the file itself
+/// stays not ready. The routed CLI output is byte-identical to direct
+/// `figmog status --db` on the same store.
+#[test]
+fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let export = dir.path().join("vars.json");
+    std::fs::write(
+        &export,
+        include_bytes!("fixtures/variables-export.json").as_slice(),
+    )
+    .unwrap();
+    common::command()
+        .args(["import-variables", export.to_str().unwrap(), "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let direct = common::command()
+        .args(["status", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let direct_json: Value = serde_json::from_slice(&direct).unwrap();
+    assert_eq!(direct_json["variables"]["state"], "current");
+    let direct_vars = common::command()
+        .args(["vars", "--snapshot", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let direct_vars_json: Value = serde_json::from_slice(&direct_vars).unwrap();
+
+    // `spawn_serve` runs with cwd = `dir`, so serve's socket lands at
+    // `<dir>/.figmog/serve.sock`, which plain CLI reads from `dir` route to.
+    let (mut guard, mut stdin, rx) = spawn_serve(&db);
+    handshake(&mut stdin, &rx);
+
+    let resp = call(&mut stdin, &rx, 2, "figmog_status", json!({}));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let status = result_json(&resp);
+    assert_eq!(status["ready"], false, "{status}");
+    assert_eq!(status["name"], Value::Null);
+    assert_eq!(status["version"], Value::Null);
+    assert_eq!(status["nodes"], 0);
+    assert_eq!(status["variables"], direct_json["variables"], "{status}");
+
+    let resp = call(&mut stdin, &rx, 3, "figmog_vars", json!({"snapshot": true}));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    assert_eq!(result_json(&resp), direct_vars_json);
+    let resp = call(&mut stdin, &rx, 4, "figmog_vars", json!({}));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    assert_eq!(result_json(&resp), direct_vars_json["variables"]);
+
+    let routed_vars = common::command()
+        .args(["vars", "--snapshot"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(routed_vars, direct_vars);
+
+    // Serve holds the writer lock, so success here proves socket routing.
+    let routed = common::command()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&routed),
+        String::from_utf8_lossy(&direct)
+    );
+    let called: Value = serde_json::from_slice(
+        &common::command()
+            .args(["call", "figmog_status"])
+            .current_dir(dir.path())
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(called["ready"], false, "{called}");
+    assert_eq!(called["variables"], direct_json["variables"]);
+
+    // A failed first pull must not look like a healthy import-only store
+    // after plain status strips the server's lifecycle fields.
+    let resp = call(&mut stdin, &rx, 5, "figmog_sync", json!({}));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let failed = wait_for_pull(&mut stdin, &rx, json!({}), "failed");
+    let pull_error = failed["pull"]["last_completed"]["error"].as_str().unwrap();
+    assert!(pull_error.contains("no file key"), "{failed}");
+    let routed = common::command()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .code(1);
+    assert!(routed.get_output().stdout.is_empty());
+    let error: Value = serde_json::from_slice(&routed.get_output().stderr).unwrap();
+    let error = error["error"].as_str().unwrap();
+    assert!(error.contains("pull failed"), "{error}");
+    assert!(error.contains(pull_error), "{error}");
+
+    // Data reads keep the not-ready error: a snapshot is not a mirror.
+    let resp = call(&mut stdin, &rx, 6, "figmog_pages", json!({}));
+    assert_eq!(resp["result"]["isError"], true, "{resp}");
+
+    drop(stdin);
+    let exit = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(exit.success(), "figmog serve exited with {exit:?}");
+}
+
+#[test]
+fn serve_e2e_empty_store_status_includes_empty_variable_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    // Create only the store's empty schema before the bounded handshake;
+    // no pull or import has written any records.
+    drop(figmog::open_store!(&db));
+    let (mut guard, mut stdin, rx) = spawn_serve(&db);
+    handshake(&mut stdin, &rx);
+
+    let resp = call(&mut stdin, &rx, 2, "figmog_status", json!({}));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let status = result_json(&resp);
+    assert_eq!(status["ready"], false, "{status}");
+    assert_eq!(status["name"], Value::Null);
+    assert_eq!(status["nodes"], 0);
+    assert_eq!(
+        status["variables"],
+        json!({
+            "state": "none", "source": null, "format": null,
+            "format_version": null, "exported_at": null, "digest": null,
+            "variables": 0, "collections": 0,
+        })
+    );
+    for (name, args) in [
+        ("figmog_vars", json!({"snapshot": true})),
+        ("figmog_pages", json!({})),
+    ] {
+        let resp = call(&mut stdin, &rx, 3, name, args);
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+    }
+    common::command()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .code(1);
+
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
 
 #[test]

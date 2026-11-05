@@ -14,6 +14,7 @@ use fold::stream::Readable;
 
 use crate::model::{
     ComponentRec, ComponentSetRec, FileMeta, NodeRec, StyleRec, VariableCollectionRec, VariableRec,
+    VariableSnapshotRec,
 };
 use crate::query::{self, TextReader};
 
@@ -26,8 +27,17 @@ fn print_value(v: Value) -> Result<(), String> {
 pub(super) fn cmd_status<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     meta: &TableReader<'_, R, u8, FileMeta>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
 ) -> Result<(), String> {
-    print_value(query::status(nodes, meta)?)
+    print_value(query::status(
+        nodes,
+        meta,
+        variables,
+        variable_collections,
+        snapshot,
+    )?)
 }
 
 pub(super) fn cmd_pages<R: Readable>(
@@ -177,9 +187,18 @@ pub(super) fn cmd_vars<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     variables: &TableReader<'_, R, String, VariableRec>,
     variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
     id: Option<String>,
+    with_snapshot: bool,
 ) -> Result<(), String> {
-    print_value(query::vars(nodes, variables, variable_collections, id)?)
+    print_value(query::vars(
+        nodes,
+        variables,
+        variable_collections,
+        snapshot,
+        id,
+        with_snapshot,
+    )?)
 }
 
 // ---- whole-file structural queries ----

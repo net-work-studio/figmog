@@ -129,7 +129,9 @@ pub(super) fn do_pull(
                 false
             } else {
                 open_store_checked(&db.path, |path| crate::open_store!(path))
-                    .map(|st| st.rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config)))
+                    .map(|st| {
+                        st.rtx(|(.., mirror_config, _, _, _)| store::read_geometry(&mirror_config))
+                    })
                     .unwrap_or(false)
             };
             let request_geometry = store::effective_geometry(geometry, stored_geometry);
@@ -159,7 +161,7 @@ fn apply_pull(
     if let Some(v) = vars_resp {
         flattened
             .recs
-            .extend(crate::vars::parse_variables_export(v).map_err(|e| e.to_string())?);
+            .extend(crate::vars::enterprise_snapshot_recs(v).map_err(|e| e.to_string())?);
     }
 
     let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
@@ -172,14 +174,14 @@ fn apply_pull(
         });
     if vars_resp.is_some() {
         let stored_var_ids = st.rtx(
-            |(_, _, _, _, variables, variable_collections, _, _, _, _)| {
+            |(_, _, _, _, variables, variable_collections, _, _, _, _, _, _)| {
                 collect_variable_ids(&variables, &variable_collections)
             },
         );
         prior.extend(stored_var_ids);
     }
     let prior_version =
-        st.rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.version.clone()));
+        st.rtx(|(_, _, _, _, _, _, meta, _, _, _, _, _)| meta.get(&0).map(|m| m.version.clone()));
     let churn = sync(&mut st, &prior, &flattened, now_ms());
 
     // Every caller of `do_pull` (`pull` and `figmog call figmog_sync`) goes
@@ -192,10 +194,11 @@ fn apply_pull(
     // here would hit the same single-open-per-process wall `figmog call
     // figmog_sync` used to.
     if prior_version.as_deref() != Some(flattened.file.version.as_str()) {
-        let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
+        let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images, pins, _)| {
             let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
             stale.extend(crate::store::stale_image_ids(
                 &images,
+                &pins,
                 &flattened.file.version,
             ));
             stale
@@ -215,7 +218,7 @@ fn apply_pull(
     // function's doc comment). `--fresh` already wiped any prior row, so
     // this store's own current read is `false` there, giving exactly
     // `geometry` as the persisted value, same as the fetch decision above.
-    let stored_now = st.rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config));
+    let stored_now = st.rtx(|(.., mirror_config, _, _, _)| store::read_geometry(&mirror_config));
     store::upsert_mirror_config(&mut st, store::effective_geometry(geometry, stored_now));
 
     if let Some(key) = &db.key {
@@ -297,6 +300,202 @@ mod tests {
         assert!(error.to_string().contains("variableCollections"));
         assert_eq!(st.get(&crate::model::Id::Meta), meta);
         assert_eq!(st.get(&crate::model::Id::MirrorConfig), config);
+    }
+
+    fn synthetic_file() -> Value {
+        serde_json::json!({
+            "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
+            "document": {"id": "0:0", "name": "Document", "type": "DOCUMENT"}
+        })
+    }
+
+    fn variables_export() -> Value {
+        serde_json::from_str(include_str!("../../tests/fixtures/variables-export.json")).unwrap()
+    }
+
+    fn snapshot_source(db: &Db) -> Option<String> {
+        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        st.rtx(|(.., snapshot)| snapshot.get(&0).map(|s| s.source))
+    }
+
+    /// NWS-2961: the provenance row rides in the pull's transaction but not
+    /// its churn — a first Enterprise pull counts only real records, and an
+    /// identical re-pull is all-unchanged with nothing added.
+    #[test]
+    fn enterprise_snapshot_row_is_excluded_from_pull_churn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let file = synthetic_file();
+        let vars = variables_export();
+
+        let (plain, ..) = apply_pull(&db, &file, None, false, false).unwrap();
+        let file_recs = plain.added;
+        let (first, ..) = apply_pull(&db, &file, Some(&vars), true, false).unwrap();
+        assert_eq!(
+            first,
+            Churn {
+                added: file_recs + 5, // + 2 collections + 3 variables, no snapshot row
+                changed: 0,
+                removed: 0,
+                unchanged: 0,
+            }
+        );
+        assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
+
+        let (again, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        assert_eq!(
+            again,
+            Churn {
+                added: 0,
+                changed: 0,
+                removed: 0,
+                unchanged: file_recs + 5,
+            },
+            "identical Enterprise re-pull must report zero churn"
+        );
+    }
+
+    #[test]
+    fn enterprise_code_metadata_edits_count_but_provenance_only_edits_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let file = synthetic_file();
+        let mut vars = variables_export();
+        apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        for (key, value) in [
+            ("codeSyntax", serde_json::json!({"WEB": "--renamed"})),
+            ("hiddenFromPublishing", serde_json::json!(true)),
+            ("remote", serde_json::json!(true)),
+        ] {
+            vars["meta"]["variables"]["VariableID:100"][key] = value;
+            let (churn, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+            assert_eq!(
+                churn.changed, 1,
+                "code metadata edit to {key} must be observable"
+            );
+            assert_eq!(churn.added, 0);
+        }
+        vars["exportedAt"] = serde_json::json!("2026-11-01T12:00:00Z");
+        let (churn, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        assert_eq!(churn.changed, 0, "provenance alone must not cause churn");
+    }
+
+    #[test]
+    fn import_enterprise_plain_pull_and_reimport_replace_whole_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let path = dir.path().join("variables.json");
+        let imported = variables_export();
+        std::fs::write(&path, serde_json::to_vec(&imported).unwrap()).unwrap();
+        super::super::call::cmd_import_variables(&db, path.clone(), false, false).unwrap();
+        assert_eq!(snapshot_source(&db).as_deref(), Some("file"));
+        let mut enterprise = imported.clone();
+        enterprise["meta"]["variables"]
+            .as_object_mut()
+            .unwrap()
+            .remove("VariableID:200");
+        enterprise["meta"]["variableCollections"]
+            .as_object_mut()
+            .unwrap()
+            .remove("VariableCollectionId:2");
+        let (churn, ..) =
+            apply_pull(&db, &synthetic_file(), Some(&enterprise), false, false).unwrap();
+        assert_eq!(churn.removed, 2);
+        assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
+        let stored = {
+            let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            assert!(
+                st.get(&crate::model::Id::Variable("VariableID:200".into()))
+                    .is_none()
+            );
+            st.get(&crate::model::Id::VariableSnapshot)
+        };
+        apply_pull(&db, &synthetic_file(), None, false, false).unwrap();
+        {
+            let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            assert_eq!(st.get(&crate::model::Id::VariableSnapshot), stored);
+            assert!(
+                st.get(&crate::model::Id::Variable("VariableID:200".into()))
+                    .is_none()
+            );
+        }
+        // Reverse direction: a file import replaces the Enterprise snapshot.
+        super::super::call::cmd_import_variables(&db, path.clone(), false, false).unwrap();
+        assert_eq!(snapshot_source(&db).as_deref(), Some("file"));
+        {
+            let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            assert!(
+                st.get(&crate::model::Id::Variable("VariableID:200".into()))
+                    .is_some()
+            );
+        }
+        std::fs::write(&path, br#"{"variables":{},"variableCollections":{}}"#).unwrap();
+        super::super::call::cmd_import_variables(&db, path, true, false).unwrap();
+        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        st.rtx(|(_, _, _, _, variables, collections, ..)| {
+            assert!(collect_variable_ids(&variables, &collections).is_empty());
+        });
+    }
+
+    /// The first Enterprise pull after upgrading, onto a store that already
+    /// holds the same variables but no snapshot row, adds nothing.
+    #[test]
+    fn enterprise_pull_onto_pre_snapshot_store_reports_zero_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let file = synthetic_file();
+        let vars = variables_export();
+        let (plain, ..) = apply_pull(&db, &file, None, false, false).unwrap();
+        {
+            let mut st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            let recs = crate::vars::parse_variables_export(&vars).unwrap();
+            st.wtx(|tx| {
+                for (id, rec) in &recs {
+                    tx.upsert(id, rec);
+                }
+            });
+        }
+        assert_eq!(snapshot_source(&db), None);
+
+        let (churn, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        assert_eq!(
+            churn,
+            Churn {
+                added: 0,
+                changed: 0,
+                removed: 0,
+                unchanged: plain.added + 5,
+            }
+        );
+        assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
+    }
+
+    /// The pull path stays lenient per entry: a malformed `variables/local`
+    /// entry doesn't fail the pull (only `import-variables` rejects it).
+    #[test]
+    fn enterprise_pull_tolerates_a_non_object_variable_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+        };
+        let mut vars = variables_export();
+        vars["meta"]["variables"]["VariableID:999"] = serde_json::json!(7);
+        let (churn, ..) = apply_pull(&db, &synthetic_file(), Some(&vars), false, false).unwrap();
+        assert_eq!(churn.removed, 0);
+        assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
     }
 
     #[test]
