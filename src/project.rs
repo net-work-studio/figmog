@@ -119,10 +119,17 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
     // Inside a skipped multi-line string (and the line it opened on): its
     // lines are content, never headers or keys.
     let mut multiline: Option<(Multiline, usize)> = None;
+    // Inside an unknown settings key's value that spans lines (an array,
+    // inline table or multi-line string), and the line it started on.
+    let mut unknown_value: Option<(ValueScan, usize)> = None;
     for (index, raw) in text.lines().enumerate() {
         let err = |message: String| format!("{name}:{}: {message}", index + 1);
         if let Some((open, line)) = multiline {
             multiline = skip_strings(raw, Some(open)).map(|open| (open, line));
+            continue;
+        }
+        if let Some((scan, line)) = unknown_value {
+            unknown_value = scan.scan(raw).open().map(|scan| (scan, line));
             continue;
         }
         let line = raw.trim();
@@ -194,6 +201,27 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
             let (value, trailing) = parse_string(rest, table_name).map_err(err)?;
             (Scalar::Str(value), trailing)
         } else {
+            let Table::Settings(known) = table else {
+                unreachable!("only [files] and settings tables get here")
+            };
+            if !RawSettings::is_known(known, &key) {
+                // A key this binary doesn't know (a newer figmog's): kept
+                // by name, its value skipped unparsed whatever its shape —
+                // across lines for an open array, inline table or
+                // multi-line string.
+                if !seen_keys.insert(format!("{known}.{key}")) {
+                    return Err(err(format!("duplicate key {known}.{key}")));
+                }
+                if rest.is_empty() || rest.starts_with('#') {
+                    return Err(err(format!("expected a value for {known}.{key}")));
+                }
+                config.settings.unknown.insert(format!("{known}.{key}"));
+                unknown_value = ValueScan::default()
+                    .scan(rest)
+                    .open()
+                    .map(|scan| (scan, index));
+                continue;
+            }
             parse_scalar(rest, table_name).map_err(err)?
         };
         let trailing = trailing.trim();
@@ -225,6 +253,9 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
             "{name}:{}: unterminated multi-line string",
             line + 1
         ));
+    }
+    if let Some((_, line)) = unknown_value {
+        return Err(format!("{name}:{}: unterminated value", line + 1));
     }
     Ok(config)
 }
@@ -301,6 +332,91 @@ fn skip_strings(line: &str, mut open: Option<Multiline>) -> Option<Multiline> {
         }
     }
     open
+}
+
+/// Where a skipped value stands at the end of a line: inside a
+/// multi-line string, and how many `[` / `{` are open outside strings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ValueScan {
+    string: Option<Multiline>,
+    depth: usize,
+}
+
+impl ValueScan {
+    /// Scan one more line of the value, like [`skip_strings`] but also
+    /// counting brackets outside strings. Single-line strings and a `#`
+    /// comment outside strings are passed over.
+    fn scan(mut self, line: &str) -> Self {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let close = |i: usize, quote: u8| {
+            let mut end = i + 3;
+            while end < bytes.len() && end < i + 5 && bytes[end] == quote {
+                end += 1;
+            }
+            end
+        };
+        while i < bytes.len() {
+            match self.string {
+                Some(Multiline::Basic) => match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' if bytes[i..].starts_with(b"\"\"\"") => {
+                        i = close(i, b'"');
+                        self.string = None;
+                    }
+                    _ => i += 1,
+                },
+                Some(Multiline::Literal) => {
+                    if bytes[i..].starts_with(b"'''") {
+                        i = close(i, b'\'');
+                        self.string = None;
+                    } else {
+                        i += 1;
+                    }
+                }
+                None => match bytes[i] {
+                    b'#' => return self,
+                    b'[' | b'{' => {
+                        self.depth += 1;
+                        i += 1;
+                    }
+                    b']' | b'}' => {
+                        self.depth = self.depth.saturating_sub(1);
+                        i += 1;
+                    }
+                    b'"' if bytes[i..].starts_with(b"\"\"\"") => {
+                        self.string = Some(Multiline::Basic);
+                        i += 3;
+                    }
+                    b'\'' if bytes[i..].starts_with(b"'''") => {
+                        self.string = Some(Multiline::Literal);
+                        i += 3;
+                    }
+                    b'"' => {
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'"' {
+                            i += if bytes[i] == b'\\' { 2 } else { 1 };
+                        }
+                        i += 1;
+                    }
+                    b'\'' => {
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'\'' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    _ => i += 1,
+                },
+            }
+        }
+        self
+    }
+
+    /// `Some(self)` while the value continues on the next line.
+    fn open(self) -> Option<Self> {
+        (self.string.is_some() || self.depth > 0).then_some(self)
+    }
 }
 
 /// `[name]` (optionally followed by a comment) → `name`.
@@ -671,8 +787,24 @@ struct RawSettings {
 impl Eq for RawSettings {}
 
 impl RawSettings {
-    /// Set `<table>.<key>`, validating its type and value. Errors are
-    /// prefixed `<table>.<key>: `.
+    /// Set a known `<table>.<key>` ([`RawSettings::is_known`]), validating
+    /// its type and value. Errors are prefixed `<table>.<key>: `.
+    /// The keys [`RawSettings::set`] knows, by table.
+    const KNOWN: [(&'static str, &'static str); 8] = [
+        ("stack", "framework"),
+        ("stack", "styling"),
+        ("stack", "tokens"),
+        ("inspector", "enabled"),
+        ("inspector", "shortcut"),
+        ("verify", "loop"),
+        ("verify", "dev_server"),
+        ("verify", "threshold"),
+    ];
+
+    fn is_known(table: &str, key: &str) -> bool {
+        Self::KNOWN.contains(&(table, key))
+    }
+
     fn set(&mut self, table: &str, key: &str, value: Scalar) -> Result<(), String> {
         let path = format!("{table}.{key}");
         let wrong =
@@ -721,9 +853,7 @@ impl RawSettings {
                 }
                 self.threshold = Some(threshold);
             }
-            _ => {
-                self.unknown.insert(path);
-            }
+            _ => unreachable!("unknown keys are skipped before set: {path}"),
         }
         Ok(())
     }
@@ -776,7 +906,7 @@ impl RawSettings {
 }
 
 /// A file path inside the project: relative, `/`-separated, no `..`, no
-/// control characters, naming a file.
+/// control characters, its last segment a file name (not `.`).
 pub(crate) fn check_project_path(value: &str) -> Result<(), String> {
     use std::path::Component;
     if value.is_empty() || value.ends_with('/') || value.chars().any(char::is_control) {
@@ -790,6 +920,11 @@ pub(crate) fn check_project_path(value: &str) -> Result<(), String> {
         return Err(format!(
             "{value:?} must be a relative path inside the project (no `..`, not absolute)"
         ));
+    }
+    // `Path::components` drops a trailing `.`, so check the text: the last
+    // segment must name a file (`.` and `src/.` are directories).
+    if matches!(value.rsplit('/').next(), Some("" | "." | "..")) {
+        return Err(format!("{value:?} is not a file path"));
     }
     Ok(())
 }
@@ -906,6 +1041,25 @@ impl Layout {
     pub(crate) fn discover_cwd() -> Result<Self, String> {
         let cwd = std::env::current_dir().map_err(|e| format!("reading working directory: {e}"))?;
         Self::discover(&cwd)
+    }
+
+    /// This layout with `root` as the project root (and `<root>/.figmog`
+    /// as the local root) and no config — `figmog init` choosing where to
+    /// create `figmog.toml` (a monorepo package). The mirror root, shared
+    /// by the repository, is unchanged.
+    pub(crate) fn with_project_root(&self, root: PathBuf) -> Layout {
+        let local_root = root.join(LOCAL_DIR);
+        let mirror_root = if self.has_legacy_root() {
+            self.mirror_root.clone()
+        } else {
+            local_root.clone()
+        };
+        Layout {
+            project_root: root,
+            config: ProjectConfig::default(),
+            mirror_root,
+            local_root,
+        }
     }
 
     /// The project's typed settings ([`ProjectConfig::settings`]).
@@ -1424,6 +1578,39 @@ mod tests {
         assert!(!settings.verify.enabled);
     }
 
+    /// Review finding 3: an unknown settings key's value is skipped
+    /// whatever its shape — arrays, inline tables, dates, multi-line
+    /// strings, across lines — so a newer figmog's settings never break
+    /// this binary; the keys around it still parse.
+    #[test]
+    fn unknown_settings_values_of_any_shape_are_skipped() {
+        let text = "[verify]\n\
+             viewports = [1440, 390]\n\
+             nested = [\n  [1, 2], # ] in a comment\n  { a = \"]\" },\n  '''\n[files]\n]''',\n]\n\
+             when = 1979-05-27T07:32:00Z\n\
+             mode = { scheme = \"light\", states = [\"default\", \"hover\"] }\n\
+             notes = \"\"\"\nthreshold = 1\n[stack]\n\"\"\"\n\
+             threshold = 80\n\
+             [stack]\n\
+             tokens = \"src/t.css\"\n";
+        let config = parse_config(text, CONFIG_FILE).unwrap();
+        assert_eq!(
+            config.unknown_keys().iter().collect::<Vec<_>>(),
+            [
+                "verify.mode",
+                "verify.nested",
+                "verify.notes",
+                "verify.viewports",
+                "verify.when"
+            ]
+        );
+        let settings = config.settings();
+        assert_eq!(settings.verify.threshold, 80.0);
+        assert_eq!(settings.stack.tokens, "src/t.css");
+        assert!(config.has_table("stack"));
+        assert!(!config.has_table("files"));
+    }
+
     #[test]
     fn rendered_tables_parse_back_to_the_same_settings() {
         let mut settings = Settings::default();
@@ -1507,10 +1694,24 @@ mod tests {
                 "expected a string, boolean or number",
             ),
             (
-                "[verify]\nviewports = [1440]\n",
+                "[verify]\nthreshold = [95]\n",
                 2,
                 "arrays and inline tables are not supported",
             ),
+            ("[verify]\nfuture = [\n1,\n", 2, "unterminated value"),
+            (
+                "[verify]\nfuture =\n",
+                2,
+                "expected a value for verify.future",
+            ),
+            (
+                "[verify]\nfuture = 1\nfuture = 2\n",
+                3,
+                "duplicate key verify.future",
+            ),
+            ("[stack]\ntokens = \".\"\n", 2, "not a file path"),
+            ("[stack]\ntokens = \"src/.\"\n", 2, "not a file path"),
+            ("[stack]\ntokens = \"./\"\n", 2, "not a file path"),
             (
                 "[verify]\nloop = true\nloop = false\n",
                 3,
@@ -1533,7 +1734,7 @@ mod tests {
                 "dotted keys are not supported in [stack]",
             ),
             (
-                "[stack]\nx = '''\n",
+                "[stack]\ntokens = '''\n",
                 2,
                 "multi-line strings are not supported in [stack]",
             ),

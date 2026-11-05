@@ -19,6 +19,13 @@
 //! 8. run the first pull (`--from-file` for offline use, `--no-pull` to
 //!    skip) — last, so a failing pull leaves everything else set up.
 //!
+//! The project root is the discovered one, except that with no
+//! `figmog.toml` up the tree, a working directory with its own
+//! `package.json` (a monorepo package) becomes the root. The first pull
+//! targets the merged default (a `figmog.local.toml` override included),
+//! the file every later read uses; what init commits or reports as the
+//! stack (`AGENTS.md`) comes from `figmog.toml` alone.
+//!
 //! The stack is detected only when `figmog.toml` has no `[stack]` table:
 //! React from a `react` dependency in `package.json`, Tailwind from a
 //! `tailwind.config.*` file or a `tailwindcss` / `@tailwindcss/vite` /
@@ -135,7 +142,19 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<Value, String> {
         None
     };
 
-    let layout = Layout::discover_cwd()?;
+    let mut layout = Layout::discover_cwd()?;
+    // A package in a monorepo (`apps/web`): with no figmog.toml anywhere up
+    // the tree, the directory init runs in becomes the project root when it
+    // has its own package.json — consistent with discovery, which walks up
+    // from there and finds the new figmog.toml first.
+    let cwd = std::env::current_dir().map_err(|e| format!("reading working directory: {e}"))?;
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    if !layout.config_path().is_file()
+        && layout.project_root != cwd
+        && cwd.join("package.json").is_file()
+    {
+        layout = layout.with_project_root(cwd);
+    }
     let root = layout.project_root.clone();
 
     // 2. figmog.toml.
@@ -262,9 +281,15 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<Value, String> {
         }
     };
     // What was written must read back (and from here on, the layout is the
-    // one every later command discovers).
+    // one every later command discovers, figmog.local.toml included).
     let layout = Layout::discover(&root)?;
-    let settings = layout.settings();
+    // What init commits (AGENTS.md, the reported stack) comes from
+    // figmog.toml alone: machine-local overrides stay local.
+    let committed_text = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("reading {}: {e}", config_path.display()))?;
+    let settings = project::parse_config(&committed_text, CONFIG_FILE)?.settings();
+    // The pull goes where every later read looks: the merged default.
+    let pull_key = layout.default_key()?.unwrap_or_else(|| product.clone());
 
     // 3. The token.
     let token = match token {
@@ -296,13 +321,14 @@ pub(super) fn cmd_init(args: InitArgs) -> Result<Value, String> {
     let pull = if args.no_pull {
         json!({"skipped": true})
     } else {
-        let churn = super::pull::pull_for_init(&layout, &product, args.from_file).map_err(|e| {
-            format!(
-                "first pull failed: {e} — everything else is set up; fix that and rerun \
+        let churn =
+            super::pull::pull_for_init(&layout, &pull_key, args.from_file).map_err(|e| {
+                format!(
+                    "first pull failed: {e} — everything else is set up; fix that and rerun \
                  `figmog init` (or run `figmog pull`)"
-            )
-        })?;
-        json!({"skipped": false, "churn": churn})
+                )
+            })?;
+        json!({"skipped": false, "file": pull_key, "churn": churn})
     };
 
     Ok(json!({
