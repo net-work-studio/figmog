@@ -224,8 +224,11 @@ impl DesktopWorker {
     /// Loop side, every iteration: apply probe outcomes and start a due
     /// probe. Returns whether the exposed tool list changed.
     pub(super) fn maintain(&mut self, now: Instant) -> bool {
-        let before = self.tools().to_vec();
+        // Snapshot the exposed tools only when an event arrives: this runs
+        // every loop iteration (as often as every 2 ms).
+        let mut before = None;
         while let Ok(event) = self.events.try_recv() {
+            before.get_or_insert_with(|| self.tools().to_vec());
             match event {
                 Event::Probed(outcome) => {
                     self.probing = false;
@@ -242,7 +245,7 @@ impl DesktopWorker {
             self.last_probe = Some(now);
             self.submit(DesktopJob::Probe);
         }
-        self.tools() != before.as_slice()
+        before.is_some_and(|before| self.tools() != before.as_slice())
     }
 
     fn apply_probe(&mut self, outcome: Result<Option<Vec<Value>>, String>, now: Instant) {

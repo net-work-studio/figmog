@@ -457,7 +457,8 @@ image download (up to the two-minute HTTP budget per request) or desktop
 call (10-second timeout) never delays other requests. `figmog_images` runs
 on its file's worker, which owns the cache writes; desktop calls run one at
 a time, in arrival order, on a single desktop worker that owns the upstream
-connection (results stay verbatim and uncached, §8). The loop parks each
+connection (results stay verbatim and uncached, §8); the desktop
+re-detection checks (§8) run on the same worker, between calls. The loop parks each
 deferred call with its requester (stdio, or the socket connection id) and
 its JSON-RPC id, drains a completion channel every iteration (at most 20ms
 latency), and writes the response to that requester, framed exactly as an
