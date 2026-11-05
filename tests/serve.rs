@@ -865,7 +865,7 @@ fn serve_desktop_proxy_observes_file_switches_and_edits_with_unchanged_mirror() 
         .join()
         .expect("every scripted desktop call should reach upstream");
     let st = figmog::open_store!(&db);
-    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _, _, _)| {
+    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _, _, _, _, _)| {
         assert_eq!(meta.get(&0).unwrap().version, "100");
         assert!(
             cache.iter().next().is_none(),
@@ -924,7 +924,7 @@ fn direct_cli_desktop_proxy_ignores_legacy_cache_and_observes_context_changes() 
         .join()
         .expect("every direct call should reach upstream");
     let st = figmog::open_store!(&db);
-    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _, _, _)| {
+    st.rtx(|(_, _, _, _, _, _, meta, cache, _, _, _, _, _, _)| {
         assert_eq!(meta.get(&0).unwrap().version, "100");
         assert_eq!(
             figmog::cache::lookup(&cache, "get_code", args, "100"),
@@ -1801,7 +1801,7 @@ fn assert_proxy_cli_preserves_args_and_current_mirror(args: Value, socket: bool)
     for key in [ROUTING_A, ROUTING_B] {
         let db = dir.path().join(".figmog").join(key).join("db");
         let store = figmog::open_store!(&db);
-        store.rtx(|(_, _, _, _, _, _, _, cache, _, _, _, _)| {
+        store.rtx(|(_, _, _, _, _, _, _, cache, _, _, _, _, _, _)| {
             assert!(cache.iter().next().is_none(), "desktop cache for {key}");
         });
     }

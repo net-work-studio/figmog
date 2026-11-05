@@ -332,6 +332,14 @@ enum Cmd {
         /// Output directory (default ./figmog-images/).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Opt in to reusing a cached render across file versions while
+        /// the node's own subtree (and the render settings) is unchanged.
+        /// Off by default.
+        #[arg(long)]
+        reuse_renders: bool,
+        /// Ignore cached renders and fetch them again.
+        #[arg(long)]
+        refresh: bool,
     },
 }
 
@@ -659,7 +667,21 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             format,
             scale,
             out,
-        } => images::cmd_images(&db, socket_root.as_ref(), ids, format, scale, out),
+            reuse_renders,
+            refresh,
+        } => images::cmd_images(
+            &db,
+            socket_root.as_ref(),
+            ids,
+            format,
+            scale,
+            out,
+            crate::images::RenderPolicy {
+                reuse: reuse_renders,
+                refresh,
+                ..Default::default()
+            },
+        ),
         Cmd::Assets { command } => assets::run(&db, socket_root.as_ref(), &command),
         Cmd::Call {
             tool,

@@ -167,6 +167,7 @@ tokens = "src/figmog-tokens.css"   # token file, relative to the project
 [inspector]
 enabled = true                     # in development builds only
 shortcut = "Alt+Shift+F"
+attributes = false                 # automatic data-figmog attributes (dev only)
 
 [verify]
 loop = true
@@ -307,6 +308,12 @@ again for an unedited file spends nothing. Nothing in figmog fetches images
 on its own, because Figma's images endpoints are its most rate-limited. See
 `docs/SPEC.md` §15.
 
+`--reuse-renders` (opt-in, off by default) keeps a cached render valid
+across file versions for as long as the node's own subtree and the render
+settings are unchanged, so editing one frame no longer refetches every
+other frame's render. `--refresh` ignores cached renders and fetches them
+again. The reuse cache is bounded (256 MiB, oldest first).
+
 `figmog --db <store> images <node-id>...` exports matching cached renders
 and fills offline. The store does not record its Figma file key, so cache
 misses produce per-item errors. To fetch missing images, run
@@ -446,6 +453,19 @@ the exported tokens only, and `figmog-shot` captures before/after evidence
 at 1440 px and 390 px against a committed **stand-in** for the Figma render
 (no Figma access is involved). `examples/slice/run.sh` reproduces it from a
 clean checkout; see `examples/slice/README.md`.
+
+### The React dev-server plugin and bridge
+
+`packages/react` (`@figmog/react`) adds a Vite plugin for development
+servers only: optional `data-figmog` / `data-figmog-node` attributes on
+the root element of each component in `figmog.map.json`, and a local
+bridge that lets the dev page ask the project's figmog for node data,
+tokens and renders (local requests only, a per-session token, read tools
+and renders only, this project's files only). Its `figmog-shot target`
+captures one element through the explicit locator in `figmog.targets.json`
+for verification. A production build contains nothing from figmog.
+`examples/dev-plugin/` is the sample app; details in `docs/SPEC.md` §20
+and `packages/react/README.md`.
 
 ### The tools
 
