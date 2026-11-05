@@ -1963,8 +1963,10 @@ tombstone with no marker is removed by any rerun.
 **`figmog init` (NWS-2946).** One non-interactive command from a React
 + Tailwind repository to a working mirror and MCP registration
 (`src/cli/init.rs`). It never prompts; every answer is a flag or
-detected: `--file <key|URL>` (the product file; default: `[files]
-default`, else `.figmog/current`), `--library`, `--framework`,
+detected: `--file <key|URL>` (the product file; default: `figmog.toml`'s
+`[files] default`, else `.figmog/current` — never `figmog.local.toml`'s,
+which is machine-local: with no `[files]` in `figmog.toml`, no
+`.figmog/current` and no `--file`, `init` asks for `--file`), `--library`, `--framework`,
 `--styling`, `--tokens`, `--dev-server`, `--token-stdin`, `--from-file
 <saved response>` (offline first pull), `--no-pull`, `--mcp-command`.
 It does not take `--db`. Steps, in order, each idempotent:
@@ -2017,7 +2019,9 @@ It does not take `--db`. Steps, in order, each idempotent:
    the markers changes.
 8. The first pull of the project's default file as every later command
    resolves it (`figmog.local.toml`'s `[files] default` when it overrides
-   the committed one), exactly as `figmog pull <key> [--from-file]` (socket-routed when a serve answers, else direct) —
+   the committed one), exactly as `figmog pull <key> [--from-file]`
+   (socket-routed when a serve answers, else direct; with the global
+   `--no-socket`, no socket is looked for or contacted) —
    last, so a failing pull (say, no token) leaves the rest set up, which
    its error says. `--no-pull` skips it.
 
@@ -2047,9 +2051,12 @@ desktop MCP server (default as for `serve`); `--db` is refused.
 | `variables_access` | `GET /v1/files/:key/variables/local` answers | 403/404 (not on this plan: use `import-variables`); network or other error; skipped | — |
 | `desktop_mcp` | the desktop server initializes | unreachable (figmog's own tools still work) | — |
 | `mcp_config` | `.mcp.json` has a `figmog` server whose command is an executable path or on `PATH` | no file, no entry, or an unresolvable command | unreadable or invalid JSON |
-| `dev_server` | a TCP connection to `[verify] dev_server`'s host and port succeeds, or the verify loop is off | not reachable | — |
+| `dev_server` | a TCP connection to `[verify] dev_server`'s host and port succeeds, or the verify loop is off | not reachable; name resolution failed or timed out | — |
 
-The store is never opened (a running serve may hold it). Network checks
+The store is never opened (a running serve may hold it). The dev
+server's `localhost` / `*.localhost` host goes straight to `127.0.0.1` and
+`::1` without a resolver, an IP literal as is; any other name is resolved
+on a detached thread abandoned after 2 s (a `warn`). Network checks
 are bounded — 10 s per Figma request, the desktop client's 2 s connect
 and 10 s request timeouts, 2 s per dev-server address — and a network
 failure is a `warn` ("could not reach Figma"), so an offline machine gets

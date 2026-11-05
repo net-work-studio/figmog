@@ -7,8 +7,9 @@
 //! `warn` saying so. The report is printed either way; the command exits 1
 //! when any check failed.
 
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -391,10 +392,11 @@ fn command_resolves(command: &str, root: &Path) -> bool {
     })
 }
 
-/// A TCP connection to the dev server's host and port (bounded).
+/// A TCP connection to the dev server's host and port (bounded: name
+/// resolution included, see [`dev_server_addrs`]).
 fn dev_server_check(url: &str) -> Check {
     let target = url::Url::parse(url).ok().and_then(|u| {
-        let host = u.host_str()?.trim_matches(['[', ']']).to_string();
+        let host = u.host()?.to_owned();
         Some((host, u.port_or_known_default()?))
     });
     let Some((host, port)) = target else {
@@ -404,10 +406,16 @@ fn dev_server_check(url: &str) -> Check {
             format!("{url} has no host and port"),
         );
     };
-    let addrs: Vec<_> = (host.as_str(), port)
-        .to_socket_addrs()
-        .map(|a| a.collect())
-        .unwrap_or_default();
+    let addrs = match dev_server_addrs(&host, port, DEV_SERVER_TIMEOUT) {
+        Ok(addrs) => addrs,
+        Err(error) => {
+            return check(
+                "dev_server",
+                Status::Warn,
+                format!("{url}: could not check ({error})"),
+            );
+        }
+    };
     let reachable = addrs
         .iter()
         .any(|addr| TcpStream::connect_timeout(addr, DEV_SERVER_TIMEOUT).is_ok());
@@ -419,5 +427,116 @@ fn dev_server_check(url: &str) -> Check {
             Status::Warn,
             format!("{url} is not reachable — start the dev server (or set [verify] dev_server)"),
         )
+    }
+}
+
+/// The addresses to try for the dev server, never blocking past `deadline`:
+/// an IP literal as is; `localhost` and `*.localhost` straight to loopback
+/// (`127.0.0.1` and `::1`, as RFC 6761 reserves them) without asking a
+/// resolver; any other name through the system resolver under `deadline`.
+fn dev_server_addrs(
+    host: &url::Host,
+    port: u16,
+    deadline: Duration,
+) -> Result<Vec<SocketAddr>, String> {
+    match host {
+        url::Host::Ipv4(ip) => Ok(vec![SocketAddr::new(IpAddr::V4(*ip), port)]),
+        url::Host::Ipv6(ip) => Ok(vec![SocketAddr::new(IpAddr::V6(*ip), port)]),
+        url::Host::Domain(domain) => {
+            let domain = domain.to_ascii_lowercase();
+            let domain = domain.trim_end_matches('.');
+            if domain == "localhost" || domain.ends_with(".localhost") {
+                return Ok(vec![
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+                ]);
+            }
+            let name = domain.to_string();
+            resolve_within(deadline, move || {
+                (name.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|a| a.collect())
+                    .map_err(|e| e.to_string())
+            })
+        }
+    }
+}
+
+/// Run a blocking `resolve` on a detached thread and wait at most
+/// `deadline` for it. The thread is never joined: a resolver stuck past the
+/// deadline is left to finish (or not) on its own, and its late answer is
+/// dropped.
+fn resolve_within(
+    deadline: Duration,
+    resolve: impl FnOnce() -> Result<Vec<SocketAddr>, String> + Send + 'static,
+) -> Result<Vec<SocketAddr>, String> {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("figmog-doctor-resolve".into())
+        .spawn(move || {
+            let _ = tx.send(resolve());
+        });
+    if let Err(e) = spawned {
+        return Err(format!("starting name resolution: {e}"));
+    }
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "name resolution took longer than {} s",
+            deadline.as_secs_f64()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err("name resolution failed".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Review finding (NWS-2946): `localhost` and `*.localhost` go straight
+    /// to loopback, never through a resolver that could stall doctor.
+    #[test]
+    fn localhost_names_resolve_to_loopback_without_dns() {
+        let loopback = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5173),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5173),
+        ];
+        for name in ["localhost", "app.localhost", "App.LocalHost."] {
+            let host = url::Host::Domain(name.to_string());
+            // A zero deadline: any resolver call would time out.
+            assert_eq!(
+                dev_server_addrs(&host, 5173, Duration::ZERO).unwrap(),
+                loopback,
+                "{name}"
+            );
+        }
+        let url = url::Url::parse("http://[::1]:5173").unwrap();
+        assert_eq!(
+            dev_server_addrs(&url.host().unwrap().to_owned(), 5173, Duration::ZERO).unwrap(),
+            vec![loopback[1]]
+        );
+    }
+
+    /// Review finding (NWS-2946): a resolver stuck past the deadline is
+    /// abandoned (its thread never joined), reported as a timeout.
+    #[test]
+    fn slow_resolution_is_abandoned_at_the_deadline() {
+        let (release, wait) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let error = resolve_within(Duration::from_millis(100), move || {
+            let _ = wait.recv();
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(error.contains("took longer"), "{error}");
+        drop(release);
+
+        let fast = resolve_within(Duration::from_secs(5), || {
+            Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1)])
+        })
+        .unwrap();
+        assert_eq!(fast.len(), 1);
     }
 }

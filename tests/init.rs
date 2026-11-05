@@ -415,6 +415,95 @@ fn init_in_a_monorepo_package_makes_the_package_the_project() {
     assert_eq!(again["config"]["status"], "unchanged");
 }
 
+/// Attimo review finding: with an existing figmog.toml lacking `[files]`,
+/// a machine-only `[files] default` in figmog.local.toml is never written
+/// into the committed figmog.toml — `.figmog/current` is the fallback that
+/// is committed, and with neither it nor `--file`, init asks for `--file`.
+/// The merged default still picks the first pull's file.
+#[test]
+fn init_never_commits_a_local_only_files_default() {
+    let repo = react_tailwind_repo();
+    let (_saved, response) = saved_response();
+    let original = "# ours\n[inspector]\nshortcut = \"Alt+Shift+I\"\n";
+    std::fs::write(repo.path().join("figmog.toml"), original).unwrap();
+    std::fs::write(
+        repo.path().join("figmog.local.toml"),
+        format!("[files]\ndefault = \"{OTHER}\"\n"),
+    )
+    .unwrap();
+
+    // No --file and no current pointer: nothing to commit, nothing written.
+    let error = run_error(repo.path(), &["init", "--no-pull"]);
+    assert!(
+        error.contains("--file") && error.contains("figmog.local.toml"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("figmog.toml")).unwrap(),
+        original
+    );
+
+    // A different current pointer is the committed fallback.
+    std::fs::create_dir_all(repo.path().join(".figmog")).unwrap();
+    std::fs::write(repo.path().join(".figmog/current"), format!("{KEY}\n")).unwrap();
+    let out = run_json(
+        repo.path(),
+        &["init", "--from-file", response.to_str().unwrap()],
+    );
+    assert_eq!(out["files"]["default"], KEY);
+    assert_eq!(out["pull"]["file"], OTHER);
+    let toml = std::fs::read_to_string(repo.path().join("figmog.toml")).unwrap();
+    assert!(toml.starts_with(original), "{toml}");
+    assert!(toml.contains(&format!("default = \"{KEY}\"")), "{toml}");
+    assert!(!toml.contains(OTHER), "{toml}");
+}
+
+/// Attimo review finding: the global `--no-socket` reaches init's first
+/// pull — a listening serve socket is never contacted, the pull runs
+/// direct. Without the flag the same socket is tried (so the listener sits
+/// where init would look).
+#[test]
+fn init_with_no_socket_never_contacts_a_running_serve() {
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let repo = react_tailwind_repo();
+    let (_saved, response) = saved_response();
+    std::fs::create_dir_all(repo.path().join(".figmog")).unwrap();
+    let listener = UnixListener::bind(repo.path().join(".figmog/serve.sock")).unwrap();
+    let contacted = Arc::new(AtomicUsize::new(0));
+    {
+        let contacted = contacted.clone();
+        std::thread::spawn(move || {
+            // Accept and hang up: a pull routed here fails.
+            for stream in listener.incoming().flatten() {
+                contacted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+    }
+    let args = [
+        "init",
+        "--file",
+        KEY,
+        "--from-file",
+        response.to_str().unwrap(),
+    ];
+
+    let error = run_error(repo.path(), &args);
+    assert!(error.contains("first pull failed"), "{error}");
+    assert!(contacted.load(Ordering::SeqCst) > 0);
+
+    contacted.store(0, Ordering::SeqCst);
+    let mut no_socket = vec!["--no-socket"];
+    no_socket.extend(args);
+    let out = run_json(repo.path(), &no_socket);
+    assert_eq!(out["pull"]["file"], KEY);
+    assert_eq!(contacted.load(Ordering::SeqCst), 0);
+    assert!(mirror(repo.path(), KEY).is_dir());
+}
+
 /// An existing project: the old per-checkout mirror moves to the shared
 /// root, an existing `figmog.toml` keeps its text and only gains the
 /// tables it lacks, and a flag contradicting it changes nothing.

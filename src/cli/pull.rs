@@ -116,11 +116,14 @@ fn pull_routed(
 /// The first pull `figmog init` runs (NWS-2946) into `key`'s active store:
 /// through a running serve when its socket answers, else direct — exactly
 /// as `figmog pull <key> [--from-file]` would, minus the printing and the
-/// `.gitignore` step (`init` does its own). Returns the churn.
+/// `.gitignore` step (`init` does its own). With `no_socket` (the global
+/// `--no-socket`) no socket is discovered or contacted: always direct.
+/// Returns the churn.
 pub(super) fn pull_for_init(
     layout: &crate::project::Layout,
     key: &str,
     from_file: Option<PathBuf>,
+    no_socket: bool,
 ) -> Result<Value, String> {
     super::check_key(key)?;
     let store = layout.active_store(key)?;
@@ -129,12 +132,14 @@ pub(super) fn pull_for_init(
         key: Some(key.to_string()),
         layout: Some(layout.clone()),
     };
-    let mut route = super::socket::Route::new(layout);
-    if layout.legacy_store(key, &db.path).is_some() {
-        route = route.local_only();
-    }
-    if let Some(client) = super::socket::connect(&route) {
-        return pull_routed(&db, key, &route, client?, from_file, false, false);
+    if !no_socket {
+        let mut route = super::socket::Route::new(layout);
+        if layout.legacy_store(key, &db.path).is_some() {
+            route = route.local_only();
+        }
+        if let Some(client) = super::socket::connect(&route) {
+            return pull_routed(&db, key, &route, client?, from_file, false, false);
+        }
     }
     pull_direct(&db, None, from_file, false, false)
 }
