@@ -27,9 +27,11 @@ const LOCAL_CONFIG_ENTRY: (&str, &str) = (
 );
 
 /// `cwd` is the project root; `local_config` adds `figmog.local.toml`.
-pub(super) fn ignore_local_mirror(cwd: &Path, local_config: bool) -> Result<(), String> {
+/// `Ok(true)` when a pattern was appended; `Ok(false)` when everything was
+/// already ignored or `cwd` is outside Git.
+pub(super) fn ignore_local_mirror(cwd: &Path, local_config: bool) -> Result<bool, String> {
     let Some(root) = repository_root(cwd) else {
-        return Ok(());
+        return Ok(false);
     };
     // Git reads every ancestor's ignore file, not only our append target.
     // Reject FIFOs and other nonregular entries before launching it.
@@ -43,9 +45,9 @@ pub(super) fn ignore_local_mirror(cwd: &Path, local_config: bool) -> Result<(), 
         }
     }
     if missing.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
-    append_ignore(&path, &missing)
+    append_ignore(&path, &missing).map(|()| true)
 }
 
 fn is_ignored(cwd: &Path, name: &str, timeout: Duration) -> Result<bool, String> {

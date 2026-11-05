@@ -1324,8 +1324,10 @@ mapping of the 18 read-only query commands onto `dispatch::ReadCommand`),
 surface, so every tool `figmog serve` would expose is reachable without
 an MCP client), `src/cli/images.rs` (`images`, §15),
 `src/cli/socket.rs` (the client half of the control plane, §6a),
-`src/cli/migrate.rs` (`migrate`, §16), and `src/cli/tokens.rs` (`tokens
-export`, §9 — mapped onto the `figmog_vars` read, then rendered as CSS).
+`src/cli/migrate.rs` (`migrate`, §16), `src/cli/init.rs` (`init` and
+`settings`, §16), `src/cli/doctor.rs` (`doctor`, §16), and
+`src/cli/tokens.rs` (`tokens export`, §9 — mapped onto the `figmog_vars`
+read, then rendered as CSS).
 `src/cli/auth.rs` handles credential commands and hidden terminal input;
 `src/auth.rs` owns credential resolution and native storage.
 
@@ -1341,7 +1343,9 @@ Default mirror paths come from the project layout (§16): the key's
 file is `figmog.toml`'s `[files] default`, else `.figmog/current` (in the
 project root). Every command except `version`, `auth` and `--db`
 invocations discovers the project first, so a malformed `figmog.toml` or
-`figmog.local.toml` fails every such command with `<file>:<line>: <message>`.
+`figmog.local.toml` fails every such command with `<file>:<line>: <message>`
+(`doctor` reports it as its failed `config` check instead; `init`,
+`doctor` and `settings` refuse `--db`).
 `figmog migrate [FILE]` (§16) moves old mirrors into the shared root.
 Persisted `.figmog/current`
 contents are trimmed and must be a bare key of at least 10 ASCII
@@ -1664,7 +1668,8 @@ and opens the explicit store, including for cached-image extraction.
 ## 16. Project config and mirror roots
 
 Source: `src/project.rs` (discovery, config, active-store rules),
-`src/cli/migrate.rs` (`figmog migrate`).
+`src/cli/migrate.rs` (`figmog migrate`), `src/cli/init.rs` (`figmog init`,
+`figmog settings`), `src/cli/doctor.rs` (`figmog doctor`).
 
 **Project root.** The nearest directory containing a regular file named
 `figmog.toml`, walking up from the working directory but never past the
@@ -1692,25 +1697,67 @@ the project has a `figmog.toml`). Both use the same hand-parsed TOML subset
 ```toml
 [files]
 default = "AbCdEf1234"                                  # file key or Figma URL
-design-system = "https://www.figma.com/design/XYZ/..."  # named entry
+library = "https://www.figma.com/design/XYZ/..."        # named entry
+
+[verify]
+dev_server = "http://localhost:3000"
 ```
 
-Supported: `#` comments, blank lines, `[table]` headers, and inside
+Supported: `#` comments, blank lines, `[table]` headers, inside
 `[files]` only `key = "string"` (bare or quoted keys; basic strings with
-`\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings). Every
-`[files]` value must be a file key or Figma URL and is stored as its key.
-Other tables, top-level keys and `[[array]]` tables are skipped unparsed
-(reserved for later settings, never an error), except that multi-line
-strings (`"""` and `'''`) in skipped values are tracked so a `[files]`
-line inside one is content, not the table; multi-line values inside
-`[files]` itself are an error. Errors — unterminated
-headers, strings or multi-line strings, a missing `=`, a non-string value, trailing text, an
-invalid file reference, a duplicate key or a second `[files]` table — read
-`figmog.toml:<line>: <message>` (or `figmog.local.toml:...`). Local entries
-replace same-named ones. Only `default` has meaning today: it is the file
-every command uses when none is given, ahead of `.figmog/current`, which
-remains the fallback (and is still written by `pull` and serve's default
-session). Named entries are parsed and validated but not yet addressable.
+`\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings), and inside
+the settings tables `[stack]`, `[inspector]` and `[verify]` (below)
+`key = <value>` where the value is such a string, `true`/`false`, or a
+decimal integer or float (`_` separators allowed). Every `[files]` value
+must be a file key or Figma URL and is stored as its key. Other tables,
+top-level keys and `[[array]]` tables are skipped unparsed (reserved for
+later settings, never an error), except that multi-line strings (`"""`
+and `'''`) in skipped values are tracked so a header line inside one is
+content, not a table; multi-line strings, arrays and inline tables inside
+the known tables are an error. Errors — unterminated headers, strings or
+multi-line strings, a missing `=`, a value of the wrong type, trailing
+text, an invalid file reference or setting, a duplicate key or a second
+copy of a known table — read `figmog.toml:<line>: <message>` (or
+`figmog.local.toml:...`); a settings error names its key
+(`figmog.toml:7: verify.threshold: must be between 0 and 100, found
+500`). Local entries replace same-named ones, key by key in the settings
+tables too. In `[files]`, `default` is the *product* file: the file every
+command uses when none is given, ahead of `.figmog/current`, which remains
+the fallback (and is still written by `pull` and serve's default session).
+`library` names the optional library file holding tokens and components
+(for later features). Other named entries are parsed and validated but
+not yet addressable.
+
+**Settings (NWS-2946).** The typed settings later features read
+(`project::Settings`, through `ProjectConfig::settings` /
+`Layout::settings`; `figmog settings` for tools outside the binary).
+Every key is optional; a missing key is its default:
+
+| key | type | default | rule |
+|---|---|---|---|
+| `stack.framework` | string | `"react"` | v1: `react` only |
+| `stack.styling` | string | `"tailwind"` | v1: `tailwind` only |
+| `stack.tokens` | string | `"src/figmog-tokens.css"` | relative path inside the project: no `..`, not absolute, no `\`, names a file |
+| `inspector.enabled` | boolean | `true` | the dev-server inspector, development builds only |
+| `inspector.shortcut` | string | `"Alt+Shift+F"` | one or more of `Ctrl`/`Alt`/`Shift`/`Meta` (any case, each once), `+`-joined, then one ASCII letter or digit, or `F1`–`F12` |
+| `verify.loop` | boolean | `true` | the verify loop on or off |
+| `verify.dev_server` | string | `"http://localhost:5173"` | `http`/`https`, no credentials, loopback host only (`localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`): v1 is local only |
+| `verify.threshold` | number | `95` | advisory match score, 0–100 (the screenshot comparison's `score`) |
+
+The verify contract is fixed for v1 and not configurable: viewports 1440
+and 390 CSS px wide, `light` color scheme, `default` state
+(`VERIFY_VIEWPORTS`, `VERIFY_COLOR_SCHEME`, `VERIFY_STATE`). A key this
+binary does not know inside a settings table is kept, not rejected
+(`ProjectConfig::unknown_keys`, sorted `<table>.<key>`), so a newer
+figmog's settings never break an older binary; its value must still be a
+single-line string, boolean or number. `figmog doctor` reports unknown
+keys as a warning.
+
+`figmog settings` prints `{project_root, config (the figmog.toml path or
+null), files, unknown_keys, stack: {framework, styling, tokens,
+tokens_path}, inspector: {enabled, shortcut}, verify: {loop, dev_server,
+threshold, viewports, color_scheme, state}}` (`tokens_path` is absolute).
+It does not take `--db`.
 
 **Active store.** The mirror root is where mirrors *should* live; the
 active store is where a key's mirror *is*. Outside Git both are the same
@@ -1785,6 +1832,94 @@ older binary's interrupted step 5 left half deleted in place is still
 checked for anchors and fjall locks, but failing to open as a store (it is
 not lock contention) does not stop the rerun from retiring it. A stray
 tombstone with no marker is removed by any rerun.
+
+**`figmog init` (NWS-2946).** One non-interactive command from a React
++ Tailwind repository to a working mirror and MCP registration
+(`src/cli/init.rs`). It never prompts; every answer is a flag or
+detected: `--file <key|URL>` (the product file; default: `[files]
+default`, else `.figmog/current`), `--library`, `--framework`,
+`--styling`, `--tokens`, `--dev-server`, `--token-stdin`, `--from-file
+<saved response>` (offline first pull), `--no-pull`, `--mcp-command`.
+It does not take `--db`. Steps, in order, each idempotent:
+
+1. Validate every flag (reading and shape-checking a `--token-stdin`
+   token) before writing anything, then discover the project (above):
+   `init` writes at the existing `figmog.toml`'s directory, else the Git
+   top level, else the working directory.
+2. `figmog.toml`: created whole (a header comment, then `[files]`,
+   `[stack]`, `[inspector]`, `[verify]` with every key written), or, when
+   it exists, only the known tables it lacks are appended after a blank
+   line — an existing table is never edited, and a flag that contradicts
+   an existing table's value (its default when the key is absent) is an
+   error naming the key. An existing `[files]` without `default` is an
+   error. The stack is detected only for a new `[stack]`: React from a
+   `react` key in `package.json`'s `dependencies`, `devDependencies` or
+   `peerDependencies` (searched in that order); Tailwind from a
+   `tailwindcss`, `@tailwindcss/vite` or `@tailwindcss/postcss`
+   dependency, else a `tailwind.config.{js,cjs,mjs,ts,cts,mts}` file;
+   `--framework`/`--styling` skip detection. Not finding both is an error
+   (v1 supports React + Tailwind only) naming the flags to pass. The file
+   is read back through discovery before continuing.
+3. Token: `--token-stdin` saves it through `auth::login` (§10
+   "Credentials"); otherwise `auth status` is reported.
+4. `.gitignore`: `.figmog/` and `figmog.local.toml`, by the §10 "Git
+   ignore rules".
+5. `figmog migrate` (every key) moves old `.figmog/<key>/db` mirrors to
+   the shared root (above).
+6. `.mcp.json` at the project root (Claude Code's project scope): adds
+   `mcpServers.figmog = {"type": "stdio", "command": "figmog" (or
+   --mcp-command), "args": ["serve"], "env": {}}`. An identical entry is
+   left alone; a different one is kept unless `--mcp-command` was given
+   (then replaced); every other key is preserved. The file is rewritten
+   (sorted keys, two-space indent, trailing newline) only when the entry
+   changes. Invalid JSON or a non-object is an error, never overwritten.
+   v1 registers Claude Code only and never runs `claude`.
+7. `AGENTS.md`: figmog's block — how to read the design (MCP tools, CLI),
+   the stack and token file from the settings, the v1 verify contract,
+   what never to commit — between `<!-- figmog:begin (managed by `figmog
+   init`; edits inside are replaced) -->` and `<!-- figmog:end -->`.
+   Created when absent, appended (after a blank line) when it has no
+   markers, replaced in place when it has exactly one begin marker before
+   one end marker; any other marker layout is an error. Nothing outside
+   the markers changes.
+8. The first pull of the product file, exactly as `figmog pull <key>
+   [--from-file]` (socket-routed when a serve answers, else direct) —
+   last, so a failing pull (say, no token) leaves the rest set up, which
+   its error says. `--no-pull` skips it.
+
+Output: `{project_root, config: {path, status: created|updated|unchanged,
+added_tables}, files: {default, library}, stack: {framework, styling,
+tokens, source: {framework, styling}}, token, gitignore: {updated},
+migrated, mcp: {path, status: added|updated|kept|unchanged, server},
+agents: {path, status: created|appended|updated|unchanged}, pull:
+{skipped, churn?}}`. A rerun with the same flags rewrites no file.
+
+**`figmog doctor` (NWS-2946).** Checks the setup (`src/cli/doctor.rs`) and
+prints `{status, checks: [{name, status, detail}]}`, the checks in this
+fixed order, each `ok`, `warn` or `fail`; `status` is the worst. It
+discovers the project itself, so a malformed config is a failed check
+rather than an exit before the report. `--upstream <url>` names the
+desktop MCP server (default as for `serve`); `--db` is refused.
+
+| check | ok | warn | fail |
+|---|---|---|---|
+| `config` | `figmog.toml` read | no `figmog.toml` (defaults apply); unknown settings keys | malformed config |
+| `token` | a token resolves | — | none, or the credential store fails |
+| `mirror` | the product file's active store exists | no product file; not pulled yet; migration pending | invalid `.figmog/current`; two mirrors |
+| `file_access` | `GET /v1/files/:key/meta` answers | network error or rate limit; skipped (no token or no product file) | 403 or another HTTP error |
+| `variables_access` | `GET /v1/files/:key/variables/local` answers | 403/404 (not on this plan: use `import-variables`); network or other error; skipped | — |
+| `desktop_mcp` | the desktop server initializes | unreachable (figmog's own tools still work) | — |
+| `mcp_config` | `.mcp.json` has a `figmog` server whose command is an executable path or on `PATH` | no file, no entry, or an unresolvable command | unreadable or invalid JSON |
+| `dev_server` | a TCP connection to `[verify] dev_server`'s host and port succeeds, or the verify loop is off | not reachable | — |
+
+The store is never opened (a running serve may hold it). Network checks
+are bounded — 10 s per Figma request, the desktop client's 2 s connect
+and 10 s request timeouts, 2 s per dev-server address — and a network
+failure is a `warn` ("could not reach Figma"), so an offline machine gets
+a complete report quickly. Figma checks use serve's API client (debug
+builds honor `FIGMOG_API_BASE`, for tests). The token is never printed.
+Exit 0 unless a check failed; then the report is still printed and
+`{"error": "doctor: failed checks: <names>"}` goes to stderr, exit 1.
 
 ## 17. Binding-aware spec (NWS-2968)
 

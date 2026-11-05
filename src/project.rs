@@ -1,5 +1,6 @@
-//! Project config (`figmog.toml` / `figmog.local.toml`) and mirror-root
-//! discovery (spec §16).
+//! Project config (`figmog.toml` / `figmog.local.toml`), the typed
+//! project settings later features read ([`Settings`], NWS-2946) and
+//! mirror-root discovery (spec §16).
 //!
 //! * **Project root:** the nearest directory holding a `figmog.toml`,
 //!   walking up from the working directory but never past the Git top
@@ -15,13 +16,19 @@
 //!   root ([`crate::owner`]).
 //!
 //! The config format is a deliberately tiny TOML subset parsed by hand (no
-//! `toml` dependency): `#` comments, blank lines, table headers, and
-//! `key = "string"` pairs inside `[files]`. Everything outside `[files]`
-//! is skipped unparsed so later settings never break this binary — except
-//! that multi-line strings there are tracked, so a `[files]` line inside
-//! one is never mistaken for the table.
+//! `toml` dependency): `#` comments, blank lines, table headers,
+//! `key = "string"` pairs inside `[files]`, and `key = <string | boolean |
+//! number>` pairs inside the settings tables `[stack]`, `[inspector]` and
+//! `[verify]` (spec §16). Every other table and top-level key is skipped
+//! unparsed so later settings never break this binary — except that
+//! multi-line strings there are tracked, so a header line inside one is
+//! never mistaken for a table. Unknown keys inside a settings table are
+//! kept (as [`ProjectConfig::unknown_keys`], which `figmog doctor`
+//! reports) rather than rejected, for the same reason; a known key with a
+//! wrong type or an invalid value is a `<file>:<line>:` error, like any
+//! malformed `[files]` line.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -37,12 +44,20 @@ pub(crate) const LOCAL_DIR: &str = ".figmog";
 /// the old copy; its presence marks an interrupted migration.
 pub(crate) const MIGRATED_MARKER: &str = "migrated-from";
 
-/// The parsed `[files]` table: entry name → Figma file key (URLs are
-/// reduced to their key when parsed). `default` names the project's
-/// default file; other names are reserved for later features.
+/// One parsed config file (or `figmog.toml` with `figmog.local.toml`
+/// merged on top): the `[files]` table — entry name → Figma file key (URLs
+/// are reduced to their key when parsed) — plus the settings tables.
+/// `default` names the project's default file, its *product* file;
+/// `library` names the optional library file holding tokens and
+/// components (NWS-2946); other names are reserved for later features.
+/// Read settings through [`ProjectConfig::settings`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ProjectConfig {
     pub(crate) files: BTreeMap<String, String>,
+    /// Boxed: [`Layout`] is carried by value in enums.
+    settings: Box<RawSettings>,
+    /// The known tables (`files`, `stack`, `inspector`, `verify`) present.
+    tables: BTreeSet<&'static str>,
 }
 
 impl ProjectConfig {
@@ -50,18 +65,53 @@ impl ProjectConfig {
         self.files.get("default").map(String::as_str)
     }
 
+    /// The optional library file (`[files] library`).
+    pub(crate) fn library_key(&self) -> Option<&str> {
+        self.files.get("library").map(String::as_str)
+    }
+
+    /// The typed settings, every key not set filled with its default.
+    pub(crate) fn settings(&self) -> Settings {
+        self.settings.resolve()
+    }
+
+    /// `<table>.<key>` for each key a settings table set that this binary
+    /// does not know, sorted. Kept, not rejected (a newer figmog may have
+    /// written it); `figmog doctor` reports them.
+    pub(crate) fn unknown_keys(&self) -> &BTreeSet<String> {
+        &self.settings.unknown
+    }
+
+    /// Whether the file(s) this config came from had a `[name]` table, for
+    /// one of the known tables (`files`, `stack`, `inspector`, `verify`).
+    pub(crate) fn has_table(&self, name: &str) -> bool {
+        self.tables.contains(name)
+    }
+
     /// Later entries (from `figmog.local.toml`) replace same-named ones.
     fn merge(&mut self, other: ProjectConfig) {
         self.files.extend(other.files);
+        self.settings.merge(*other.settings);
+        self.tables.extend(other.tables);
     }
+}
+
+/// The table a config line belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Table {
+    Files,
+    Settings(&'static str),
+    /// Any other table, or top-level keys: skipped unparsed.
+    Skipped,
 }
 
 /// Parse one config file's text. `name` prefixes every error as
 /// `<name>:<line>: <message>`.
 pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, String> {
     let mut config = ProjectConfig::default();
-    let mut in_files = false;
-    let mut seen_files = false;
+    let mut table = Table::Skipped;
+    // `<table>.<key>` for every settings key set in this file.
+    let mut seen_keys = BTreeSet::new();
     // Inside content this parser skips (other tables, top-level keys and
     // their possibly multi-line values), a `[`-led line may be a value
     // continuation rather than a header, so a malformed one is skipped too.
@@ -80,8 +130,8 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
             continue;
         }
         if line.starts_with("[[") {
-            // Array of tables: never `[files]`, so always skipped.
-            in_files = false;
+            // Array of tables: never a known table, so always skipped.
+            table = Table::Skipped;
             skipping = true;
             continue;
         }
@@ -96,42 +146,78 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
                 }
                 Err(message) => return Err(err(message)),
             };
-            in_files = header == "files";
-            skipping = !in_files;
-            if in_files {
-                if seen_files {
-                    return Err(err("duplicate [files] table".into()));
-                }
-                seen_files = true;
+            table = match header {
+                "files" => Table::Files,
+                other => match SETTINGS_TABLES.iter().find(|t| **t == other) {
+                    Some(known) => Table::Settings(known),
+                    None => Table::Skipped,
+                },
+            };
+            skipping = table == Table::Skipped;
+            let known = match table {
+                Table::Files => Some("files"),
+                Table::Settings(known) => Some(known),
+                Table::Skipped => None,
+            };
+            if let Some(known) = known
+                && !config.tables.insert(known)
+            {
+                return Err(err(format!("duplicate [{known}] table")));
             }
             continue;
         }
-        if !in_files {
-            // Top-level keys and other tables belong to later features;
-            // skipped unparsed, including multi-line values — but a
-            // multi-line string's lines are tracked so a `[files]` inside
-            // one is never taken for the table.
-            skipping = true;
-            multiline = skip_strings(raw, None).map(|open| (open, index));
-            continue;
-        }
-        let (key, rest) = parse_key(line).map_err(err)?;
+        let table_name = match table {
+            Table::Skipped => {
+                // Top-level keys and other tables belong to later features;
+                // skipped unparsed, including multi-line values — but a
+                // multi-line string's lines are tracked so a header inside
+                // one is never taken for a table.
+                skipping = true;
+                multiline = skip_strings(raw, None).map(|open| (open, index));
+                continue;
+            }
+            Table::Files => "files",
+            Table::Settings(known) => known,
+        };
+        let (key, rest) = parse_key(line, table_name).map_err(err)?;
         let rest = rest.trim_start();
         let Some(rest) = rest.strip_prefix('=') else {
-            return Err(err(format!("expected `{key} = \"...\"`")));
+            let shape = if table == Table::Files {
+                "\"...\""
+            } else {
+                "<value>"
+            };
+            return Err(err(format!("expected `{key} = {shape}`")));
         };
-        let (value, trailing) = parse_string(rest.trim_start()).map_err(err)?;
+        let rest = rest.trim_start();
+        let (value, trailing) = if table == Table::Files {
+            let (value, trailing) = parse_string(rest, table_name).map_err(err)?;
+            (Scalar::Str(value), trailing)
+        } else {
+            parse_scalar(rest, table_name).map_err(err)?
+        };
         let trailing = trailing.trim();
         if !(trailing.is_empty() || trailing.starts_with('#')) {
             return Err(err(format!("unexpected text after the value of {key}")));
         }
-        let file_key = parse_file_ref(&value).ok_or_else(|| {
-            err(format!(
-                "files.{key}: not a Figma file key or URL: {value:?}"
-            ))
-        })?;
-        if config.files.insert(key.clone(), file_key).is_some() {
-            return Err(err(format!("duplicate key files.{key}")));
+        match (table, value) {
+            (Table::Files, Scalar::Str(value)) => {
+                let file_key = parse_file_ref(&value).ok_or_else(|| {
+                    err(format!(
+                        "files.{key}: not a Figma file key or URL: {value:?}"
+                    ))
+                })?;
+                if config.files.insert(key.clone(), file_key).is_some() {
+                    return Err(err(format!("duplicate key files.{key}")));
+                }
+            }
+            (Table::Settings(known), value) => {
+                if !seen_keys.insert(format!("{known}.{key}")) {
+                    return Err(err(format!("duplicate key {known}.{key}")));
+                }
+                config.settings.set(known, &key, value).map_err(err)?;
+            }
+            _ => unreachable!("[files] values are always strings; skipped lines never get here"),
         }
     }
     if let Some((_, line)) = multiline {
@@ -235,9 +321,9 @@ fn parse_header(line: &str) -> Result<&str, String> {
 }
 
 /// A bare (`A-Za-z0-9_-`) or quoted key, and the text after it.
-fn parse_key(line: &str) -> Result<(String, &str), String> {
+fn parse_key<'a>(line: &'a str, table: &str) -> Result<(String, &'a str), String> {
     if line.starts_with('"') || line.starts_with('\'') {
-        let (key, rest) = parse_string(line)?;
+        let (key, rest) = parse_string(line, table)?;
         if key.is_empty() {
             return Err("empty key".into());
         }
@@ -250,21 +336,21 @@ fn parse_key(line: &str) -> Result<(String, &str), String> {
         return Err("expected a key".into());
     }
     if line[end..].trim_start().starts_with('.') {
-        return Err("dotted keys are not supported in [files]".into());
+        return Err(format!("dotted keys are not supported in [{table}]"));
     }
     Ok((line[..end].to_string(), &line[end..]))
 }
 
 /// A basic (`"..."`, with `\" \\ \n \t \r \uXXXX` escapes) or literal
 /// (`'...'`) single-line string, and the text after it.
-fn parse_string(input: &str) -> Result<(String, &str), String> {
+fn parse_string<'a>(input: &'a str, table: &str) -> Result<(String, &'a str), String> {
     let mut chars = input.char_indices();
     let quote = match chars.next() {
         Some((_, q @ ('"' | '\''))) => q,
         _ => return Err("expected a quoted string".into()),
     };
     if input.starts_with("\"\"\"") || input.starts_with("'''") {
-        return Err("multi-line strings are not supported in [files]".into());
+        return Err(format!("multi-line strings are not supported in [{table}]"));
     }
     let mut out = String::new();
     while let Some((i, c)) = chars.next() {
@@ -295,6 +381,476 @@ fn parse_string(input: &str) -> Result<(String, &str), String> {
         }
     }
     Err("unterminated string".into())
+}
+
+// ---- settings (NWS-2946) ----
+
+/// The settings tables, in the order `figmog init` writes them.
+pub(crate) const SETTINGS_TABLES: [&str; 3] = ["stack", "inspector", "verify"];
+
+/// `[stack] tokens` default: where `figmog tokens export` output lives.
+pub(crate) const DEFAULT_TOKENS_PATH: &str = "src/figmog-tokens.css";
+/// `[inspector] shortcut` default.
+pub(crate) const DEFAULT_SHORTCUT: &str = "Alt+Shift+F";
+/// `[verify] dev_server` default (Vite's default dev server).
+pub(crate) const DEFAULT_DEV_SERVER: &str = "http://localhost:5173";
+/// `[verify] threshold` default: the advisory match score (0–100, the
+/// screenshot comparison's `score`) below which a verify run is flagged.
+pub(crate) const DEFAULT_THRESHOLD: f64 = 95.0;
+/// The v1 verify contract (not configurable): viewport widths in CSS px.
+pub(crate) const VERIFY_VIEWPORTS: [u32; 2] = [1440, 390];
+/// The v1 verify contract: color scheme.
+pub(crate) const VERIFY_COLOR_SCHEME: &str = "light";
+/// The v1 verify contract: component state.
+pub(crate) const VERIFY_STATE: &str = "default";
+
+/// `[stack] framework`. v1 supports React only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Framework {
+    #[default]
+    React,
+}
+
+impl Framework {
+    const ALL: [Framework; 1] = [Framework::React];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Framework::React => "react",
+        }
+    }
+
+    /// The config spelling (`"react"`) to its value.
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|known| known.as_str() == value)
+            .ok_or_else(|| format!("unsupported framework {value:?} (supported: react)"))
+    }
+}
+
+/// `[stack] styling`. v1 supports Tailwind only (CSS modules and vanilla
+/// CSS are planned).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Styling {
+    #[default]
+    Tailwind,
+}
+
+impl Styling {
+    const ALL: [Styling; 1] = [Styling::Tailwind];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Styling::Tailwind => "tailwind",
+        }
+    }
+
+    /// The config spelling (`"tailwind"`) to its value.
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|known| known.as_str() == value)
+            .ok_or_else(|| format!("unsupported styling {value:?} (supported: tailwind)"))
+    }
+}
+
+/// The project's settings with every default filled in — what later
+/// features (token export, spec, assets, the inspector and the verify
+/// loop) read, through [`ProjectConfig::settings`] /
+/// [`Layout::settings`], or `figmog settings` for tools outside this
+/// binary.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Settings {
+    pub(crate) stack: StackSettings,
+    pub(crate) inspector: InspectorSettings,
+    pub(crate) verify: VerifySettings,
+}
+
+/// `[stack]`: what code figmog's output should be shaped for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StackSettings {
+    pub(crate) framework: Framework,
+    pub(crate) styling: Styling,
+    /// The token file, relative to the project root (`/`-separated, never
+    /// absolute, never leaving the project).
+    pub(crate) tokens: String,
+}
+
+impl StackSettings {
+    /// [`StackSettings::tokens`] under `project_root`.
+    pub(crate) fn tokens_path(&self, project_root: &Path) -> PathBuf {
+        project_root.join(&self.tokens)
+    }
+}
+
+/// `[inspector]`: the in-page inspector of the dev-server plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InspectorSettings {
+    /// On in development builds (never in production builds).
+    pub(crate) enabled: bool,
+    /// `Modifier+…+Key`, e.g. `Alt+Shift+F`.
+    pub(crate) shortcut: String,
+}
+
+/// `[verify]`: the visual verify loop. The viewport, color scheme and
+/// state contract is fixed for v1 ([`VERIFY_VIEWPORTS`] …).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VerifySettings {
+    /// The loop on or off (`loop` in the file).
+    pub(crate) enabled: bool,
+    /// The local dev server's URL (loopback hosts only).
+    pub(crate) dev_server: String,
+    /// Advisory match score, 0–100.
+    pub(crate) threshold: f64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        RawSettings::default().resolve()
+    }
+}
+
+impl Settings {
+    /// The settings as `figmog settings` prints them (fixed key order).
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "stack": {
+                "framework": self.stack.framework.as_str(),
+                "styling": self.stack.styling.as_str(),
+                "tokens": self.stack.tokens,
+            },
+            "inspector": {
+                "enabled": self.inspector.enabled,
+                "shortcut": self.inspector.shortcut,
+            },
+            "verify": {
+                "loop": self.verify.enabled,
+                "dev_server": self.verify.dev_server,
+                "threshold": self.verify.threshold,
+                "viewports": VERIFY_VIEWPORTS,
+                "color_scheme": VERIFY_COLOR_SCHEME,
+                "state": VERIFY_STATE,
+            },
+        })
+    }
+
+    /// The `[name]` settings table (one of [`SETTINGS_TABLES`]) as `figmog
+    /// init` writes it: every key, set to this value, with a comment.
+    /// Parses back to the same values.
+    pub(crate) fn render_table(&self, name: &str) -> String {
+        match name {
+            "stack" => format!(
+                "[stack]\n\
+                 framework = {}  # react (v1)\n\
+                 styling = {}  # tailwind (v1)\n\
+                 tokens = {}  # token file, relative to this file\n",
+                quote(self.stack.framework.as_str()),
+                quote(self.stack.styling.as_str()),
+                quote(&self.stack.tokens),
+            ),
+            "inspector" => format!(
+                "[inspector]\n\
+                 enabled = {}  # in development builds only\n\
+                 shortcut = {}\n",
+                self.inspector.enabled,
+                quote(&self.inspector.shortcut),
+            ),
+            "verify" => format!(
+                "[verify]\n\
+                 loop = {}\n\
+                 dev_server = {}  # local only\n\
+                 threshold = {}  # advisory match score, 0-100\n",
+                self.verify.enabled,
+                quote(&self.verify.dev_server),
+                self.verify.threshold,
+            ),
+            other => unreachable!("not a settings table: {other}"),
+        }
+    }
+}
+
+/// The `[files]` table as `figmog init` writes it.
+pub(crate) fn render_files_table(product: &str, library: Option<&str>) -> String {
+    let mut table = format!(
+        "[files]\ndefault = {}  # the product file\n",
+        quote(product)
+    );
+    if let Some(library) = library {
+        table.push_str(&format!(
+            "library = {}  # tokens and components\n",
+            quote(library)
+        ));
+    }
+    table
+}
+
+/// A TOML basic string.
+fn quote(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A settings value as written.
+#[derive(Debug, Clone, PartialEq)]
+enum Scalar {
+    Str(String),
+    Bool(bool),
+    Num(f64),
+}
+
+impl Scalar {
+    fn kind(&self) -> &'static str {
+        match self {
+            Scalar::Str(_) => "a string",
+            Scalar::Bool(_) => "a boolean",
+            Scalar::Num(_) => "a number",
+        }
+    }
+}
+
+/// A string (as [`parse_string`]), `true`/`false`, or a decimal integer or
+/// float (`_` separators allowed), and the text after it.
+fn parse_scalar<'a>(input: &'a str, table: &str) -> Result<(Scalar, &'a str), String> {
+    if input.starts_with('"') || input.starts_with('\'') {
+        let (value, rest) = parse_string(input, table)?;
+        return Ok((Scalar::Str(value), rest));
+    }
+    let end = input
+        .find(|c: char| c.is_whitespace() || c == '#')
+        .unwrap_or(input.len());
+    let (word, rest) = input.split_at(end);
+    match word {
+        "true" => return Ok((Scalar::Bool(true), rest)),
+        "false" => return Ok((Scalar::Bool(false), rest)),
+        _ => {}
+    }
+    let numeric = word
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'_' | b'e' | b'E'));
+    if numeric
+        && word.bytes().any(|b| b.is_ascii_digit())
+        && let Ok(number) = word.replace('_', "").parse::<f64>()
+        && number.is_finite()
+    {
+        return Ok((Scalar::Num(number), rest));
+    }
+    Err(format!(
+        "expected a string, boolean or number (arrays and inline tables are not supported in [{table}])"
+    ))
+}
+
+/// Settings as written in one file (or merged), every key optional.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct RawSettings {
+    framework: Option<Framework>,
+    styling: Option<Styling>,
+    tokens: Option<String>,
+    inspector_enabled: Option<bool>,
+    shortcut: Option<String>,
+    verify_loop: Option<bool>,
+    dev_server: Option<String>,
+    threshold: Option<f64>,
+    /// `<table>.<key>` of keys this binary does not know.
+    unknown: BTreeSet<String>,
+}
+
+// `threshold` is validated finite (0–100), so equality is total.
+impl Eq for RawSettings {}
+
+impl RawSettings {
+    /// Set `<table>.<key>`, validating its type and value. Errors are
+    /// prefixed `<table>.<key>: `.
+    fn set(&mut self, table: &str, key: &str, value: Scalar) -> Result<(), String> {
+        let path = format!("{table}.{key}");
+        let wrong =
+            |want: &str, value: &Scalar| format!("{path}: expected {want}, found {}", value.kind());
+        let string = |value: Scalar| match value {
+            Scalar::Str(s) => Ok(s),
+            other => Err(wrong("a string", &other)),
+        };
+        let boolean = |value: Scalar| match value {
+            Scalar::Bool(b) => Ok(b),
+            other => Err(wrong("a boolean (true or false)", &other)),
+        };
+        let invalid = |message: String| format!("{path}: {message}");
+        match (table, key) {
+            ("stack", "framework") => {
+                self.framework = Some(Framework::parse(&string(value)?).map_err(invalid)?);
+            }
+            ("stack", "styling") => {
+                self.styling = Some(Styling::parse(&string(value)?).map_err(invalid)?);
+            }
+            ("stack", "tokens") => {
+                let tokens = string(value)?;
+                check_project_path(&tokens).map_err(invalid)?;
+                self.tokens = Some(tokens);
+            }
+            ("inspector", "enabled") => self.inspector_enabled = Some(boolean(value)?),
+            ("inspector", "shortcut") => {
+                let shortcut = string(value)?;
+                check_shortcut(&shortcut).map_err(invalid)?;
+                self.shortcut = Some(shortcut);
+            }
+            ("verify", "loop") => self.verify_loop = Some(boolean(value)?),
+            ("verify", "dev_server") => {
+                let url = string(value)?;
+                check_dev_server(&url).map_err(invalid)?;
+                self.dev_server = Some(url);
+            }
+            ("verify", "threshold") => {
+                let Scalar::Num(threshold) = value else {
+                    return Err(wrong("a number", &value));
+                };
+                if !(0.0..=100.0).contains(&threshold) {
+                    return Err(invalid(format!(
+                        "must be between 0 and 100, found {threshold}"
+                    )));
+                }
+                self.threshold = Some(threshold);
+            }
+            _ => {
+                self.unknown.insert(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// `other`'s keys replace this one's.
+    fn merge(&mut self, other: RawSettings) {
+        fn take<T>(mine: &mut Option<T>, theirs: Option<T>) {
+            if theirs.is_some() {
+                *mine = theirs;
+            }
+        }
+        take(&mut self.framework, other.framework);
+        take(&mut self.styling, other.styling);
+        take(&mut self.tokens, other.tokens);
+        take(&mut self.inspector_enabled, other.inspector_enabled);
+        take(&mut self.shortcut, other.shortcut);
+        take(&mut self.verify_loop, other.verify_loop);
+        take(&mut self.dev_server, other.dev_server);
+        take(&mut self.threshold, other.threshold);
+        self.unknown.extend(other.unknown);
+    }
+
+    fn resolve(&self) -> Settings {
+        Settings {
+            stack: StackSettings {
+                framework: self.framework.unwrap_or_default(),
+                styling: self.styling.unwrap_or_default(),
+                tokens: self
+                    .tokens
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_TOKENS_PATH.to_string()),
+            },
+            inspector: InspectorSettings {
+                enabled: self.inspector_enabled.unwrap_or(true),
+                shortcut: self
+                    .shortcut
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_SHORTCUT.to_string()),
+            },
+            verify: VerifySettings {
+                enabled: self.verify_loop.unwrap_or(true),
+                dev_server: self
+                    .dev_server
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_DEV_SERVER.to_string()),
+                threshold: self.threshold.unwrap_or(DEFAULT_THRESHOLD),
+            },
+        }
+    }
+}
+
+/// A file path inside the project: relative, `/`-separated, no `..`, no
+/// control characters, naming a file.
+pub(crate) fn check_project_path(value: &str) -> Result<(), String> {
+    use std::path::Component;
+    if value.is_empty() || value.ends_with('/') || value.chars().any(char::is_control) {
+        return Err(format!("{value:?} is not a file path"));
+    }
+    let inside = !value.contains('\\')
+        && Path::new(value)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    if !inside {
+        return Err(format!(
+            "{value:?} must be a relative path inside the project (no `..`, not absolute)"
+        ));
+    }
+    Ok(())
+}
+
+/// `Modifier+…+Key`: at least one of `Ctrl`, `Alt`, `Shift`, `Meta` (any
+/// case, each once), then one letter, digit or `F1`–`F12`.
+pub(crate) fn check_shortcut(value: &str) -> Result<(), String> {
+    let invalid = || {
+        format!(
+            "{value:?} is not a shortcut like \"Alt+Shift+F\" (one or more of Ctrl, Alt, Shift, \
+             Meta, then a letter, digit or F1-F12)"
+        )
+    };
+    let parts: Vec<&str> = value.split('+').collect();
+    let Some((key, modifiers)) = parts.split_last() else {
+        return Err(invalid());
+    };
+    let mut seen = BTreeSet::new();
+    for modifier in modifiers {
+        let lower = modifier.to_ascii_lowercase();
+        if !matches!(lower.as_str(), "ctrl" | "alt" | "shift" | "meta") || !seen.insert(lower) {
+            return Err(invalid());
+        }
+    }
+    let function_key = key
+        .strip_prefix(['F', 'f'])
+        .and_then(|n| n.parse::<u8>().ok())
+        .is_some_and(|n| (1..=12).contains(&n) && !key[1..].starts_with('0'));
+    let plain_key = key.len() == 1 && key.bytes().all(|b| b.is_ascii_alphanumeric());
+    if seen.is_empty() || !(function_key || plain_key) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// An `http`/`https` URL on a loopback host (`localhost`, `*.localhost`,
+/// `127.0.0.0/8`, `[::1]`) without credentials: v1 is local only.
+pub(crate) fn check_dev_server(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|e| format!("{value:?} is not a URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("{value:?} must be an http:// or https:// URL"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("{value:?} must not carry credentials"));
+    }
+    let local = match url.host() {
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if !local {
+        return Err(format!(
+            "{value:?} is not a local address — v1 supports a dev server on this machine only \
+             (localhost, 127.0.0.1 or [::1])"
+        ));
+    }
+    Ok(())
 }
 
 /// Where this invocation's project, config and mirrors live.
@@ -350,6 +906,16 @@ impl Layout {
     pub(crate) fn discover_cwd() -> Result<Self, String> {
         let cwd = std::env::current_dir().map_err(|e| format!("reading working directory: {e}"))?;
         Self::discover(&cwd)
+    }
+
+    /// The project's typed settings ([`ProjectConfig::settings`]).
+    pub(crate) fn settings(&self) -> Settings {
+        self.config.settings()
+    }
+
+    /// `<project root>/figmog.toml`.
+    pub(crate) fn config_path(&self) -> PathBuf {
+        self.project_root.join(CONFIG_FILE)
     }
 
     /// `<mirror root>/<key>` — the shared store directory.
@@ -799,6 +1365,204 @@ mod tests {
         assert_eq!(layout.project_root, sub);
         assert_eq!(layout.mirror_root, expected);
         assert_eq!(Layout::discover(&main).unwrap().project_root, main);
+    }
+
+    /// NWS-2946: the settings tables, their defaults and validation.
+    #[test]
+    fn settings_default_parse_and_override_per_key() {
+        let defaults = parse_config("", CONFIG_FILE).unwrap().settings();
+        assert_eq!(defaults, Settings::default());
+        assert_eq!(defaults.stack.framework, Framework::React);
+        assert_eq!(defaults.stack.styling, Styling::Tailwind);
+        assert_eq!(defaults.stack.tokens, DEFAULT_TOKENS_PATH);
+        assert!(defaults.inspector.enabled);
+        assert_eq!(defaults.inspector.shortcut, DEFAULT_SHORTCUT);
+        assert!(defaults.verify.enabled);
+        assert_eq!(defaults.verify.dev_server, DEFAULT_DEV_SERVER);
+        assert_eq!(defaults.verify.threshold, DEFAULT_THRESHOLD);
+
+        let text = format!(
+            "[files]\ndefault = \"{KEY}\"\nlibrary = \"{OTHER}\"\n\
+             [stack]\nframework = 'react'\nstyling = \"tailwind\" # v1\ntokens = \"app/tokens.css\"\n\
+             future = \"kept\"\n\
+             [inspector]\nenabled = false\nshortcut = \"ctrl+F12\"\n\
+             [verify]\nloop = false\ndev_server = \"http://127.0.0.1:3000/app\"\nthreshold = 87.5\n"
+        );
+        let config = parse_config(&text, CONFIG_FILE).unwrap();
+        assert_eq!(config.library_key(), Some(OTHER));
+        for table in ["files", "stack", "inspector", "verify"] {
+            assert!(config.has_table(table), "{table}");
+        }
+        assert_eq!(
+            config.unknown_keys().iter().collect::<Vec<_>>(),
+            ["stack.future"]
+        );
+        let settings = config.settings();
+        assert_eq!(settings.stack.tokens, "app/tokens.css");
+        assert_eq!(
+            settings.stack.tokens_path(Path::new("/p")),
+            Path::new("/p/app/tokens.css")
+        );
+        assert!(!settings.inspector.enabled);
+        assert_eq!(settings.inspector.shortcut, "ctrl+F12");
+        assert!(!settings.verify.enabled);
+        assert_eq!(settings.verify.dev_server, "http://127.0.0.1:3000/app");
+        assert_eq!(settings.verify.threshold, 87.5);
+
+        // figmog.local.toml replaces single keys, not whole tables.
+        let mut merged = config.clone();
+        merged.merge(
+            parse_config(
+                "[verify]\ndev_server = \"http://localhost:4000\"\n",
+                LOCAL_CONFIG_FILE,
+            )
+            .unwrap(),
+        );
+        let settings = merged.settings();
+        assert_eq!(settings.verify.dev_server, "http://localhost:4000");
+        assert_eq!(settings.verify.threshold, 87.5);
+        assert!(!settings.verify.enabled);
+    }
+
+    #[test]
+    fn rendered_tables_parse_back_to_the_same_settings() {
+        let mut settings = Settings::default();
+        settings.stack.tokens = "src/\"odd\" dir/tokens.css".into();
+        settings.verify.threshold = 90.25;
+        settings.inspector.enabled = false;
+        let mut text = render_files_table(KEY, Some(OTHER));
+        for table in SETTINGS_TABLES {
+            text.push_str(&settings.render_table(table));
+        }
+        let config = parse_config(&text, CONFIG_FILE).unwrap();
+        assert_eq!(config.settings(), settings);
+        assert_eq!(config.default_key(), Some(KEY));
+        assert_eq!(config.library_key(), Some(OTHER));
+        assert!(config.unknown_keys().is_empty());
+    }
+
+    #[test]
+    fn malformed_settings_name_the_file_line_and_key() {
+        for (text, line, needle) in [
+            (
+                "[stack]\nframework = \"vue\"\n",
+                2,
+                "stack.framework: unsupported framework \"vue\"",
+            ),
+            (
+                "[stack]\nstyling = \"css-modules\"\n",
+                2,
+                "unsupported styling",
+            ),
+            (
+                "[stack]\nframework = true\n",
+                2,
+                "stack.framework: expected a string, found a boolean",
+            ),
+            (
+                "[stack]\ntokens = \"../x.css\"\n",
+                2,
+                "relative path inside the project",
+            ),
+            (
+                "[stack]\ntokens = \"/abs.css\"\n",
+                2,
+                "relative path inside the project",
+            ),
+            ("[stack]\ntokens = \"src/\"\n", 2, "not a file path"),
+            ("[inspector]\nenabled = \"yes\"\n", 2, "expected a boolean"),
+            ("[inspector]\nshortcut = \"F\"\n", 2, "not a shortcut"),
+            (
+                "[inspector]\nshortcut = \"Alt+Alt+F\"\n",
+                2,
+                "not a shortcut",
+            ),
+            ("[inspector]\nshortcut = \"Hyper+F\"\n", 2, "not a shortcut"),
+            ("[inspector]\nshortcut = \"Alt+F13\"\n", 2, "not a shortcut"),
+            (
+                "[verify]\ndev_server = \"http://192.168.1.2:5173\"\n",
+                2,
+                "not a local address",
+            ),
+            (
+                "[verify]\ndev_server = \"ftp://localhost\"\n",
+                2,
+                "http:// or https://",
+            ),
+            (
+                "[verify]\ndev_server = \"http://u:p@localhost\"\n",
+                2,
+                "credentials",
+            ),
+            (
+                "[verify]\ndev_server = \"localhost:5173\"\n",
+                2,
+                "http:// or https://",
+            ),
+            ("[verify]\nthreshold = 101\n", 2, "between 0 and 100"),
+            ("[verify]\nthreshold = \"95\"\n", 2, "expected a number"),
+            (
+                "[verify]\nthreshold = nan\n",
+                2,
+                "expected a string, boolean or number",
+            ),
+            (
+                "[verify]\nviewports = [1440]\n",
+                2,
+                "arrays and inline tables are not supported",
+            ),
+            (
+                "[verify]\nloop = true\nloop = false\n",
+                3,
+                "duplicate key verify.loop",
+            ),
+            (
+                "[verify]\n[stack]\n[verify]\n",
+                3,
+                "duplicate [verify] table",
+            ),
+            ("[stack]\nframework\n", 2, "expected `framework = <value>`"),
+            (
+                "[stack]\nframework = \"react\" extra\n",
+                2,
+                "unexpected text",
+            ),
+            (
+                "[stack]\na.b = 1\n",
+                2,
+                "dotted keys are not supported in [stack]",
+            ),
+            (
+                "[stack]\nx = '''\n",
+                2,
+                "multi-line strings are not supported in [stack]",
+            ),
+        ] {
+            let error = parse_config(text, CONFIG_FILE).unwrap_err();
+            assert!(
+                error.starts_with(&format!("figmog.toml:{line}: ")) && error.contains(needle),
+                "{text:?}: {error}"
+            );
+        }
+        // Accepted spellings.
+        for shortcut in ["Alt+Shift+F", "ctrl+meta+7", "Shift+f1", "Alt+F12"] {
+            let text = format!("[inspector]\nshortcut = \"{shortcut}\"\n");
+            assert!(parse_config(&text, CONFIG_FILE).is_ok(), "{shortcut}");
+        }
+        for url in [
+            "http://localhost:5173",
+            "https://app.localhost/",
+            "http://127.0.0.2:80",
+            "http://[::1]:3000",
+        ] {
+            let text = format!("[verify]\ndev_server = \"{url}\"\n");
+            assert!(parse_config(&text, CONFIG_FILE).is_ok(), "{url}");
+        }
+        let config =
+            parse_config("[verify]\nthreshold = 1_0\nextra = -2.5e1\n", CONFIG_FILE).unwrap();
+        assert_eq!(config.settings().verify.threshold, 10.0);
+        // Other tables keep being skipped unparsed.
+        assert!(parse_config("[later]\nlist = [\n 1,\n]\n", CONFIG_FILE).is_ok());
     }
 
     fn layout_with_legacy(dir: &Path) -> Layout {

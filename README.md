@@ -87,6 +87,36 @@ desktop server's tools are forwarded — Figma's remote MCP server is not.
 Keep both connections and the agent sees two overlapping Figma
 servers, then picks tools badly.
 
+### Or: set up a React + Tailwind repository in one step
+
+```console
+$ cd my-app
+$ figmog init --file "https://www.figma.com/design/<key>/<name>"
+$ figmog doctor
+```
+
+`init` detects React (`react` in `package.json`) and Tailwind (a
+`tailwind.config.*` file, or a `tailwindcss` / `@tailwindcss/vite` /
+`@tailwindcss/postcss` dependency), writes `figmog.toml`, keeps `.figmog/`
+and `figmog.local.toml` out of Git, moves mirrors from older versions into
+the shared location, registers figmog for Claude Code in the project's
+`.mcp.json`, adds a short figmog section to `AGENTS.md` (between
+`<!-- figmog:begin -->`-style markers, replaced on rerun), and runs the
+first pull. It never prompts: pipe a token to `--token-stdin` to save it,
+use `--framework react` / `--styling tailwind` when detection can't tell,
+`--from-file` to pull a saved response offline, `--no-pull` to skip the
+pull. Rerunning it changes nothing that is already set up; it only adds
+the `figmog.toml` tables that are missing and never edits one you have.
+`.mcp.json` runs `figmog serve` from your `PATH` (`--mcp-command <path>`
+names another binary); Claude Code asks you to approve the project's
+server the first time.
+
+`figmog doctor` checks the token, access to the file, whether your plan
+has the Variables REST API, the Figma desktop app's MCP server, the
+`.mcp.json` registration and your dev server. Each check prints `ok`,
+`warn` or `fail`; offline checks warn instead of hanging, and the command
+exits 1 only when a check fails.
+
 ### 4. Ask for something
 
 > Using figmog, pull this file: [figma file URL], then build this frame in
@@ -119,18 +149,37 @@ else the Git top level, else the current directory. A project can name the
 Figma file(s) it mirrors:
 
 ```toml
-# figmog.toml — commit this
+# figmog.toml — commit this (`figmog init` writes it)
 [files]
-default = "https://www.figma.com/design/<key>/<name>"   # or a bare file key
-# design-system = "<key-or-url>"                        # named entries (reserved)
+default = "https://www.figma.com/design/<key>/<name>"   # the product file
+library = "<key-or-url>"                                 # optional: tokens and components
+
+[stack]
+framework = "react"                # v1: react
+styling = "tailwind"               # v1: tailwind
+tokens = "src/figmog-tokens.css"   # token file, relative to the project
+
+[inspector]
+enabled = true                     # in development builds only
+shortcut = "Alt+Shift+F"
+
+[verify]
+loop = true
+dev_server = "http://localhost:5173"   # local addresses only
+threshold = 95                         # advisory match score, 0-100
 ```
 
-`default` is the file every command uses when you don't pass one; without
-it, `.figmog/current` (the last pulled file) still applies. A
-`figmog.local.toml` beside it, in the same format, overrides entries for
-your machine only. Other tables and keys are ignored, so later settings
-won't break older binaries. A malformed file is an error naming the file
-and line (`figmog.toml:3: ...`).
+Every key is optional; the values above are the defaults. `default` is
+the file every command uses when you don't pass one; without it,
+`.figmog/current` (the last pulled file) still applies. A
+`figmog.local.toml` beside it, in the same format, overrides single keys
+for your machine only (say, another `dev_server` port). `figmog settings`
+prints the result as JSON, defaults filled in. Verification always uses
+1440 px and 390 px wide viewports, light mode and the default state.
+Other tables, and keys figmog doesn't know inside these tables, are
+ignored (`figmog doctor` lists the unknown ones), so later settings won't
+break older binaries. A malformed file — or a known key with a wrong type
+or value — is an error naming the file and line (`figmog.toml:3: ...`).
 
 Inside Git, mirrors live in the repository's Git directory,
 `<git-common-dir>/figmog/<key>/db` (for example `.git/figmog/`), shared by

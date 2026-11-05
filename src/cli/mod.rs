@@ -20,8 +20,10 @@ use crate::project::Layout;
 
 mod auth;
 mod call;
+mod doctor;
 mod gitignore;
 mod images;
+mod init;
 mod migrate;
 mod pull;
 mod socket;
@@ -117,6 +119,22 @@ enum Cmd {
         #[arg(long, hide = true, conflicts_with_all = ["figmog_root", "files"])]
         background: bool,
     },
+    /// Set up this repository in one step: write `figmog.toml` (detecting
+    /// React and Tailwind), save the token, keep `.figmog/` out of Git,
+    /// move old mirrors to the shared root, register the MCP server for
+    /// Claude Code (`.mcp.json`), add figmog's block to `AGENTS.md`, and
+    /// run the first pull. Never prompts; safe to rerun.
+    Init(init::InitArgs),
+    /// Check the token, file access, the plan's variables access, the
+    /// desktop MCP connection, the MCP registration and the dev server.
+    /// Exits 1 when any check fails.
+    Doctor {
+        /// Figma desktop app's Dev Mode MCP server URL.
+        #[arg(long, default_value = crate::serve::DEFAULT_UPSTREAM_URL)]
+        upstream: String,
+    },
+    /// Print the project's settings (`figmog.toml` over defaults).
+    Settings,
     /// Move old per-checkout mirrors (`.figmog/<key>/`) into the shared
     /// mirror root (inside Git: `<git-common-dir>/figmog/`). Resumable;
     /// never overwrites an existing mirror; fails while a store is open.
@@ -344,6 +362,31 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     if let Cmd::Auth { command } = &cli.cmd {
         return auth::run(command);
     }
+    // `init` and `doctor` discover the project themselves: `init` may be
+    // creating its config, and `doctor` reports a malformed one as a check.
+    if let Cmd::Init(_) | Cmd::Doctor { .. } = &cli.cmd
+        && cli.db.is_some()
+    {
+        return Err("init and doctor work on the project and do not take --db".into());
+    }
+    if let Cmd::Init(args) = cli.cmd {
+        return write_json(&init::cmd_init(args)?);
+    }
+    if let Cmd::Doctor { upstream } = &cli.cmd {
+        let (report, failed) = doctor::cmd_doctor(upstream);
+        write_json(&report)?;
+        if failed {
+            let names: Vec<&str> = report["checks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| c["status"] == "fail")
+                .filter_map(|c| c["name"].as_str())
+                .collect();
+            return Err(format!("doctor: failed checks: {}", names.join(", ")));
+        }
+        return Ok(());
+    }
     // `serve` manages its own (possibly many) session stores via
     // `SessionManager` (`sessions.rs`) rather than the single `Db` every
     // other command resolves below — handled here, before `resolve_db`,
@@ -409,6 +452,13 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(_) => None,
         None => Some(Layout::discover_cwd()?),
     };
+
+    if let Cmd::Settings = &cli.cmd {
+        let Some(layout) = &layout else {
+            return Err("settings reads the project's figmog.toml and does not take --db".into());
+        };
+        return write_json(&init::cmd_settings(layout));
+    }
 
     if let Cmd::Migrate { file } = &cli.cmd {
         let Some(layout) = &layout else {
@@ -825,7 +875,10 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
         | Cmd::Call { .. }
         | Cmd::ImportVariables { .. }
         | Cmd::Images { .. }
-        | Cmd::Migrate { .. } => return None,
+        | Cmd::Migrate { .. }
+        | Cmd::Init(_)
+        | Cmd::Doctor { .. }
+        | Cmd::Settings => return None,
     })
 }
 
