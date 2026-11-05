@@ -73,6 +73,7 @@ is deterministic: running it twice gives byte-identical outputs.
 | `app/variants/Card.hardcoded.jsx` | Test fixture: the card with every token value written as a literal. |
 | `app/scripts/` | `slice.mjs` (the run) and `lib.mjs` (shared plumbing). |
 | `app/test/slice.test.mjs` | The slice tests. |
+| `app/test/icons.test.mjs` | NWS-2952: renders the icon components `figmog assets export` generates (`tests/fixtures/assets/export/`) with React and checks that repeated instances never share an id. Needs only `npm ci`. |
 | `evidence/` | Run outputs (committed). |
 
 ## The card and the tokens
@@ -81,9 +82,10 @@ is deterministic: running it twice gives byte-identical outputs.
 its default theme**, then `tokens.css`. The only theme keys are the exported
 tokens, so `bg-surface`, `rounded-md`, `py-4`, `gap-4`, `gap-2`, `bg-brand`
 and `text-text-primary` resolve to them, and a utility naming a value the
-design system lacks generates nothing. Tokens the export emits unitless and
-without a theme entry (font sizes, weight, line height, stroke width) are
-used through their CSS variables, e.g. `text-[length:calc(var(--font-size-title)*1px)]`.
+design system lacks generates nothing. Tokens without a theme entry (font
+sizes, line height and stroke width, exported in px, and the unitless font
+weight) are used through their CSS variables, e.g.
+`text-[length:var(--font-size-title)]`.
 
 Values the spec flags `untokenized` (horizontal padding 24, width 320, title
 line height 28, body fill and weight, badge size and radius, letter spacing)

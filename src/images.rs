@@ -232,10 +232,39 @@ pub fn scan<R: Readable>(
     format: &str,
     scale_milli: u32,
 ) -> Scanned {
+    scan_split(
+        nodes,
+        meta,
+        images,
+        pins,
+        node_ids,
+        node_ids,
+        format,
+        scale_milli,
+    )
+}
+
+/// [`scan`] with the renders and the fill scan asked for separately
+/// (NWS-2952): `render_ids` are rendered, `fill_ids`' own `fills` are
+/// scanned for imageRefs. `figmog assets export` renders its icons
+/// without fetching their fills, and fetches image fills without
+/// rendering the nodes that hold them; pass the same `render_ids` to
+/// [`resolve`].
+#[allow(clippy::too_many_arguments)]
+pub fn scan_split<R: Readable>(
+    nodes: &TableReader<'_, R, String, NodeRec>,
+    meta: &TableReader<'_, R, u8, FileMeta>,
+    images: &TableReader<'_, R, String, ImageBlobRec>,
+    pins: &TableReader<'_, R, String, ImagePinRec>,
+    render_ids: &[String],
+    fill_ids: &[String],
+    format: &str,
+    scale_milli: u32,
+) -> Scanned {
     let version = meta.get(&0).map(|m| m.version.clone()).unwrap_or_default();
 
     let mut render_hits: BTreeMap<String, ImageItem> = BTreeMap::new();
-    for id in node_ids {
+    for id in render_ids {
         let key = image_key(RENDER, id, format, scale_milli);
         if let Some(rec) = images.get(&key)
             && rec.file_version == version
@@ -259,7 +288,7 @@ pub fn scan<R: Readable>(
     }
 
     let mut fill_refs: BTreeSet<String> = BTreeSet::new();
-    for id in node_ids {
+    for id in fill_ids {
         if let Some(n) = nodes.get(id)
             && let Ok(raw) = serde_json::from_str::<Value>(&n.raw)
         {

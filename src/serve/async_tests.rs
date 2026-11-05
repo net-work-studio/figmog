@@ -22,6 +22,10 @@ struct Api {
     metadata_error: Mutex<Option<ApiError>>,
     /// Gate every render request (a slow image cache miss).
     block_images: AtomicBool,
+    /// Render requests made (`images_render`).
+    renders: AtomicUsize,
+    /// Fill requests made (`file_image_fills`).
+    fills: AtomicUsize,
 }
 
 impl FigmaApi for Api {
@@ -61,6 +65,7 @@ impl FigmaApi for Api {
         _: Option<f64>,
         _: Option<&str>,
     ) -> Result<Value, ApiError> {
+        self.renders.fetch_add(1, Ordering::Relaxed);
         if self.block_images.load(Ordering::Relaxed) {
             self.entered.send("render").unwrap();
             self.release
@@ -70,6 +75,10 @@ impl FigmaApi for Api {
                 .unwrap();
         }
         Ok(json!({"images": {}}))
+    }
+    fn file_image_fills(&self, _: &str) -> Result<Value, ApiError> {
+        self.fills.fetch_add(1, Ordering::Relaxed);
+        Ok(json!({"meta": {"images": {}}}))
     }
 }
 
@@ -173,6 +182,8 @@ impl Harness {
             block_meta: AtomicBool::new(false),
             metadata_error: Mutex::new(None),
             block_images: AtomicBool::new(false),
+            renders: AtomicUsize::new(0),
+            fills: AtomicUsize::new(0),
         });
         let session = sessions::open_session_with_hooks(
             dir.path().join("ABC1234567890/db"),

@@ -1,35 +1,53 @@
-//! `figmog tokens export` (NWS-2967): render the imported variable
-//! snapshot as one CSS file — custom properties for the default modes, one
-//! collection's light/dark modes as `:root` / `[data-theme="dark"]`, and a
-//! Tailwind v4 `@theme` / `@theme inline` block.
+//! `figmog tokens export` / `diff` / `check` (NWS-2967, NWS-2948): render
+//! the imported variable snapshot as one CSS file — custom properties for
+//! every collection's root mode, one block per other mode selector, and,
+//! in the `tailwind` format, a Tailwind v4 `@theme` / `@theme inline`
+//! block — and compare a committed file with that rendering.
 //!
 //! Pure: the input is exactly what `figmog vars --snapshot` returns
 //! (`query::vars` with `with_snapshot`), so the command reads the store
 //! through the ordinary `figmog_vars` read — socket-routed or direct — and
-//! only the rendering lives here. Output is a function of that value
-//! alone: every list is sorted, nothing reads a clock or a `HashMap`.
+//! only the rendering lives here. Output is a function of that value and
+//! the [`ExportOptions`] alone: every list is sorted, nothing reads a clock
+//! or a `HashMap`.
 //!
-//! Rules (SPEC §9 "Token export"):
+//! Rules (SPEC §9 "Token export, diff and check"):
 //!
+//! - **Identity.** A token is its variable id (within its collection), not
+//!   its display name: two variables producing one CSS name — `brand/primary`
+//!   and `brand-primary`, or `primary` in two collections — are an error
+//!   naming both, never a silent overwrite.
 //! - **Names.** A variable's `codeSyntax.WEB` (`--x` or `var(--x)`) when it
 //!   is a valid custom property name (`--` then ASCII letters, digits, `-`
 //!   or `_`); otherwise the kebab-cased variable name path (`/` segments,
 //!   lower-cased, every other run of non-alphanumerics a single `-`). An
-//!   invalid WEB name falls back to the path and is reported. Two
-//!   variables producing one name are an error naming both.
-//! - **Values.** COLOR → `#rrggbb`, or `#rrggbbaa` when alpha < 1 (each
-//!   channel `round(x * 255)`). FLOAT → `<n>px` when its scopes include a
-//!   spacing/size scope (`GAP`, `WIDTH_HEIGHT`) or `CORNER_RADIUS`, else a
-//!   unitless number (reported). An alias → `var(--target)`, except that
-//!   a px FLOAT aliasing a unitless one → `calc(var(--target) * 1px)`; a
-//!   unitless FLOAT aliasing a px one, or an alias across types, is
-//!   skipped and reported (CSS cannot strip a unit). STRING, BOOLEAN and
-//!   other types are skipped and reported, as is a variable lacking a
-//!   value for a mode it needs or aliasing a skipped variable.
-//! - **Dark subtrees.** `var()` in a custom property resolves where the
-//!   property is declared, so `[data-theme="dark"]` redeclares — with its
-//!   one value — every variable that aliases, directly or through a chain,
-//!   a variable the dark mode overrides.
+//!   invalid WEB name falls back to the path and is reported.
+//! - **Modes.** Each collection's modes map to selectors: one root mode
+//!   (`:root`), every other mode its own selector, from the explicit
+//!   mapping ([`ExportOptions::modes`], figmog.toml `[tokens.modes]`) or the
+//!   default — the one mode named like "dark" → `[data-theme="dark"]`, any
+//!   other → `[data-<collection>="<mode>"]`. Collections are independent
+//!   (theme × density × brand): each declares only its own variables.
+//! - **Values.** COLOR → `#rrggbb`, or `#rrggbbaa` when alpha < 1. FLOAT →
+//!   `<n><unit>` from its scopes: px for spacing/size, radius, typography
+//!   sizes, stroke and effect sizes, `%` for opacity (0–100), none for font
+//!   weight; scopes implying different units, or none at all
+//!   (`ALL_SCOPES`), give a unitless number, reported as ambiguous. An
+//!   alias → `var(--target)`, except that a FLOAT with a unit aliasing a
+//!   unitless one → `calc(var(--target) * 1<unit>)`; a unitless FLOAT
+//!   aliasing one with a unit, an alias between px and `%`, or an alias
+//!   across types, is skipped and reported (CSS cannot strip or convert a
+//!   unit). STRING, BOOLEAN and other types are skipped and reported, as is
+//!   a variable lacking a value for a mode it needs, aliasing a variable
+//!   outside the snapshot (a remote library variable: reported, never
+//!   flattened), on an alias cycle (in any combination of modes CSS can
+//!   produce), or aliasing a skipped variable.
+//! - **Subtrees.** `var()` in a custom property resolves where the
+//!   property is declared, so a mode's selector redeclares every variable
+//!   of other collections that aliases, directly or through a chain, a
+//!   variable that selector overrides — with its root value, and with each
+//!   of its own modes' values under a combined selector, so nesting one
+//!   collection's mode inside another's keeps both.
 //! - **Tailwind namespaces.** COLOR → `--color-*`, spacing/size scopes →
 //!   `--spacing-*`, `CORNER_RADIUS` → `--radius-*`; a name already in its
 //!   namespace is kept, otherwise the namespace is prefixed
@@ -40,12 +58,140 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use serde_json::Value;
 
-/// Which collection's modes become `:root` / `[data-theme="dark"]`.
-#[derive(Debug, Default, Clone)]
+/// The selector of every collection's root mode.
+pub const ROOT: &str = ":root";
+/// The default selector of a collection's one mode named like "dark".
+pub const DARK_SELECTOR: &str = "[data-theme=\"dark\"]";
+/// What `tokens check` certifies about a passing token file — about the
+/// snapshot in the mirror, never the live Figma file.
+pub const CERTIFIES: &str = "matches the last published snapshot";
+/// How every file `figmog tokens export` writes begins: `export` only
+/// overwrites a file that starts with it (unless forced).
+pub const GENERATED_HEADER: &str = "/* Generated by `figmog tokens export`";
+/// Mode combinations checked for one alias loop before giving up on it.
+const MAX_CONTEXTS: usize = 4096;
+
+/// The token file format (`[tokens] format`, `--format`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// CSS custom properties plus a Tailwind v4 `@theme` / `@theme inline`.
+    #[default]
+    Tailwind,
+    /// CSS custom properties only.
+    Css,
+}
+
+impl Format {
+    const ALL: [Format; 2] = [Format::Tailwind, Format::Css];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Format::Tailwind => "tailwind",
+            Format::Css => "css",
+        }
+    }
+
+    /// The config spelling (`"tailwind"`, `"css"`) to its value.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|known| known.as_str() == value)
+            .ok_or_else(|| format!("unsupported token format {value:?} (supported: tailwind, css)"))
+    }
+}
+
+/// How to render: the format and the explicit mode mapping.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExportOptions {
-    pub collection: Option<String>,
-    pub light_mode: Option<String>,
-    pub dark_mode: Option<String>,
+    pub format: Format,
+    /// `"<collection>/<mode>"` → selector: `:root` for the collection's
+    /// root mode, `""` to leave the mode out, else the mode's selector.
+    /// Modes not named here get the default mapping.
+    pub modes: BTreeMap<String, String>,
+}
+
+impl ExportOptions {
+    /// As the `tokens` argument of `figmog_spec`: `{format, modes}`.
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({"format": self.format.as_str(), "modes": self.modes})
+    }
+
+    /// The `tokens` argument of `figmog_spec` (`{format?, modes?}`), each
+    /// value validated like figmog.toml's `[tokens]` / `[tokens.modes]`.
+    pub fn from_json(value: &Value) -> Result<Self, String> {
+        let obj = value
+            .as_object()
+            .ok_or("tokens: expected an object {format?, modes?}")?;
+        let mut opts = ExportOptions::default();
+        for (key, v) in obj {
+            match key.as_str() {
+                "format" => {
+                    let f = v.as_str().ok_or("tokens.format: expected a string")?;
+                    opts.format = Format::parse(f).map_err(|e| format!("tokens.format: {e}"))?;
+                }
+                "modes" => {
+                    let modes = v
+                        .as_object()
+                        .ok_or("tokens.modes: expected an object of \"<collection>/<mode>\": \"<selector>\"")?;
+                    for (k, sel) in modes {
+                        let sel = sel
+                            .as_str()
+                            .ok_or_else(|| format!("tokens.modes.{k:?}: expected a string"))?;
+                        check_mode_key(k)
+                            .and_then(|()| check_mode_selector(sel))
+                            .map_err(|e| format!("tokens.modes: {e}"))?;
+                        opts.modes.insert(k.clone(), sel.to_string());
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "tokens: unknown key {other:?} (expected format, modes)"
+                    ));
+                }
+            }
+        }
+        Ok(opts)
+    }
+}
+
+/// A mode-mapping key: `<collection>/<mode>` (either may contain `/`; the
+/// key is matched against every collection/mode pair of the snapshot).
+pub fn check_mode_key(key: &str) -> Result<(), String> {
+    if !key.contains('/') || key.starts_with('/') || key.ends_with('/') {
+        return Err(format!("{key:?} is not \"<collection>/<mode>\""));
+    }
+    Ok(())
+}
+
+/// A mode-mapping value: `:root`, `""` (mode not exported) or one CSS
+/// selector — no selector list, block, declaration, at-rule or comment, so
+/// it can be combined with another mode's selector.
+pub fn check_mode_selector(selector: &str) -> Result<(), String> {
+    if selector.is_empty() || selector == ROOT {
+        return Ok(());
+    }
+    let bad = selector.trim() != selector
+        || selector.chars().any(char::is_control)
+        || selector.contains(['{', '}', ';', ',', '@'])
+        || selector.contains("/*")
+        || selector.contains("*/");
+    if bad {
+        return Err(format!(
+            "{selector:?} is not one CSS selector (no surrounding spaces, `,`, `{{`, `}}`, `;`, `@` or comments; \":root\" for the root mode, \"\" to leave the mode out)"
+        ));
+    }
+    Ok(())
+}
+
+/// `--mode "<collection>/<mode>=<selector>"` (split at the first `=`).
+pub fn parse_mode_arg(arg: &str) -> Result<(String, String), String> {
+    let (key, selector) = arg
+        .split_once('=')
+        .ok_or_else(|| format!("--mode {arg:?}: expected \"<collection>/<mode>=<selector>\""))?;
+    check_mode_key(key)
+        .and_then(|()| check_mode_selector(selector))
+        .map_err(|e| format!("--mode: {e}"))?;
+    Ok((key.to_string(), selector.to_string()))
 }
 
 /// One reported variable: skipped, emitted unitless, or renamed.
@@ -56,7 +202,8 @@ pub struct ReportEntry {
     pub reason: String,
 }
 
-/// The chosen light/dark collection.
+/// The light/dark summary kept from the slice export: the one collection
+/// with a mode on `[data-theme="dark"]`, its root and dark modes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Theme {
     pub collection: String,
@@ -64,19 +211,45 @@ pub struct Theme {
     pub dark_mode: String,
 }
 
+/// One collection mode and where it is written (`None`: not exported).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModeMapping {
+    pub collection: String,
+    pub mode: String,
+    pub selector: Option<String>,
+}
+
 /// A rendered export.
 #[derive(Debug)]
 pub struct Export {
     pub css: String,
+    pub format: Format,
     /// Variables emitted as custom properties.
     pub tokens: usize,
     pub theme: Option<Theme>,
+    /// Every collection's modes, by collection name then root first.
+    pub modes: Vec<ModeMapping>,
+    /// Collection name → its root mode.
+    pub root_modes: BTreeMap<String, String>,
     /// Sorted by variable id, then reason.
     pub report: Vec<ReportEntry>,
     /// Variable id → the custom property name it exports as (`--x`), for
     /// every emitted variable — what `figmog spec` (NWS-2968) shows as a
     /// bound token's `css`, so the two can't drift.
     pub names: BTreeMap<String, String>,
+    /// Variable id → its Tailwind theme name (`--color-*`, `--spacing-*`,
+    /// `--radius-*`) in the `tailwind` format; empty in `css`. What
+    /// `figmog spec`'s Tailwind hint (NWS-2947) turns into a utility
+    /// (`--color-brand` → `bg-brand`).
+    pub theme_names: BTreeMap<String, String>,
+    /// Variable id → the unit its FLOAT value is emitted with (`px`, `%`,
+    /// or `None`: unitless), for every emitted non-COLOR variable — what
+    /// `figmog spec` (NWS-2947) needs to use a token where CSS wants a
+    /// length (`calc(var(--x) * 1px)` for a unitless one).
+    pub units: BTreeMap<String, Option<&'static str>>,
+    /// Every property the file declares (token and Tailwind theme names)
+    /// → its variable id, for `tokens diff`.
+    pub ids: BTreeMap<String, String>,
 }
 
 /// One authoritative variable row of `figmog vars --snapshot`.
@@ -85,6 +258,8 @@ struct Var {
     name: String,
     resolved_type: String,
     collection: String,
+    /// The collection's id (its name from a serve older than the field).
+    collection_key: String,
     default_mode: String,
     scopes: Vec<String>,
     web: Option<String>,
@@ -96,8 +271,17 @@ struct Var {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Color,
+    /// px, Tailwind `--spacing-*` (`GAP`, `WIDTH_HEIGHT`).
     Spacing,
+    /// px, Tailwind `--radius-*` (`CORNER_RADIUS`).
     Radius,
+    /// px without a Tailwind namespace (typography, stroke, effect sizes).
+    Length,
+    /// `%` (`OPACITY`: Figma opacity variables are 0–100).
+    Percent,
+    /// Unitless by nature (`FONT_WEIGHT`).
+    Weight,
+    /// Unitless because the scopes don't settle a unit (reported).
     Number,
 }
 
@@ -107,7 +291,16 @@ impl Kind {
             Kind::Color => Some("--color-"),
             Kind::Spacing => Some("--spacing-"),
             Kind::Radius => Some("--radius-"),
-            Kind::Number => None,
+            Kind::Length | Kind::Percent | Kind::Weight | Kind::Number => None,
+        }
+    }
+
+    /// The CSS unit a FLOAT of this kind carries (`None`: unitless).
+    fn unit(self) -> Option<&'static str> {
+        match self {
+            Kind::Spacing | Kind::Radius | Kind::Length => Some("px"),
+            Kind::Percent => Some("%"),
+            Kind::Color | Kind::Weight | Kind::Number => None,
         }
     }
 }
@@ -117,9 +310,9 @@ impl Kind {
 enum Val {
     Literal(String),
     Alias(String),
-    /// An alias from a px FLOAT to a unitless one, emitted as
-    /// `calc(var(--target) * 1px)` so the alias keeps its unit.
-    AliasPx(String),
+    /// An alias from a FLOAT with a unit to a unitless one, emitted as
+    /// `calc(var(--target) * 1<unit>)` so the alias keeps its unit.
+    AliasUnit(String, &'static str),
 }
 
 impl Val {
@@ -127,14 +320,50 @@ impl Val {
     fn target(&self) -> Option<&str> {
         match self {
             Val::Literal(_) => None,
-            Val::Alias(t) | Val::AliasPx(t) => Some(t),
+            Val::Alias(t) | Val::AliasUnit(t, _) => Some(t),
         }
     }
 }
 
+/// One collection's modes and their selectors.
+struct ColModes {
+    name: String,
+    root: String,
+    /// Non-root mode → selector.
+    sels: BTreeMap<String, String>,
+    /// Modes mapped to `""`: not exported.
+    skipped: BTreeSet<String>,
+}
+
+impl ColModes {
+    /// `(mode, selector)` for every exported mode, the root first.
+    fn emitted(&self) -> impl Iterator<Item = (&str, &str)> {
+        std::iter::once((self.root.as_str(), ROOT))
+            .chain(self.sels.iter().map(|(m, s)| (m.as_str(), s.as_str())))
+    }
+
+    /// The mode written under `selector`.
+    fn mode_of(&self, selector: &str) -> &str {
+        self.emitted()
+            .find(|(_, s)| *s == selector)
+            .map(|(m, _)| m)
+            .unwrap_or_default()
+    }
+}
+
+/// An exported variable.
+struct Token {
+    name: String,
+    kind: Kind,
+    /// Collection key (see [`Var::collection_key`]).
+    col: String,
+    /// Selector (`:root` for the root mode) → value.
+    vals: BTreeMap<String, Val>,
+}
+
 /// Render `vars` (`{snapshot, variables}`, as `figmog vars --snapshot`
-/// returns it) to CSS. Errors: no current snapshot, an ambiguous or
-/// unknown theme collection/mode, a name collision.
+/// returns it) to CSS. Errors: no current snapshot, an invalid or
+/// ambiguous mode mapping, a name collision.
 pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> {
     let snapshot = &vars["snapshot"];
     let state = snapshot["state"].as_str().unwrap_or("none");
@@ -162,13 +391,18 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             return Err("the variables read carries no `default_mode` — the figmog serving this mirror is older than this CLI; restart it (kill the pid in owner.json) and retry".into());
         };
         let text = |k: &str| row[k].as_str().unwrap_or_default().to_string();
+        let collection = text("collection");
         all.insert(
             id.clone(),
             Var {
                 id,
                 name: text("name"),
                 resolved_type: text("resolved_type"),
-                collection: text("collection"),
+                collection_key: row["collection_id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| collection.clone()),
+                collection,
                 default_mode: default_mode.to_string(),
                 scopes: row["scopes"]
                     .as_array()
@@ -188,39 +422,14 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         );
     }
 
-    let theme = choose_theme(&all, opts)?;
-    // The modes each variable is emitted in: its root mode (the theme's
-    // light mode for the theme collection, else its default) and, for the
-    // theme collection, the dark mode.
-    let modes_of = |v: &Var| -> Vec<String> {
-        match &theme {
-            Some(t) if t.collection == v.collection => {
-                vec![t.light_mode.clone(), t.dark_mode.clone()]
-            }
-            _ => vec![v.default_mode.clone()],
-        }
-    };
+    let cols = resolve_modes(&all, opts)?;
 
     // First pass: type, name and per-mode values.
-    struct Token {
-        name: String,
-        kind: Kind,
-        vals: Vec<Val>,
-    }
     let mut tokens: BTreeMap<String, Token> = BTreeMap::new();
     for v in all.values() {
-        let kind = match v.resolved_type.as_str() {
-            "COLOR" => Kind::Color,
-            "FLOAT" => {
-                let has = |s: &[&str]| v.scopes.iter().any(|x| s.contains(&x.as_str()));
-                if has(&["CORNER_RADIUS"]) {
-                    Kind::Radius
-                } else if has(&["GAP", "WIDTH_HEIGHT"]) {
-                    Kind::Spacing
-                } else {
-                    Kind::Number
-                }
-            }
+        let (kind, unitless) = match v.resolved_type.as_str() {
+            "COLOR" => (Kind::Color, None),
+            "FLOAT" => float_kind(&v.scopes),
             other => {
                 let t = if other.is_empty() { "unknown" } else { other };
                 report.insert(entry(
@@ -257,11 +466,13 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
                 }
             }
         };
-        let mut vals = Vec::new();
+        let mut vals = BTreeMap::new();
         let mut failed = None;
-        for mode in modes_of(v) {
-            match v.values.get(&mode).map(|raw| value(raw, kind)) {
-                Some(Ok(val)) => vals.push(val),
+        for (mode, selector) in cols[&v.collection_key].emitted() {
+            match v.values.get(mode).map(|raw| value(raw, kind)) {
+                Some(Ok(val)) => {
+                    vals.insert(selector.to_string(), val);
+                }
                 Some(Err(why)) => {
                     failed = Some(format!("value in mode {mode:?} {why}: skipped"));
                     break;
@@ -276,48 +487,89 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             report.insert(entry(&v.id, &v.name, &why));
             continue;
         }
-        if kind == Kind::Number {
-            report.insert(entry(
-                &v.id,
-                &v.name,
-                "FLOAT without a spacing, size or radius scope: emitted unitless, no Tailwind theme entry",
-            ));
+        if let Some(why) = unitless {
+            report.insert(entry(&v.id, &v.name, &why));
         }
-        tokens.insert(v.id.clone(), Token { name, kind, vals });
+        tokens.insert(
+            v.id.clone(),
+            Token {
+                name,
+                kind,
+                col: v.collection_key.clone(),
+                vals,
+            },
+        );
     }
+    let name_of = |id: &str| all.get(id).map(|v| v.name.clone()).unwrap_or_default();
+
+    // Aliases to variables outside the snapshot — a remote library
+    // variable the import doesn't carry — are reported, never flattened.
+    let unresolved: Vec<(String, String)> = tokens
+        .iter()
+        .filter_map(|(id, t)| {
+            t.vals
+                .values()
+                .find_map(|val| val.target().filter(|x| !all.contains_key(*x)))
+                .map(|x| (id.clone(), x.to_string()))
+        })
+        .collect();
+    for (id, target) in unresolved {
+        tokens.remove(&id);
+        report.insert(entry(
+            &id,
+            &name_of(&id),
+            &format!("aliases {target}, which is not in the variable snapshot (a remote library variable? import or pull the library's variables too): unresolved, not flattened, skipped"),
+        ));
+    }
+
+    // Alias cycles, in any combination of modes: CSS would make every
+    // variable on one invalid, so they are skipped (their aliases drop
+    // below).
+    for (id, why) in alias_cycles(&tokens, &cols) {
+        tokens.remove(&id);
+        report.insert(entry(&id, &name_of(&id), &why));
+    }
+
     // Units across aliases. Every emitted FLOAT carries its own kind's
-    // unit (px for spacing/size/radius, none for the rest): a px alias to
-    // a unitless FLOAT scales it (`calc(var(--t) * 1px)`); a unitless alias
-    // to a px FLOAT can't drop the unit in CSS, so it is skipped, as is an
-    // alias across types. A target's kind is fixed, so this holds through
-    // any alias chain.
+    // unit (px, % or none): an alias with a unit to a unitless FLOAT
+    // scales it (`calc(var(--t) * 1px)`); a unitless alias to a FLOAT with
+    // a unit can't drop the unit in CSS, so it is skipped, as are an alias
+    // between px and % and an alias across types. A target's kind is
+    // fixed, so this holds through any alias chain.
     let kinds: BTreeMap<String, Kind> = tokens.iter().map(|(id, t)| (id.clone(), t.kind)).collect();
     let mut mismatched = Vec::new();
     for (id, t) in tokens.iter_mut() {
-        for val in &mut t.vals {
+        for val in t.vals.values_mut() {
             let Val::Alias(target) = val else { continue };
             let Some(&to) = kinds.get(target.as_str()) else {
                 continue;
             };
-            let px = |k: Kind| matches!(k, Kind::Spacing | Kind::Radius);
             if (t.kind == Kind::Color) != (to == Kind::Color) {
                 mismatched.push((
                     id.clone(),
                     format!("aliases {target}, a variable of another type: skipped"),
                 ));
                 break;
-            } else if px(t.kind) && to == Kind::Number {
-                *val = Val::AliasPx(target.clone());
-            } else if t.kind == Kind::Number && px(to) {
-                mismatched.push((id.clone(), format!("unitless FLOAT aliases {target}, a px FLOAT: skipped (CSS cannot drop its unit)")));
-                break;
+            }
+            match (t.kind.unit(), to.unit()) {
+                (Some(unit), None) if t.kind != Kind::Color => {
+                    *val = Val::AliasUnit(target.clone(), unit);
+                }
+                (None, Some(unit)) => {
+                    mismatched.push((id.clone(), format!("unitless FLOAT aliases {target}, a {unit} FLOAT: skipped (CSS cannot drop its unit)")));
+                    break;
+                }
+                (Some(mine), Some(theirs)) if mine != theirs => {
+                    mismatched.push((id.clone(), format!("{mine} FLOAT aliases {target}, a {theirs} FLOAT: skipped (CSS cannot convert units)")));
+                    break;
+                }
+                _ => {}
             }
         }
     }
     for (id, why) in mismatched {
         tokens.remove(&id);
-        let name = all.get(&id).map(|v| v.name.as_str()).unwrap_or_default();
-        report.insert(entry(&id, name, &why));
+        report.insert(entry(&id, &name_of(&id), &why));
     }
     // Drop aliases to variables that aren't exported, until none remain
     // (an alias chain to a skipped variable drops as a whole).
@@ -325,7 +577,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         let dangling: Vec<(String, String)> = tokens
             .iter()
             .filter_map(|(id, t)| {
-                t.vals.iter().find_map(|val| match val.target() {
+                t.vals.values().find_map(|val| match val.target() {
                     Some(target) if !tokens.contains_key(target) => {
                         Some((id.clone(), target.to_string()))
                     }
@@ -338,20 +590,20 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         }
         for (id, target) in dangling {
             tokens.remove(&id);
-            let name = all.get(&id).map(|v| v.name.as_str()).unwrap_or_default();
             report.insert(entry(
                 &id,
-                name,
+                &name_of(&id),
                 &format!("aliases {target}, which is not exported: skipped"),
             ));
         }
     }
 
     // Collisions: custom property names first, then theme names against
-    // every name already in use.
-    let label = |id: &str| {
-        let name = all.get(id).map(|v| v.name.as_str()).unwrap_or_default();
-        format!("`{name}` ({id})")
+    // every name already in use. Identity is the variable id within its
+    // collection, so the error names both.
+    let label = |id: &str| match all.get(id) {
+        Some(v) => format!("`{}` (collection {:?}, {id})", v.name, v.collection),
+        None => format!("({id})"),
     };
     let mut by_name: BTreeMap<&str, &str> = BTreeMap::new();
     for (id, t) in &tokens {
@@ -367,87 +619,128 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
     let ref_of = |val: &Val| match val {
         Val::Literal(s) => s.clone(),
         Val::Alias(target) => format!("var({})", tokens[target].name),
-        Val::AliasPx(target) => format!("calc(var({}) * 1px)", tokens[target].name),
+        Val::AliasUnit(target, unit) => {
+            format!("calc(var({}) * 1{unit})", tokens[target].name)
+        }
     };
+    let mut ids: BTreeMap<String, String> = tokens
+        .iter()
+        .map(|(id, t)| (t.name.clone(), id.clone()))
+        .collect();
+    let mut theme_by_id: BTreeMap<String, String> = BTreeMap::new();
     let mut theme_plain: BTreeMap<String, String> = BTreeMap::new();
     let mut theme_inline: BTreeMap<String, String> = BTreeMap::new();
-    let mut theme_names: BTreeMap<String, &str> = BTreeMap::new();
-    for (id, t) in &tokens {
-        let Some(prefix) = t.kind.namespace() else {
-            continue;
-        };
-        let theme_name = if t.name.len() > prefix.len() && t.name.starts_with(prefix) {
-            t.name.clone()
-        } else {
-            format!("{prefix}{}", &t.name[2..])
-        };
-        let clash = theme_names.get(&theme_name).copied().or_else(|| {
-            (theme_name != t.name)
-                .then(|| by_name.get(theme_name.as_str()).copied())
-                .flatten()
-        });
-        if let Some(other) = clash {
-            return Err(format!(
-                "Tailwind theme name collision: {} and {} both claim `{theme_name}` — rename one or set its WEB code syntax",
-                label(other),
-                label(id),
-            ));
-        }
-        theme_names.insert(theme_name.clone(), id);
-        let same_alias = match t.vals.first() {
-            Some(first) if first.target().is_some() => t.vals.iter().all(|v| v == first),
-            _ => false,
-        };
-        if theme_name != t.name {
-            // Reference the token itself, inline, so a utility reads it
-            // where it's used and follows the theme there.
-            theme_inline.insert(theme_name, format!("var({})", t.name));
-        } else if same_alias {
-            theme_inline.insert(theme_name, ref_of(&t.vals[0]));
-        } else {
-            theme_plain.insert(theme_name, ref_of(&t.vals[0]));
+    if opts.format == Format::Tailwind {
+        let mut theme_names: BTreeMap<String, &str> = BTreeMap::new();
+        for (id, t) in &tokens {
+            let Some(prefix) = t.kind.namespace() else {
+                continue;
+            };
+            let theme_name = if t.name.len() > prefix.len() && t.name.starts_with(prefix) {
+                t.name.clone()
+            } else {
+                format!("{prefix}{}", &t.name[2..])
+            };
+            let clash = theme_names.get(&theme_name).copied().or_else(|| {
+                (theme_name != t.name)
+                    .then(|| by_name.get(theme_name.as_str()).copied())
+                    .flatten()
+            });
+            if let Some(other) = clash {
+                return Err(format!(
+                    "Tailwind theme name collision: {} and {} both claim `{theme_name}` — rename one or set its WEB code syntax",
+                    label(other),
+                    label(id),
+                ));
+            }
+            theme_names.insert(theme_name.clone(), id);
+            theme_by_id.insert(id.clone(), theme_name.clone());
+            ids.insert(theme_name.clone(), id.clone());
+            let root = &t.vals[ROOT];
+            let same_alias = root.target().is_some() && t.vals.values().all(|v| v == root);
+            if theme_name != t.name {
+                // Reference the token itself, inline, so a utility reads it
+                // where it's used and follows the mode there.
+                theme_inline.insert(theme_name, format!("var({})", t.name));
+            } else if same_alias {
+                theme_inline.insert(theme_name, ref_of(root));
+            } else {
+                theme_plain.insert(theme_name, ref_of(root));
+            }
         }
     }
 
-    // Emit. A custom property's `var()` resolves where it is declared, so
-    // an alias declared only in `:root` keeps its light value inside a dark
-    // subtree. The dark block therefore also redeclares, unchanged, every
-    // variable that reaches a dark-overridden one through aliases.
+    // Emit. Every variable is declared in `:root` with its root value and
+    // under each other mode's selector with that mode's value.
     let mut root: BTreeMap<&str, String> = BTreeMap::new();
-    let mut dark: BTreeMap<&str, String> = BTreeMap::new();
+    let mut blocks: BTreeMap<&str, BTreeMap<&str, String>> = BTreeMap::new();
     for t in tokens.values() {
-        root.insert(&t.name, ref_of(&t.vals[0]));
-        if let Some(val) = t.vals.get(1) {
-            dark.insert(&t.name, ref_of(val));
+        for (selector, val) in &t.vals {
+            if selector == ROOT {
+                root.insert(&t.name, ref_of(val));
+            } else {
+                blocks
+                    .entry(selector.as_str())
+                    .or_default()
+                    .insert(&t.name, ref_of(val));
+            }
         }
     }
-    let mut themed: BTreeSet<&str> = tokens
-        .iter()
-        .filter(|(_, t)| t.vals.len() > 1)
-        .map(|(id, _)| id.as_str())
-        .collect();
-    loop {
-        let more: Vec<&str> = tokens
+    // A custom property's `var()` resolves where it is declared, so an
+    // alias declared only in `:root` would keep its root value inside a
+    // subtree switching another collection's mode. Each selector therefore
+    // also redeclares every other-collection variable that reaches one it
+    // overrides through aliases: unchanged (its root value) in the plain
+    // block, and with each of its own modes' values under a combined
+    // selector (`<its mode> <this mode>` and both on one element), which
+    // outranks both plain blocks, so nesting either way keeps both modes.
+    let mut combined: BTreeMap<(&str, &str), BTreeMap<&str, String>> = BTreeMap::new();
+    let selectors: Vec<&str> = blocks.keys().copied().collect();
+    for selector in selectors {
+        let owns = |t: &Token| t.vals.contains_key(selector);
+        let mut reached: BTreeSet<&str> = tokens
             .iter()
-            .filter(|(id, t)| {
-                !themed.contains(id.as_str())
-                    && t.vals[0].target().is_some_and(|x| themed.contains(x))
-            })
+            .filter(|(_, t)| owns(t))
             .map(|(id, _)| id.as_str())
             .collect();
-        if more.is_empty() {
-            break;
-        }
-        for id in more {
-            let t = &tokens[id];
-            dark.insert(&t.name, ref_of(&t.vals[0]));
-            themed.insert(id);
+        loop {
+            let more: Vec<&str> = tokens
+                .iter()
+                .filter(|(id, t)| {
+                    !reached.contains(id.as_str())
+                        && !owns(t)
+                        && t.vals
+                            .values()
+                            .any(|v| v.target().is_some_and(|x| reached.contains(x)))
+                })
+                .map(|(id, _)| id.as_str())
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            for id in more {
+                let t = &tokens[id];
+                if let Some(block) = blocks.get_mut(selector) {
+                    block.insert(&t.name, ref_of(&t.vals[ROOT]));
+                }
+                for (own, val) in &t.vals {
+                    if own != ROOT {
+                        combined
+                            .entry((own.as_str(), selector))
+                            .or_default()
+                            .insert(&t.name, ref_of(val));
+                    }
+                }
+                reached.insert(id);
+            }
         }
     }
+
     let field = |k: &str| snapshot[k].as_str().map(comment_safe);
     let opt = |v: Option<String>| v.unwrap_or_else(|| "null".to_string());
     let mut css = String::new();
-    css.push_str("/* Generated by `figmog tokens export` — do not edit by hand.\n");
+    css.push_str(GENERATED_HEADER);
+    css.push_str(" — do not edit by hand.\n");
     css.push_str(&format!(
         " * snapshot: source={} format={} format_version={} exported_at={}\n",
         opt(field("source")),
@@ -456,31 +749,113 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         opt(field("exported_at")),
     ));
     css.push_str(&format!(" * digest: {}\n", opt(field("digest"))));
-    match &theme {
-        Some(t) => css.push_str(&format!(
-            " * theme: collection \"{}\": mode \"{}\" -> :root, mode \"{}\" -> [data-theme=\"dark\"]\n",
-            comment_safe(&t.collection),
-            comment_safe(&t.light_mode),
-            comment_safe(&t.dark_mode),
-        )),
-        None => css.push_str(" * theme: none (no collection with a dark mode)\n"),
+    let mut by_name_cols: Vec<&ColModes> = cols.values().collect();
+    by_name_cols.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut themed = false;
+    for c in &by_name_cols {
+        if c.sels.is_empty() && c.skipped.is_empty() {
+            continue;
+        }
+        themed = true;
+        let mut line = format!(
+            " * theme: collection \"{}\": mode \"{}\" -> :root",
+            comment_safe(&c.name),
+            comment_safe(&c.root)
+        );
+        let mut others: Vec<(&str, Option<&str>)> = c
+            .sels
+            .iter()
+            .map(|(m, s)| (m.as_str(), Some(s.as_str())))
+            .chain(c.skipped.iter().map(|m| (m.as_str(), None)))
+            .collect();
+        others.sort();
+        for (mode, selector) in others {
+            line.push_str(&format!(
+                ", mode \"{}\" -> {}",
+                comment_safe(mode),
+                selector.map_or_else(|| "(not exported)".to_string(), comment_safe)
+            ));
+        }
+        css.push_str(&line);
+        css.push('\n');
+    }
+    if !themed {
+        css.push_str(" * theme: none (every collection exports one mode)\n");
     }
     css.push_str(" */\n");
-    block(&mut css, ":root", &root);
-    if theme.is_some() {
-        block(&mut css, "[data-theme=\"dark\"]", &dark);
+    block(&mut css, ROOT, &root);
+    for (selector, decls) in &blocks {
+        block(&mut css, selector, decls);
+    }
+    for ((own, other), decls) in &combined {
+        block(&mut css, &combined_selector(own, other), decls);
     }
     block(&mut css, "@theme", &theme_plain);
     block(&mut css, "@theme inline", &theme_inline);
+
+    let dark: Vec<&ColModes> = by_name_cols
+        .iter()
+        .copied()
+        .filter(|c| c.sels.values().any(|s| s == DARK_SELECTOR))
+        .collect();
+    let theme = match dark.as_slice() {
+        [c] => c
+            .sels
+            .iter()
+            .find(|(_, s)| *s == DARK_SELECTOR)
+            .map(|(m, _)| Theme {
+                collection: c.name.clone(),
+                light_mode: c.root.clone(),
+                dark_mode: m.clone(),
+            }),
+        _ => None,
+    };
+    let mut modes = Vec::new();
+    for c in &by_name_cols {
+        modes.push(ModeMapping {
+            collection: c.name.clone(),
+            mode: c.root.clone(),
+            selector: Some(ROOT.to_string()),
+        });
+        let mut others: Vec<ModeMapping> = c
+            .sels
+            .iter()
+            .map(|(m, s)| ModeMapping {
+                collection: c.name.clone(),
+                mode: m.clone(),
+                selector: Some(s.clone()),
+            })
+            .chain(c.skipped.iter().map(|m| ModeMapping {
+                collection: c.name.clone(),
+                mode: m.clone(),
+                selector: None,
+            }))
+            .collect();
+        others.sort_by(|a, b| a.mode.cmp(&b.mode));
+        modes.extend(others);
+    }
     Ok(Export {
         css,
+        format: opts.format,
         tokens: tokens.len(),
         theme,
+        modes,
+        root_modes: by_name_cols
+            .iter()
+            .map(|c| (c.name.clone(), c.root.clone()))
+            .collect(),
         report: report.into_iter().collect(),
+        theme_names: theme_by_id,
+        units: tokens
+            .iter()
+            .filter(|(_, t)| t.kind != Kind::Color)
+            .map(|(id, t)| (id.clone(), t.kind.unit()))
+            .collect(),
         names: tokens
             .iter()
             .map(|(id, t)| (id.clone(), t.name.clone()))
             .collect(),
+        ids,
     })
 }
 
@@ -490,6 +865,86 @@ fn entry(id: &str, name: &str, reason: &str) -> ReportEntry {
         name: name.to_string(),
         reason: reason.to_string(),
     }
+}
+
+/// A FLOAT's kind from its scopes, and why it is reported when unitless.
+/// Each known scope implies one unit — px for spacing/size, radius,
+/// typography sizes, stroke and effect sizes; `%` for `OPACITY` (Figma
+/// opacity variables are 0–100); none for `FONT_WEIGHT`. Scopes implying
+/// different units, `ALL_SCOPES`, no scopes or an unknown scope are
+/// ambiguous: unitless, reported.
+fn float_kind(scopes: &[String]) -> (Kind, Option<String>) {
+    const SPACING: [&str; 2] = ["GAP", "WIDTH_HEIGHT"];
+    const RADIUS: [&str; 1] = ["CORNER_RADIUS"];
+    const LENGTH: [&str; 7] = [
+        "FONT_SIZE",
+        "LINE_HEIGHT",
+        "LETTER_SPACING",
+        "PARAGRAPH_SPACING",
+        "PARAGRAPH_INDENT",
+        "STROKE_FLOAT",
+        "EFFECT_FLOAT",
+    ];
+    let kind_of = |scope: &str| {
+        if SPACING.contains(&scope) {
+            Some(Kind::Spacing)
+        } else if RADIUS.contains(&scope) {
+            Some(Kind::Radius)
+        } else if LENGTH.contains(&scope) {
+            Some(Kind::Length)
+        } else if scope == "OPACITY" {
+            Some(Kind::Percent)
+        } else if scope == "FONT_WEIGHT" {
+            Some(Kind::Weight)
+        } else {
+            None
+        }
+    };
+    let kinds: Option<Vec<Kind>> = scopes.iter().map(|s| kind_of(s)).collect();
+    let list = || {
+        scopes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let unitless = "emitted unitless, no Tailwind theme entry";
+    let kinds = match kinds {
+        Some(kinds) if !kinds.is_empty() => kinds,
+        _ => {
+            return (
+                Kind::Number,
+                Some(format!(
+                    "FLOAT scopes [{}] don't say what it measures — ambiguous unit: {unitless}",
+                    list()
+                )),
+            );
+        }
+    };
+    let units: BTreeSet<Option<&str>> = kinds.iter().map(|k| k.unit()).collect();
+    if units.len() > 1 {
+        return (
+            Kind::Number,
+            Some(format!(
+                "FLOAT scopes [{}] imply different units — ambiguous unit: {unitless}",
+                list()
+            )),
+        );
+    }
+    // One unit. The Tailwind namespace: radius when any scope is a radius
+    // and the rest spacing/size, spacing when all are, else none.
+    let all = |k: &[Kind]| kinds.iter().all(|x| k.contains(x));
+    let kind = if all(&[Kind::Spacing]) {
+        Kind::Spacing
+    } else if all(&[Kind::Spacing, Kind::Radius]) {
+        Kind::Radius
+    } else if kinds[0].unit() == Some("px") {
+        Kind::Length
+    } else {
+        // `%` and unitless each have one kind: Percent, Weight.
+        kinds[0]
+    };
+    (kind, None)
 }
 
 /// Append `selector { name: value; ... }` (sorted), or nothing when empty.
@@ -506,109 +961,390 @@ fn block<K: AsRef<str>>(css: &mut String, selector: &str, decls: &BTreeMap<K, St
     css.push_str("}\n");
 }
 
+/// `own` outside `other`, or both on one element: `a b, ab` (`a:is(b)`
+/// when `b` starts with a type selector, which can't follow `a`).
+fn combined_selector(own: &str, other: &str) -> String {
+    let same = if other.starts_with(['[', '.', ':', '#']) {
+        format!("{own}{other}")
+    } else {
+        format!("{own}:is({other})")
+    };
+    format!("{own} {other}, {same}")
+}
+
 /// Text safe inside a `/* ... */` comment on one line.
 fn comment_safe(s: &str) -> String {
     s.replace("*/", "* /").replace(['\n', '\r'], " ")
 }
 
-/// The theme collection and its light/dark modes: explicit flags first;
-/// otherwise the one collection with a mode named like "dark" (none ⇒ no
-/// theme blocks; several ⇒ an error asking for `--collection`).
-fn choose_theme(
+/// Every collection's root mode and other-mode selectors: the explicit
+/// mapping first, then the defaults (the root is the one "light"-like mode
+/// when the collection also has one "dark"-like mode, else its default
+/// mode; the one "dark"-like mode → `[data-theme="dark"]`; any other mode
+/// → `[data-<collection>="<mode>"]`).
+fn resolve_modes(
     all: &BTreeMap<String, Var>,
     opts: &ExportOptions,
-) -> Result<Option<Theme>, String> {
-    // Collection name → (mode names, default modes).
-    let mut collections: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
+) -> Result<BTreeMap<String, ColModes>, String> {
+    // Collection key → (name, mode names, default modes).
+    #[allow(clippy::type_complexity)]
+    let mut seen: BTreeMap<&str, (&str, BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
     for v in all.values() {
-        let c = collections.entry(&v.collection).or_default();
-        c.0.extend(v.values.keys().map(String::as_str));
-        c.0.insert(&v.default_mode);
+        let c = seen
+            .entry(&v.collection_key)
+            .or_insert_with(|| (v.collection.as_str(), BTreeSet::new(), BTreeSet::new()));
+        c.1.extend(v.values.keys().map(String::as_str));
         c.1.insert(&v.default_mode);
+        c.2.insert(&v.default_mode);
+    }
+    // Collection key → mode → configured selector.
+    let mut wanted: BTreeMap<&str, BTreeMap<&str, &str>> = BTreeMap::new();
+    for (key, selector) in &opts.modes {
+        check_mode_key(key)
+            .and_then(|()| check_mode_selector(selector))
+            .map_err(|e| format!("mode mapping: {e}"))?;
+        let mut hits: Vec<(&str, &str)> = Vec::new();
+        for (ck, (name, modes, _)) in &seen {
+            let Some(mode) = key
+                .strip_prefix(*name)
+                .and_then(|rest| rest.strip_prefix('/'))
+            else {
+                continue;
+            };
+            if let Some(m) = modes.get(mode) {
+                hits.push((ck, m));
+            }
+        }
+        match hits.as_slice() {
+            [(ck, m)] => {
+                wanted.entry(ck).or_default().insert(m, selector);
+            }
+            [] => {
+                let known: Vec<String> = seen
+                    .values()
+                    .flat_map(|(name, modes, _)| modes.iter().map(move |m| format!("{name}/{m}")))
+                    .collect();
+                return Err(format!(
+                    "mode mapping {key:?} names no collection mode of the variable snapshot (modes: {})",
+                    quoted(known.iter())
+                ));
+            }
+            many => {
+                return Err(format!(
+                    "mode mapping {key:?} matches {} collection modes — rename a collection in Figma",
+                    many.len()
+                ));
+            }
+        }
     }
     let like = |mode: &str, word: &str| mode.to_ascii_lowercase().contains(word);
-    let collection = match &opts.collection {
-        Some(name) => {
-            if !collections.contains_key(name.as_str()) {
-                return Err(format!(
-                    "no variable collection named {name:?} (collections: {})",
-                    quoted(collections.keys())
-                ));
+    let mut out = BTreeMap::new();
+    for (ck, (name, modes, defaults)) in &seen {
+        let get = |m: &str| wanted.get(ck).and_then(|w| w.get(m)).copied();
+        let unique = |word: &str| {
+            let hits: Vec<&str> = modes.iter().copied().filter(|m| like(m, word)).collect();
+            match hits.as_slice() {
+                [one] => Some(*one),
+                _ => None,
             }
-            name.as_str()
-        }
-        None => {
-            let with_dark: Vec<&str> = collections
-                .iter()
-                .filter(|(_, (modes, _))| modes.iter().any(|m| like(m, "dark")))
-                .map(|(name, _)| *name)
-                .collect();
-            match with_dark.as_slice() {
-                [one] => *one,
-                [] if opts.light_mode.is_none() && opts.dark_mode.is_none() => return Ok(None),
-                [] => {
+        };
+        let dark = unique("dark");
+        let roots: Vec<&str> = modes
+            .iter()
+            .copied()
+            .filter(|m| get(m) == Some(ROOT))
+            .collect();
+        let root = match roots.as_slice() {
+            [one] => *one,
+            [] => {
+                let fallback = match (dark, unique("light")) {
+                    (Some(_), Some(light)) => light,
+                    _ => match defaults.iter().collect::<Vec<_>>().as_slice() {
+                        [one] => **one,
+                        _ => {
+                            return Err(format!(
+                                "collection {name:?} has no single default mode — map one of its modes to \":root\""
+                            ));
+                        }
+                    },
+                };
+                if let Some(selector) = get(fallback) {
                     return Err(format!(
-                        "no collection has a mode named like \"dark\" — pass --collection (collections: {})",
-                        quoted(collections.keys())
+                        "collection {name:?}: mode {fallback:?} would be its :root mode but is mapped to {selector:?} — map one of its modes to \":root\""
                     ));
                 }
-                many => {
-                    return Err(format!(
-                        "several collections have a mode named like \"dark\" ({}) — pass --collection",
-                        quoted(many.iter())
-                    ));
+                fallback
+            }
+            many => {
+                return Err(format!(
+                    "collection {name:?} maps several modes to \":root\" ({}) — map exactly one",
+                    quoted(many.iter())
+                ));
+            }
+        };
+        let mut sels = BTreeMap::new();
+        let mut skipped = BTreeSet::new();
+        let mut taken: BTreeMap<String, &str> = BTreeMap::new();
+        for &m in modes {
+            if m == root {
+                continue;
+            }
+            let selector = match get(m) {
+                Some("") => {
+                    skipped.insert(m.to_string());
+                    continue;
                 }
-            }
-        }
-    };
-    let (modes, defaults) = &collections[collection];
-    let pick = |flag: &Option<String>, word: &str, what: &str| -> Result<Option<String>, String> {
-        if let Some(m) = flag {
-            if !modes.contains(m.as_str()) {
+                Some(selector) => selector.to_string(),
+                None if Some(m) == dark => DARK_SELECTOR.to_string(),
+                None => default_selector(name, m).ok_or_else(|| {
+                    format!(
+                        "mode {m:?} of collection {name:?} has no ASCII letters or digits for a default selector — map it in figmog.toml [tokens.modes] (or with --mode)"
+                    )
+                })?,
+            };
+            if let Some(other) = taken.insert(selector.clone(), m) {
                 return Err(format!(
-                    "collection {collection:?} has no mode named {m:?} (modes: {})",
-                    quoted(modes.iter())
+                    "collection {name:?}: modes {other:?} and {m:?} both map to {selector} — give each mode its own selector"
                 ));
             }
-            return Ok(Some(m.clone()));
+            sels.insert(m.to_string(), selector);
         }
-        let hits: Vec<&&str> = modes.iter().filter(|m| like(m, word)).collect();
-        match hits.as_slice() {
-            [one] => Ok(Some(one.to_string())),
-            [] => Ok(None),
-            _ => Err(format!(
-                "collection {collection:?} has several modes named like {word:?} ({}) — pass --{what}-mode",
-                quoted(hits.iter())
-            )),
-        }
-    };
-    let dark = pick(&opts.dark_mode, "dark", "dark")?.ok_or_else(|| {
-        format!(
-            "collection {collection:?} has no mode named like \"dark\" — pass --dark-mode (modes: {})",
-            quoted(modes.iter())
-        )
-    })?;
-    let light = match pick(&opts.light_mode, "light", "light")? {
-        Some(m) => m,
-        None => match defaults.iter().collect::<Vec<_>>().as_slice() {
-            [one] => one.to_string(),
-            _ => {
-                return Err(format!(
-                    "collection {collection:?} has no single default or \"light\" mode — pass --light-mode"
-                ));
-            }
-        },
-    };
-    if light == dark {
-        return Err(format!(
-            "the light and dark modes are both {light:?} — pass --light-mode/--dark-mode"
-        ));
+        out.insert(
+            ck.to_string(),
+            ColModes {
+                name: name.to_string(),
+                root: root.to_string(),
+                sels,
+                skipped,
+            },
+        );
     }
-    Ok(Some(Theme {
-        collection: collection.to_string(),
-        light_mode: light,
-        dark_mode: dark,
-    }))
+    Ok(out)
+}
+
+/// `[data-<collection>="<mode>"]`, both kebab-cased like a name path.
+fn default_selector(collection: &str, mode: &str) -> Option<String> {
+    let c = path_name(collection)?;
+    let m = path_name(mode)?;
+    Some(format!("[data-{}=\"{}\"]", &c[2..], &m[2..]))
+}
+
+/// Every token on an alias cycle in some combination of modes → why. The
+/// alias graph over all modes is split into strongly connected components;
+/// for each that loops, every combination of modes CSS can produce is
+/// checked — each set of matching mode selectors, so collections sharing
+/// a selector switch together (a variable has one value per combination).
+/// A cycle that only exists in some modes is found and named with its
+/// modes, while a loop no producible combination closes is no cycle.
+fn alias_cycles(
+    tokens: &BTreeMap<String, Token>,
+    cols: &BTreeMap<String, ColModes>,
+) -> BTreeMap<String, String> {
+    let ids: Vec<&str> = tokens.keys().map(String::as_str).collect();
+    let index: BTreeMap<&str, usize> = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let adj: Vec<Vec<usize>> = ids
+        .iter()
+        .map(|id| {
+            let targets: BTreeSet<usize> = tokens[*id]
+                .vals
+                .values()
+                .filter_map(Val::target)
+                .filter_map(|t| index.get(t).copied())
+                .collect();
+            targets.into_iter().collect()
+        })
+        .collect();
+    let mut out = BTreeMap::new();
+    for comp in strongly_connected(&adj) {
+        if comp.len() == 1 && !adj[comp[0]].contains(&comp[0]) {
+            continue;
+        }
+        let members: BTreeSet<usize> = comp.into_iter().collect();
+        let col_keys: Vec<&str> = members
+            .iter()
+            .map(|&i| tokens[ids[i]].col.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // The combinations CSS can produce: a set of matching mode
+        // selectors, each collection in the mode whose selector matches
+        // (its root mode when none does). Collections sharing a selector
+        // switch together; two modes of one collection never apply at once.
+        let selectors: Vec<&str> = col_keys
+            .iter()
+            .flat_map(|ck| cols[*ck].sels.values().map(String::as_str))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let max_bits = MAX_CONTEXTS.trailing_zeros() as usize;
+        if selectors.len() > max_bits {
+            for &i in &members {
+                out.insert(
+                    ids[i].to_string(),
+                    format!("is on an alias loop across more than {MAX_CONTEXTS} mode combinations, not checked mode by mode: skipped"),
+                );
+            }
+            continue;
+        }
+        let mut contexts: Vec<BTreeMap<&str, &str>> = Vec::new();
+        let mut seen: BTreeSet<Vec<&str>> = BTreeSet::new();
+        'masks: for mask in 0..(1usize << selectors.len()) {
+            let active = |s: &str| {
+                selectors
+                    .iter()
+                    .position(|x| *x == s)
+                    .is_some_and(|k| mask & (1 << k) != 0)
+            };
+            let mut ctx = BTreeMap::new();
+            for ck in &col_keys {
+                let hits: Vec<&str> = cols[*ck]
+                    .sels
+                    .values()
+                    .map(String::as_str)
+                    .filter(|s| active(s))
+                    .collect();
+                match hits.as_slice() {
+                    [] => ctx.insert(*ck, ROOT),
+                    [one] => ctx.insert(*ck, *one),
+                    _ => continue 'masks,
+                };
+            }
+            if seen.insert(ctx.values().copied().collect()) {
+                contexts.push(ctx);
+            }
+        }
+        let total = contexts.len();
+        // Member → (its first cycle, with the modes it closes in; how
+        // many combinations close one through it).
+        let mut found: BTreeMap<usize, (String, String, usize)> = BTreeMap::new();
+        for ctx in &contexts {
+            let next = |i: usize| -> Option<usize> {
+                let t = &tokens[ids[i]];
+                t.vals
+                    .get(ctx[t.col.as_str()])?
+                    .target()
+                    .and_then(|x| index.get(x).copied())
+                    .filter(|j| members.contains(j))
+            };
+            let modes_text = || {
+                col_keys
+                    .iter()
+                    .map(|ck| {
+                        let c = &cols[*ck];
+                        format!("{:?} mode {:?}", c.name, c.mode_of(ctx[ck]))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut on_cycle: BTreeSet<usize> = BTreeSet::new();
+            for &start in &members {
+                let mut path = vec![start];
+                while let Some(j) = next(path[path.len() - 1]) {
+                    if let Some(pos) = path.iter().position(|&p| p == j) {
+                        let cycle = &path[pos..];
+                        if cycle.iter().all(|c| !on_cycle.contains(c)) {
+                            let first = cycle
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, c)| **c)
+                                .map_or(0, |(k, _)| k);
+                            let mut names: Vec<&str> = cycle[first..]
+                                .iter()
+                                .chain(&cycle[..first])
+                                .map(|&c| tokens[ids[c]].name.as_str())
+                                .collect();
+                            names.push(names[0]);
+                            let text = names.join(" -> ");
+                            for &c in cycle {
+                                on_cycle.insert(c);
+                                found
+                                    .entry(c)
+                                    .or_insert_with(|| (text.clone(), modes_text(), 0));
+                            }
+                        }
+                        break;
+                    }
+                    if path.len() > members.len() {
+                        break;
+                    }
+                    path.push(j);
+                }
+            }
+            for c in on_cycle {
+                if let Some(f) = found.get_mut(&c) {
+                    f.2 += 1;
+                }
+            }
+        }
+        for (i, (cycle, modes, count)) in found {
+            let reason = if count == total {
+                format!("is on an alias cycle {cycle} in every mode: skipped")
+            } else {
+                format!("is on an alias cycle {cycle} only in some modes (first: {modes}): skipped")
+            };
+            out.insert(ids[i].to_string(), reason);
+        }
+    }
+    out
+}
+
+/// Tarjan's strongly connected components, iteratively (no recursion, so
+/// a long alias chain can't overflow the stack).
+fn strongly_connected(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    const UNSEEN: usize = usize::MAX;
+    let n = adj.len();
+    let mut index = vec![UNSEEN; n];
+    let mut low = vec![0; n];
+    let mut on_stack = vec![false; n];
+    let mut stack = Vec::new();
+    let mut next = 0;
+    let mut out = Vec::new();
+    for start in 0..n {
+        if index[start] != UNSEEN {
+            continue;
+        }
+        let mut calls: Vec<(usize, usize)> = vec![(start, 0)];
+        index[start] = next;
+        low[start] = next;
+        next += 1;
+        stack.push(start);
+        on_stack[start] = true;
+        while let Some(&(v, i)) = calls.last() {
+            if let Some(&w) = adj[v].get(i) {
+                if let Some(call) = calls.last_mut() {
+                    call.1 += 1;
+                }
+                if index[w] == UNSEEN {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    calls.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(u, _)) = calls.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut comp = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                comp.sort_unstable();
+                out.push(comp);
+            }
+        }
+    }
+    out
 }
 
 fn quoted<'a, S: AsRef<str> + 'a>(names: impl Iterator<Item = S>) -> String {
@@ -619,7 +1355,8 @@ fn quoted<'a, S: AsRef<str> + 'a>(names: impl Iterator<Item = S>) -> String {
 }
 
 /// A `codeSyntax.WEB` value as a custom property name: `--x` or
-/// `var(--x)`, `x` nonempty ASCII letters/digits/`-`/`_`. `None` if invalid.
+/// `var(--x)`, `x` nonempty ASCII letters/digits/`-`/`_`. `None` if invalid
+/// (an expression, a JS identifier, a fallback, …).
 fn web_name(web: &str) -> Option<String> {
     let web = web.trim();
     let inner = web
@@ -671,9 +1408,9 @@ fn value(raw: &Value, kind: Kind) -> Result<Val, String> {
                 .filter(|n| n.is_finite())
                 .ok_or_else(|| "is not a number".to_string())?;
             let n = number(n);
-            Ok(Val::Literal(match kind {
-                Kind::Number => n,
-                _ => format!("{n}px"),
+            Ok(Val::Literal(match kind.unit() {
+                Some(unit) => format!("{n}{unit}"),
+                None => n,
             }))
         }
     }
@@ -708,6 +1445,202 @@ fn number(n: f64) -> String {
     format!("{n}")
 }
 
+// ---- tokens diff / check ----
+
+/// One declaration of a token file: `block` is its selector (or
+/// `@theme` / `@theme inline`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct Decl {
+    pub name: String,
+    pub block: String,
+    pub value: String,
+    pub variable_id: Option<String>,
+}
+
+/// One declaration whose value differs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct Change {
+    pub name: String,
+    pub block: String,
+    pub from: String,
+    pub to: String,
+    pub variable_id: Option<String>,
+}
+
+/// A committed token file against a fresh export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Diff {
+    /// `up_to_date` (byte-identical), `out_of_date` or `missing`.
+    pub status: &'static str,
+    /// The header comment (snapshot provenance and mode mapping) differs.
+    pub header_changed: bool,
+    /// Declarations the export has and the file lacks, by name then block.
+    pub added: Vec<Decl>,
+    /// Declarations the file has and the export lacks.
+    pub removed: Vec<Decl>,
+    pub changed: Vec<Change>,
+}
+
+impl Diff {
+    /// `N added, N removed, N changed` (plus the header, when it alone or
+    /// also differs).
+    pub fn summary(&self) -> String {
+        let mut s = format!(
+            "{} added, {} removed, {} changed",
+            self.added.len(),
+            self.removed.len(),
+            self.changed.len()
+        );
+        if self.header_changed {
+            s.push_str(", header (snapshot provenance or mode mapping) changed");
+        }
+        s
+    }
+}
+
+/// Compare `committed` (the token file's text, `None` when it does not
+/// exist) with `export`. Declarations are matched by block and property
+/// name. Errors: a file that isn't flat CSS blocks of declarations.
+pub fn diff(committed: Option<&str>, export: &Export) -> Result<Diff, String> {
+    let new = declarations(&export.css)?;
+    let id = |name: &str| export.ids.get(name).cloned();
+    let Some(old_text) = committed else {
+        let mut added: Vec<Decl> = flatten(&new)
+            .map(|(block, name, value)| Decl {
+                variable_id: id(name),
+                name: name.to_string(),
+                block: block.to_string(),
+                value: value.to_string(),
+            })
+            .collect();
+        added.sort();
+        return Ok(Diff {
+            status: "missing",
+            header_changed: true,
+            added,
+            removed: Vec::new(),
+            changed: Vec::new(),
+        });
+    };
+    let old = declarations(old_text)?;
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    for (block, name, value) in flatten(&new) {
+        match old.get(block).and_then(|b| b.get(name)) {
+            None => added.push(Decl {
+                variable_id: id(name),
+                name: name.to_string(),
+                block: block.to_string(),
+                value: value.to_string(),
+            }),
+            Some(before) if before != value => changed.push(Change {
+                variable_id: id(name),
+                name: name.to_string(),
+                block: block.to_string(),
+                from: before.clone(),
+                to: value.to_string(),
+            }),
+            Some(_) => {}
+        }
+    }
+    let mut removed: Vec<Decl> = flatten(&old)
+        .filter(|(block, name, _)| new.get(*block).is_none_or(|b| !b.contains_key(*name)))
+        .map(|(block, name, value)| Decl {
+            variable_id: id(name),
+            name: name.to_string(),
+            block: block.to_string(),
+            value: value.to_string(),
+        })
+        .collect();
+    added.sort();
+    removed.sort();
+    changed.sort();
+    Ok(Diff {
+        status: if old_text == export.css {
+            "up_to_date"
+        } else {
+            "out_of_date"
+        },
+        header_changed: header(old_text) != header(&export.css),
+        added,
+        removed,
+        changed,
+    })
+}
+
+type Blocks = BTreeMap<String, BTreeMap<String, String>>;
+
+fn flatten(blocks: &Blocks) -> impl Iterator<Item = (&str, &str, &str)> {
+    blocks.iter().flat_map(|(block, decls)| {
+        decls
+            .iter()
+            .map(move |(n, v)| (block.as_str(), n.as_str(), v.as_str()))
+    })
+}
+
+/// The leading `/* ... */` comment, if any.
+fn header(css: &str) -> Option<&str> {
+    let rest = css.trim_start().strip_prefix("/*")?;
+    rest.find("*/").map(|end| &rest[..end])
+}
+
+/// A flat CSS file's declarations: selector (whitespace collapsed) →
+/// property → value. Comments are ignored; nested blocks are an error.
+fn declarations(css: &str) -> Result<Blocks, String> {
+    let mut text = String::new();
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        text.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find("*/")
+            .ok_or_else(|| "unterminated comment".to_string())?;
+        rest = &after[end + 2..];
+    }
+    text.push_str(rest);
+    let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: Blocks = BTreeMap::new();
+    let mut rest = text.as_str();
+    loop {
+        let Some(open) = rest.find('{') else {
+            if rest.trim().is_empty() {
+                break;
+            }
+            return Err(format!(
+                "text outside a block: {:?}",
+                rest.trim().chars().take(40).collect::<String>()
+            ));
+        };
+        let selector = collapse(&rest[..open]);
+        if selector.is_empty() || selector.contains('}') {
+            return Err("a block without a selector".to_string());
+        }
+        let body_and_rest = &rest[open + 1..];
+        let close = body_and_rest
+            .find('}')
+            .ok_or_else(|| format!("unterminated block {selector:?}"))?;
+        let body = &body_and_rest[..close];
+        if body.contains('{') {
+            return Err(format!(
+                "nested blocks in {selector:?} are not a figmog token file"
+            ));
+        }
+        let decls = out.entry(selector.clone()).or_default();
+        for decl in body.split(';') {
+            let decl = decl.trim();
+            if decl.is_empty() {
+                continue;
+            }
+            let (name, value) = decl
+                .split_once(':')
+                .ok_or_else(|| format!("{decl:?} in {selector:?} is not a declaration"))?;
+            decls.insert(name.trim().to_string(), collapse(value));
+        }
+        rest = &body_and_rest[close + 1..];
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +1670,30 @@ mod tests {
         })
     }
 
+    fn in_collection(mut r: Value, collection: &str, default_mode: &str) -> Value {
+        r["collection"] = json!(collection);
+        r["collection_id"] = json!(format!("C:{collection}"));
+        r["default_mode"] = json!(default_mode);
+        r
+    }
+
+    fn reasons(out: &Export) -> Vec<(&str, &str)> {
+        out.report
+            .iter()
+            .map(|r| (r.variable_id.as_str(), r.reason.as_str()))
+            .collect()
+    }
+
+    fn modes(pairs: &[(&str, &str)]) -> ExportOptions {
+        ExportOptions {
+            modes: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn names() {
         assert_eq!(
@@ -747,6 +1704,8 @@ mod tests {
         assert_eq!(web_name("colorBrand"), None);
         assert_eq!(web_name("--"), None);
         assert_eq!(web_name("--a b"), None);
+        assert_eq!(web_name("var(--a, red)"), None);
+        assert_eq!(web_name("calc(var(--a) * 2)"), None);
         assert_eq!(
             path_name("Color/Brand Primary").as_deref(),
             Some("--color-brand-primary")
@@ -770,6 +1729,29 @@ mod tests {
     }
 
     #[test]
+    fn mode_arguments_and_selectors_are_validated() {
+        assert_eq!(
+            parse_mode_arg("Theme/Dark=[data-theme=\"dark\"]").unwrap(),
+            (
+                "Theme/Dark".to_string(),
+                "[data-theme=\"dark\"]".to_string()
+            )
+        );
+        assert_eq!(
+            parse_mode_arg("Brand/Off=").unwrap(),
+            ("Brand/Off".into(), "".into())
+        );
+        assert!(parse_mode_arg("Theme=:root").is_err());
+        assert!(parse_mode_arg("Theme/Dark").is_err());
+        for bad in [".a, .b", ".a { x }", " .a", ".a /* x */", "@media x"] {
+            assert!(check_mode_selector(bad).is_err(), "{bad}");
+        }
+        assert!(check_mode_selector(".dark").is_ok());
+        assert_eq!(Format::parse("css").unwrap(), Format::Css);
+        assert!(Format::parse("dtcg").unwrap_err().contains("supported"));
+    }
+
+    #[test]
     fn collision_names_both_variables() {
         let v = snap(vec![
             row(
@@ -790,9 +1772,37 @@ mod tests {
             ),
         ]);
         let err = export_css(&v, &ExportOptions::default()).unwrap_err();
-        assert!(err.contains("`brand/primary` (V:1)"), "{err}");
-        assert!(err.contains("`brand primary` (V:2)"), "{err}");
+        assert!(
+            err.contains("`brand/primary` (collection \"c\", V:1)"),
+            "{err}"
+        );
+        assert!(
+            err.contains("`brand primary` (collection \"c\", V:2)"),
+            "{err}"
+        );
         assert!(err.contains("--brand-primary"), "{err}");
+    }
+
+    #[test]
+    fn one_name_in_two_collections_is_a_collision() {
+        let black = json!({"light": {"r":0,"g":0,"b":0,"a":1}});
+        let v = snap(vec![
+            in_collection(
+                row("V:1", "primary", "COLOR", black.clone(), json!([]), None),
+                "Brand",
+                "light",
+            ),
+            in_collection(
+                row("V:2", "primary", "COLOR", black, json!([]), None),
+                "Product",
+                "light",
+            ),
+        ]);
+        let err = export_css(&v, &ExportOptions::default()).unwrap_err();
+        assert_eq!(
+            err,
+            "token name collision: `primary` (collection \"Brand\", V:1) and `primary` (collection \"Product\", V:2) both export as `--primary` — rename one or set its WEB code syntax"
+        );
     }
 
     #[test]
@@ -804,11 +1814,180 @@ mod tests {
         ]);
         let err = export_css(&v, &ExportOptions::default()).unwrap_err();
         assert!(err.contains("Tailwind theme name collision"), "{err}");
-        assert!(err.contains("(V:1)") && err.contains("(V:2)"), "{err}");
+        assert!(err.contains("V:1)") && err.contains("V:2)"), "{err}");
+        // Plain CSS has no theme names, so no theme collision.
+        let css = export_css(
+            &v,
+            &ExportOptions {
+                format: Format::Css,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!css.css.contains("@theme"), "{}", css.css);
     }
 
     #[test]
-    fn ambiguous_dark_collections_need_a_flag() {
+    fn invalid_web_code_syntax_falls_back_and_is_reported() {
+        let v = snap(vec![row(
+            "V:1",
+            "Brand/Primary",
+            "COLOR",
+            json!({"light": {"r":0,"g":0,"b":0,"a":1}}),
+            json!([]),
+            Some("tokens.brand.primary"),
+        )]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        assert!(
+            out.css.contains("  --brand-primary: #000000;\n"),
+            "{}",
+            out.css
+        );
+        assert_eq!(
+            reasons(&out),
+            [(
+                "V:1",
+                "codeSyntax.WEB \"tokens.brand.primary\" is not a valid custom property name: used the name path"
+            )]
+        );
+    }
+
+    #[test]
+    fn float_units_come_from_scopes_and_ambiguity_is_reported() {
+        let v = snap(vec![
+            row(
+                "V:1",
+                "gap",
+                "FLOAT",
+                json!({"light": 4}),
+                json!(["GAP"]),
+                None,
+            ),
+            row(
+                "V:2",
+                "mixed",
+                "FLOAT",
+                json!({"light": 4}),
+                json!(["GAP", "OPACITY"]),
+                None,
+            ),
+            row(
+                "V:3",
+                "any",
+                "FLOAT",
+                json!({"light": 4}),
+                json!(["ALL_SCOPES"]),
+                None,
+            ),
+            row(
+                "V:4",
+                "weight",
+                "FLOAT",
+                json!({"light": 700}),
+                json!(["FONT_WEIGHT"]),
+                None,
+            ),
+            row(
+                "V:5",
+                "radius",
+                "FLOAT",
+                json!({"light": 2}),
+                json!(["CORNER_RADIUS", "WIDTH_HEIGHT"]),
+                None,
+            ),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        for decl in [
+            "--gap: 4px;",
+            "--mixed: 4;",
+            "--any: 4;",
+            "--weight: 700;",
+            "--radius: 2px;",
+        ] {
+            assert!(out.css.contains(decl), "{decl}\n{}", out.css);
+        }
+        let r = reasons(&out);
+        // FONT_WEIGHT is unitless by nature: not reported.
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(
+            r[0].1.contains("[GAP, OPACITY] imply different units"),
+            "{r:?}"
+        );
+        assert!(r[1].1.contains("[ALL_SCOPES] don't say"), "{r:?}");
+    }
+
+    #[test]
+    fn typography_stroke_effect_are_px_and_opacity_is_percent() {
+        let float = |id: &str, name: &str, n: f64, scopes: Value| {
+            row(id, name, "FLOAT", json!({"light": n}), scopes, None)
+        };
+        let alias = |id: &str, name: &str, to: &str, scopes: Value| {
+            row(
+                id,
+                name,
+                "FLOAT",
+                json!({"light": {"type": "VARIABLE_ALIAS", "id": to}}),
+                scopes,
+                None,
+            )
+        };
+        let v = snap(vec![
+            float("V:01", "font/size", 16.0, json!(["FONT_SIZE"])),
+            float("V:02", "line", 24.0, json!(["LINE_HEIGHT"])),
+            float("V:03", "tracking", 0.5, json!(["LETTER_SPACING"])),
+            float(
+                "V:04",
+                "para",
+                8.0,
+                json!(["PARAGRAPH_SPACING", "PARAGRAPH_INDENT"]),
+            ),
+            float("V:05", "stroke", 1.0, json!(["STROKE_FLOAT"])),
+            float("V:06", "blur", 4.0, json!(["EFFECT_FLOAT"])),
+            float("V:07", "opacity", 50.0, json!(["OPACITY"])),
+            float("V:08", "weight", 700.0, json!(["FONT_WEIGHT"])),
+            float("V:09", "type/gap", 4.0, json!(["FONT_SIZE", "GAP"])),
+            float("V:10", "base", 2.0, json!(["ALL_SCOPES"])),
+            // A % alias of a unitless FLOAT keeps its unit; px → % can't.
+            alias("V:11", "fade", "V:10", json!(["OPACITY"])),
+            alias("V:12", "bad", "V:01", json!(["OPACITY"])),
+            alias("V:13", "body", "V:01", json!(["FONT_SIZE"])),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        for decl in [
+            "--font-size: 16px;",
+            "--line: 24px;",
+            "--tracking: 0.5px;",
+            "--para: 8px;",
+            "--stroke: 1px;",
+            "--blur: 4px;",
+            "--opacity: 50%;",
+            "--weight: 700;",
+            "--type-gap: 4px;",
+            "--base: 2;",
+            "--fade: calc(var(--base) * 1%);",
+            "--body: var(--font-size);",
+        ] {
+            assert!(out.css.contains(decl), "{decl}\n{}", out.css);
+        }
+        // px lengths outside spacing/radius get no Tailwind theme entry.
+        assert!(!out.css.contains("--spacing-type-gap"), "{}", out.css);
+        assert_eq!(
+            reasons(&out),
+            [
+                (
+                    "V:10",
+                    "FLOAT scopes [ALL_SCOPES] don't say what it measures — ambiguous unit: emitted unitless, no Tailwind theme entry"
+                ),
+                (
+                    "V:12",
+                    "% FLOAT aliases V:01, a px FLOAT: skipped (CSS cannot convert units)"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn mode_mapping_defaults_and_errors() {
         let mut a = row(
             "V:1",
             "a",
@@ -818,26 +1997,98 @@ mod tests {
             None,
         );
         let mut b = a.clone();
-        a["collection"] = json!("one");
+        a = in_collection(a, "one", "light");
         b["variable_id"] = json!("V:2");
         b["name"] = json!("b");
-        b["collection"] = json!("two");
+        b = in_collection(b, "two", "light");
         let v = snap(vec![a, b]);
-        let err = export_css(&v, &ExportOptions::default()).unwrap_err();
-        assert!(err.contains("pass --collection"), "{err}");
-        let ok = export_css(
+        // Two collections with a dark mode combine; neither overwrites.
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        assert!(
+            out.css
+                .contains("[data-theme=\"dark\"] {\n  --a: 2px;\n  --b: 2px;\n}"),
+            "{}",
+            out.css
+        );
+        assert_eq!(out.theme, None);
+        let out = export_css(&v, &modes(&[("two/dark", "[data-two=\"dark\"]")])).unwrap();
+        assert!(
+            out.css.contains("[data-two=\"dark\"] {\n  --b: 2px;\n}"),
+            "{}",
+            out.css
+        );
+        assert_eq!(out.theme.unwrap().collection, "one");
+        // Explicit root, swapped.
+        let out = export_css(
             &v,
-            &ExportOptions {
-                collection: Some("two".into()),
-                ..Default::default()
-            },
+            &modes(&[("one/dark", ":root"), ("one/light", ".light")]),
         )
         .unwrap();
-        assert_eq!(ok.theme.unwrap().collection, "two");
         assert!(
-            ok.css.contains("[data-theme=\"dark\"] {\n  --b: 2px;\n}"),
+            out.css.contains(":root {\n  --a: 2px;\n  --b: 1px;\n}"),
             "{}",
-            ok.css
+            out.css
+        );
+        assert!(out.css.contains(".light {\n  --a: 1px;\n}"), "{}", out.css);
+        // Leaving a mode out.
+        let out = export_css(&v, &modes(&[("one/dark", "")])).unwrap();
+        assert!(
+            out.css.contains("mode \"dark\" -> (not exported)"),
+            "{}",
+            out.css
+        );
+        for (pairs, needle) in [
+            (vec![("one/night", ".x")], "names no collection mode"),
+            (vec![("one/light", ".x")], "would be its :root mode"),
+            (
+                vec![("one/light", ":root"), ("one/dark", ":root")],
+                "several modes to \":root\"",
+            ),
+        ] {
+            let err = export_css(&v, &modes(&pairs)).unwrap_err();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    #[test]
+    fn other_modes_get_their_own_selectors_and_nest() {
+        let alias = |id: &str| json!({"type": "VARIABLE_ALIAS", "id": id});
+        let v = snap(vec![
+            in_collection(
+                row(
+                    "V:1",
+                    "space/card",
+                    "FLOAT",
+                    json!({"Comfortable": 24, "Compact": 12}),
+                    json!(["GAP"]),
+                    None,
+                ),
+                "Density",
+                "Comfortable",
+            ),
+            in_collection(
+                row(
+                    "V:2",
+                    "space/section",
+                    "FLOAT",
+                    json!({"Light": alias("V:1"), "Dark": 32}),
+                    json!(["GAP"]),
+                    None,
+                ),
+                "Theme",
+                "Light",
+            ),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        let expected = "\n:root {\n  --space-card: 24px;\n  --space-section: var(--space-card);\n}\n\
+             \n[data-density=\"compact\"] {\n  --space-card: 12px;\n  --space-section: var(--space-card);\n}\n\
+             \n[data-theme=\"dark\"] {\n  --space-section: 32px;\n}\n\
+             \n[data-theme=\"dark\"] [data-density=\"compact\"], [data-theme=\"dark\"][data-density=\"compact\"] {\n  --space-section: 32px;\n}\n";
+        assert!(out.css.contains(expected), "{}", out.css);
+        assert!(out.css.contains(" * theme: collection \"Density\": mode \"Comfortable\" -> :root, mode \"Compact\" -> [data-density=\"compact\"]\n"), "{}", out.css);
+        assert_eq!(
+            combined_selector(".a", "html.b"),
+            ".a html.b, .a:is(html.b)"
         );
     }
 
@@ -900,15 +2151,11 @@ mod tests {
             "{}",
             out.css
         );
-        let reasons: Vec<(&str, &str)> = out
-            .report
-            .iter()
-            .map(|r| (r.variable_id.as_str(), r.reason.as_str()))
-            .collect();
+        let reasons = reasons(&out);
         assert!(
             reasons.contains(&(
                 "V:4",
-                "unitless FLOAT aliases V:3, a px FLOAT: skipped (CSS cannot drop its unit)"
+                "% FLOAT aliases V:3, a px FLOAT: skipped (CSS cannot convert units)"
             )),
             "{reasons:?}"
         );
@@ -919,6 +2166,185 @@ mod tests {
         assert!(
             reasons.contains(&("V:6", "aliases V:1, a variable of another type: skipped")),
             "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn remote_aliases_are_reported_not_flattened() {
+        let v = snap(vec![
+            row(
+                "V:1",
+                "brand",
+                "COLOR",
+                json!({"light": {"type": "VARIABLE_ALIAS", "id": "VariableID:abc/1:2"}}),
+                json!([]),
+                None,
+            ),
+            row(
+                "V:2",
+                "action",
+                "COLOR",
+                json!({"light": {"type": "VARIABLE_ALIAS", "id": "V:1"}}),
+                json!([]),
+                None,
+            ),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        assert!(!out.css.contains("--brand") && !out.css.contains("--action"));
+        let r = reasons(&out);
+        assert!(
+            r[0].1
+                .starts_with("aliases VariableID:abc/1:2, which is not in the variable snapshot"),
+            "{r:?}"
+        );
+        assert!(r[0].1.contains("not flattened"), "{r:?}");
+        assert_eq!(r[1], ("V:2", "aliases V:1, which is not exported: skipped"));
+    }
+
+    #[test]
+    fn alias_cycles_are_found_including_mode_only_ones() {
+        let alias = |id: &str| json!({"type": "VARIABLE_ALIAS", "id": id});
+        let ink = json!({"r":0,"g":0,"b":0,"a":1});
+        let theme = |id: &str, name: &str, light: Value, dark: Value| {
+            in_collection(
+                row(
+                    id,
+                    name,
+                    "COLOR",
+                    json!({"Light": light, "Dark": dark}),
+                    json!([]),
+                    None,
+                ),
+                "Theme",
+                "Light",
+            )
+        };
+        let v = snap(vec![
+            // A cycle only in Dark.
+            theme("V:1", "a", ink.clone(), alias("V:2")),
+            theme("V:2", "b", alias("V:3"), alias("V:1")),
+            theme("V:3", "c", ink.clone(), ink.clone()),
+            // A loop in the union graph no single mode closes: no cycle.
+            theme("V:4", "d", alias("V:5"), ink.clone()),
+            theme("V:5", "e", ink.clone(), alias("V:4")),
+            // A self-alias, in every mode.
+            theme("V:6", "f", alias("V:6"), alias("V:6")),
+            // Aliasing a cycle member drops.
+            theme("V:7", "g", alias("V:1"), alias("V:1")),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        let r = reasons(&out);
+        assert_eq!(
+            r,
+            [
+                (
+                    "V:1",
+                    "is on an alias cycle --a -> --b -> --a only in some modes (first: \"Theme\" mode \"Dark\"): skipped"
+                ),
+                (
+                    "V:2",
+                    "is on an alias cycle --a -> --b -> --a only in some modes (first: \"Theme\" mode \"Dark\"): skipped"
+                ),
+                (
+                    "V:6",
+                    "is on an alias cycle --f -> --f in every mode: skipped"
+                ),
+                ("V:7", "aliases V:1, which is not exported: skipped"),
+            ]
+        );
+        assert!(out.css.contains("--d: var(--e);"), "{}", out.css);
+        assert!(out.css.contains("--e: var(--d);"), "{}", out.css);
+    }
+
+    /// Review: collections sharing a selector switch together, so a loop
+    /// closing only when one is Light and the other Dark is no cycle while
+    /// both darks are `[data-theme="dark"]` — but is once they are not.
+    #[test]
+    fn collections_sharing_a_selector_switch_together() {
+        let alias = |id: &str| json!({"type": "VARIABLE_ALIAS", "id": id});
+        let ink = json!({"r":0,"g":0,"b":0,"a":1});
+        let v = snap(vec![
+            in_collection(
+                row(
+                    "V:1",
+                    "a",
+                    "COLOR",
+                    json!({"Light": alias("V:2"), "Dark": ink.clone()}),
+                    json!([]),
+                    None,
+                ),
+                "Theme",
+                "Light",
+            ),
+            in_collection(
+                row(
+                    "V:2",
+                    "b",
+                    "COLOR",
+                    json!({"Light": ink, "Dark": alias("V:1")}),
+                    json!([]),
+                    None,
+                ),
+                "Surface",
+                "Light",
+            ),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        assert!(out.report.is_empty(), "{:?}", out.report);
+        assert!(
+            out.css
+                .contains("[data-theme=\"dark\"] {\n  --a: #000000;\n  --b: var(--a);\n}"),
+            "{}",
+            out.css
+        );
+        let out = export_css(&v, &modes(&[("Surface/Dark", ".surface-dark")])).unwrap();
+        let r = reasons(&out);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(
+            r[0].1.contains(
+                "only in some modes (first: \"Surface\" mode \"Dark\", \"Theme\" mode \"Light\")"
+            ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn cross_collection_mode_only_cycles_name_their_modes() {
+        let alias = |id: &str| json!({"type": "VARIABLE_ALIAS", "id": id});
+        let ink = json!({"r":0,"g":0,"b":0,"a":1});
+        let v = snap(vec![
+            in_collection(
+                row(
+                    "V:1",
+                    "a",
+                    "COLOR",
+                    json!({"Light": ink.clone(), "Dark": alias("V:2")}),
+                    json!([]),
+                    None,
+                ),
+                "Theme",
+                "Light",
+            ),
+            in_collection(
+                row(
+                    "V:2",
+                    "b",
+                    "COLOR",
+                    json!({"Acme": ink, "Globex": alias("V:1")}),
+                    json!([]),
+                    None,
+                ),
+                "Brand",
+                "Acme",
+            ),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        let r = reasons(&out);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(
+            r[0].1
+                .contains("(first: \"Brand\" mode \"Globex\", \"Theme\" mode \"Dark\")"),
+            "{r:?}"
         );
     }
 
@@ -965,6 +2391,86 @@ mod tests {
             "{}",
             out.css
         );
+    }
+
+    #[test]
+    fn diff_matches_declarations_by_block_and_name() {
+        let base = snap(vec![
+            row(
+                "V:1",
+                "a",
+                "COLOR",
+                json!({"light": {"r":0,"g":0,"b":0,"a":1}}),
+                json!([]),
+                None,
+            ),
+            row(
+                "V:2",
+                "b",
+                "COLOR",
+                json!({"light": {"r":1,"g":1,"b":1,"a":1}}),
+                json!([]),
+                None,
+            ),
+        ]);
+        let old = export_css(&base, &ExportOptions::default()).unwrap();
+        let same = diff(Some(&old.css), &old).unwrap();
+        assert_eq!(same.status, "up_to_date");
+        assert!(same.added.is_empty() && same.removed.is_empty() && same.changed.is_empty());
+
+        let mut next = base.clone();
+        next["variables"][0]["values_by_mode"]["light"] = json!({"r":1,"g":0,"b":0,"a":1});
+        next["variables"][1] = row(
+            "V:3",
+            "c",
+            "COLOR",
+            json!({"light": {"r":0,"g":0,"b":1,"a":1}}),
+            json!([]),
+            None,
+        );
+        next["snapshot"]["digest"] = json!("fnv1a64:1");
+        let new = export_css(&next, &ExportOptions::default()).unwrap();
+        let d = diff(Some(&old.css), &new).unwrap();
+        assert_eq!(d.status, "out_of_date");
+        assert!(d.header_changed);
+        let names = |xs: &[Decl]| {
+            xs.iter()
+                .map(|x| (x.block.clone(), x.name.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&d.added),
+            [
+                (":root".to_string(), "--c".to_string()),
+                ("@theme inline".to_string(), "--color-c".to_string())
+            ]
+        );
+        assert_eq!(d.added[0].variable_id.as_deref(), Some("V:3"));
+        assert_eq!(d.added[1].variable_id.as_deref(), Some("V:3"));
+        assert_eq!(names(&d.removed).len(), 2);
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(
+            (d.changed[0].from.as_str(), d.changed[0].to.as_str()),
+            ("#000000", "#ff0000")
+        );
+        assert_eq!(
+            d.summary(),
+            "2 added, 2 removed, 1 changed, header (snapshot provenance or mode mapping) changed"
+        );
+
+        let missing = diff(None, &new).unwrap();
+        assert_eq!(missing.status, "missing");
+        assert_eq!(missing.added.len(), 4);
+        assert!(diff(Some("a { b { c: d } }"), &new).is_err());
+        assert!(diff(Some("stray"), &new).is_err());
+    }
+
+    #[test]
+    fn strongly_connected_components() {
+        let adj = vec![vec![1], vec![2], vec![0], vec![3], vec![]];
+        let mut comps = strongly_connected(&adj);
+        comps.sort();
+        assert_eq!(comps, [vec![0, 1, 2], vec![3], vec![4]]);
     }
 
     #[test]

@@ -18,10 +18,14 @@ use crate::dispatch::{DEFAULT_SEARCH_LIMIT, ReadCommand};
 use crate::ident::{is_file_key, parse_file_ref};
 use crate::project::Layout;
 
+mod assets;
 mod auth;
 mod call;
+mod doctor;
 mod gitignore;
 mod images;
+mod init;
+mod map;
 mod migrate;
 mod pull;
 mod socket;
@@ -117,6 +121,22 @@ enum Cmd {
         #[arg(long, hide = true, conflicts_with_all = ["figmog_root", "files"])]
         background: bool,
     },
+    /// Set up this repository in one step: write `figmog.toml` (detecting
+    /// React and Tailwind), save the token, keep `.figmog/` out of Git,
+    /// move old mirrors to the shared root, register the MCP server for
+    /// Claude Code (`.mcp.json`), add figmog's block to `AGENTS.md`, and
+    /// run the first pull. Never prompts; safe to rerun.
+    Init(init::InitArgs),
+    /// Check the token, file access, the plan's variables access, the
+    /// desktop MCP connection, the MCP registration and the dev server.
+    /// Exits 1 when any check fails.
+    Doctor {
+        /// Figma desktop app's Dev Mode MCP server URL.
+        #[arg(long, default_value = crate::serve::DEFAULT_UPSTREAM_URL)]
+        upstream: String,
+    },
+    /// Print the project's settings (`figmog.toml` over defaults).
+    Settings,
     /// Move old per-checkout mirrors (`.figmog/<key>/`) into the shared
     /// mirror root (inside Git: `<git-common-dir>/figmog/`). Resumable;
     /// never overwrites an existing mirror; fails while a store is open.
@@ -234,6 +254,17 @@ enum Cmd {
         #[command(subcommand)]
         command: tokens::TokensCommand,
     },
+    /// The project's Figma → code component map (figmog.map.json).
+    Map {
+        #[command(subcommand)]
+        command: map::MapCommand,
+    },
+    /// Icons and images exported into the project (figmog.toml's
+    /// `[assets]`), with the manifest `figmog spec` references.
+    Assets {
+        #[command(subcommand)]
+        command: assets::AssetsCommand,
+    },
     /// Node counts by type and page, table totals, text-node count, max tree depth.
     Stats,
     /// Ancestor chain root→node for one id.
@@ -267,10 +298,20 @@ enum Cmd {
         #[arg(long)]
         y: f64,
     },
-    /// Binding-aware spec of an auto-layout subtree: layout and values,
-    /// each value as its bound token (with the `tokens export` CSS name)
-    /// or flagged untokenized; out-of-scope cases listed as unsupported.
-    Spec { id: String },
+    /// Code-ready spec of a subtree: per node the recorded design layout
+    /// and figmog's CSS interpretation, each value as its bound token
+    /// (with the `tokens export` CSS name) or flagged untokenized, text,
+    /// instances and assets; untranslatable cases listed as unsupported.
+    Spec {
+        id: String,
+        /// Add a Tailwind class hint per node (default in a project: on
+        /// when `[stack] styling` is `tailwind`; with --db: off).
+        #[arg(long, conflicts_with = "no_tailwind")]
+        tailwind: bool,
+        /// Leave the Tailwind class hint out.
+        #[arg(long)]
+        no_tailwind: bool,
+    },
     /// Download node renders and/or fill images to --out, caching by file version.
     ///
     /// With --db, export cached images only: stores do not record a file key.
@@ -344,6 +385,31 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     if let Cmd::Auth { command } = &cli.cmd {
         return auth::run(command);
     }
+    // `init` and `doctor` discover the project themselves: `init` may be
+    // creating its config, and `doctor` reports a malformed one as a check.
+    if let Cmd::Init(_) | Cmd::Doctor { .. } = &cli.cmd
+        && cli.db.is_some()
+    {
+        return Err("init and doctor work on the project and do not take --db".into());
+    }
+    if let Cmd::Init(args) = cli.cmd {
+        return write_json(&init::cmd_init(args, cli.no_socket)?);
+    }
+    if let Cmd::Doctor { upstream } = &cli.cmd {
+        let (report, failed) = doctor::cmd_doctor(upstream);
+        write_json(&report)?;
+        if failed {
+            let names: Vec<&str> = report["checks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| c["status"] == "fail")
+                .filter_map(|c| c["name"].as_str())
+                .collect();
+            return Err(format!("doctor: failed checks: {}", names.join(", ")));
+        }
+        return Ok(());
+    }
     // `serve` manages its own (possibly many) session stores via
     // `SessionManager` (`sessions.rs`) rather than the single `Db` every
     // other command resolves below — handled here, before `resolve_db`,
@@ -409,6 +475,35 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(_) => None,
         None => Some(Layout::discover_cwd()?),
     };
+
+    if let Cmd::Settings = &cli.cmd {
+        let Some(layout) = &layout else {
+            return Err("settings reads the project's figmog.toml and does not take --db".into());
+        };
+        return write_json(&init::cmd_settings(layout));
+    }
+
+    // `map` reads the project's figmog.map.json: no project, no map.
+    if let Cmd::Map { command } = &cli.cmd {
+        let Some(layout) = &layout else {
+            return Err(format!(
+                "map reads the project's {} and does not take --db",
+                crate::map::MAP_FILE
+            ));
+        };
+        if let map::MapCommand::Check = command {
+            return map::check(layout);
+        }
+    }
+
+    // `assets` writes into the project: no project, nowhere to write.
+    if let Cmd::Assets { .. } = &cli.cmd
+        && layout.is_none()
+    {
+        return Err(
+            "assets writes into the project's [assets] folders and does not take --db".into(),
+        );
+    }
 
     if let Cmd::Migrate { file } = &cli.cmd {
         let Some(layout) = &layout else {
@@ -483,7 +578,14 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 return write_json(&result?);
             }
         } else if let Some(read) = read_command(&cli.cmd) {
-            let (tool, tool_args) = read.to_tool_call();
+            // The file this read targets: what the socket call carries.
+            let target = with_current_file(read.to_tool_call().1, layout)?
+                .get("file")
+                .and_then(Value::as_str)
+                .and_then(parse_file_ref)
+                .or_else(|| crate::dispatch::infer_file_from_node_ref(&read.to_tool_call().1));
+            let (tool, tool_args) =
+                with_project_settings(read, Some(layout), target.as_deref())?.to_tool_call();
             let tool_args = with_current_file(tool_args, layout)?;
             if let Some(route) = route_for(root, layout, &tool_args, true)
                 && let Some(result) = socket::try_call(&route, tool, tool_args.clone())
@@ -502,7 +604,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 } else {
                     result
                 };
-                return write_read(&cli.cmd, &result);
+                return write_read(&cli.cmd, &result, Some(layout));
             }
         }
     }
@@ -558,6 +660,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             scale,
             out,
         } => images::cmd_images(&db, socket_root.as_ref(), ids, format, scale, out),
+        Cmd::Assets { command } => assets::run(&db, socket_root.as_ref(), &command),
         Cmd::Call {
             tool,
             args,
@@ -568,6 +671,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let Some(read) = read_command(&other) else {
                 unreachable!("every non-read command is handled above")
             };
+            let read = with_project_settings(read, db.layout.as_ref(), db.key.as_deref())?;
             // `open_store!`'s pipeline type contains fn items and can't be
             // named, so the store must be opened at this concrete call
             // site; the reader tuple itself is nameable (`RootReaders`), so
@@ -576,16 +680,76 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let st = db.open(|path| crate::open_store!(path))?;
             let result = st.rtx(|r| read.execute(&r))?;
             drop(st);
-            write_read(&other, &result)
+            write_read(&other, &result, db.layout.as_ref())
         }
     }
 }
 
+/// `figmog spec` names tokens exactly as the project's token file does:
+/// the project's `[tokens]` settings ride along as `figmog_spec`'s
+/// `tokens` argument (NWS-2948), and its `[stack] styling` turns on the
+/// Tailwind class hint (NWS-2947) unless `--tailwind`/`--no-tailwind`
+/// said otherwise; its `figmog.map.json`, when there is one, rides along
+/// as `map` (NWS-2949) — an invalid map fails the command — and its asset
+/// manifest (`[assets] manifest`), when there is one, as `assets`
+/// (NWS-2952), likewise, for the file `target` (its icons match by node id
+/// only when they were exported from that file). With `--db` (no
+/// project): the defaults, no hint, no map, no manifest.
+fn with_project_settings(
+    read: ReadCommand,
+    layout: Option<&Layout>,
+    target: Option<&str>,
+) -> Result<ReadCommand, String> {
+    Ok(match read {
+        ReadCommand::Spec {
+            id,
+            tokens,
+            tailwind,
+            map,
+            assets,
+        } => {
+            let settings = layout.map(Layout::settings);
+            let map = match (map, layout) {
+                (Some(map), _) => Some(map),
+                (None, Some(layout)) => crate::map::CodeMap::load(&layout.project_root)?,
+                (None, None) => None,
+            };
+            let assets = match (assets, layout, &settings) {
+                (Some(assets), _, _) => Some(assets),
+                (None, Some(layout), Some(settings)) => crate::assets::AssetIndex::load(
+                    &layout.project_root,
+                    &settings.assets.manifest,
+                )?
+                .map(|index| index.for_file(target)),
+                _ => None,
+            };
+            ReadCommand::Spec {
+                id,
+                tokens: tokens.or_else(|| settings.as_ref().map(|s| s.tokens.export_options())),
+                tailwind: tailwind.or_else(|| {
+                    settings
+                        .as_ref()
+                        .map(|s| s.stack.styling == crate::project::Styling::Tailwind)
+                }),
+                map,
+                assets,
+            }
+        }
+        other => other,
+    })
+}
+
 /// Print a read command's result: JSON for every read, except `tokens`,
-/// which renders its `figmog_vars` read as CSS (NWS-2967).
-fn write_read(cmd: &Cmd, result: &Value) -> Result<(), String> {
+/// which renders its `figmog_vars` read as CSS and compares it with the
+/// project's token file (NWS-2967, NWS-2948), and `map coverage`, which
+/// compares its `figmog_components` read with the project's map (NWS-2949).
+fn write_read(cmd: &Cmd, result: &Value, layout: Option<&Layout>) -> Result<(), String> {
     match cmd {
-        Cmd::Tokens { command } => tokens::write_export(command, result),
+        Cmd::Tokens { command } => tokens::run(command, result, layout),
+        Cmd::Map { .. } => match layout {
+            Some(layout) => map::run_coverage(result, layout),
+            None => unreachable!("`map` without a project fails before any read"),
+        },
         _ => write_json(result),
     }
 }
@@ -731,8 +895,8 @@ fn strip_routed_status_fields(mut result: Value) -> Value {
 /// produces byte-identical results to the direct-open path (spec §6a).
 /// `None` for every other command: the writers `pull` and
 /// `import-variables` route as serve operations (NWS-2963, in `dispatch`);
-/// `serve`/`tools`/`call`/`images` are each handled at their own call
-/// sites.
+/// `serve`/`tools`/`call`/`images`/`assets` are each handled at their own
+/// call sites.
 fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
     Some(match cmd {
         Cmd::Status => ReadCommand::Status,
@@ -815,8 +979,23 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
             under: under.clone(),
         },
         Cmd::At { x, y } => ReadCommand::At { x: *x, y: *y },
-        Cmd::Spec { id } => ReadCommand::Spec { id: id.clone() },
+        Cmd::Spec {
+            id,
+            tailwind,
+            no_tailwind,
+        } => ReadCommand::Spec {
+            id: id.clone(),
+            tokens: None,
+            tailwind: match (tailwind, no_tailwind) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+            map: None,
+            assets: None,
+        },
         Cmd::Tokens { .. } => tokens::read(),
+        Cmd::Map { .. } => map::read(),
         Cmd::Version
         | Cmd::Auth { .. }
         | Cmd::Pull { .. }
@@ -825,7 +1004,11 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
         | Cmd::Call { .. }
         | Cmd::ImportVariables { .. }
         | Cmd::Images { .. }
-        | Cmd::Migrate { .. } => return None,
+        | Cmd::Assets { .. }
+        | Cmd::Migrate { .. }
+        | Cmd::Init(_)
+        | Cmd::Doctor { .. }
+        | Cmd::Settings => return None,
     })
 }
 
@@ -1325,6 +1508,16 @@ mod tests {
                 json!({"x": 1.5, "y": 2.0}),
             ),
             (&["spec", "1:1"], "figmog_spec", json!({"id": "1:1"})),
+            (
+                &["spec", "1:1", "--tailwind"],
+                "figmog_spec",
+                json!({"id": "1:1", "tailwind": true}),
+            ),
+            (
+                &["spec", "1:1", "--no-tailwind"],
+                "figmog_spec",
+                json!({"id": "1:1", "tailwind": false}),
+            ),
         ];
         for (argv, tool, want) in cases {
             let cli =
@@ -1342,6 +1535,7 @@ mod tests {
             &["pull"][..],
             &["call", "figmog_status"],
             &["images", "1:1"],
+            &["assets", "export", "--icons", "1:1"],
         ] {
             let cli =
                 Cli::try_parse_from(std::iter::once("figmog").chain(argv.iter().copied())).unwrap();

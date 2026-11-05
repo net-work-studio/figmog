@@ -87,6 +87,41 @@ desktop server's tools are forwarded — Figma's remote MCP server is not.
 Keep both connections and the agent sees two overlapping Figma
 servers, then picks tools badly.
 
+### Or: set up a React + Tailwind repository in one step
+
+```console
+$ cd my-app
+$ figmog init --file "https://www.figma.com/design/<key>/<name>"
+$ figmog doctor
+```
+
+`init` detects React (`react` in `package.json`) and Tailwind (a
+`tailwind.config.*` file, or a `tailwindcss` / `@tailwindcss/vite` /
+`@tailwindcss/postcss` dependency), writes `figmog.toml`, keeps `.figmog/`
+and `figmog.local.toml` out of Git, moves mirrors from older versions into
+the shared location, registers figmog for Claude Code in the project's
+`.mcp.json`, adds a short figmog section to `AGENTS.md` (between
+`<!-- figmog:begin -->`-style markers, replaced on rerun), and runs the
+first pull. It never prompts: pipe a token to `--token-stdin` to save it,
+use `--framework react` / `--styling tailwind` when detection can't tell,
+`--from-file` to pull a saved response offline, `--no-pull` to skip the
+pull. Rerunning it changes nothing that is already set up; it only adds
+the `figmog.toml` tables that are missing and never edits one you have.
+In a monorepo, running it in a package with its own `package.json`
+(say `apps/web`) and no `figmog.toml` above makes that package the
+project: run figmog commands, and your agent, from there. The first pull
+follows a `figmog.local.toml` override of `[files] default`, but what init
+commits (`figmog.toml`, `AGENTS.md`) never includes your local overrides.
+`.mcp.json` runs `figmog serve` from your `PATH` (`--mcp-command <path>`
+names another binary); Claude Code asks you to approve the project's
+server the first time.
+
+`figmog doctor` checks the token, access to the file, whether your plan
+has the Variables REST API, the Figma desktop app's MCP server, the
+`.mcp.json` registration and your dev server. Each check prints `ok`,
+`warn` or `fail`; offline checks warn instead of hanging, and the command
+exits 1 only when a check fails.
+
 ### 4. Ask for something
 
 > Using figmog, pull this file: [figma file URL], then build this frame in
@@ -119,18 +154,38 @@ else the Git top level, else the current directory. A project can name the
 Figma file(s) it mirrors:
 
 ```toml
-# figmog.toml — commit this
+# figmog.toml — commit this (`figmog init` writes it)
 [files]
-default = "https://www.figma.com/design/<key>/<name>"   # or a bare file key
-# design-system = "<key-or-url>"                        # named entries (reserved)
+default = "https://www.figma.com/design/<key>/<name>"   # the product file
+library = "<key-or-url>"                                 # optional: tokens and components
+
+[stack]
+framework = "react"                # v1: react
+styling = "tailwind"               # v1: tailwind
+tokens = "src/figmog-tokens.css"   # token file, relative to the project
+
+[inspector]
+enabled = true                     # in development builds only
+shortcut = "Alt+Shift+F"
+
+[verify]
+loop = true
+dev_server = "http://localhost:5173"   # local addresses only
+threshold = 95                         # advisory match score, 0-100
 ```
 
-`default` is the file every command uses when you don't pass one; without
-it, `.figmog/current` (the last pulled file) still applies. A
-`figmog.local.toml` beside it, in the same format, overrides entries for
-your machine only. Other tables and keys are ignored, so later settings
-won't break older binaries. A malformed file is an error naming the file
-and line (`figmog.toml:3: ...`).
+Every key is optional; the values above are the defaults. `default` is
+the file every command uses when you don't pass one; without it,
+`.figmog/current` (the last pulled file) still applies. A
+`figmog.local.toml` beside it, in the same format, overrides single keys
+for your machine only (say, another `dev_server` port). `figmog settings`
+prints the result as JSON, defaults filled in. Verification always uses
+1440 px and 390 px wide viewports, light mode and the default state.
+Other tables, and keys figmog doesn't know inside these tables (with
+values of any shape, arrays and multi-line strings included), are ignored
+(`figmog doctor` lists the unknown ones), so later settings won't break
+older binaries. A malformed file — or a known key with a wrong type or
+value — is an error naming the file and line (`figmog.toml:3: ...`).
 
 Inside Git, mirrors live in the repository's Git directory,
 `<git-common-dir>/figmog/<key>/db` (for example `.git/figmog/`), shared by
@@ -279,24 +334,108 @@ file is rejected and the last good snapshot kept. `figmog vars --snapshot`
 and `figmog status` report the snapshot's state and provenance. See
 `docs/SPEC.md` §9.
 
-`figmog tokens export [--out tokens.css]` turns the imported snapshot into
-one CSS file: custom properties for the default modes, one collection's
-light/dark modes as `:root` and `[data-theme="dark"]`, and a Tailwind v4
-`@theme` (`@theme inline` for aliases), so `bg-brand` or `p-card` follow the
-theme. Names come from each variable's WEB code syntax, else its kebab-cased
-path; a name collision is an error. See `docs/SPEC.md` §9 "Token export".
+`figmog tokens export` turns the imported snapshot into one CSS file,
+written to `[stack] tokens` in `figmog.toml` (or `--out`, or `--stdout`):
+custom properties for every collection's root mode, one block per other
+mode (light/dark become `:root` and `[data-theme="dark"]`, other modes such
+as brand or density their own selectors, configurable in `[tokens.modes]`),
+and, in the default `tailwind` format, a Tailwind v4 `@theme` (`@theme
+inline` for aliases), so `bg-brand` or `p-card` follow every mode, nested
+or not. Aliases stay `var()` references; names come from each variable's
+WEB code syntax, else its kebab-cased path; a name collision, cycle or
+unresolved remote alias is never silently papered over; FLOAT units come
+from the variable's scopes (px, `%` for opacity). `--format css`
+writes plain CSS variables. `figmog tokens diff` lists the tokens added,
+removed or changed since the committed file, and `figmog tokens check`
+exits 1 in CI unless the committed file matches the last published
+snapshot byte for byte (it prints that snapshot's provenance; it does not
+look at the live Figma file, and a re-import with new provenance but the
+same values counts as stale until you re-export). `export` refuses to
+overwrite a file it didn't generate unless `--force`, and never writes
+through a symlink. See `docs/SPEC.md` §9 "Token export, diff and check".
 
 ### A spec of one component
 
-`figmog spec <node>` (tool `figmog_spec`) describes an auto-layout card the
-way you rebuild it: direction, gap, padding, alignment and hug/fill/fixed
-sizing for every frame, and fill, stroke, radius and typography for every
-layer. Each value is shown as the variable token it is bound to, with the
-CSS name `figmog tokens export` gives it and the raw value beside it. An
-unbound value is flagged as untokenized, and named "matches X" when it
-equals a token's light/default value. Grid layout, absolutely positioned
-children, mixed text runs, gradients and the like are listed under
+`figmog spec <node>` (tool `figmog_spec`) describes a subtree the way you
+build it. For every node it gives two layers: `design`, the layout Figma
+recorded (auto layout, grid, sizing, constraints, min/max sizes, clipping,
+text auto-resize), and figmog's interpretation of it: layout and values
+(gap, padding, alignment, hug/fill/fixed sizing, grid tracks, fill,
+stroke, radius, effects, opacity, typography) and the CSS declarations
+they become (flex or CSS grid, constraints as absolute offsets). Each value
+is shown as the variable token it is bound to, with the CSS name
+`figmog tokens export` gives it and the raw value beside it. An unbound
+value is flagged as untokenized, and named "matches X" when it equals a
+token's light/default value — it never counts as using that token.
+Text nodes carry their text and mixed-style runs, instances their
+component and variant properties, and image fills and vector icons are
+referenced as assets by node id and `imageRef` — or, once `figmog assets
+export` has run, by the exported file and icon component (`<IconArrowRight
+/>`). In a project whose
+`[stack] styling` is `tailwind`, each node also gets a Tailwind class hint
+(`--tailwind` / `--no-tailwind` override it). Whatever has no exact CSS
+equivalent — a rotated layer, a gradient, a blur — is listed under
 `unsupported` instead of being guessed. See `docs/SPEC.md` §17.
+
+### Mapping Figma components to code
+
+A committed `figmog.map.json` at the project root links Figma components
+to the code components that implement them, so the spec can say "use
+`<PricingCard tier="pro" />`" instead of describing rectangles:
+
+```json
+{
+  "version": 1,
+  "components": [
+    {
+      "figma": {"component_set": "<key from figmog components>"},
+      "code": {"path": "src/components/PricingCard.tsx", "export": "PricingCard"},
+      "props": {"Tier": {"prop": "tier", "values": {"Free": "free", "Pro": "pro"}}}
+    }
+  ]
+}
+```
+
+Each instance of a mapped component then carries `code_component` in
+`figmog spec`: the import path, export, mapped props and a JSX rendering.
+The mapping is marked `partial`, with the reasons listed, whenever the
+instance has something the map can't express — a property without a
+prop, a hand-made text override, a nested instance swapped by hand or to
+a component that isn't mapped (a swap to a mapped component renders as
+that component, e.g. `icon={<StarIcon />}`), slot content.
+`figmog map check` validates the file; `figmog map coverage` compares it
+with the project's default mirror (the same one `figmog components`
+reads) and lists Figma components with no entry, entries whose component
+isn't in that mirror, and mapped code files that don't exist. See
+`docs/SPEC.md` §18.
+
+### Icons and images in the codebase
+
+`figmog assets export --icons <icon set or page> --images <frame>` writes
+icons as sanitized SVG plus React components (`<IconArrowRight />`, with
+per-instance gradient/mask/clip ids via `useId`) and image fills as files
+named by their content hash, into the folders `[assets]` in `figmog.toml`
+names (defaults `src/icons` and `public/figma`), plus a manifest
+(`figmog.assets.json`) that `figmog spec` then references. Single-color
+icons can follow the text color (`current_color = true`; multicolor icons
+keep theirs). Names and SVG markup from the file are treated as untrusted:
+names are reduced to safe identifiers, SVG goes through an allowlist
+sanitizer (no scripts, event handlers or external references), nothing is
+written outside those folders or through a symlink, and files figmog
+didn't generate are never overwritten without `--force`. A plain `figmog
+assets export` repeats the last export, and re-exporting an unchanged file
+changes no files. Renders and fills come from `figmog images`'s cache, so
+only cache misses spend Figma API budget. See `docs/SPEC.md` §19.
+
+```toml
+[assets]
+icons = "src/icons"
+images = "public/figma"
+manifest = "figmog.assets.json"
+prefix = "Icon"
+current_color = false   # opt-in, single-color icons only
+components = "tsx"      # or "jsx"
+```
 
 ### The vertical slice example
 

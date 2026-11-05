@@ -326,6 +326,66 @@ fn slow_image_download_does_not_delay_local_reads_and_answers_its_requester() {
     server.join().unwrap().unwrap();
 }
 
+/// NWS-2952: `renders: false` fetches a node's image fills without a
+/// render request; the default still renders.
+#[test]
+fn images_without_renders_fetch_fills_only() {
+    let mut h = Harness::new();
+    *h.api.response.lock().unwrap() = Ok(json!({
+        "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T12:00:00Z",
+        "document": {"id": "0:0", "name": "Doc", "type": "DOCUMENT", "children": [
+            {"id": "0:1", "name": "Page", "type": "CANVAS", "children": [
+                {"id": "1:1", "name": "Photo", "type": "RECTANGLE",
+                 "fills": [{"type": "IMAGE", "imageRef": "feed01"}], "children": []}
+            ]}
+        ]}
+    }));
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    let (answers_tx, answers_rx) = mpsc::channel();
+    let ids = vec!["1:1".to_string()];
+    for renders in [false, true] {
+        let answers = answers_tx.clone();
+        h.manager.sessions[0]
+            .images(
+                &ids,
+                "png",
+                None,
+                renders,
+                Box::new(move |result| {
+                    let kinds = result.map(|items| {
+                        items
+                            .iter()
+                            .map(|item| item.kind)
+                            .collect::<Vec<&'static str>>()
+                    });
+                    answers.send(kinds).unwrap();
+                }),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let kinds = loop {
+            h.manager.sessions[0].maintain(true);
+            if let Ok(answer) = answers_rx.try_recv() {
+                break answer.unwrap();
+            }
+            assert!(Instant::now() < deadline, "no images answer");
+            std::thread::yield_now();
+        };
+        let rendered = h.api.renders.load(Ordering::Relaxed);
+        if renders {
+            assert_eq!(kinds, ["render", "fill"]);
+            assert_eq!(rendered, 1, "the default renders");
+        } else {
+            assert_eq!(kinds, ["fill"]);
+            assert_eq!(rendered, 0, "renders: false made a render request");
+        }
+    }
+    assert_eq!(h.api.fills.load(Ordering::Relaxed), 2);
+}
+
 #[test]
 fn a_pull_taking_the_worker_answers_queued_images_busy() {
     let mut h = mirrored_harness();
@@ -341,12 +401,16 @@ fn a_pull_taking_the_worker_answers_queued_images_busy() {
     };
     let session = &mut h.manager.sessions[0];
     let ids = vec!["0:0".to_string()];
-    session.images(&ids, "png", None, reply("first")).unwrap();
+    session
+        .images(&ids, "png", None, true, reply("first"))
+        .unwrap();
     assert_eq!(
         h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
         "render"
     );
-    session.images(&ids, "png", None, reply("queued")).unwrap();
+    session
+        .images(&ids, "png", None, true, reply("queued"))
+        .unwrap();
     // A pull requested meanwhile waits for the worker, then takes it.
     let accepted = session.request_pull(false, Duration::from_secs(3600));
     assert_eq!(accepted["state"], "queued");
@@ -487,14 +551,18 @@ fn a_poll_due_during_images_gets_the_worker_before_queued_images() {
     let hour = Duration::from_secs(3600);
     let ids = vec!["0:0".to_string()];
     let session = &mut h.manager.sessions[0];
-    session.images(&ids, "png", None, reply("first")).unwrap();
+    session
+        .images(&ids, "png", None, true, reply("first"))
+        .unwrap();
     assert_eq!(
         h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
         "render"
     );
     // The scheduler's visit finds the worker busy with images...
     assert!(!session.poll_at(hour, Instant::now()));
-    session.images(&ids, "png", None, reply("second")).unwrap();
+    session
+        .images(&ids, "png", None, true, reply("second"))
+        .unwrap();
     h.release.send(()).unwrap();
     assert_eq!(
         answers.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -545,12 +613,16 @@ fn no_watch_images_do_not_dispatch_a_due_watch_retry() {
     };
     let ids = vec!["0:0".to_string()];
     let session = &mut h.manager.sessions[0];
-    session.images(&ids, "png", None, reply("first")).unwrap();
+    session
+        .images(&ids, "png", None, true, reply("first"))
+        .unwrap();
     assert_eq!(
         h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
         "render"
     );
-    session.images(&ids, "png", None, reply("second")).unwrap();
+    session
+        .images(&ids, "png", None, true, reply("second"))
+        .unwrap();
     h.release.send(()).unwrap();
     assert_eq!(
         answers.recv_timeout(Duration::from_secs(5)).unwrap(),

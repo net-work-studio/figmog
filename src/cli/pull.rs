@@ -41,6 +41,18 @@ pub(super) fn cmd_pull(
     fresh: bool,
     geometry: bool,
 ) -> Result<(), String> {
+    let churn = pull_direct(db, file, from_file, fresh, geometry)?;
+    finish_pull(db, &churn)
+}
+
+/// [`do_pull`] with `cmd_pull`'s error wording; the churn as JSON.
+fn pull_direct(
+    db: &Db,
+    file: Option<String>,
+    from_file: Option<PathBuf>,
+    fresh: bool,
+    geometry: bool,
+) -> Result<Value, String> {
     let (churn, _name, _version) = do_pull(db, file, from_file, fresh, geometry).map_err(|e| {
         let message = e.to_string();
         // A reachable serve already took this pull (NWS-2963,
@@ -58,10 +70,7 @@ pub(super) fn cmd_pull(
             message
         }
     })?;
-    finish_pull(
-        db,
-        &serde_json::to_value(&churn).map_err(|e| e.to_string())?,
-    )
+    serde_json::to_value(&churn).map_err(|e| e.to_string())
 }
 
 /// `figmog pull` through the running serve that owns the store (NWS-2963):
@@ -79,6 +88,20 @@ pub(super) fn cmd_pull_routed(
     fresh: bool,
     geometry: bool,
 ) -> Result<(), String> {
+    let churn = pull_routed(db, key, route, client, from_file, fresh, geometry)?;
+    finish_pull(db, &churn)
+}
+
+/// The routed half of [`cmd_pull_routed`]: the churn, nothing printed.
+fn pull_routed(
+    db: &Db,
+    key: &str,
+    route: &super::socket::Route,
+    client: super::socket::Client,
+    from_file: Option<PathBuf>,
+    fresh: bool,
+    geometry: bool,
+) -> Result<Value, String> {
     let mut args = serde_json::json!({"file": key, "fresh": fresh, "geometry": geometry});
     if let Some(path) = from_file {
         args["from_file"] = read_saved_response(&path)?;
@@ -87,7 +110,38 @@ pub(super) fn cmd_pull_routed(
     if let Some(layout) = &db.layout {
         write_current(&layout.local_root, key)?;
     }
-    finish_pull(db, &done["result"])
+    Ok(done["result"].clone())
+}
+
+/// The first pull `figmog init` runs (NWS-2946) into `key`'s active store:
+/// through a running serve when its socket answers, else direct — exactly
+/// as `figmog pull <key> [--from-file]` would, minus the printing and the
+/// `.gitignore` step (`init` does its own). With `no_socket` (the global
+/// `--no-socket`) no socket is discovered or contacted: always direct.
+/// Returns the churn.
+pub(super) fn pull_for_init(
+    layout: &crate::project::Layout,
+    key: &str,
+    from_file: Option<PathBuf>,
+    no_socket: bool,
+) -> Result<Value, String> {
+    super::check_key(key)?;
+    let store = layout.active_store(key)?;
+    let db = Db {
+        path: store.path,
+        key: Some(key.to_string()),
+        layout: Some(layout.clone()),
+    };
+    if !no_socket {
+        let mut route = super::socket::Route::new(layout);
+        if layout.legacy_store(key, &db.path).is_some() {
+            route = route.local_only();
+        }
+        if let Some(client) = super::socket::connect(&route) {
+            return pull_routed(&db, key, &route, client?, from_file, false, false);
+        }
+    }
+    pull_direct(&db, None, from_file, false, false)
 }
 
 /// After a successful pull (either path): keep `.figmog/` ignored, then

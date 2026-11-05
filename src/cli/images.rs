@@ -107,9 +107,9 @@ pub(super) fn cmd_images(
 /// from a socket-routed tool response's own manifest text block); `data`
 /// is the bytes to write to disk when this invocation actually has them.
 #[derive(Debug)]
-struct Fetched {
-    entry: Value,
-    data: Option<Vec<u8>>,
+pub(super) struct Fetched {
+    pub(super) entry: Value,
+    pub(super) data: Option<Vec<u8>>,
 }
 
 fn fetch_direct(
@@ -172,7 +172,7 @@ fn fetch_direct(
 /// as its manifest row, matched by that tag rather than by position (an
 /// oversized item's block is `text`, not `image`, at whatever position it
 /// falls — see `images::to_mcp_content`).
-fn from_socket_result(result: Value) -> Result<Vec<Fetched>, String> {
+pub(super) fn from_socket_result(result: Value) -> Result<Vec<Fetched>, String> {
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
         let msg = result["content"][0]["text"]
             .as_str()
