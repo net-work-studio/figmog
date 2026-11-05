@@ -399,3 +399,51 @@ fn assert_deep_equals_match(mut rows: serde_json::Value) {
     }
     assert!(value.is_null());
 }
+
+#[test]
+fn deep_equals_survives_current_mirror_routing_without_a_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("fixture.json");
+    std::fs::write(
+        &response,
+        serde_json::json!({
+            "name": "Routing", "version": "1", "lastModified": "now",
+            "document": {"id": "0:0", "type": "DOCUMENT"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    common::command()
+        .current_dir(dir.path())
+        .args(["pull", "SyntheticFileKey123", "--from-file"])
+        .arg(&response)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".figmog/current"))
+            .unwrap()
+            .trim(),
+        "SyntheticFileKey123"
+    );
+    // Keep this compact deep argument below the OS's per-argument size limit.
+    let equals = format!("{}null{}", r#"{"":["#.repeat(15_000), "]}".repeat(15_000));
+    for no_socket in [true, false] {
+        let mut command = common::command();
+        command.current_dir(dir.path());
+        if no_socket {
+            command.arg("--no-socket");
+        }
+        let output = command
+            .args(["where", "--pointer", "/id", "--equals", &equals])
+            .output()
+            .expect("launch CLI");
+        assert!(
+            output.status.success(),
+            "{:?}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(rows, serde_json::json!([]));
+    }
+}

@@ -826,6 +826,101 @@ fn desktop_results() -> Vec<Value> {
 }
 
 #[test]
+fn serve_forwards_deep_arguments_to_http_desktop_without_recursive_copies() {
+    let (_dir, db) = common::fixture_db();
+    let payload = format!(
+        "{}null{}",
+        r#"{"layer":["#.repeat(30_000),
+        "]}".repeat(30_000)
+    );
+    let expected_payload = payload.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}/mcp", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let peer = std::thread::spawn(move || {
+        for method in [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "tools/call",
+        ] {
+            let deadline = Instant::now() + TIMEOUT;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "waiting for {method}");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let body = read_request(&mut stream);
+            // Check the entire payload byte-for-byte without constructing a
+            // recursive Value in the test peer, then inspect the shallow frame.
+            let body = if method == "tools/call" {
+                assert_eq!(body.matches(&expected_payload).count(), 1);
+                body.replacen(&expected_payload, "null", 1)
+            } else {
+                body
+            };
+            let request: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(request["method"], method);
+            let result = match method {
+                "initialize" => json!({
+                    "protocolVersion":"2025-06-18", "capabilities":{},
+                    "serverInfo":{"name":"synthetic-desktop", "version":"1"}
+                }),
+                "notifications/initialized" => {
+                    write_response(&mut stream, "202 Accepted", &[], "");
+                    continue;
+                }
+                "tools/list" => json!({"tools":[{
+                    "name":"get_code", "description":"Synthetic deep argument probe",
+                    "inputSchema":{"type":"object"}
+                }]}),
+                "tools/call" => {
+                    assert_eq!(request["params"]["name"], "get_code");
+                    assert_eq!(request["params"]["arguments"], json!({"payload":null}));
+                    json!({"content":[{"type":"text", "text":"received deep payload"}], "isError":false})
+                }
+                _ => unreachable!(),
+            };
+            let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":result});
+            write_response(
+                &mut stream,
+                "200 OK",
+                &[("Content-Type", "application/json")],
+                &response.to_string(),
+            );
+        }
+    });
+    let (mut guard, mut stdin, rx) = spawn_serve_with_args(&db, &["--upstream", &address]);
+    handshake(&mut stdin, &rx);
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_code","arguments":{{"payload":{payload}}}}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let response = recv(&rx);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(
+        response["result"]["content"][0]["text"],
+        "received deep payload"
+    );
+    // The same serve process must remain available for its local mirror.
+    let status = call(&mut stdin, &rx, 3, "figmog_status", json!({}));
+    assert_eq!(result_json(&status)["nodes"], 12);
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    peer.join().unwrap();
+}
+
+#[test]
 fn direct_cli_desktop_proxy_ignores_legacy_cache_and_observes_context_changes() {
     let (_dir, db) = common::fixture_db();
     let legacy =

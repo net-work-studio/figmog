@@ -857,7 +857,10 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
         Cmd::Call { tool, args, .. } if is_per_file_local_tool(tool) => {
             requested_file(&call::parse_args(args.as_deref())?)
         }
-        cmd => cmd_as_tool_call(cmd).and_then(|(_, args)| requested_file(&args)),
+        cmd => cmd_as_tool_call(cmd).and_then(|(_, args)| {
+            let args = crate::deep_json::OwnedValue(args);
+            requested_file(&args)
+        }),
     };
     let key = match file {
         Some(file) => {
@@ -1119,6 +1122,28 @@ mod tests {
     }
 
     // ---- socket-routing helpers (review C1/C2/m1 fix round) ----
+
+    #[test]
+    fn resolve_db_safely_discards_deep_equals_arguments() {
+        crate::test_support::small_stack(|| {
+            let equals = format!("{}null{}", r#"{"":["#.repeat(15_000), "]}".repeat(15_000));
+            let cli = Cli::try_parse_from([
+                "figmog",
+                "--no-socket",
+                "where",
+                "--pointer",
+                "/id",
+                "--equals",
+                &equals,
+                "--under",
+                "https://www.figma.com/file/SyntheticFileKey123/Test?node-id=0-0",
+            ])
+            .unwrap();
+            let db = resolve_db(&cli).unwrap();
+            assert_eq!(db.key.as_deref(), Some("SyntheticFileKey123"));
+            assert_eq!(db.path, PathBuf::from(".figmog/SyntheticFileKey123/db"));
+        });
+    }
 
     #[test]
     fn strip_null_options_preserves_literal_null_equality() {
