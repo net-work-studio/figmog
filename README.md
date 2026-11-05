@@ -334,12 +334,21 @@ file is rejected and the last good snapshot kept. `figmog vars --snapshot`
 and `figmog status` report the snapshot's state and provenance. See
 `docs/SPEC.md` §9.
 
-`figmog tokens export [--out tokens.css]` turns the imported snapshot into
-one CSS file: custom properties for the default modes, one collection's
-light/dark modes as `:root` and `[data-theme="dark"]`, and a Tailwind v4
-`@theme` (`@theme inline` for aliases), so `bg-brand` or `p-card` follow the
-theme. Names come from each variable's WEB code syntax, else its kebab-cased
-path; a name collision is an error. See `docs/SPEC.md` §9 "Token export".
+`figmog tokens export` turns the imported snapshot into one CSS file,
+written to `[stack] tokens` in `figmog.toml` (or `--out`, or `--stdout`):
+custom properties for every collection's root mode, one block per other
+mode (light/dark become `:root` and `[data-theme="dark"]`, other modes such
+as brand or density their own selectors, configurable in `[tokens.modes]`),
+and, in the default `tailwind` format, a Tailwind v4 `@theme` (`@theme
+inline` for aliases), so `bg-brand` or `p-card` follow every mode, nested
+or not. Aliases stay `var()` references; names come from each variable's
+WEB code syntax, else its kebab-cased path; a name collision, cycle or
+unresolved remote alias is never silently papered over. `--format css`
+writes plain CSS variables. `figmog tokens diff` lists the tokens added,
+removed or changed since the committed file, and `figmog tokens check`
+exits 1 in CI unless the committed file matches the last published
+snapshot (it prints that snapshot's provenance; it does not look at the
+live Figma file). See `docs/SPEC.md` §9 "Token export, diff and check".
 
 ### A spec of one component
 

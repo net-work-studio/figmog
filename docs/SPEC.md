@@ -1198,75 +1198,134 @@ legacy snapshot — plus the variable's `scopes` and its collection's
 `--snapshot`/`snapshot: true` the result stays the plain row array; with
 it, `{snapshot, variables}`.
 
-### Token export (NWS-2967)
+### Token export, diff and check (NWS-2967, NWS-2948)
 
-`figmog tokens export [--out <path>] [--collection <name>] [--light-mode
-<mode>] [--dark-mode <mode>]` renders the variable snapshot as one CSS
-file (`src/tokens.rs`, pure; the CLI half is `src/cli/tokens.rs`).
+`figmog tokens export [--out <path> | --stdout] [--format tailwind|css]
+[--mode <collection>/<mode>=<selector>]...` renders the variable snapshot
+as one CSS file; `figmog tokens diff [--file <path>]` and `figmog tokens
+check [--file <path>]` (same `--format`/`--mode`) compare a committed file
+with that rendering. The renderer and comparison are pure
+(`src/tokens.rs`); the CLI half is `src/cli/tokens.rs`. DTCG JSON and
+TypeScript output are out of v1 scope.
 
-**How it reads.** It is not a new read tool: the CLI maps it to the
+**How it reads.** None is a new read tool: the CLI maps each to the
 existing `figmog_vars {snapshot: true}` read (`ReadCommand::Vars`), so it
 is socket-routed to a running serve/background owner or opens the store
 directly exactly like `figmog vars --snapshot` (§10 "Socket-first
 routing"), and renders that JSON locally. A serving binary older than the
 `default_mode` field is reported as an error asking to restart it.
+Authoritative `vars` rows also carry `collection_id` (additive JSON).
+
+**Settings.** In a project, the token file is `[stack] tokens`, the format
+`[tokens] format` and the mode mapping `[tokens.modes]` (§16);
+`--format` replaces the format and each `--mode` one mapping. With `--db`
+there is no project: defaults apply, `export` writes to stdout unless
+`--out` names a file, and `diff`/`check` need `--file`.
 
 **Snapshot.** Only state `current` exports; `none`, `legacy` (no
 provenance) and `empty` are exit-1 errors. Only authoritative rows are
 exported — an inferred-only variable (bound in the file, absent from the
 snapshot) is skipped and reported.
 
-**Output.** Deterministic, every block sorted by property name:
-
-1. a header comment with the snapshot's `source`, `format`,
-   `format_version`, `exported_at` and `digest` (null when absent) and the
-   theme choice;
-2. `:root { … }` — every exported variable's value in its collection's
-   default mode, except the theme collection, which uses its light mode;
-3. `[data-theme="dark"] { … }` — the theme collection's variables in the
-   dark mode (absent without a theme collection). Every theme-collection
-   variable, aliases included, is redeclared there, so `data-theme` works
-   on the root or on any subtree. A custom property's `var()` resolves
-   where the property is declared, so every variable outside the theme
-   collection that aliases a theme variable — directly or through a chain
-   — is also redeclared there, with its one value (otherwise
-   `var(--color-action-primary)` would keep its light value inside a dark
-   subtree);
-4. `@theme { … }` and `@theme inline { … }` — the Tailwind v4 theme
-   (below). Empty blocks are omitted.
-
-**Theme collection and modes.** `--collection` names it; otherwise it is
-the one collection with a mode whose name contains "dark"
-(ASCII-case-insensitive) — none ⇒ no dark block (an error if
-`--light-mode`/`--dark-mode` was given), several ⇒ an error asking for
-`--collection`. The dark mode is `--dark-mode`, else the collection's one
-mode named like "dark"; the light mode is `--light-mode`, else its one mode
-named like "light", else its default mode. Unknown names, several
-matches and light = dark are errors. Other mode kinds and combining
-collections are out of scope.
-
-**Names.** `codeSyntax.WEB` (`--x` or `var(--x)`) when `x` is nonempty
-ASCII letters, digits, `-` and `_`; an invalid WEB value is reported and
-falls back to the name path: the variable name lower-cased, every run of
+**Identity and names.** A token is its variable id, within its
+collection, never its display name. Its CSS name is `codeSyntax.WEB`
+(`--x` or `var(--x)`) when `x` is nonempty ASCII letters, digits, `-` and
+`_` — WEB code syntax can be any expression, so anything else (a JS
+identifier, `var(--x, red)`, `calc(...)`) is reported and falls back to
+the name path: the variable name lower-cased, every run of
 non-alphanumerics (including the `/` group separators) one `-`, prefixed
 `--` (`Color/Brand Primary` → `--color-brand-primary`; no collection
 prefix). A name with no ASCII alphanumerics is skipped and reported. Two
-variables with one name are an error naming both (`token name collision:
-`a/b` (VariableID:…) and `a b` (VariableID:…) both export as `--a-b` …`).
+variables with one name — `brand/primary` and `brand-primary`, or
+`primary` in two collections — are an error naming both, never an
+overwrite: ``token name collision: `primary` (collection "Brand",
+VariableID:…) and `primary` (collection "Product", VariableID:…) both
+export as `--primary` …``.
+
+**Modes.** Every collection's modes map to selectors: exactly one *root*
+mode, written to `:root`, and every other mode its own selector. Each
+collection's mapping comes from `[tokens.modes]`/`--mode` (keys
+`"<collection>/<mode>"`; a key naming no mode of the snapshot, or more than
+one, is an error), else the default:
+
+- root: the mode mapped to `:root`; else the collection's one mode named
+  like "light" (ASCII-case-insensitive substring) when it also has one
+  named like "dark"; else its default mode. Several `:root` modes, or a
+  default root mapped elsewhere, are errors;
+- the one mode named like "dark" → `[data-theme="dark"]`;
+- any other mode → `[data-<collection>="<mode>"]`, both kebab-cased like a
+  name path (`Density`/`Compact` → `[data-density="compact"]`); a name
+  with no ASCII alphanumerics must be mapped explicitly;
+- `""` leaves a mode out (listed in the header as `(not exported)`).
+
+Two modes of one collection on one selector are an error; modes of
+different collections may share one (`"Color/Dark"` and `"Theme/Dark"`
+both on `[data-theme="dark"]` switch together). Collections are
+independent — theme × density × brand — and each block declares only its
+own collections' variables, so nothing overwrites another collection.
+Modes of one collection are not nested inside each other (other than
+under the root mode).
+
+**Output.** Deterministic, every block sorted by property name:
+
+1. a header comment with the snapshot's `source`, `format`,
+   `format_version`, `exported_at` and `digest` (null when absent), then
+   one ` * theme: collection "<c>": mode "<root>" -> :root, mode "<m>" ->
+   <selector>, …` line per collection with more than one mode (sorted by
+   collection, then mode), or ` * theme: none (every collection exports one
+   mode)`;
+2. `:root { … }` — every exported variable's root-mode value;
+3. one block per other selector (sorted), with each variable of a
+   collection mapped there in that mode;
+4. combined blocks `<own> <other>, <own><other>` (sorted; `<own>:is(<other>)`
+   when `<other>` starts with a type selector) — see below;
+5. format `tailwind` only: `@theme { … }` and `@theme inline { … }` — the
+   Tailwind v4 theme (below). Empty blocks are omitted.
+
+**Subtrees.** A custom property's `var()` resolves where the property is
+declared, so a variable declared only in `:root` that aliases one a mode
+overrides would keep its root value inside that mode's subtree. Each
+mode's block therefore also redeclares every variable of *another*
+collection that aliases, directly or through a chain (in any of its
+modes), a variable the block declares — with its root value. For each of
+that variable's own non-root modes, a combined block (its mode's selector
+outside this one, or both on one element) declares it with that mode's
+value; at specificity (0,2,0) it outranks both plain blocks, so nesting
+either collection inside the other, or setting both on one element, keeps
+both modes (`[data-theme="dark"] [data-density="compact"],
+[data-theme="dark"][data-density="compact"] { --space-section: 32px }`).
 
 **Values.** COLOR → `#rrggbb`, or `#rrggbbaa` below full alpha (each
-channel `round(clamp(x, 0, 1) × 255)`). FLOAT → `<n>px` when its `scopes`
-include `GAP` or `WIDTH_HEIGHT` (spacing/size) or `CORNER_RADIUS`
-(radius); any other FLOAT is emitted unitless and reported. Numbers print
-in shortest round-trip form (`16`, `0.5`). An alias → `var(--target)`;
-CSS resolves chains. Every emitted FLOAT carries its own unit, so a px
-FLOAT aliasing a unitless one → `calc(var(--target) * 1px)` (a bare
-`var()` would make `padding: 16` invalid, i.e. 0px), while a unitless
-FLOAT aliasing a px one is skipped and reported (CSS cannot strip a
-unit; emitting the resolved number would silently detach the alias), as
-is an alias between COLOR and FLOAT. STRING, BOOLEAN and other types are skipped and
-reported, as is a variable missing a needed mode's value or aliasing a
-variable that isn't exported (transitively).
+channel `round(clamp(x, 0, 1) × 255)`). FLOAT units come from `scopes`:
+`<n>px` when every scope is `GAP`/`WIDTH_HEIGHT` (spacing/size) or
+`CORNER_RADIUS` (radius); otherwise unitless and reported — as an
+*ambiguous unit* when px scopes are mixed with others or the scopes say
+nothing (`ALL_SCOPES`, none). Typography, stroke and effect scopes stay
+unitless in v1. Numbers print in shortest round-trip form (`16`, `0.5`).
+An alias → `var(--target)`; CSS resolves chains. Every emitted FLOAT
+carries its own unit, so a px FLOAT aliasing a unitless one →
+`calc(var(--target) * 1px)` (a bare `var()` would make `padding: 16`
+invalid, i.e. 0px), while a unitless FLOAT aliasing a px one is skipped
+and reported (CSS cannot strip a unit; emitting the resolved number would
+silently detach the alias), as is an alias between COLOR and FLOAT.
+STRING, BOOLEAN and other types are skipped and reported, as is a
+variable missing a needed mode's value.
+
+**Aliases.** Aliases are kept as references, never flattened:
+
+- an alias to a variable absent from the snapshot — typically a remote
+  library variable the import doesn't carry — is reported as unresolved
+  (`… not in the variable snapshot … unresolved, not flattened`) and the
+  variable skipped;
+- alias cycles are found per combination of modes: the alias graph over
+  all modes is split into strongly connected components, and each that
+  loops is checked under every combination of its collections' modes (a
+  variable has one value per combination; more than 4096 combinations ⇒
+  every member is skipped unchecked). A member of a cycle is skipped and
+  reported with the cycle and either `in every mode` or `only in some
+  modes (first: "Theme" mode "Dark")`; a loop no combination closes is no
+  cycle;
+- a variable aliasing a skipped one is skipped too, transitively.
 
 **Tailwind namespaces.** COLOR → `--color-*`, spacing/size → `--spacing-*`,
 radius → `--radius-*`; unitless FLOATs get no theme entry. A name already
@@ -1279,31 +1338,70 @@ prefixed (`--surface` → `--color-surface`). Entries:
   emitted mode ⇒ `@theme inline { --color-action-primary:
   var(--color-brand) }` (the utility uses the alias target directly);
 - otherwise ⇒ `@theme { --color-brand: <root value> }`: the utility reads
-  `var(--color-brand)`, which the unlayered `:root`/`[data-theme]` blocks
-  override per mode.
+  `var(--color-brand)`, which the unlayered mode blocks override.
 
 A theme name that collides with another theme name or another token's
-name is an error naming both variables.
+name is an error naming both variables (format `tailwind` only).
 
-**Output and report.** Without `--out` the CSS goes to stdout and, when
-anything was reported, one `{"report": [...]}` JSON line to stderr. With
-`--out` the file is written and stdout gets `{out, tokens, theme,
-report}` JSON. Report entries are `{variable_id, name, reason}`, sorted.
+**Export output and report.** To the token file (`--out <path>`, else
+`[stack] tokens` in a project), creating its directory and leaving
+identical bytes untouched; stdout gets `{out, status: written|unchanged,
+format, tokens, theme, modes, report}` JSON. `theme` is the one collection
+with a mode on `[data-theme="dark"]` as `{collection, light_mode,
+dark_mode}` (else null; `figmog spec` shows it); `modes` lists every
+collection's `{collection, mode, selector}` (`selector` null when left
+out). With `--stdout`, `--out -`, or `--db` without `--out`, the CSS goes
+to stdout and, when anything was reported, one `{"report": [...]}` JSON
+line to stderr. Report entries are `{variable_id, name, reason}`, sorted.
+
+**Diff.** `tokens diff` compares the committed file (`--file`, else
+`[stack] tokens`) with a fresh rendering, as flat CSS: declarations are
+matched by block (selector, whitespace-collapsed, or `@theme`/`@theme
+inline`) and property name. It prints `{status, file, snapshot,
+header_changed, added, removed, changed}` and exits 0: `status` is
+`up_to_date` (byte-identical), `out_of_date` or `missing` (no file: every
+declaration is `added`); `added`/`removed` entries are `{name, block,
+value, variable_id}`, `changed` entries `{name, block, from, to,
+variable_id}` (`variable_id` from the fresh export, null for a removed
+name), sorted by name then block; `header_changed` flags a different
+header comment (snapshot provenance or mode mapping); `snapshot` is the
+provenance below. A file that isn't flat CSS blocks (nested blocks, text
+outside a block) is an exit-1 error.
+
+**Check.** `tokens check` passes only when the committed file is
+byte-identical to the rendering, printing `{status: "ok", file,
+certifies: "matches the last published snapshot", result: "<file> matches
+the last published snapshot", snapshot: {source, format, format_version,
+exported_at, digest}, note}` — the snapshot's provenance (NWS-2961). It
+certifies the file against the variable snapshot in the mirror, never the
+live Figma file, and `note` says so: Figma changes published after that
+snapshot are seen only once it is re-imported or re-pulled. Otherwise it
+prints the diff report on stdout and exits 1 with the error "`<file>`
+does not match the last published snapshot (N added, N removed, N
+changed[, header … changed]) — run `figmog tokens export` to regenerate
+it" (or "`<file>` does not exist — …"). It never writes the file.
 
 **Fixtures.** `tests/fixtures/tokens/variables.json` (synthetic: a
 Light/Dark `Theme` collection, an alias chain `action/hover →
 action/primary → brand → ocean/500` and a GAP alias of a unitless FLOAT)
-exports to the golden `tests/fixtures/tokens/export.css`
-(`tests/tokens.rs`; `FIGMOG_BLESS=1` regenerates it).
-`packages/react/test/tokens.test.ts` compiles that golden file with
-Tailwind v4 and asserts computed values in Chromium in both modes.
+exports to the golden `export.css` (tailwind) and `export.plain.css`
+(css); `modes.json` (Brand × Theme × Density with aliases across them, a
+dark-only alias cycle and an alias to a remote variable, `Brand/Globex`
+mapped to `.brand-globex`) to `modes.css` (`tests/tokens.rs`, which also
+covers `diff`/`check` and the figmog.toml settings in a project;
+`FIGMOG_BLESS=1` regenerates the goldens).
+`packages/react/test/tokens.test.ts` compiles `export.css` and
+`modes.css` with Tailwind v4 and asserts computed values in Chromium: both
+modes, dark subtrees, and theme/brand/density modes nested either way or
+on one element, through nested semantic aliases.
 
 ## 10. CLI surface
 
 JSON is the CLI's only output mode (there is no `--json` flag — there's
 nothing to select between). Every command prints pretty-printed JSON on
 stdout via one seam (`cli::write_json`) — the one exception is `tokens
-export` without `--out`, whose stdout is the CSS file itself (§9); every failure prints
+export` to stdout (`--stdout`, `--out -`, or `--db` without `--out`), whose
+stdout is the CSS file itself (§9); every failure prints
 `{"error": "..."}` on stderr and exits 1 (a raw internal panic exits 101
 instead, still as one JSON stderr line — see `open_store_checked`'s doc
 comment in `src/cli/mod.rs`). A reader that vanishes mid-write (piped
@@ -1326,8 +1424,9 @@ an MCP client), `src/cli/images.rs` (`images`, §15),
 `src/cli/socket.rs` (the client half of the control plane, §6a),
 `src/cli/migrate.rs` (`migrate`, §16), `src/cli/init.rs` (`init` and
 `settings`, §16), `src/cli/doctor.rs` (`doctor`, §16), and
-`src/cli/tokens.rs` (`tokens export`, §9 — mapped onto the `figmog_vars`
-read, then rendered as CSS).
+`src/cli/tokens.rs` (`tokens export|diff|check`, §9 — mapped onto the
+`figmog_vars` read, then rendered as CSS and compared with the token
+file).
 `src/cli/auth.rs` handles credential commands and hidden terminal input;
 `src/auth.rs` owns credential resolution and native storage.
 
@@ -1706,9 +1805,11 @@ dev_server = "http://localhost:3000"
 Supported: `#` comments, blank lines, `[table]` headers, inside
 `[files]` only `key = "string"` (bare or quoted keys; basic strings with
 `\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings), and inside
-the settings tables `[stack]`, `[inspector]` and `[verify]` (below)
-`key = <value>` where the value is such a string, `true`/`false`, or a
-decimal integer or float (`_` separators allowed). Every `[files]` value
+the settings tables `[stack]`, `[inspector]`, `[verify]` and `[tokens]`
+(below) `key = <value>` where the value is such a string, `true`/`false`,
+or a decimal integer or float (`_` separators allowed), and inside
+`[tokens.modes]` only `"<collection>/<mode>" = "<selector>"` (quoted keys,
+string values; NWS-2948). Every `[files]` value
 must be a file key or Figma URL and is stored as its key. Other tables,
 top-level keys and `[[array]]` tables are skipped unparsed (reserved for
 later settings, never an error), except that multi-line strings (`"""`
@@ -1748,6 +1849,27 @@ Every key is optional; a missing key is its default:
 | `verify.loop` | boolean | `true` | the verify loop on or off |
 | `verify.dev_server` | string | `"http://localhost:5173"` | `http`/`https`, no credentials, loopback host only (`localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`): v1 is local only |
 | `verify.threshold` | number | `95` | advisory match score, 0–100 (the screenshot comparison's `score`) |
+| `tokens.format` | string | `"tailwind"` | `tailwind` (CSS variables plus a Tailwind v4 `@theme`) or `css` (CSS variables only); DTCG and TypeScript are not v1 (NWS-2948) |
+
+`[tokens.modes]` (NWS-2948) maps variable-collection modes to the
+selectors `figmog tokens` writes them under, one `"<collection>/<mode>" =
+"<selector>"` per mode: `":root"` makes it the collection's root mode,
+`""` leaves it out, anything else must be one CSS selector (no surrounding
+spaces, `,`, `{`, `}`, `;`, `@` or comments). Keys must contain a `/`;
+whether they name a real mode is checked against the snapshot at export
+time (§9 "Token export, diff and check"). Modes not named keep the default mapping.
+`figmog.local.toml` replaces single mappings. `figmog init` writes neither
+`[tokens]` table.
+
+```toml
+[tokens]
+format = "tailwind"
+
+[tokens.modes]
+"Theme/Dark" = '[data-theme="dark"]'   # the default for a dark-like mode
+"Brand/Globex" = ".brand-globex"
+"Density/Spacious" = ""                  # not exported
+```
 
 The verify contract is fixed for v1 and not configurable: viewports 1440
 and 390 CSS px wide, `light` color scheme, `default` state
@@ -1760,7 +1882,8 @@ is skipped (above). `figmog doctor` reports unknown keys as a warning.
 `figmog settings` prints `{project_root, config (the figmog.toml path or
 null), files, unknown_keys, stack: {framework, styling, tokens,
 tokens_path}, inspector: {enabled, shortcut}, verify: {loop, dev_server,
-threshold, viewports, color_scheme, state}}` (`tokens_path` is absolute).
+threshold, viewports, color_scheme, state}, tokens: {format, modes}}`
+(`tokens_path` is absolute).
 It does not take `--db`.
 
 **Active store.** The mirror root is where mirrors *should* live; the
@@ -2013,16 +2136,16 @@ its type style's (`fontFamily`, `fontSize`, `fontWeight`, `lineHeight`,
 `letterSpacing`), an alias or an array of aliases naming one variable.
 `token` is the variable's name in the snapshot (null for a variable bound
 in the file but absent from the snapshot); `css` is the custom property
-name `figmog tokens export` emits for it (§9 "Token export", taken from
+name `figmog tokens export` emits for it (§9 "Token export, diff and check", taken from
 that export run on the same snapshot, so they cannot drift) — null for a
 variable the export skips (STRING, BOOLEAN…). An alias variable is shown
 as itself (`surface`, not the primitive it aliases).
 
 Unbound: `{"untokenized": true, "raw", "matches"?}` — never token usage.
 `matches` lists (sorted by token name, then id) every snapshot variable
-`{token, variable_id, css}` whose value in its root mode — the theme
-collection's light mode, else its collection's default mode, aliases
-followed — equals the raw value (colors as `#rrggbb[aa]`, numbers within
+`{token, variable_id, css}` whose value in its root mode — the mode the
+token export writes to `:root` under the default mode mapping (§9), else
+its collection's default mode, aliases followed — equals the raw value (colors as `#rrggbb[aa]`, numbers within
 1e-6, strings exactly), of the property's type, and scoped for it:
 `ALL_SCOPES`, or `ALL_FILLS` plus `TEXT_FILL` / `FRAME_FILL` /
 `SHAPE_FILL` by node type for fills, `STROKE_COLOR`, `STROKE_FLOAT`,

@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value, json};
 
-use crate::tokens::{ExportOptions, Theme, color, export_css};
+use crate::tokens::{ExportOptions, color, export_css};
 
 /// One authoritative variable row of `figmog vars --snapshot`.
 struct Var {
@@ -62,8 +62,9 @@ struct Tokens {
     vars: BTreeMap<String, Var>,
     /// Variable id → custom property name, from the token export.
     css: BTreeMap<String, String>,
-    /// Variable id → its value in the root mode (the theme collection's
-    /// light mode, else the collection's default mode), aliases followed.
+    /// Variable id → its value in the root mode (the mode the token export
+    /// writes to `:root`, else the collection's default mode), aliases
+    /// followed.
     root: BTreeMap<String, Lit>,
 }
 
@@ -110,11 +111,11 @@ fn fill_prop(node_type: &str) -> Prop {
 /// Build the spec. `tree` is the `figmog_subtree` answer for the node;
 /// `vars` the `figmog_vars {snapshot: true}` answer.
 pub fn build(tree: &Value, vars: &Value) -> Value {
-    let (css, theme, css_unavailable) = match export_css(vars, &ExportOptions::default()) {
-        Ok(export) => (export.names, export.theme, Value::Null),
-        Err(e) => (BTreeMap::new(), None, Value::String(e)),
+    let (css, theme, roots, css_unavailable) = match export_css(vars, &ExportOptions::default()) {
+        Ok(export) => (export.names, export.theme, export.root_modes, Value::Null),
+        Err(e) => (BTreeMap::new(), None, BTreeMap::new(), Value::String(e)),
     };
-    let tokens = Tokens::new(vars, css, theme.as_ref());
+    let tokens = Tokens::new(vars, css, &roots);
     let mut cx = Cx {
         tokens: &tokens,
         unsupported: BTreeSet::new(),
@@ -136,7 +137,11 @@ pub fn build(tree: &Value, vars: &Value) -> Value {
 }
 
 impl Tokens {
-    fn new(vars: &Value, css: BTreeMap<String, String>, theme: Option<&Theme>) -> Tokens {
+    fn new(
+        vars: &Value,
+        css: BTreeMap<String, String>,
+        roots: &BTreeMap<String, String>,
+    ) -> Tokens {
         let mut all = BTreeMap::new();
         for row in vars["variables"].as_array().into_iter().flatten() {
             if row["source"] != "imported" {
@@ -166,7 +171,7 @@ impl Tokens {
         }
         let root = all
             .keys()
-            .filter_map(|id| Some((id.clone(), root_value(&all, theme, id, 0)?)))
+            .filter_map(|id| Some((id.clone(), root_value(&all, roots, id, 0)?)))
             .collect();
         Tokens {
             vars: all,
@@ -229,19 +234,16 @@ impl Tokens {
 /// cyclic snapshot can't loop).
 fn root_value(
     all: &BTreeMap<String, Var>,
-    theme: Option<&Theme>,
+    roots: &BTreeMap<String, String>,
     id: &str,
     depth: usize,
 ) -> Option<Lit> {
     let v = all.get(id)?;
-    let mode = match theme {
-        Some(t) if t.collection == v.collection => Some(&t.light_mode),
-        _ => v.default_mode.as_ref(),
-    }?;
+    let mode = roots.get(&v.collection).or(v.default_mode.as_ref())?;
     let raw = v.values.get(mode)?;
     if raw["type"] == "VARIABLE_ALIAS" {
         return (depth < 32)
-            .then(|| root_value(all, theme, raw["id"].as_str()?, depth + 1))
+            .then(|| root_value(all, roots, raw["id"].as_str()?, depth + 1))
             .flatten();
     }
     match v.resolved_type.as_str() {

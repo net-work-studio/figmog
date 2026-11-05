@@ -17,9 +17,10 @@
 //!
 //! The config format is a deliberately tiny TOML subset parsed by hand (no
 //! `toml` dependency): `#` comments, blank lines, table headers,
-//! `key = "string"` pairs inside `[files]`, and `key = <string | boolean |
-//! number>` pairs inside the settings tables `[stack]`, `[inspector]` and
-//! `[verify]` (spec §16). Every other table and top-level key is skipped
+//! `key = "string"` pairs inside `[files]`, `key = <string | boolean |
+//! number>` pairs inside the settings tables `[stack]`, `[inspector]`,
+//! `[verify]` and `[tokens]`, and `"<collection>/<mode>" = "<selector>"`
+//! pairs inside `[tokens.modes]` (spec §16; NWS-2948). Every other table and top-level key is skipped
 //! unparsed so later settings never break this binary — except that
 //! multi-line strings there are tracked, so a header line inside one is
 //! never mistaken for a table. Unknown keys inside a settings table are
@@ -56,7 +57,8 @@ pub(crate) struct ProjectConfig {
     pub(crate) files: BTreeMap<String, String>,
     /// Boxed: [`Layout`] is carried by value in enums.
     settings: Box<RawSettings>,
-    /// The known tables (`files`, `stack`, `inspector`, `verify`) present.
+    /// The known tables (`files`, `stack`, `inspector`, `verify`, `tokens`,
+    /// `tokens.modes`) present.
     tables: BTreeSet<&'static str>,
 }
 
@@ -83,7 +85,8 @@ impl ProjectConfig {
     }
 
     /// Whether the file(s) this config came from had a `[name]` table, for
-    /// one of the known tables (`files`, `stack`, `inspector`, `verify`).
+    /// one of the known tables (`files`, `stack`, `inspector`, `verify`,
+    /// `tokens`, `tokens.modes`).
     pub(crate) fn has_table(&self, name: &str) -> bool {
         self.tables.contains(name)
     }
@@ -101,6 +104,8 @@ impl ProjectConfig {
 enum Table {
     Files,
     Settings(&'static str),
+    /// `[tokens.modes]`: free-form `"<collection>/<mode>" = "<selector>"`.
+    Modes,
     /// Any other table, or top-level keys: skipped unparsed.
     Skipped,
 }
@@ -155,6 +160,8 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
             };
             table = match header {
                 "files" => Table::Files,
+                TOKEN_MODES_TABLE => Table::Modes,
+                TOKENS_TABLE => Table::Settings(TOKENS_TABLE),
                 other => match SETTINGS_TABLES.iter().find(|t| **t == other) {
                     Some(known) => Table::Settings(known),
                     None => Table::Skipped,
@@ -164,6 +171,7 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
             let known = match table {
                 Table::Files => Some("files"),
                 Table::Settings(known) => Some(known),
+                Table::Modes => Some(TOKEN_MODES_TABLE),
                 Table::Skipped => None,
             };
             if let Some(known) = known
@@ -185,11 +193,12 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
             }
             Table::Files => "files",
             Table::Settings(known) => known,
+            Table::Modes => TOKEN_MODES_TABLE,
         };
         let (key, rest) = parse_key(line, table_name).map_err(err)?;
         let rest = rest.trim_start();
         let Some(rest) = rest.strip_prefix('=') else {
-            let shape = if table == Table::Files {
+            let shape = if matches!(table, Table::Files | Table::Modes) {
                 "\"...\""
             } else {
                 "<value>"
@@ -197,6 +206,25 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
             return Err(err(format!("expected `{key} = {shape}`")));
         };
         let rest = rest.trim_start();
+        if table == Table::Modes {
+            let (selector, trailing) = parse_string(rest, table_name).map_err(err)?;
+            let trailing = trailing.trim();
+            if !(trailing.is_empty() || trailing.starts_with('#')) {
+                return Err(err(format!("unexpected text after the value of {key:?}")));
+            }
+            crate::tokens::check_mode_key(&key)
+                .and_then(|()| crate::tokens::check_mode_selector(&selector))
+                .map_err(|e| err(format!("{TOKEN_MODES_TABLE}: {e}")))?;
+            if config
+                .settings
+                .mode_selectors
+                .insert(key.clone(), selector)
+                .is_some()
+            {
+                return Err(err(format!("duplicate key {TOKEN_MODES_TABLE}.{key:?}")));
+            }
+            continue;
+        }
         let (value, trailing) = if table == Table::Files {
             let (value, trailing) = parse_string(rest, table_name).map_err(err)?;
             (Scalar::Str(value), trailing)
@@ -503,6 +531,12 @@ fn parse_string<'a>(input: &'a str, table: &str) -> Result<(String, &'a str), St
 
 /// The settings tables, in the order `figmog init` writes them.
 pub(crate) const SETTINGS_TABLES: [&str; 3] = ["stack", "inspector", "verify"];
+/// `[tokens]` (NWS-2948): how `figmog tokens` renders. Optional — `figmog
+/// init` does not write it; every key has a default.
+pub(crate) const TOKENS_TABLE: &str = "tokens";
+/// `[tokens.modes]`: `"<collection>/<mode>" = "<selector>"` — `":root"`
+/// for a collection's root mode, `""` to leave a mode out.
+pub(crate) const TOKEN_MODES_TABLE: &str = "tokens.modes";
 
 /// `[stack] tokens` default: where `figmog tokens export` output lives.
 pub(crate) const DEFAULT_TOKENS_PATH: &str = "src/figmog-tokens.css";
@@ -581,6 +615,19 @@ pub(crate) struct Settings {
     pub(crate) stack: StackSettings,
     pub(crate) inspector: InspectorSettings,
     pub(crate) verify: VerifySettings,
+    pub(crate) tokens: TokenSettings,
+}
+
+/// `[tokens]` and `[tokens.modes]`: how `figmog tokens` renders the
+/// variable snapshot (the file itself is `[stack] tokens`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TokenSettings {
+    /// `tailwind` (CSS variables plus a Tailwind v4 `@theme`) or `css`.
+    pub(crate) format: crate::tokens::Format,
+    /// `"<collection>/<mode>"` → selector; modes not named get the default
+    /// mapping (light-like/default → `:root`, the dark-like mode →
+    /// `[data-theme="dark"]`, others → `[data-<collection>="<mode>"]`).
+    pub(crate) modes: BTreeMap<String, String>,
 }
 
 /// `[stack]`: what code figmog's output should be shaped for.
@@ -647,6 +694,10 @@ impl Settings {
                 "viewports": VERIFY_VIEWPORTS,
                 "color_scheme": VERIFY_COLOR_SCHEME,
                 "state": VERIFY_STATE,
+            },
+            "tokens": {
+                "format": self.tokens.format.as_str(),
+                "modes": self.tokens.modes,
             },
         })
     }
@@ -779,6 +830,9 @@ struct RawSettings {
     verify_loop: Option<bool>,
     dev_server: Option<String>,
     threshold: Option<f64>,
+    token_format: Option<crate::tokens::Format>,
+    /// `[tokens.modes]`, as written.
+    mode_selectors: BTreeMap<String, String>,
     /// `<table>.<key>` of keys this binary does not know.
     unknown: BTreeSet<String>,
 }
@@ -790,7 +844,7 @@ impl RawSettings {
     /// Set a known `<table>.<key>` ([`RawSettings::is_known`]), validating
     /// its type and value. Errors are prefixed `<table>.<key>: `.
     /// The keys [`RawSettings::set`] knows, by table.
-    const KNOWN: [(&'static str, &'static str); 8] = [
+    const KNOWN: [(&'static str, &'static str); 9] = [
         ("stack", "framework"),
         ("stack", "styling"),
         ("stack", "tokens"),
@@ -799,6 +853,7 @@ impl RawSettings {
         ("verify", "loop"),
         ("verify", "dev_server"),
         ("verify", "threshold"),
+        ("tokens", "format"),
     ];
 
     fn is_known(table: &str, key: &str) -> bool {
@@ -853,6 +908,10 @@ impl RawSettings {
                 }
                 self.threshold = Some(threshold);
             }
+            ("tokens", "format") => {
+                self.token_format =
+                    Some(crate::tokens::Format::parse(&string(value)?).map_err(invalid)?);
+            }
             _ => unreachable!("unknown keys are skipped before set: {path}"),
         }
         Ok(())
@@ -873,6 +932,8 @@ impl RawSettings {
         take(&mut self.verify_loop, other.verify_loop);
         take(&mut self.dev_server, other.dev_server);
         take(&mut self.threshold, other.threshold);
+        take(&mut self.token_format, other.token_format);
+        self.mode_selectors.extend(other.mode_selectors);
         self.unknown.extend(other.unknown);
     }
 
@@ -900,6 +961,10 @@ impl RawSettings {
                     .clone()
                     .unwrap_or_else(|| DEFAULT_DEV_SERVER.to_string()),
                 threshold: self.threshold.unwrap_or(DEFAULT_THRESHOLD),
+            },
+            tokens: TokenSettings {
+                format: self.token_format.unwrap_or_default(),
+                modes: self.mode_selectors.clone(),
             },
         }
     }
@@ -1611,6 +1676,62 @@ mod tests {
         assert!(!config.has_table("files"));
     }
 
+    /// NWS-2948: `[tokens]` and `[tokens.modes]` parse into typed settings,
+    /// figmog.local.toml overrides single mappings, and unknown `[tokens]`
+    /// keys or `[tokens.*]` tables stay forward-compatible.
+    #[test]
+    fn token_settings_parse_merge_and_stay_forward_compatible() {
+        assert_eq!(
+            Settings::default().tokens,
+            TokenSettings {
+                format: crate::tokens::Format::Tailwind,
+                modes: BTreeMap::new(),
+            }
+        );
+        let text = "[tokens]\nformat = \"css\"\nflavor = [\"dtcg\"]\n\n\
+             [tokens.modes]\n\"Theme/Dark\" = '[data-theme=\"dark\"]'  # dark\n\
+             \"Brand/Acme\" = \":root\"\n\"Brand/Off\" = \"\"\n\n\
+             [tokens.typescript]\nout = { path = \"x.ts\" }\n";
+        let config = parse_config(text, CONFIG_FILE).unwrap();
+        assert!(config.has_table("tokens") && config.has_table("tokens.modes"));
+        assert_eq!(
+            config.unknown_keys().iter().collect::<Vec<_>>(),
+            ["tokens.flavor"]
+        );
+        let tokens = config.settings().tokens;
+        assert_eq!(tokens.format, crate::tokens::Format::Css);
+        assert_eq!(
+            tokens.modes.iter().collect::<Vec<_>>(),
+            [
+                (&"Brand/Acme".to_string(), &":root".to_string()),
+                (&"Brand/Off".to_string(), &String::new()),
+                (
+                    &"Theme/Dark".to_string(),
+                    &"[data-theme=\"dark\"]".to_string()
+                ),
+            ]
+        );
+        let mut merged = config.clone();
+        merged.merge(
+            parse_config(
+                "[tokens.modes]\n\"Theme/Dark\" = \".dark\"\n",
+                LOCAL_CONFIG_FILE,
+            )
+            .unwrap(),
+        );
+        let tokens = merged.settings().tokens;
+        assert_eq!(tokens.modes["Theme/Dark"], ".dark");
+        assert_eq!(tokens.modes["Brand/Acme"], ":root");
+        assert_eq!(tokens.format, crate::tokens::Format::Css);
+        assert_eq!(
+            merged.settings().to_json()["tokens"],
+            serde_json::json!({
+                "format": "css",
+                "modes": {"Brand/Acme": ":root", "Brand/Off": "", "Theme/Dark": ".dark"},
+            })
+        );
+    }
+
     #[test]
     fn rendered_tables_parse_back_to_the_same_settings() {
         let mut settings = Settings::default();
@@ -1687,6 +1808,31 @@ mod tests {
                 "http:// or https://",
             ),
             ("[verify]\nthreshold = 101\n", 2, "between 0 and 100"),
+            (
+                "[tokens]\nformat = \"dtcg\"\n",
+                2,
+                "tokens.format: unsupported token format \"dtcg\"",
+            ),
+            (
+                "[tokens.modes]\n\"Theme/Dark\" = \".a, .b\"\n",
+                2,
+                "tokens.modes: \".a, .b\" is not one CSS selector",
+            ),
+            (
+                "[tokens.modes]\nDark = \".dark\"\n",
+                2,
+                "tokens.modes: \"Dark\" is not \"<collection>/<mode>\"",
+            ),
+            (
+                "[tokens.modes]\n\"Theme/Dark\" = true\n",
+                2,
+                "expected a quoted string",
+            ),
+            (
+                "[tokens.modes]\n\"Theme/Dark\" = \".a\"\n'Theme/Dark' = \".b\"\n",
+                3,
+                "duplicate key tokens.modes.\"Theme/Dark\"",
+            ),
             ("[verify]\nthreshold = \"95\"\n", 2, "expected a number"),
             (
                 "[verify]\nthreshold = nan\n",

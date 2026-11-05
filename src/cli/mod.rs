@@ -552,7 +552,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 } else {
                     result
                 };
-                return write_read(&cli.cmd, &result);
+                return write_read(&cli.cmd, &result, Some(layout));
             }
         }
     }
@@ -626,16 +626,17 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let st = db.open(|path| crate::open_store!(path))?;
             let result = st.rtx(|r| read.execute(&r))?;
             drop(st);
-            write_read(&other, &result)
+            write_read(&other, &result, db.layout.as_ref())
         }
     }
 }
 
 /// Print a read command's result: JSON for every read, except `tokens`,
-/// which renders its `figmog_vars` read as CSS (NWS-2967).
-fn write_read(cmd: &Cmd, result: &Value) -> Result<(), String> {
+/// which renders its `figmog_vars` read as CSS and compares it with the
+/// project's token file (NWS-2967, NWS-2948).
+fn write_read(cmd: &Cmd, result: &Value, layout: Option<&Layout>) -> Result<(), String> {
     match cmd {
-        Cmd::Tokens { command } => tokens::write_export(command, result),
+        Cmd::Tokens { command } => tokens::run(command, result, layout),
         _ => write_json(result),
     }
 }
