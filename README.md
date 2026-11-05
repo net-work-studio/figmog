@@ -369,7 +369,9 @@ value is flagged as untokenized, and named "matches X" when it equals a
 token's light/default value — it never counts as using that token.
 Text nodes carry their text and mixed-style runs, instances their
 component and variant properties, and image fills and vector icons are
-referenced as assets by node id and `imageRef`. In a project whose
+referenced as assets by node id and `imageRef` — or, once `figmog assets
+export` has run, by the exported file and icon component (`<IconArrowRight
+/>`). In a project whose
 `[stack] styling` is `tailwind`, each node also gets a Tailwind class hint
 (`--tailwind` / `--no-tailwind` override it). Whatever has no exact CSS
 equivalent — a rotated layer, a gradient, a blur — is listed under
@@ -406,6 +408,34 @@ with the project's default mirror (the same one `figmog components`
 reads) and lists Figma components with no entry, entries whose component
 isn't in that mirror, and mapped code files that don't exist. See
 `docs/SPEC.md` §18.
+
+### Icons and images in the codebase
+
+`figmog assets export --icons <icon set or page> --images <frame>` writes
+icons as sanitized SVG plus React components (`<IconArrowRight />`, with
+per-instance gradient/mask/clip ids via `useId`) and image fills as files
+named by their content hash, into the folders `[assets]` in `figmog.toml`
+names (defaults `src/icons` and `public/figma`), plus a manifest
+(`figmog.assets.json`) that `figmog spec` then references. Single-color
+icons can follow the text color (`current_color = true`; multicolor icons
+keep theirs). Names and SVG markup from the file are treated as untrusted:
+names are reduced to safe identifiers, SVG goes through an allowlist
+sanitizer (no scripts, event handlers or external references), nothing is
+written outside those folders or through a symlink, and files figmog
+didn't generate are never overwritten without `--force`. A plain `figmog
+assets export` repeats the last export, and re-exporting an unchanged file
+changes no files. Renders and fills come from `figmog images`'s cache, so
+only cache misses spend Figma API budget. See `docs/SPEC.md` §19.
+
+```toml
+[assets]
+icons = "src/icons"
+images = "public/figma"
+manifest = "figmog.assets.json"
+prefix = "Icon"
+current_color = false   # opt-in, single-color icons only
+components = "tsx"      # or "jsx"
+```
 
 ### The vertical slice example
 

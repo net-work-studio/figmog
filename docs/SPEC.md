@@ -1447,7 +1447,10 @@ an MCP client), `src/cli/images.rs` (`images`, §15),
 `src/cli/tokens.rs` (`tokens export|diff|check`, §9 — mapped onto the
 `figmog_vars` read, then rendered as CSS and compared with the token
 file), and `src/cli/map.rs` (`map check|coverage`, §18 — `coverage` mapped
-onto the `figmog_components` read, then compared with `figmog.map.json`).
+onto the `figmog_components` read, then compared with `figmog.map.json`),
+and `src/cli/assets.rs` (`assets export`, §19 — the `figmog_subtree` and
+`figmog_components` reads plus `figmog_images`, then files written into
+the project).
 `src/cli/auth.rs` handles credential commands and hidden terminal input;
 `src/auth.rs` owns credential resolution and native storage.
 
@@ -1715,8 +1718,10 @@ outside `sync`'s, and is never swept.
 ## 15. Images
 
 `figmog images <node-id>... [--format png|svg] [--scale N] [--out <dir>]`
-and the `figmog_images { ids, format?, scale?, file? }` tool fetch image
-bytes. Nothing in figmog calls them on its own: the images endpoints are
+and the `figmog_images { ids, format?, scale?, renders?, file? }` tool fetch image
+bytes. `renders: false` (default true; NWS-2952) skips the renders and
+fetches only the fills the nodes' own `fills` reference — what `figmog
+assets export` (§19) uses for image fills. Nothing in figmog calls them on its own: the images endpoints are
 Figma's most rate-limited, so a fetch happens only when a person or an
 agent asks for one.
 
@@ -1826,8 +1831,8 @@ dev_server = "http://localhost:3000"
 Supported: `#` comments, blank lines, `[table]` headers, inside
 `[files]` only `key = "string"` (bare or quoted keys; basic strings with
 `\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings), and inside
-the settings tables `[stack]`, `[inspector]`, `[verify]` and `[tokens]`
-(below) `key = <value>` where the value is such a string, `true`/`false`,
+the settings tables `[stack]`, `[inspector]`, `[verify]`, `[tokens]` and
+`[assets]` (below) `key = <value>` where the value is such a string, `true`/`false`,
 or a decimal integer or float (`_` separators allowed), and inside
 `[tokens.modes]` only `"<collection>/<mode>" = "<selector>"` (quoted keys,
 string values; NWS-2948). Every `[files]` value
@@ -1871,6 +1876,12 @@ Every key is optional; a missing key is its default:
 | `verify.dev_server` | string | `"http://localhost:5173"` | `http`/`https`, no credentials, loopback host only (`localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`): v1 is local only |
 | `verify.threshold` | number | `95` | advisory match score, 0–100 (the screenshot comparison's `score`) |
 | `tokens.format` | string | `"tailwind"` | `tailwind` (CSS variables plus a Tailwind v4 `@theme`) or `css` (CSS variables only); DTCG and TypeScript are not v1 (NWS-2948) |
+| `assets.icons` | string | `"src/icons"` | the icon components' folder (`svg/` beneath it holds the SVGs); a relative path inside the project, like `stack.tokens` (NWS-2952) |
+| `assets.images` | string | `"public/figma"` | the image fills' folder; same rule |
+| `assets.manifest` | string | `"figmog.assets.json"` | the generated asset manifest `figmog spec` reads; same rule |
+| `assets.prefix` | string | `"Icon"` | every icon component name starts with it: an ASCII capital letter, then up to 31 ASCII letters or digits |
+| `assets.current_color` | boolean | `false` | convert single-color icons to `currentColor` (opt-in; multicolor icons always keep their colors) |
+| `assets.components` | string | `"tsx"` | `tsx` or `jsx` |
 
 `[tokens.modes]` (NWS-2948) maps variable-collection modes to the
 selectors `figmog tokens` writes them under, one `"<collection>/<mode>" =
@@ -1880,7 +1891,7 @@ spaces, `,`, `{`, `}`, `;`, `@` or comments). Keys must contain a `/`;
 whether they name a real mode is checked against the snapshot at export
 time (§9 "Token export, diff and check"). Modes not named keep the default mapping.
 `figmog.local.toml` replaces single mappings. `figmog init` writes neither
-`[tokens]` table.
+`[tokens]` table, nor `[assets]` (§19).
 
 ```toml
 [tokens]
@@ -2115,13 +2126,18 @@ figmog.toml's `[tokens]`/`[tokens.modes]`). The Tailwind class hint
 `--tailwind`/`--no-tailwind` (or an explicit `tailwind` argument)
 override it. The Figma → code component map (§18) is the optional `map`
 argument: the content of `figmog.map.json`, validated exactly like the
-file. `figmog spec` in a project and the stdio relay (`figmog serve`'s
-default shape) fill in whichever of the three the caller left out (`map`
-from the project root's `figmog.map.json`, read on every call; when there
-is none, no map; when it is invalid, the call fails naming the file and
-JSON path); with `--db`, `figmog call`, or an MCP client of an in-process
-serve, an omitted `tokens` is the default mapping, an omitted `tailwind`
-is off and an omitted `map` is none.
+file. The asset manifest (§19) is the optional `assets` argument: the
+manifest's content (or its normalized `{version, icons: [{node_id, key,
+component, path, svg}], images: [{image_ref, path, url}]}` form),
+validated strictly (node ids, imageRefs, component names, project-relative
+paths, root-relative URLs). `figmog spec` in a project and the stdio relay
+(`figmog serve`'s default shape) fill in whichever of the four the caller
+left out (`map` from the project root's `figmog.map.json` and `assets`
+from `[assets] manifest`, each read on every call; when there is none,
+none; when it is invalid, the call fails naming the file and JSON path);
+with `--db`, `figmog call`, or an MCP client of an in-process serve, an
+omitted `tokens` is the default mapping, an omitted `tailwind` is off and
+an omitted `map` or `assets` is none.
 
 **Output.** One JSON object, every key sorted (`serde_json` without
 `preserve_order`); byte-identical across runs for the same mirror:
@@ -2288,9 +2304,15 @@ style and the runs' overrides name every variable in them.
   `BOOLEAN_OPERATION`, `STAR`, `LINE`, `REGULAR_POLYGON` — one asset, its
   children are part of it and not specified; its fills/strokes are still
   value entries but get no CSS); `{kind: "export", node_id, formats}` for
-  a node with `exportSettings` (`PNG@2x`…). Assets are referenced by node
-  id and `imageRef` only: local file paths come with the asset manifest
-  (NWS-2952); `figmog images` (§15) fetches them meanwhile.
+  a node with `exportSettings` (`PNG@2x`…). Without an asset manifest
+  (§19), assets are referenced by node id and `imageRef` only. With one,
+  an exported image fill's entry also carries the file's `path` and
+  `url` (null outside `public/`), and its `unsupported` reason says it
+  was exported (its scaling and cropping still have no CSS); a node that
+  is an exported icon — by its own node id, or for an instance by its
+  main component's key, else id — gets `{kind: "icon", node_id,
+  component, path, svg, jsx: "<IconX />"}` (instead of the `vector`
+  entry, for a vector node). Without a manifest the output is unchanged.
 - `instance` (INSTANCE nodes): `{component_id, component: {name, key,
   remote} | null, component_set: {id, name, key} | null, variant: {name:
   value} (VARIANT properties), properties: {name: {type, value, token?}}
@@ -2602,3 +2624,142 @@ figmog_spec` with the same `map`; `coverage` reports the unmapped
 components, the entry that's not in the mirror, a stale prop and a
 missing code file; invalid maps fail `check`, `coverage` and `spec` with
 the file and path); `tests/owner.rs` covers the relay's injection.
+
+## 19. Asset pipeline (NWS-2952)
+
+Source: `src/assets.rs` (pure: icon discovery, naming, React components,
+content-hashed image names, the manifest), `src/svg.rs` (the SVG
+sanitizer), `src/cli/assets.rs` (reads, fetches and writes).
+
+`figmog assets export [--icons <node>]... [--images <node>]... [--force]
+[--partial]` exports, into the folders figmog.toml's `[assets]` names
+(§16):
+
+- **Icons.** Each `--icons` root yields icons: a component set → each
+  visible variant; a page, section, frame or group holding components →
+  each visible component set's variants and standalone component at any
+  depth (a component's own content is never searched); anything else (a
+  component, an instance, a vector, a frame of vectors) → the node itself.
+  Each icon is rendered as SVG at scale 1 (the `figmog images` render
+  cache, version-pinned, §15), sanitized (below), and written twice:
+  `<icons>/svg/<Name>.svg` and a React component `<icons>/<Name>.tsx`
+  (or `.jsx`), plus a barrel `<icons>/index.ts` (`index.js`).
+- **Images.** Every visible `IMAGE` fill under each `--images` root
+  (visible nodes only) is fetched (`figmog_images` with `renders: false`)
+  and written to `<images>/<first 16 hex of its SHA-256>.<ext>`, the
+  extension sniffed from the bytes (PNG, JPEG, GIF, WebP; anything else
+  is skipped). The name depends only on the content, so an unchanged
+  image never produces a diff.
+- **Manifest** (`[assets] manifest`): `{"$generated", version: 1,
+  sources: {icons, images}, icons: [{component, figma_name, key, node_id,
+  path, svg, colors: "single"|"multi", current_color}], images:
+  [{image_ref, path, url, format, bytes, sha256, nodes}]}` — sorted keys,
+  icons by component name, images by imageRef, no timestamps or file
+  version (a re-export after unrelated edits is byte-identical). `url` is
+  the root-relative URL when the images folder is `public` or under
+  `public/` (the Vite / Next.js static folder), else null. `sources`
+  records the roots, so a plain `figmog assets export` repeats the last
+  export. `figmog spec` reads it (§17).
+
+**Naming.** An icon's name is built from ASCII letters and digits only
+(every other character separates words), PascalCased: a variant from its
+set's name (last `/` segment) and its property values (`Icon` / `Name=Arrow
+Right` → `IconArrowRight`), anything else from the last `/` segment of its
+own name. The `[assets] prefix` (default `Icon`) is prepended unless the
+name already starts with it as a word. Names longer than 64 characters,
+names with no ASCII letter or digit, and names that collide
+case-insensitively (case-insensitive filesystems) are skipped — every
+icon in a collision, with the node ids involved; nothing is picked
+arbitrarily.
+
+**Untrusted input.** Names, ids, imageRefs and markup come from the Figma
+file. Figma names never reach generated code (only the manifest, as JSON
+data); node ids reach a comment only after a strict character check
+(`[A-Za-z0-9:;-]`, ≤ 128); imageRefs must be ASCII alphanumeric; file
+names are the validated component name or the content hash. Every write
+target is checked before anything is written: inside the project, no
+symlink anywhere on its path below the project root (the file or any
+directory; `--force` doesn't change this), a regular file; files are
+opened `O_NOFOLLOW`. An existing file is replaced only when figmog wrote
+it — a text file starting with figmog's generated header (`// Generated
+by \`figmog assets export\`…`, `<!-- … -->` for SVG, a leading
+`"$generated"` key for the manifest), an image whose bytes are what its
+content-hash name says — or with `--force`. One refusal and nothing is
+written. A file whose bytes are already right is not rewritten, so
+re-exporting an unchanged file changes no files (not even mtimes).
+
+**SVG sanitizing** (`src/svg.rs`, no XML dependency): a strict,
+non-validating reader — elements, quoted attributes, text, CDATA,
+comments and PIs; the five predefined entities and numeric references
+only; any `<!DOCTYPE`/`<!ENTITY>` rejects the document (no entity
+expansion); size (4 MiB), depth (64), element (20 000) and attribute (64)
+caps; malformed markup is an error. Then an allowlist: only SVG's shape,
+paint-server, clip/mask, text and common filter-primitive elements
+survive (everything else — `script`, `style`, `foreignObject`, `a`,
+animations, `feImage`, prefixed names — is dropped with its content);
+only allowlisted presentation/geometry attributes survive (no `on*`,
+`class`, `xml:base`); values containing quotes, `<>&`, backticks,
+braces, backslashes or control characters are dropped; `href` must be a
+local `#id` (or, on `<image>`, a base64 raster `data:` URI); `fill`,
+`stroke`, `clip-path`, `mask`, `filter` may reference only a local
+`url(#id)`, and a reference to an undefined id is dropped; `style` keeps
+only `mask-type`, `mix-blend-mode` and `isolation` keywords. Every
+removal is reported per icon (`removed` in the command's output). Light
+optimization only: comments, PIs, whitespace, empty `<defs>`/`<g>`,
+unreferenced ids and attribute-less `<g>` wrappers go; geometry is
+verbatim. Limitations: no `<style>` sheets (CSS-styled SVGs lose those
+styles), no `<symbol>`/`<marker>`/`<switch>`; meant for Figma's own SVG
+export shape.
+
+**Fidelity.** An icon is single-color when exactly one flat paint color
+(fill, stroke, stop, flood — normalized, `none` ignored) appears outside
+`<clipPath>`/`<mask>` (their colors are geometry, not paint) and it uses
+no gradient, pattern, filter or image. With `current_color = true` that
+color becomes `currentColor`, so Tailwind text colors apply; multicolor
+icons and logos always keep their colors (`colors` in the manifest). Ids
+are renumbered in document order: the `.svg` file prefixes them with the
+component name; the component with React's `useId()` (reduced to
+`[A-Za-z0-9_-]`, prefixed `figmog`), so two instances on one page never
+share a gradient, mask, clip-path or filter id. Components need React 18+
+(for `useId`) and the automatic JSX runtime, nothing else; they are
+`aria-hidden` unless given `aria-label`/`aria-labelledby`, and spread
+their props last (`className`, `width`, … override).
+
+**Reads and routing.** The roots' `figmog_subtree` and the
+`figmog_components` inventory (component keys, set names), then the
+renders and fills — through a running serve's socket when one answers
+(the shared owner holds the store), else from the store opened directly,
+like `figmog images`: cache hits cost nothing, misses spend Figma API
+budget and need a token. `assets` writes into the project, so it doesn't
+take `--db`.
+
+**Failures.** An icon or image that can't be exported (a failed fetch,
+an unusable name or SVG, a collision) is listed under `skipped` with the
+reason; by default a skipped asset writes nothing (so a good manifest is
+never replaced by one missing an entry) and exits 1. `--partial` writes
+the rest (the manifest then lists only those) and still exits 1. Files a
+previous export listed that this one doesn't produce are reported as
+`stale`, never deleted.
+
+**Output.** `{manifest, sources, icons: [{component, node_id, path, svg,
+colors, current_color, removed}], images: [...], files: [{path, status:
+"written"|"unchanged"}], written, unchanged, skipped, stale}`.
+
+**Tests.** `src/svg.rs` (Figma shapes, hostile markup, entities, limits,
+colors, JSX), `src/assets.rs` (SHA-256 vectors, sniffing, naming,
+discovery, plan determinism, collisions, opt-in `currentColor`, manifest
+validation); `tests/assets.rs` on the synthetic
+`tests/fixtures/assets/icons.json` with seeded renders (the done-when: the
+icon set exports to React components — golden in
+`tests/fixtures/assets/export/` — and re-exporting changes no bytes and no
+mtimes; hostile SVG; foreign files, symlinks, `--force`; all-or-nothing
+and `--partial`; `spec` with and without the manifest);
+`tests/owner.rs` (export routed through the shared owner, the relay's
+manifest injection); `examples/slice/app/test/icons.test.mjs` renders the
+golden components with React (react-dom/server) and checks repeated
+instances never share an id and every reference resolves inside its own
+`<svg>`.
+
+Deferred: deleting stale files (`--prune`), sprites, an icon `size`
+prop / Tailwind sizing classes, CSS for image fills' scale modes and
+crops in `figmog spec`, raster icons, and a sanitizer for `<style>`.

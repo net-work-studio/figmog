@@ -351,6 +351,10 @@ pub(crate) enum ReadCommand {
         /// `figmog.map.json`, injected by the CLI and the stdio relay;
         /// `None`, every `code_component` is null.
         map: Option<crate::map::CodeMap>,
+        /// The asset manifest (NWS-2952): the project's `[assets]
+        /// manifest`, injected by the CLI and the stdio relay; `None`,
+        /// assets are referenced by node id and imageRef only.
+        assets: Option<crate::assets::AssetIndex>,
     },
 }
 
@@ -436,6 +440,10 @@ impl ReadCommand {
                 map: match args.get("map") {
                     None | Some(Value::Null) => None,
                     Some(v) => Some(crate::map::CodeMap::from_json(v, "map")?),
+                },
+                assets: match args.get("assets") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(crate::assets::AssetIndex::from_json(v, "assets")?),
                 },
             },
             _ => return Ok(None),
@@ -554,6 +562,7 @@ impl ReadCommand {
                 tokens,
                 tailwind,
                 map,
+                assets,
             } => {
                 args = json!({"id": id});
                 if let Some(tokens) = tokens {
@@ -561,6 +570,9 @@ impl ReadCommand {
                 }
                 if let Some(map) = map {
                     args["map"] = map.to_json();
+                }
+                if let Some(assets) = assets {
+                    args["assets"] = assets.to_json();
                 }
                 put(&mut args, "tailwind", *tailwind);
                 "figmog_spec"
@@ -697,6 +709,7 @@ impl ReadCommand {
                 tokens,
                 tailwind,
                 map,
+                assets,
             } => query::spec(
                 nodes,
                 children,
@@ -709,6 +722,7 @@ impl ReadCommand {
                 &tokens.unwrap_or_default(),
                 tailwind.unwrap_or(false),
                 map.as_ref(),
+                assets.as_ref(),
             ),
         }
     }
@@ -953,7 +967,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                         "description": "Node ids (or Figma URLs carrying node-id=) to render, and/or to scan for fill imageRefs."
                     },
                     "format": {"type": "string", "description": "Render format: png or svg (default png)."},
-                    "scale": {"type": "number", "description": "Render scale (default 1)."}
+                    "scale": {"type": "number", "description": "Render scale (default 1)."},
+                    "renders": {"type": "boolean", "description": "Render the nodes (default true). false: only fetch the image fills their own `fills` reference."}
                 },
                 "required": ["ids"]
             }),
@@ -992,6 +1007,10 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                     "map": {
                         "type": "object",
                         "description": "The Figma → code component map, as figmog.map.json: {version: 1, components: [{figma: {component|component_set: <key>}, code: {path, export}, props?: {\"<Figma property>\": {prop, values?}}}]}. The figmog CLI and stdio relay pass the project's figmog.map.json; omit for none (every code_component null)."
+                    },
+                    "assets": {
+                        "type": "object",
+                        "description": "The asset manifest `figmog assets export` writes ([assets] manifest, default figmog.assets.json): {icons: [{node_id, key, component, path, svg}], images: [{image_ref, path, url}]}. The figmog CLI and stdio relay pass the project's manifest; omit for none (assets by node id and imageRef only)."
                     }
                 },
                 "required": ["id"]
@@ -1054,6 +1073,31 @@ pub(crate) fn output_schema(name: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NWS-2952: `figmog_spec`'s `assets` (the manifest, normalized)
+    /// round-trips; an unsafe manifest is the call's error.
+    #[test]
+    fn spec_assets_argument_round_trips_and_is_validated() {
+        let manifest = json!({
+            "icons": [{"node_id": "1:2", "key": "abc", "component": "IconStar",
+                       "path": "src/icons/IconStar.tsx", "svg": "src/icons/svg/IconStar.svg"}],
+            "images": [{"image_ref": "ff00", "path": "public/figma/x.png", "url": "/figma/x.png"}],
+        });
+        let read =
+            ReadCommand::from_tool_args("figmog_spec", &json!({"id": "1:1", "assets": manifest}))
+                .unwrap()
+                .unwrap();
+        let (name, args) = read.to_tool_call();
+        assert_eq!(name, "figmog_spec");
+        assert_eq!(args["assets"]["icons"][0]["component"], "IconStar");
+        assert_eq!(ReadCommand::from_tool_args(name, &args), Ok(Some(read)));
+        let err = ReadCommand::from_tool_args(
+            "figmog_spec",
+            &json!({"id": "1:1", "assets": {"images": [{"image_ref": "x", "path": "../up.png"}]}}),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("assets: images[0].path:"), "{err}");
+    }
 
     #[test]
     fn require_str_reports_wrong_type_not_missing() {

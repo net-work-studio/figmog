@@ -19,8 +19,9 @@
 //! `toml` dependency): `#` comments, blank lines, table headers,
 //! `key = "string"` pairs inside `[files]`, `key = <string | boolean |
 //! number>` pairs inside the settings tables `[stack]`, `[inspector]`,
-//! `[verify]` and `[tokens]`, and `"<collection>/<mode>" = "<selector>"`
-//! pairs inside `[tokens.modes]` (spec §16; NWS-2948). Every other table and top-level key is skipped
+//! `[verify]`, `[tokens]` and `[assets]`, and `"<collection>/<mode>" =
+//! "<selector>"` pairs inside `[tokens.modes]` (spec §16; NWS-2948,
+//! NWS-2952). Every other table and top-level key is skipped
 //! unparsed so later settings never break this binary — except that
 //! multi-line strings there are tracked, so a header line inside one is
 //! never mistaken for a table. Unknown keys inside a settings table are
@@ -162,6 +163,7 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
                 "files" => Table::Files,
                 TOKEN_MODES_TABLE => Table::Modes,
                 TOKENS_TABLE => Table::Settings(TOKENS_TABLE),
+                ASSETS_TABLE => Table::Settings(ASSETS_TABLE),
                 other => match SETTINGS_TABLES.iter().find(|t| **t == other) {
                     Some(known) => Table::Settings(known),
                     None => Table::Skipped,
@@ -538,6 +540,18 @@ pub(crate) const TOKENS_TABLE: &str = "tokens";
 /// for a collection's root mode, `""` to leave a mode out.
 pub(crate) const TOKEN_MODES_TABLE: &str = "tokens.modes";
 
+/// `[assets]` (NWS-2952): where and how `figmog assets export` writes.
+/// Optional — `figmog init` does not write it; every key has a default.
+pub(crate) const ASSETS_TABLE: &str = "assets";
+/// `[assets] icons` default: the icon components' folder.
+pub(crate) const DEFAULT_ICONS_DIR: &str = "src/icons";
+/// `[assets] images` default: the image fills' folder.
+pub(crate) const DEFAULT_IMAGES_DIR: &str = "public/figma";
+/// `[assets] manifest` default: the generated asset index.
+pub(crate) const DEFAULT_ASSET_MANIFEST: &str = "figmog.assets.json";
+/// `[assets] prefix` default: icon component names start with it.
+pub(crate) const DEFAULT_ICON_PREFIX: &str = "Icon";
+
 /// `[stack] tokens` default: where `figmog tokens export` output lives.
 pub(crate) const DEFAULT_TOKENS_PATH: &str = "src/figmog-tokens.css";
 /// `[inspector] shortcut` default.
@@ -616,6 +630,56 @@ pub(crate) struct Settings {
     pub(crate) inspector: InspectorSettings,
     pub(crate) verify: VerifySettings,
     pub(crate) tokens: TokenSettings,
+    pub(crate) assets: AssetSettings,
+}
+
+/// `[assets] components`: the generated icon components' language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ComponentLang {
+    /// TypeScript (`.tsx`, typed `SVGProps<SVGSVGElement>` props).
+    #[default]
+    Tsx,
+    /// JavaScript (`.jsx`).
+    Jsx,
+}
+
+impl ComponentLang {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ComponentLang::Tsx => "tsx",
+            ComponentLang::Jsx => "jsx",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "tsx" => Ok(ComponentLang::Tsx),
+            "jsx" => Ok(ComponentLang::Jsx),
+            _ => Err(format!(
+                "unsupported language {value:?} (supported: tsx, jsx)"
+            )),
+        }
+    }
+}
+
+/// `[assets]`: where `figmog assets export` writes icons, images and the
+/// manifest, and how icons are named (NWS-2952). Every path is relative
+/// to the project root and stays inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AssetSettings {
+    /// Icon components (and `svg/` beneath it).
+    pub(crate) icons: String,
+    /// Image fills, named by content.
+    pub(crate) images: String,
+    /// The generated asset manifest `figmog spec` reads.
+    pub(crate) manifest: String,
+    /// Every icon component's name starts with it (`Icon` →
+    /// `IconArrowRight`).
+    pub(crate) prefix: String,
+    /// Convert single-color icons to `currentColor` (opt-in).
+    pub(crate) current_color: bool,
+    /// `.tsx` or `.jsx` components.
+    pub(crate) components: ComponentLang,
 }
 
 /// `[tokens]` and `[tokens.modes]`: how `figmog tokens` renders the
@@ -708,6 +772,14 @@ impl Settings {
             "tokens": {
                 "format": self.tokens.format.as_str(),
                 "modes": self.tokens.modes,
+            },
+            "assets": {
+                "icons": self.assets.icons,
+                "images": self.assets.images,
+                "manifest": self.assets.manifest,
+                "prefix": self.assets.prefix,
+                "current_color": self.assets.current_color,
+                "components": self.assets.components.as_str(),
             },
         })
     }
@@ -841,6 +913,12 @@ struct RawSettings {
     dev_server: Option<String>,
     threshold: Option<f64>,
     token_format: Option<crate::tokens::Format>,
+    asset_icons: Option<String>,
+    asset_images: Option<String>,
+    asset_manifest: Option<String>,
+    icon_prefix: Option<String>,
+    current_color: Option<bool>,
+    asset_components: Option<ComponentLang>,
     /// `[tokens.modes]`, as written.
     mode_selectors: BTreeMap<String, String>,
     /// `<table>.<key>` of keys this binary does not know.
@@ -854,7 +932,7 @@ impl RawSettings {
     /// Set a known `<table>.<key>` ([`RawSettings::is_known`]), validating
     /// its type and value. Errors are prefixed `<table>.<key>: `.
     /// The keys [`RawSettings::set`] knows, by table.
-    const KNOWN: [(&'static str, &'static str); 9] = [
+    const KNOWN: [(&'static str, &'static str); 15] = [
         ("stack", "framework"),
         ("stack", "styling"),
         ("stack", "tokens"),
@@ -864,6 +942,12 @@ impl RawSettings {
         ("verify", "dev_server"),
         ("verify", "threshold"),
         ("tokens", "format"),
+        ("assets", "icons"),
+        ("assets", "images"),
+        ("assets", "manifest"),
+        ("assets", "prefix"),
+        ("assets", "current_color"),
+        ("assets", "components"),
     ];
 
     fn is_known(table: &str, key: &str) -> bool {
@@ -922,6 +1006,31 @@ impl RawSettings {
                 self.token_format =
                     Some(crate::tokens::Format::parse(&string(value)?).map_err(invalid)?);
             }
+            ("assets", "icons") => {
+                let dir = string(value)?;
+                check_project_path(&dir).map_err(invalid)?;
+                self.asset_icons = Some(dir);
+            }
+            ("assets", "images") => {
+                let dir = string(value)?;
+                check_project_path(&dir).map_err(invalid)?;
+                self.asset_images = Some(dir);
+            }
+            ("assets", "manifest") => {
+                let file = string(value)?;
+                check_project_path(&file).map_err(invalid)?;
+                self.asset_manifest = Some(file);
+            }
+            ("assets", "prefix") => {
+                let prefix = string(value)?;
+                check_icon_prefix(&prefix).map_err(invalid)?;
+                self.icon_prefix = Some(prefix);
+            }
+            ("assets", "current_color") => self.current_color = Some(boolean(value)?),
+            ("assets", "components") => {
+                self.asset_components =
+                    Some(ComponentLang::parse(&string(value)?).map_err(invalid)?);
+            }
             _ => unreachable!("unknown keys are skipped before set: {path}"),
         }
         Ok(())
@@ -943,6 +1052,12 @@ impl RawSettings {
         take(&mut self.dev_server, other.dev_server);
         take(&mut self.threshold, other.threshold);
         take(&mut self.token_format, other.token_format);
+        take(&mut self.asset_icons, other.asset_icons);
+        take(&mut self.asset_images, other.asset_images);
+        take(&mut self.asset_manifest, other.asset_manifest);
+        take(&mut self.icon_prefix, other.icon_prefix);
+        take(&mut self.current_color, other.current_color);
+        take(&mut self.asset_components, other.asset_components);
         self.mode_selectors.extend(other.mode_selectors);
         self.unknown.extend(other.unknown);
     }
@@ -976,6 +1091,26 @@ impl RawSettings {
                 format: self.token_format.unwrap_or_default(),
                 modes: self.mode_selectors.clone(),
             },
+            assets: AssetSettings {
+                icons: self
+                    .asset_icons
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_ICONS_DIR.to_string()),
+                images: self
+                    .asset_images
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_IMAGES_DIR.to_string()),
+                manifest: self
+                    .asset_manifest
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_ASSET_MANIFEST.to_string()),
+                prefix: self
+                    .icon_prefix
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_ICON_PREFIX.to_string()),
+                current_color: self.current_color.unwrap_or(false),
+                components: self.asset_components.unwrap_or_default(),
+            },
         }
     }
 }
@@ -1002,6 +1137,22 @@ pub(crate) fn check_project_path(value: &str) -> Result<(), String> {
         return Err(format!("{value:?} is not a file path"));
     }
     Ok(())
+}
+
+/// An icon component name prefix: an ASCII capital letter, then up to 31
+/// ASCII letters or digits — so every generated name is a valid,
+/// capitalized JSX identifier whatever the Figma name was.
+pub(crate) fn check_icon_prefix(value: &str) -> Result<(), String> {
+    let valid = value.len() <= 32
+        && value.starts_with(|c: char| c.is_ascii_uppercase())
+        && value.chars().all(|c| c.is_ascii_alphanumeric());
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{value:?} is not an icon prefix (an ASCII capital letter, then up to 31 ASCII letters or digits)"
+        ))
+    }
 }
 
 /// `Modifier+…+Key`: at least one of `Ctrl`, `Alt`, `Shift`, `Meta` (any
@@ -1745,6 +1896,88 @@ mod tests {
                 "modes": {"Brand/Acme": ":root", "Brand/Off": "", "Theme/Dark": ".dark"},
             })
         );
+    }
+
+    #[test]
+    fn asset_settings_parse_validate_merge_and_stay_forward_compatible() {
+        assert_eq!(
+            Settings::default().assets,
+            AssetSettings {
+                icons: "src/icons".into(),
+                images: "public/figma".into(),
+                manifest: "figmog.assets.json".into(),
+                prefix: "Icon".into(),
+                current_color: false,
+                components: ComponentLang::Tsx,
+            }
+        );
+        let text = "[assets]\nicons = \"app/icons\"\nimages = 'public/img'\n\
+             prefix = \"Glyph\"\ncurrent_color = true\ncomponents = \"jsx\"\n\
+             sprite = { out = \"x.svg\" }\n";
+        let config = parse_config(text, CONFIG_FILE).unwrap();
+        assert_eq!(
+            config.unknown_keys().iter().collect::<Vec<_>>(),
+            ["assets.sprite"]
+        );
+        let mut merged = config.clone();
+        merged.merge(
+            parse_config(
+                "[assets]\nmanifest = \"gen/assets.json\"\n",
+                LOCAL_CONFIG_FILE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            merged.settings().assets,
+            AssetSettings {
+                icons: "app/icons".into(),
+                images: "public/img".into(),
+                manifest: "gen/assets.json".into(),
+                prefix: "Glyph".into(),
+                current_color: true,
+                components: ComponentLang::Jsx,
+            }
+        );
+        assert_eq!(
+            merged.settings().to_json()["assets"],
+            serde_json::json!({
+                "icons": "app/icons", "images": "public/img", "manifest": "gen/assets.json",
+                "prefix": "Glyph", "current_color": true, "components": "jsx",
+            })
+        );
+        for (bad, message) in [
+            (
+                "icons = \"../up\"",
+                "figmog.toml:2: assets.icons: \"../up\" must be a relative path inside the project",
+            ),
+            (
+                "images = \"/abs\"",
+                "figmog.toml:2: assets.images: \"/abs\" must be a relative path inside the project",
+            ),
+            (
+                "manifest = \"a/\"",
+                "figmog.toml:2: assets.manifest: \"a/\" is not a file path",
+            ),
+            (
+                "prefix = \"icon\"",
+                "figmog.toml:2: assets.prefix: \"icon\" is not an icon prefix",
+            ),
+            (
+                "prefix = \"I-con\"",
+                "figmog.toml:2: assets.prefix: \"I-con\" is not an icon prefix",
+            ),
+            (
+                "current_color = \"yes\"",
+                "figmog.toml:2: assets.current_color: expected a boolean",
+            ),
+            (
+                "components = \"vue\"",
+                "figmog.toml:2: assets.components: unsupported language",
+            ),
+        ] {
+            let err = parse_config(&format!("[assets]\n{bad}\n"), CONFIG_FILE).unwrap_err();
+            assert!(err.starts_with(message), "{bad}: {err}");
+        }
     }
 
     #[test]
