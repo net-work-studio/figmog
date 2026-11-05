@@ -107,6 +107,11 @@ use `--framework react` / `--styling tailwind` when detection can't tell,
 `--from-file` to pull a saved response offline, `--no-pull` to skip the
 pull. Rerunning it changes nothing that is already set up; it only adds
 the `figmog.toml` tables that are missing and never edits one you have.
+In a monorepo, running it in a package with its own `package.json`
+(say `apps/web`) and no `figmog.toml` above makes that package the
+project: run figmog commands, and your agent, from there. The first pull
+follows a `figmog.local.toml` override of `[files] default`, but what init
+commits (`figmog.toml`, `AGENTS.md`) never includes your local overrides.
 `.mcp.json` runs `figmog serve` from your `PATH` (`--mcp-command <path>`
 names another binary); Claude Code asks you to approve the project's
 server the first time.
@@ -176,10 +181,11 @@ the file every command uses when you don't pass one; without it,
 for your machine only (say, another `dev_server` port). `figmog settings`
 prints the result as JSON, defaults filled in. Verification always uses
 1440 px and 390 px wide viewports, light mode and the default state.
-Other tables, and keys figmog doesn't know inside these tables, are
-ignored (`figmog doctor` lists the unknown ones), so later settings won't
-break older binaries. A malformed file — or a known key with a wrong type
-or value — is an error naming the file and line (`figmog.toml:3: ...`).
+Other tables, and keys figmog doesn't know inside these tables (with
+values of any shape, arrays and multi-line strings included), are ignored
+(`figmog doctor` lists the unknown ones), so later settings won't break
+older binaries. A malformed file — or a known key with a wrong type or
+value — is an error naming the file and line (`figmog.toml:3: ...`).
 
 Inside Git, mirrors live in the repository's Git directory,
 `<git-common-dir>/figmog/<key>/db` (for example `.git/figmog/`), shared by

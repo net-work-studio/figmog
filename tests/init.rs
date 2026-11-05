@@ -148,8 +148,17 @@ impl Mcp {
     }
 }
 
+/// `PATH` with the built `figmog`'s directory first, so the default
+/// `.mcp.json` command (`figmog`) resolves as it would once installed.
+fn path_with_bin() -> std::ffi::OsString {
+    let dir = bin().parent().unwrap().to_path_buf();
+    let rest = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&rest))).unwrap()
+}
+
 /// Start the server exactly as Claude Code would from `.mcp.json`: its
-/// command and args, in the project directory.
+/// command (looked up on [`path_with_bin`]) and args, in the project
+/// directory.
 fn start_from_mcp_json(repo: &Path) -> Mcp {
     let config: Value =
         serde_json::from_str(&std::fs::read_to_string(repo.join(".mcp.json")).unwrap()).unwrap();
@@ -164,6 +173,7 @@ fn start_from_mcp_json(repo: &Path) -> Mcp {
     let mut child = Command::new(server["command"].as_str().unwrap())
         .args(&args)
         .current_dir(repo)
+        .env("PATH", path_with_bin())
         .env("FIGMA_TOKEN", "")
         .env("FIGMOG_OWNER_IDLE_MS", "300")
         .stdin(Stdio::piped())
@@ -203,15 +213,13 @@ fn wait_owner_gone(repo: &Path) {
 fn init_takes_a_new_react_tailwind_repo_to_a_mirror_and_mcp_server() {
     let repo = react_tailwind_repo();
     let (_saved, response) = saved_response();
-    let bin = bin();
+    // No --mcp-command: the committed default, `figmog` from PATH.
     let args = [
         "init",
         "--file",
         &format!("https://www.figma.com/design/{KEY}/Synthetic?node-id=1-2"),
         "--from-file",
         response.to_str().unwrap(),
-        "--mcp-command",
-        bin.to_str().unwrap(),
     ];
     let out = run_json(repo.path(), &args);
     assert_eq!(out["config"]["status"], "created");
@@ -284,6 +292,19 @@ fn init_takes_a_new_react_tailwind_repo_to_a_mirror_and_mcp_server() {
     assert_eq!(again["pull"]["churn"]["changed"], 0);
     assert_eq!(written(repo.path()), files);
 
+    // doctor finds the default command on PATH.
+    let output = Command::new(bin())
+        .args(["doctor", "--upstream"])
+        .arg(format!("http://127.0.0.1:{}/mcp", closed_port()))
+        .current_dir(repo.path())
+        .env("PATH", path_with_bin())
+        .env("FIGMA_TOKEN", "")
+        .output()
+        .unwrap();
+    let found = checks(&serde_json::from_slice(&output.stdout).unwrap());
+    assert_eq!(found["mcp_config"].0, "ok", "{found:?}");
+    assert_eq!(found["mirror"].0, "ok", "{found:?}");
+
     // The registered server answers from the new mirror.
     let mut mcp = start_from_mcp_json(repo.path());
     mcp.send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -304,6 +325,94 @@ fn init_takes_a_new_react_tailwind_repo_to_a_mirror_and_mcp_server() {
     }
     drop(mcp);
     wait_owner_gone(repo.path());
+}
+
+/// Review findings 1 and 2: figmog.local.toml overrides steer the first
+/// pull (to the file every later read uses) but never reach what init
+/// commits (AGENTS.md) or reports as the stack.
+#[test]
+fn init_pulls_the_local_default_but_commits_only_figmog_toml_settings() {
+    let repo = react_tailwind_repo();
+    let (_saved, response) = saved_response();
+    std::fs::write(
+        repo.path().join("figmog.local.toml"),
+        format!(
+            "[files]\ndefault = \"{OTHER}\"\n[stack]\ntokens = \"local/only.css\"\n\
+             [verify]\ndev_server = \"http://localhost:9999\"\n"
+        ),
+    )
+    .unwrap();
+    let out = run_json(
+        repo.path(),
+        &[
+            "init",
+            "--file",
+            KEY,
+            "--from-file",
+            response.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(out["files"]["default"], KEY);
+    assert_eq!(out["stack"]["tokens"], "src/figmog-tokens.css");
+    assert_eq!(out["pull"]["file"], OTHER);
+    assert!(mirror(repo.path(), OTHER).is_dir());
+    assert!(!mirror(repo.path(), KEY).exists());
+    assert_eq!(run_json(repo.path(), &["status"])["name"], "Fixture");
+
+    let toml = std::fs::read_to_string(repo.path().join("figmog.toml")).unwrap();
+    assert!(toml.contains(&format!("default = \"{KEY}\"")), "{toml}");
+    assert!(
+        !toml.contains("local/only.css") && !toml.contains("9999"),
+        "{toml}"
+    );
+    let agents = std::fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+    assert!(agents.contains("src/figmog-tokens.css"), "{agents}");
+    assert!(!agents.contains("local/only.css"), "{agents}");
+    // The merged settings still apply locally.
+    let settings = run_json(repo.path(), &["settings"]);
+    assert_eq!(settings["stack"]["tokens"], "local/only.css");
+    assert_eq!(settings["files"]["default"], OTHER);
+}
+
+/// Review finding 5: in a monorepo package with its own package.json and no
+/// figmog.toml up the tree, init sets the package up as the project, and
+/// every later command run there finds it.
+#[test]
+fn init_in_a_monorepo_package_makes_the_package_the_project() {
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q", "."]);
+    std::fs::write(repo.path().join("package.json"), r#"{"private": true}"#).unwrap();
+    let web = repo.path().join("apps/web");
+    std::fs::create_dir_all(&web).unwrap();
+    std::fs::write(
+        web.join("package.json"),
+        r#"{"dependencies": {"react": "19.0.0"}, "devDependencies": {"tailwindcss": "4.0.0"}}"#,
+    )
+    .unwrap();
+    let (_saved, response) = saved_response();
+    let out = run_json(
+        &web,
+        &[
+            "init",
+            "--file",
+            KEY,
+            "--from-file",
+            response.to_str().unwrap(),
+        ],
+    );
+    let web = std::fs::canonicalize(&web).unwrap();
+    assert_eq!(out["project_root"], web.display().to_string());
+    for name in ["figmog.toml", ".mcp.json", "AGENTS.md"] {
+        assert!(web.join(name).is_file(), "{name}");
+        assert!(!repo.path().join(name).exists(), "{name}");
+    }
+    assert!(mirror(repo.path(), KEY).is_dir());
+    let settings = run_json(&web, &["settings"]);
+    assert_eq!(settings["project_root"], web.display().to_string());
+    assert_eq!(run_json(&web, &["status"])["name"], "Fixture");
+    // Idempotent from the package too.
+    let again = run_json(&web, &["init", "--no-pull"]);
+    assert_eq!(again["config"]["status"], "unchanged");
 }
 
 /// An existing project: the old per-checkout mirror moves to the shared

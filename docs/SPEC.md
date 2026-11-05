@@ -1713,11 +1713,16 @@ must be a file key or Figma URL and is stored as its key. Other tables,
 top-level keys and `[[array]]` tables are skipped unparsed (reserved for
 later settings, never an error), except that multi-line strings (`"""`
 and `'''`) in skipped values are tracked so a header line inside one is
-content, not a table; multi-line strings, arrays and inline tables inside
-the known tables are an error. Errors — unterminated headers, strings or
+content, not a table. In the settings tables, a key this binary does not
+know has its value skipped unparsed whatever its shape (arrays, inline
+tables, dates, multi-line strings — tracked across lines by bracket depth
+outside strings, so a header line inside one is content); a *known* key's
+value must be a single-line string, boolean or number, and multi-line
+strings, arrays and inline tables there are an error. Errors — unterminated headers, strings or
 multi-line strings, a missing `=`, a value of the wrong type, trailing
 text, an invalid file reference or setting, a duplicate key or a second
-copy of a known table — read `figmog.toml:<line>: <message>` (or
+copy of a known table, an unknown key's value left open at the end of
+the file (`unterminated value`) — read `figmog.toml:<line>: <message>` (or
 `figmog.local.toml:...`); a settings error names its key
 (`figmog.toml:7: verify.threshold: must be between 0 and 100, found
 500`). Local entries replace same-named ones, key by key in the settings
@@ -1737,7 +1742,7 @@ Every key is optional; a missing key is its default:
 |---|---|---|---|
 | `stack.framework` | string | `"react"` | v1: `react` only |
 | `stack.styling` | string | `"tailwind"` | v1: `tailwind` only |
-| `stack.tokens` | string | `"src/figmog-tokens.css"` | relative path inside the project: no `..`, not absolute, no `\`, names a file |
+| `stack.tokens` | string | `"src/figmog-tokens.css"` | relative path inside the project: no `..`, not absolute, no `\`, last segment a file name (not `.`, `..` or empty) |
 | `inspector.enabled` | boolean | `true` | the dev-server inspector, development builds only |
 | `inspector.shortcut` | string | `"Alt+Shift+F"` | one or more of `Ctrl`/`Alt`/`Shift`/`Meta` (any case, each once), `+`-joined, then one ASCII letter or digit, or `F1`–`F12` |
 | `verify.loop` | boolean | `true` | the verify loop on or off |
@@ -1749,9 +1754,8 @@ and 390 CSS px wide, `light` color scheme, `default` state
 (`VERIFY_VIEWPORTS`, `VERIFY_COLOR_SCHEME`, `VERIFY_STATE`). A key this
 binary does not know inside a settings table is kept, not rejected
 (`ProjectConfig::unknown_keys`, sorted `<table>.<key>`), so a newer
-figmog's settings never break an older binary; its value must still be a
-single-line string, boolean or number. `figmog doctor` reports unknown
-keys as a warning.
+figmog's settings never break an older binary; its value, of any shape,
+is skipped (above). `figmog doctor` reports unknown keys as a warning.
 
 `figmog settings` prints `{project_root, config (the figmog.toml path or
 null), files, unknown_keys, stack: {framework, styling, tokens,
@@ -1844,8 +1848,14 @@ It does not take `--db`. Steps, in order, each idempotent:
 
 1. Validate every flag (reading and shape-checking a `--token-stdin`
    token) before writing anything, then discover the project (above):
-   `init` writes at the existing `figmog.toml`'s directory, else the Git
-   top level, else the working directory.
+   `init` writes at the existing `figmog.toml`'s directory; with none up
+   the tree, at the working directory when it has its own `package.json`
+   (a monorepo package such as `apps/web` — consistent with discovery,
+   which walks up from there and finds the new `figmog.toml` first; the
+   mirror root stays the repository's), else the Git top level, else the
+   working directory. Commands run outside that package (say, from the
+   repository root) do not see its `figmog.toml`, and old mirrors in
+   another directory's `.figmog/` are not migrated.
 2. `figmog.toml`: created whole (a header comment, then `[files]`,
    `[stack]`, `[inspector]`, `[verify]` with every key written), or, when
    it exists, only the known tables it lacks are appended after a blank
@@ -1882,8 +1892,9 @@ It does not take `--db`. Steps, in order, each idempotent:
    markers, replaced in place when it has exactly one begin marker before
    one end marker; any other marker layout is an error. Nothing outside
    the markers changes.
-8. The first pull of the product file, exactly as `figmog pull <key>
-   [--from-file]` (socket-routed when a serve answers, else direct) —
+8. The first pull of the project's default file as every later command
+   resolves it (`figmog.local.toml`'s `[files] default` when it overrides
+   the committed one), exactly as `figmog pull <key> [--from-file]` (socket-routed when a serve answers, else direct) —
    last, so a failing pull (say, no token) leaves the rest set up, which
    its error says. `--no-pull` skips it.
 
@@ -1892,7 +1903,10 @@ added_tables}, files: {default, library}, stack: {framework, styling,
 tokens, source: {framework, styling}}, token, gitignore: {updated},
 migrated, mcp: {path, status: added|updated|kept|unchanged, server},
 agents: {path, status: created|appended|updated|unchanged}, pull:
-{skipped, churn?}}`. A rerun with the same flags rewrites no file.
+{skipped, file?, churn?}}`. `files` and `stack` — and the `AGENTS.md`
+block — come from `figmog.toml` alone: machine-local overrides in
+`figmog.local.toml` are never committed. A rerun with the same flags
+rewrites no file.
 
 **`figmog doctor` (NWS-2946).** Checks the setup (`src/cli/doctor.rs`) and
 prints `{status, checks: [{name, status, detail}]}`, the checks in this
