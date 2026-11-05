@@ -571,6 +571,49 @@ fn async_delayed_metadata_poll_keeps_reads_responsive_and_reconciles_once() {
     }
 }
 
+/// A metadata poll already running when shutdown's drain begins may still
+/// report `Changed`, but the drain barrier holds at pull dispatch: no new
+/// network pull starts while draining (NWS-2963, NWS-2955).
+#[test]
+fn a_poll_that_completes_changed_during_drain_starts_no_pull() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    assert!(h.manager.sessions[0].poll_at(Duration::ZERO, Instant::now()));
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.manager.sessions[0].begin_drain();
+    *h.api.metadata.lock().unwrap() = "t2".into();
+    h.api.block_meta.store(false, Ordering::Relaxed);
+    h.release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        h.manager.sessions[0].maintain(false);
+        if h.manager.sessions[0].status().unwrap()["pull"]["polling"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    for _ in 0..10 {
+        h.manager.sessions[0].maintain(false);
+        assert!(!h.manager.sessions[0].poll_at(Duration::ZERO, Instant::now()));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        h.entered.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a pull started while draining"
+    );
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 1);
+    let status = h.manager.sessions[0].status().unwrap();
+    assert_ne!(status["pull"]["job"]["state"], "running", "{status}");
+}
+
 #[test]
 fn async_graceful_shutdown_drains_running_pull_and_discards_followup() {
     let mut h = Harness::new();

@@ -551,8 +551,12 @@ impl FileSession {
         self.start_if_ready_at(Instant::now());
     }
 
+    /// Start the queued pull job, if the worker is free. Never while
+    /// draining (NWS-2963): shutdown's barrier sits here, at the one
+    /// dispatch point every pull request reaches — an explicit sync, a
+    /// queued follow-up, and a completed watch poll's `Changed` alike.
     fn start_if_ready_at(&mut self, now: Instant) {
-        if self.busy || self.reset.is_some() || now < self.retry_at {
+        if self.draining || self.busy || self.reset.is_some() || now < self.retry_at {
             return;
         }
         let Some(geometry) = self
@@ -691,9 +695,7 @@ impl FileSession {
         }
         // CLI writes go first: their callers are waiting on them.
         self.start_write();
-        if !self.draining {
-            self.start_if_ready_at(now);
-        }
+        self.start_if_ready_at(now);
         if watch && self.expedited_poll {
             self.poll_at(self.interval, now);
         }
@@ -860,7 +862,7 @@ impl FileSession {
             // image request finishes, ahead of any queued one.
             self.poll_owed = true;
         }
-        if !self.busy && self.reset.is_none() && eligible {
+        if !self.busy && self.reset.is_none() && !self.draining && eligible {
             let expedited = std::mem::take(&mut self.expedited_poll);
             if self.send(Command::Poll { expedited }).is_err() {
                 return false;
@@ -879,7 +881,9 @@ impl FileSession {
     /// Shutdown's drain (NWS-2963): answer every not-yet-started image
     /// request and CLI write with an error instead of running it — a write
     /// with [`WRITE_NOT_STARTED`], which its requester may safely retry —
-    /// and start no queued pull. Work already running (a write, its fresh
+    /// and start no new pull or poll from then on, even one a completed
+    /// poll's `Changed` asks for (the barrier is enforced where pulls and
+    /// polls are dispatched). Work already running (a write, its fresh
     /// pull's reset and apply, a pull, an image request) still finishes and
     /// publishes as [`Self::maintain`] processes its completion.
     pub(crate) fn begin_drain(&mut self) {

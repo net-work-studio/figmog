@@ -23,7 +23,7 @@ impl Live {
             .prefix("fw-")
             .tempdir_in("/tmp")
             .unwrap();
-        let socket = dir.path().join("s.sock");
+        let socket = crate::serve::socket_path(dir.path());
         let listener = UnixListener::bind(&socket).unwrap();
         let (tx, rx) = mpsc::channel();
         let registry: ConnRegistry = Arc::default();
@@ -57,6 +57,17 @@ impl Live {
     ) -> std::thread::JoinHandle<Result<Value, String>> {
         let stream = UnixStream::connect(&self.socket).unwrap();
         std::thread::spawn(move || crate::cli::write_over_stream(stream, tool, args))
+    }
+
+    /// Run one write exactly as the CLI does against an in-process serve:
+    /// through its local-only route, reconnecting through it.
+    fn write_local(
+        &self,
+        tool: &'static str,
+        args: Value,
+    ) -> std::thread::JoinHandle<Result<Value, String>> {
+        let root = self.socket.parent().unwrap().to_path_buf();
+        std::thread::spawn(move || crate::cli::write_over_local(&root, tool, args))
     }
 
     /// One plain `tools/call` on a fresh connection; the response frame.
@@ -371,6 +382,50 @@ fn shutdown_finishes_a_running_write_and_refuses_a_queued_one() {
         "{queued}"
     );
     assert_eq!(api.calls.load(Ordering::Relaxed), 2, "the queued write ran");
+}
+
+/// A write queued in an in-process serve that then drains (stdin EOF,
+/// NWS-2963) is refused "not accepted" while that serve's socket still
+/// listens: the CLI reports it not applied at once instead of resending it
+/// to the same exiting process — which never reads it, leaving the retry
+/// unanswered and, once the process exits, "outcome unknown".
+#[test]
+fn a_draining_local_serve_refusal_is_reported_unapplied_not_retried() {
+    let h = Harness::new();
+    let Harness {
+        release,
+        entered,
+        manager,
+        ..
+    } = h;
+    let mut live = Live::start(manager, Offload::new(None));
+    let running = live.write_local(PULL, json!({"file": KEY}));
+    assert_eq!(
+        entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "fetch"
+    );
+    let queued = live.write_local(PULL, json!({"file": KEY, "geometry": true}));
+    settle();
+    live.tx.send(Incoming::StdinClosed).unwrap();
+    // The refusal arrives while the running pull still holds the drain
+    // open (and the socket keeps listening).
+    let answered = Instant::now() + Duration::from_secs(5);
+    while !queued.is_finished() && Instant::now() < answered {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        queued.is_finished(),
+        "the refused write was retried and hung"
+    );
+    let queued = queued.join().unwrap().unwrap_err();
+    assert!(
+        queued.contains("before accepting this write; nothing was applied")
+            && !queued.contains("outcome unknown"),
+        "{queued}"
+    );
+    release.send(()).unwrap();
+    live.thread.take().unwrap().join().unwrap().unwrap();
+    running.join().unwrap().unwrap();
 }
 
 /// The CLI's side when the owner goes away mid-write: it reports "outcome
