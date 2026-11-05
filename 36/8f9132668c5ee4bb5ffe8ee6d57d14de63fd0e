@@ -1,0 +1,56 @@
+tests/flatten.rs
+  s_f10395619e391b::t_2e1a28f144df40 344-369,371-374
+  s_f10395619e391b::t_b6abc11979ce4b 370
+  s_f10395619e391b::t_eb621fbada69de 343
+src/mcp.rs
+  s_f10395619e391b::t_5bc346d3affdac 261-262
+  s_f10395619e391b::t_a4becdf99ff04a 10-11,104,115-121,126,132-133,135,139,144-148,157,159-162,164,202,207,215,221-222,229
+  s_f10395619e391b::t_468473014f5565 122-125,216-220
+  s_f10395619e391b::t_2cc184880988e4 249-260,263-275
+src/serve.rs
+  s_f10395619e391b::t_a4becdf99ff04a 975
+src/cli/socket.rs
+  s_f10395619e391b::t_0663c8cc0de90c 32-33,56,120-125,158
+src/query.rs
+  s_f10395619e391b::t_3e7529ced0a0ab 200,204-206,212,409,411,413-415,420-421,426
+  s_f10395619e391b::t_468473014f5565 400-406,974
+  s_f10395619e391b::t_dc005b67d63120 949
+src/flatten.rs
+  s_f10395619e391b::t_3b5325fca05b64 10,113-114,117,192-196,204-222
+  s_f10395619e391b::t_b6abc11979ce4b 197
+  s_f10395619e391b::t_a02418d3004d34 223
+src/query/tests.rs
+  s_f10395619e391b::t_dc005b67d63120 359
+  s_f10395619e391b::t_1c1fabf7bb15cb 4-19,26-58,63-77,96-99,118-121
+  s_f10395619e391b::t_468473014f5565 20-25,59-62,78-95,100-117,343-345,371,374
+  s_f10395619e391b::t_d79ae26baa3037 3
+src/cli/mod.rs
+  s_f10395619e391b::t_0663c8cc0de90c 682-683,688,695
+src/cli/read.rs
+  s_f10395619e391b::t_468473014f5565 244-249
+  s_f10395619e391b::t_dc005b67d63120 193-195,242
+  s_f10395619e391b::t_7eeb9ac96c49d1 10-11
+tests/deep.rs
+  s_f10395619e391b::t_e511eadd81125d 348-381,383-401
+  s_f10395619e391b::t_468473014f5565 382
+tests/serve.rs
+  s_f10395619e391b::t_e511eadd81125d 2875
+src/dispatch.rs
+  s_f10395619e391b::t_dc005b67d63120 316
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "368f9132668c5ee4bb5ffe8ee6d57d14de63fd0e",
+  "prompts": {},
+  "sessions": {
+    "s_f10395619e391b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1a8a3-8e0a-7f61-97b9-6f0fccc195e4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
