@@ -779,18 +779,18 @@ fn file_arg_property() -> Value {
 pub(crate) fn tool_registry() -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
-            name: "figmog_status",
-            description: "Committed file name/version/time/node count plus ready and pull lifecycle (job progress, last successful version/churn and errors). Local reads remain available during a pull; ready=false means no successful mirror yet. No Figma API cost.",
+            name: "figmog_status".into(),
+            description: "Committed file name/version/time/node count plus ready and pull lifecycle (job progress, last successful version/churn and errors). Local reads remain available during a pull; ready=false means no successful mirror yet. No Figma API cost.".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_pages",
-            description: "List the file's pages (CANVAS nodes), in document order — reads the local mirror (no Figma API cost).",
+            name: "figmog_pages".into(),
+            description: "List the file's pages (CANVAS nodes), in document order — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_tree",
-            description: "Subtree outline (id, name, type, children) rooted at a node, defaulting to the whole document — reads the local mirror (no Figma API cost).",
+            name: "figmog_tree".into(),
+            description: "Subtree outline (id, name, type, children) rooted at a node, defaulting to the whole document — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -800,8 +800,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_node",
-            description: "Full raw JSON of one node by id, optionally with a one-level children summary and/or a resolved_variables annotation — reads the local mirror (no Figma API cost).",
+            name: "figmog_node".into(),
+            description: "Full raw JSON of one node by id, optionally with a one-level children summary and/or a resolved_variables annotation — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -813,8 +813,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_subtree",
-            description: "Full raw JSON of a node and its descendants, nested under `children` in child-index order — reads the local mirror (no Figma API cost). Use `depth` and `fields` to keep the response small; an unbounded dump of a large subtree can be huge.",
+            name: "figmog_subtree".into(),
+            description: "Full raw JSON of a node and its descendants, nested under `children` in child-index order — reads the local mirror (no Figma API cost). Use `depth` and `fields` to keep the response small; an unbounded dump of a large subtree can be huge.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -831,8 +831,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_find",
-            description: "Nodes by Figma node type, optionally scoped to one page and/or a subtree — reads the local mirror (no Figma API cost).",
+            name: "figmog_find".into(),
+            description: "Nodes by Figma node type, optionally scoped to one page and/or a subtree — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -844,8 +844,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_search",
-            description: "BM25 search over layer names and text content, optionally scoped to a subtree — reads the local mirror (no Figma API cost).",
+            name: "figmog_search".into(),
+            description: "BM25 search over layer names and text content, optionally scoped to a subtree — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -857,8 +857,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_instances",
-            description: "Instances of a component, resolved by node id, global key, or component/component-set name — reads the local mirror (no Figma API cost).",
+            name: "figmog_instances".into(),
+            description: "Instances of a component, resolved by node id, global key, or component/component-set name — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -868,13 +868,13 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_components",
-            description: "Design-system inventory: component sets with their variant axes, plus standalone components — reads the local mirror (no Figma API cost).",
+            name: "figmog_components".into(),
+            description: "Design-system inventory: component sets with their variant axes, plus standalone components — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_styles",
-            description: "Styles with usage counts; `values` derives each style's definition from a consumer node — reads the local mirror (no Figma API cost).",
+            name: "figmog_styles".into(),
+            description: "Styles with usage counts; `values` derives each style's definition from a consumer node — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -885,8 +885,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_uses",
-            description: "Nodes using a style id or bound to a variable id — reads the local mirror (no Figma API cost).",
+            name: "figmog_uses".into(),
+            description: "Nodes using a style id or bound to a variable id — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"id": {"type": "string", "description": "A style id or variable id."}},
@@ -894,8 +894,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_vars",
-            description: "Variables: the authoritative record (with code_syntax, hidden_from_publishing, remote) if imported via figmog import-variables or an Enterprise pull, else inferred from bindings — reads the local mirror (no Figma API cost).",
+            name: "figmog_vars".into(),
+            description: "Variables: the authoritative record (with code_syntax, hidden_from_publishing, remote) if imported via figmog import-variables or an Enterprise pull, else inferred from bindings — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -905,18 +905,18 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_sync",
-            description: "Queue a background pull from Figma. Returns {accepted, key, job_id, state} immediately; poll figmog_status or figmog_files for completion, version/churn or errors. Duplicate active requests coalesce. Spends Tier-1 rate budget. Direct CLI sync without serve remains synchronous.",
+            name: "figmog_sync".into(),
+            description: "Queue a background pull from Figma. Returns {accepted, key, job_id, state} immediately; poll figmog_status or figmog_files for completion, version/churn or errors. Duplicate active requests coalesce. Spends Tier-1 rate budget. Direct CLI sync without serve remains synchronous.".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_stats",
-            description: "Node counts by type and by page, component/set/style/variable totals, text-node count, max tree depth — reads the local mirror (no Figma API cost).",
+            name: "figmog_stats".into(),
+            description: "Node counts by type and by page, component/set/style/variable totals, text-node count, max tree depth — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_path",
-            description: "Ancestor chain from the document root to a node, as [{id, name, type}] — reads the local mirror (no Figma API cost).",
+            name: "figmog_path".into(),
+            description: "Ancestor chain from the document root to a node, as [{id, name, type}] — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -924,8 +924,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_text",
-            description: "Every TEXT node's (id, characters, page_id), optionally scoped to one page and/or a subtree, sorted by id — reads the local mirror (no Figma API cost).",
+            name: "figmog_text".into(),
+            description: "Every TEXT node's (id, characters, page_id), optionally scoped to one page and/or a subtree, sorted by id — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -935,8 +935,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_where",
-            description: "Nodes whose raw JSON matches an RFC 6901 pointer, optionally filtered by value and/or scoped to a page/subtree — reads the local mirror (no Figma API cost).",
+            name: "figmog_where".into(),
+            description: "Nodes whose raw JSON matches an RFC 6901 pointer, optionally filtered by value and/or scoped to a page/subtree — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -949,8 +949,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_images",
-            description: "Download node renders and/or fill images (v0.0.2 spec §5), cached by file version — spends Figma API budget (the images endpoints are the most rate-limited; never called automatically). Returns a JSON manifest plus, per item up to 1MB encoded: an image content block (base64) for raster formats, or the raw SVG markup as a text block for format=svg; larger items point at the CLI's `figmog images --out` instead.",
+            name: "figmog_images".into(),
+            description: "Download node renders and/or fill images (v0.0.2 spec §5), cached by file version — spends Figma API budget (the images endpoints are the most rate-limited; never called automatically). Returns a JSON manifest plus, per item up to 1MB encoded: an image content block (base64) for raster formats, or the raw SVG markup as a text block for format=svg; larger items point at the CLI's `figmog images --out` instead.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -966,8 +966,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_at",
-            description: "Visible nodes on one page whose absolute bounds contain a point, sorted by area ascending then id. Excludes hidden branches; optionally intersects a subtree. Returns at most limit matches (default 100) — reads the local mirror (no Figma API cost).",
+            name: "figmog_at".into(),
+            description: "Visible nodes on one page whose absolute bounds contain a point, sorted by area ascending then id. Excludes hidden branches; optionally intersects a subtree. Returns at most limit matches (default 100) — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -993,8 +993,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
     }
 
     tools.push(ToolDef {
-        name: "figmog_open",
-        description: "Queue a background mirror pull (Tier-1 API cost). Returns {accepted, key, job_id, state} immediately. Poll figmog_status or figmog_files for ready, job progress, version/churn or errors. Duplicate active requests coalesce; a geometry upgrade can queue one follow-up.",
+        name: "figmog_open".into(),
+        description: "Queue a background mirror pull (Tier-1 API cost). Returns {accepted, key, job_id, state} immediately. Poll figmog_status or figmog_files for ready, job progress, version/churn or errors. Duplicate active requests coalesce; a geometry upgrade can queue one follow-up.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -1008,8 +1008,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         }),
     });
     tools.push(ToolDef {
-        name: "figmog_files",
-        description: "List every session: key, committed name/version/node count/time, default, ready, and pull lifecycle (job, queued, last_completed, last_success with version/churn). Failed jobs retain actionable errors and the previous successful mirror. Local state only (no Figma API cost).",
+        name: "figmog_files".into(),
+        description: "List every session: key, committed name/version/node count/time, default, ready, and pull lifecycle (job, queued, last_completed, last_success with version/churn). Failed jobs retain actionable errors and the previous successful mirror. Local state only (no Figma API cost).".into(),
         input_schema: json!({"type": "object", "properties": {}}),
     });
 
@@ -1170,14 +1170,14 @@ mod tests {
             .iter()
             .filter(|t| {
                 ReadCommand::from_tool_args(
-                    t.name,
+                    t.name.as_ref(),
                     &json!({"id": "1:1", "type": "T",
                     "query": "q", "target": "t", "pointer": "/a", "x": 0, "y": 0, "page": "0:1"}),
                 )
                 .unwrap()
                 .is_some()
             })
-            .map(|t| t.name)
+            .map(|t| t.name.to_string())
             .collect();
         assert_eq!(reads.len(), 17, "{reads:?}");
         for name in [

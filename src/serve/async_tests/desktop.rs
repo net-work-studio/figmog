@@ -266,6 +266,91 @@ fn initialize_clients(server: &mut Server, list_changed: bool) {
 }
 
 #[test]
+fn only_changes_to_the_exposed_registry_notify_clients() {
+    struct ChangingRegistry {
+        current: Vec<Value>,
+        next: Arc<Mutex<Vec<Value>>>,
+        refreshes: Arc<AtomicUsize>,
+    }
+
+    impl UpstreamMcp for ChangingRegistry {
+        fn initialize(&mut self) -> Result<(), UpstreamError> {
+            self.refresh_tools()
+        }
+
+        fn tools(&self) -> &[Value] {
+            &self.current
+        }
+
+        fn refresh_tools(&mut self) -> Result<(), UpstreamError> {
+            self.current = self.next.lock().unwrap().clone();
+            self.refreshes.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+
+        fn call(&mut self, _: &str, _: &Value) -> Result<Value, UpstreamError> {
+            unreachable!("registry-only test")
+        }
+
+        fn ping(&mut self) -> Result<(), UpstreamError> {
+            Ok(())
+        }
+    }
+
+    let mut initial = desktop_tools();
+    initial.push(json!({"name":"figmog_status", "description":"hidden A"}));
+    let next = Arc::new(Mutex::new(initial.clone()));
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let worker = DesktopWorker::spawn_with(
+        ChangingRegistry {
+            current: initial,
+            next: next.clone(),
+            refreshes: refreshes.clone(),
+        },
+        true,
+        fast(),
+    );
+    let mut server = Server::start(Some(worker));
+    initialize_clients(&mut server, true);
+    let before = server.stdio(request(json!(2), "tools/list", json!({})))["result"].clone();
+
+    let count = refreshes.load(Ordering::Acquire);
+    {
+        let mut updated = next.lock().unwrap();
+        updated[1]["description"] = json!("hidden B");
+        // The proxy exposes name, prefixed description and inputSchema;
+        // an unsupported raw field cannot change tools/list either.
+        updated[0]["internalMetadata"] = json!("changed");
+        updated.push(json!({"description":"no tool name"}));
+    }
+    let deadline = Instant::now() + EXPECT;
+    while refreshes.load(Ordering::Acquire) == count {
+        assert!(Instant::now() < deadline, "desktop was not refreshed");
+        std::thread::yield_now();
+    }
+    server.assert_stdio_silent(Duration::from_millis(200));
+    server.assert_socket_silent(0);
+    let after = server.stdio(request(json!(3), "tools/list", json!({})))["result"].clone();
+    assert_eq!(before, after);
+
+    next.lock().unwrap()[0]["description"] = json!("Updated code tool");
+    assert_eq!(server.next_stdio(), list_changed());
+    assert_eq!(server.next_socket(0), list_changed());
+    let exposed = server.stdio(request(json!(4), "tools/list", json!({})));
+    assert_eq!(
+        exposed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["description"],
+        "[via Figma desktop] Updated code tool"
+    );
+    server.assert_stdio_silent(Duration::from_millis(100));
+    server.assert_socket_silent(1);
+    server.finish();
+}
+
+#[test]
 fn desktop_tools_appear_and_disappear_with_notifications_only_to_initialized_clients() {
     let (desktop, worker) = desktop(false, fast());
     let mut server = Server::start(Some(worker));

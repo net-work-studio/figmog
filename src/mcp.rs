@@ -6,6 +6,8 @@
 //! when the handler defers a `tools/call` — the [`PendingCall`] that frames
 //! its response once the result arrives. The serve loop owns the I/O.
 
+use std::borrow::Cow;
+
 use serde_json::{Value, json};
 
 use crate::deep_json::OwnedValue;
@@ -22,10 +24,12 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 /// This server's name, reported in `initialize`'s `serverInfo.name`.
 pub const SERVER_NAME: &str = "figmog";
 
-/// One registered tool: metadata for `tools/list`.
+/// One registered tool: metadata for `tools/list`. Static local metadata
+/// is borrowed; dynamic upstream metadata is freed with its registry.
+#[derive(Debug, PartialEq)]
 pub struct ToolDef {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: Cow<'static, str>,
+    pub description: Cow<'static, str>,
     /// JSON Schema for the tool's arguments.
     pub input_schema: Value,
 }
@@ -328,7 +332,7 @@ fn tools_list_result(tools: &[ToolDef]) -> Value {
                 "description": t.description,
                 "inputSchema": t.input_schema,
             });
-            if let Some(schema) = crate::dispatch::output_schema(t.name) {
+            if let Some(schema) = crate::dispatch::output_schema(t.name.as_ref()) {
                 tool["outputSchema"] = schema;
             }
             tool
@@ -485,18 +489,18 @@ mod tests {
     fn fake_tools() -> Vec<ToolDef> {
         vec![
             ToolDef {
-                name: "ok",
-                description: "always succeeds",
+                name: "ok".into(),
+                description: "always succeeds".into(),
                 input_schema: json!({"type": "object"}),
             },
             ToolDef {
-                name: "raw",
-                description: "returns a raw passthrough result",
+                name: "raw".into(),
+                description: "returns a raw passthrough result".into(),
                 input_schema: json!({"type": "object"}),
             },
             ToolDef {
-                name: "err",
-                description: "always fails",
+                name: "err".into(),
+                description: "always fails".into(),
                 input_schema: json!({"type": "object"}),
             },
         ]

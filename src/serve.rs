@@ -1002,11 +1002,17 @@ fn request_loop(
         if let Some(desktop) = &mut offload.desktop
             && desktop.maintain(Instant::now())
         {
-            tools = merged_registry(Some(desktop));
-            let note = frame(&mcp::tools_list_changed());
-            registry.broadcast(&note);
-            if stdio_subscribed && !stdio.send(note) {
-                return LoopExit::StdoutGone;
+            // Raw upstream changes may affect only filtered collisions or
+            // unsupported metadata. Notify clients only if their exposed
+            // registry changes after the merge's filtering/transforms.
+            let updated = merged_registry(Some(desktop));
+            if updated != tools {
+                tools = updated;
+                let note = frame(&mcp::tools_list_changed());
+                registry.broadcast(&note);
+                if stdio_subscribed && !stdio.send(note) {
+                    return LoopExit::StdoutGone;
+                }
             }
         }
         let poll = if offload.reads_in_flight.is_empty() {

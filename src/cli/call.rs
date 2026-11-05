@@ -124,7 +124,7 @@ pub(super) fn cmd_tools(upstream_url: String, no_upstream: bool) -> Result<(), S
         .map(|t| {
             json!({
                 "name": t.name,
-                "source": if proxy::is_local_tool(t.name) { "local" } else { "upstream" },
+                "source": if proxy::is_local_tool(t.name.as_ref()) { "local" } else { "upstream" },
                 "cacheable": false,
             })
         })

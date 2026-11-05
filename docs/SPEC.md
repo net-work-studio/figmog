@@ -690,7 +690,9 @@ before every 64 KiB write call, so a client that trickle-reads cannot
 renew it. A full queue or a missed deadline drops the connection: its
 socket is shut down, queued frames discarded, and its pending reads
 and desktop calls skipped. A client that closes its side has frames already queued flushed
-and later responses dropped; a vanished client is a silent no-op. Stdio
+and later responses dropped. A writer closes its write half after flushing,
+so a half-closed client receives EOF without waiting for more registry
+activity; a vanished client is a silent no-op. Stdio
 has one client (the agent), so its writer thread has an unbounded queue
 and no drop policy (dropping it would be fatal); a broken stdout shuts
 serve down as before. Socket traffic interleaves with MCP frames and
@@ -772,7 +774,11 @@ registry is re-merged under the namespace rule below and every client that
 sent `initialize` gets `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`
 (`initialize` advertises `capabilities.tools.listChanged: true` when the
 desktop worker is enabled, and `false` under `--no-upstream`). Tool lists
-are sorted before comparison, so reordering alone sends nothing. A check
+are sorted before comparison, and notifications compare the merged,
+client-visible registry: reordering, changes to filtered collisions, or
+unsupported upstream fields send nothing. Dynamic tool names and
+descriptions are owned by the current registry and released when replaced.
+A check
 that confirms the current state, or a reconnect with the same tools, sends
 nothing. `figmog_status`'s `upstream` follows the current state
 (`connected` / `unreachable`). `--no-upstream` starts no desktop worker,

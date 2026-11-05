@@ -160,6 +160,10 @@ impl Conn {
                 return;
             }
         }
+        // Retiring connections remain in the registry until a later reap
+        // or shutdown. Close the socket now so their clients receive EOF
+        // immediately after the final queued frame, even while that Arc lives.
+        let _ = self.stream.shutdown(Shutdown::Write);
     }
 }
 
@@ -504,6 +508,54 @@ mod tests {
             assert!(Instant::now() < deadline, "aborted writers did not exit");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn unregister_flushes_then_sends_eof_while_the_registry_stays_alive() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let conns = Arc::new(Connections::default());
+        conns.register(1, server.try_clone().unwrap()).unwrap();
+        let response = "x".repeat(8 << 20);
+        conns.send(1, response.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let conn = conns.state.lock().unwrap().conns[&1].clone();
+            if conn.queue.lock().unwrap().in_flight {
+                break;
+            }
+            assert!(Instant::now() < deadline, "writer never started");
+            std::thread::yield_now();
+        }
+        // The large response keeps the writer blocked while EOF on its
+        // read half retires the connection, retaining its Arc in the registry.
+        let (unregistered_tx, unregistered_rx) = mpsc::channel();
+        let reader_registry = conns.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reader = server;
+            assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+            reader_registry.unregister(1);
+            unregistered_tx.send(()).unwrap();
+        });
+        client.shutdown(Shutdown::Write).unwrap();
+        unregistered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        reader.join().unwrap();
+
+        // No further registry activity may be needed to close the writer.
+        let mut received = vec![0; response.len()];
+        client.read_exact(&mut received).unwrap();
+        assert_eq!(received, response.as_bytes());
+        assert_eq!(
+            client
+                .read(&mut [0; 1])
+                .expect("EOF after the queued response"),
+            0
+        );
+        drop(conns);
     }
 
     /// The deadline covers the whole response: a client that keeps reading
