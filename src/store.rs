@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use fold::pipeline::{Keyed, Push};
-use fold::stream::KeyedStream;
+use fold::stream::{KeyedStream, KeyedTx};
 use serde::Serialize;
 
 use crate::flatten::Flattened;
@@ -280,6 +280,22 @@ pub fn sync<P: Push<Keyed<Id, Rec>>>(
     flattened: &Flattened,
     synced_at_unix_ms: u64,
 ) -> Churn {
+    sync_with_cache_eviction(st, prior_sweepable, flattened, synced_at_unix_ms, |_, _| {
+        Vec::new()
+    })
+}
+
+/// Sync file records and evict the returned cache ids in one transaction.
+/// `collect_stale` reads the transaction's updated sinks after all upserts
+/// and removals, so it can use the final churn without committing first.
+/// A panic in collection or eviction rolls back the file and cache together.
+pub(crate) fn sync_with_cache_eviction<P: Push<Keyed<Id, Rec>>>(
+    st: &mut KeyedStream<Id, Rec, P>,
+    prior_sweepable: &BTreeSet<Id>,
+    flattened: &Flattened,
+    synced_at_unix_ms: u64,
+    collect_stale: impl FnOnce(&mut KeyedTx<'_, '_, '_, Id, Rec, P>, &Churn) -> Vec<Id>,
+) -> Churn {
     let meta = FileMeta {
         name: flattened.file.name.clone(),
         version: flattened.file.version.clone(),
@@ -322,6 +338,10 @@ pub fn sync<P: Push<Keyed<Id, Rec>>>(
                 }
             }
         }
+        let mut stale = collect_stale(tx, &churn);
+        stale.sort();
+        stale.dedup();
+        evict_cache_tx(tx, &stale);
     });
     churn
 }
@@ -409,13 +429,10 @@ pub fn replace_variable_snapshot<P: Push<Keyed<Id, Rec>>>(
 
 // ---- proxy cache eviction (spec §12) ----
 //
-// Cache eviction is deliberately NOT folded into `sync`'s sweep: the sweep
-// removes ids that vanished from the *newly flattened file*, whereas cache
-// rows go stale only because the file *version* moved, independent of
-// which nodes/components/styles are still live. Keeping it a separate
-// pass means `sync`'s churn accounting (and every test that pins its
-// numbers) is untouched by this feature. Callers run a version-changing
-// pull, then `stale_cache_ids` + `evict_stale_cache` in a follow-up step.
+// Cache ids are selected separately from the file-record sweep and do not
+// contribute to churn. Production pulls use `sync_with_cache_eviction` to
+// commit both in one transaction; standalone cache maintenance can use
+// `evict_stale_cache` without changing file records.
 
 // Test-only observation of the performance contract: retaining cache rows
 // alone cannot distinguish skipping a scan from scanning without eviction.
@@ -505,15 +522,17 @@ pub fn all_image_ids<R: fold::stream::Readable>(
 /// [`stale_cache_ids`], [`stale_image_ids`] or [`all_image_ids`]. Cache
 /// eviction is separate from the file-record sweep and its churn counts.
 pub fn evict_stale_cache<P: Push<Keyed<Id, Rec>>>(st: &mut KeyedStream<Id, Rec, P>, stale: &[Id]) {
-    st.wtx(|tx| {
-        for id in stale {
-            debug_assert!(matches!(
-                id,
-                Id::ProxyCache(_) | Id::ImageBlob(_) | Id::ImagePin(_)
-            ));
-            tx.remove(id);
-        }
-    });
+    st.wtx(|tx| evict_cache_tx(tx, stale));
+}
+
+fn evict_cache_tx<P: Push<Keyed<Id, Rec>>>(tx: &mut KeyedTx<'_, '_, '_, Id, Rec, P>, stale: &[Id]) {
+    for id in stale {
+        debug_assert!(matches!(
+            id,
+            Id::ProxyCache(_) | Id::ImageBlob(_) | Id::ImagePin(_)
+        ));
+        tx.remove(id);
+    }
 }
 
 // ---- sticky vector geometry (v0.0.2 spec §4) ----
@@ -569,6 +588,110 @@ pub fn effective_geometry(flag: bool, stored: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_sync_and_image_eviction_roll_back_and_retry_together() {
+        for partial_eviction in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut file = serde_json::json!({
+                "name":"Synthetic", "version":"same", "lastModified":"before",
+                "document":{"id":"0:0", "type":"DOCUMENT", "name":"Document", "children":[
+                    {"id":"1:0", "type":"CANVAS", "name":"Page", "children":[
+                        {"id":"1:2", "type":"FRAME", "name":"Before"}
+                    ]}
+                ]}
+            });
+            let mut st = crate::open_store!(&path);
+            sync(
+                &mut st,
+                &BTreeSet::new(),
+                &crate::flatten::flatten_file(&file).unwrap(),
+                0,
+            );
+            let key = crate::images::image_key("render", "1:2", "png", 1000);
+            st.wtx(|tx| {
+                tx.upsert(
+                    &Id::ImageBlob(key.clone()),
+                    &Rec::ImageBlob(ImageBlobRec {
+                        key_hash: key.clone(),
+                        kind: "render".into(),
+                        subject: "1:2".into(),
+                        format: "png".into(),
+                        scale_milli: 1000,
+                        file_version: "same".into(),
+                        bytes: vec![1, 2, 3],
+                    }),
+                );
+                tx.upsert(
+                    &Id::ImagePin(key.clone()),
+                    &Rec::ImagePin(ImagePinRec {
+                        generation: crate::images::RENDER_PIN_GENERATION,
+                        file_version: "same".into(),
+                    }),
+                );
+            });
+            let original: Vec<_> = [
+                Id::Meta,
+                Id::Node("1:2".into()),
+                Id::ImageBlob(key.clone()),
+                Id::ImagePin(key.clone()),
+            ]
+            .into_iter()
+            .map(|id| {
+                let rec = st.get(&id).unwrap();
+                (id, rec)
+            })
+            .collect();
+            let prior = st.rtx(|((nodes, ..), components, sets, styles, ..)| {
+                collect_sweepable(&nodes, &components, &sets, &styles)
+            });
+            file["lastModified"] = serde_json::json!("after");
+            file["document"]["children"][0]["children"][0]["name"] = serde_json::json!("After");
+            let incoming = crate::flatten::flatten_file(&file).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sync_with_cache_eviction(&mut st, &prior, &incoming, 1, |tx, churn| {
+                    assert_eq!(churn.changed, 1);
+                    assert_ne!(tx.get(&Id::Meta), Some(original[0].1.clone()));
+                    let stale = tx.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, _)| {
+                        all_image_ids(&images, &pins)
+                    });
+                    if partial_eviction {
+                        evict_cache_tx(tx, &stale[..1]);
+                        assert!(tx.get(&Id::ImageBlob(key.clone())).is_none());
+                    }
+                    panic!("interrupt before cache eviction completes");
+                });
+            }));
+            let panic = result.expect_err("injected interruption must abort the sync");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"interrupt before cache eviction completes")
+            );
+            drop(st);
+
+            // Reopening must see either the old snapshot and cache or all of
+            // the new state. The interrupted transaction committed neither.
+            let mut st = crate::open_store!(&path);
+            for (id, rec) in &original {
+                assert_eq!(st.get(id), Some(rec.clone()), "partial commit: {id:?}");
+            }
+            let churn = sync_with_cache_eviction(&mut st, &prior, &incoming, 1, |tx, _| {
+                tx.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, _)| all_image_ids(&images, &pins))
+            });
+            assert_eq!(churn.changed, 1, "retry must apply the interrupted edit");
+            drop(st);
+            let st = crate::open_store!(&path);
+            assert!(
+                matches!(st.get(&Id::Meta), Some(Rec::Meta(meta)) if meta.last_modified == "after")
+            );
+            assert!(
+                matches!(st.get(&Id::Node("1:2".into())), Some(Rec::Node(node)) if node.name == "After")
+            );
+            assert!(st.get(&Id::ImageBlob(key.clone())).is_none());
+            assert!(st.get(&Id::ImagePin(key)).is_none());
+        }
+    }
 
     #[test]
     fn effective_geometry_is_sticky_once_either_side_is_true() {

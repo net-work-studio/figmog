@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::api::{ApiError, FigmaApi, UreqApi};
 use crate::flatten::flatten_file;
 use crate::ident::parse_file_ref;
-use crate::store::{self, Churn, collect_sweepable, collect_variable_ids, sync};
+use crate::store::{self, Churn, collect_sweepable, collect_variable_ids};
 use crate::watch::BACKOFF_CAP;
 
 use super::{Db, open_store_checked, write_json};
@@ -181,46 +181,35 @@ fn apply_pull(
         prior.extend(stored_var_ids);
     }
     let prior_meta = st.rtx(|(_, _, _, _, _, _, meta, _, _, _, _, _)| meta.get(&0));
-    let churn = sync(&mut st, &prior, &flattened, now_ms());
     let version_changed = prior_meta.as_ref().map(|meta| meta.version.as_str())
         != Some(flattened.file.version.as_str());
-    let snapshot_changed = prior_meta
-        .as_ref()
-        .is_some_and(|meta| meta.last_modified != flattened.file.last_modified)
-        || churn.added > 0
-        || churn.changed > 0
-        || churn.removed > 0;
-
-    // Every caller of `do_pull` (`pull` and `figmog call figmog_sync`) goes
-    // through here, so eviction lives here rather than duplicated at each
-    // call site (build design §12: a
-    // version-changing pull sweeps stale `proxy_cache` rows; v0.0.2 spec §5
-    // extends this to stale `images` rows the same way). `figmog serve`'s
-    // own pull paths don't call `do_pull` — they keep their own inline
-    // eviction blocks, since they already hold `st` open and re-opening it
-    // here would hit the same single-open-per-process wall `figmog call
-    // figmog_sync` used to.
-    // Figma can change live contents without changing the returned version.
-    // Such pulls must invalidate even rows labelled with that same version.
-    if version_changed || snapshot_changed {
-        let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images, pins, _)| {
-            if version_changed {
-                let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
-                stale.extend(crate::store::stale_image_ids(
-                    &images,
-                    &pins,
-                    &flattened.file.version,
-                ));
-                stale
-            } else {
-                crate::store::all_image_ids(&images, &pins)
+    // Cache invalidation shares the sync transaction: interruption must not
+    // commit new same-version nodes with their old cached image rows.
+    let churn =
+        store::sync_with_cache_eviction(&mut st, &prior, &flattened, now_ms(), |tx, churn| {
+            let snapshot_changed = prior_meta
+                .as_ref()
+                .is_some_and(|meta| meta.last_modified != flattened.file.last_modified)
+                || churn.added > 0
+                || churn.changed > 0
+                || churn.removed > 0;
+            if !version_changed && !snapshot_changed {
+                return Vec::new();
             }
+            tx.rtx(|(_, _, _, _, _, _, _, cache, _, images, pins, _)| {
+                if version_changed {
+                    let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
+                    stale.extend(crate::store::stale_image_ids(
+                        &images,
+                        &pins,
+                        &flattened.file.version,
+                    ));
+                    stale
+                } else {
+                    crate::store::all_image_ids(&images, &pins)
+                }
+            })
         });
-        if !stale.is_empty() {
-            stale.sort();
-            crate::store::evict_stale_cache(&mut st, &stale);
-        }
-    }
 
     // Persist the sticky geometry flag (spec §4): this call's own flag OR
     // whatever's already stored in *this* handle (re-read here rather than
@@ -326,7 +315,7 @@ mod tests {
     fn same_version_pulls_evict_images_when_metadata_or_records_change() {
         use crate::model::{Id, ImageBlobRec, ImagePinRec, Rec};
 
-        for metadata_only in [false, true] {
+        for change in ["record", "metadata", "add_last_child", "remove_last_child"] {
             let dir = tempfile::tempdir().unwrap();
             let db = Db {
                 path: dir.path().join("db"),
@@ -339,6 +328,14 @@ mod tests {
                     "fills":[{"type":"SOLID", "color":{"r":1,"g":0,"b":0,"a":1}}]}
                 ]}
             ]);
+            let child = serde_json::json!({"id":"1:3", "type":"RECTANGLE", "name":"Last child"});
+            file["document"]["children"][0]["children"][0]["children"] =
+                if change == "remove_last_child" {
+                    serde_json::json!([child.clone()])
+                } else {
+                    serde_json::json!([])
+                };
+            let before = flatten_file(&file).unwrap();
             let render_key = crate::images::image_key("render", "1:2", "png", 1000);
             let fill_key = crate::images::image_key("fill", "synthetic-fill", "", 1000);
             apply_pull(&db, &file, None, false, false).unwrap();
@@ -373,14 +370,36 @@ mod tests {
                     }
                 });
             }
-            if metadata_only {
-                file["lastModified"] = serde_json::json!("2026-01-01T00:01:00Z");
-            } else {
-                file["document"]["children"][0]["children"][0]["fills"][0]["color"] =
-                    serde_json::json!({"r":0,"g":0,"b":1,"a":1});
+            match change {
+                "metadata" => file["lastModified"] = serde_json::json!("2026-01-01T00:01:00Z"),
+                "record" => {
+                    file["document"]["children"][0]["children"][0]["fills"][0]["color"] =
+                        serde_json::json!({"r":0,"g":0,"b":1,"a":1})
+                }
+                "add_last_child" => file["document"]["children"][0]["children"][0]["children"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(child),
+                "remove_last_child" => {
+                    file["document"]["children"][0]["children"][0]["children"]
+                        .as_array_mut()
+                        .unwrap()
+                        .pop();
+                }
+                _ => unreachable!(),
+            }
+            if matches!(change, "add_last_child" | "remove_last_child") {
+                let after = flatten_file(&file).unwrap();
+                for (id, previous) in &before.recs {
+                    if let Some((_, current)) = after.recs.iter().find(|(key, _)| key == id) {
+                        assert_eq!(previous, current, "surviving record changed: {id:?}");
+                    }
+                }
             }
             let (churn, ..) = apply_pull(&db, &file, None, false, false).unwrap();
-            assert_eq!(churn.changed, usize::from(!metadata_only));
+            assert_eq!(churn.changed, usize::from(change == "record"));
+            assert_eq!(churn.added, usize::from(change == "add_last_child"));
+            assert_eq!(churn.removed, usize::from(change == "remove_last_child"));
             let st = crate::open_store!(&db.path);
             for id in [
                 Id::ImageBlob(render_key.clone()),

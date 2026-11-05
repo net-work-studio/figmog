@@ -2,10 +2,10 @@
 use super::*;
 use crate::model::{Id, ImageBlobRec, ImagePinRec, Rec};
 
-fn seed_cache(path: &std::path::Path, prior_version: Option<&str>) {
+fn seed_cache(path: &std::path::Path, prior_file: Option<&Value>) {
     let mut st = crate::open_store!(path);
-    if let Some(version) = prior_version {
-        let flattened = crate::flatten::flatten_file(&fixture(version)).unwrap();
+    if let Some(file) = prior_file {
+        let flattened = crate::flatten::flatten_file(file).unwrap();
         store::sync(&mut st, &std::collections::BTreeSet::new(), &flattened, 0);
     }
     for version in ["0", "1"] {
@@ -52,10 +52,43 @@ fn cache_rows(path: &std::path::Path) -> Vec<Rec> {
 /// Observe the actual scan helpers on the worker thread. Their counters
 /// are thread-local so independent tests cannot contaminate each other.
 fn cached_harness(prior: Option<&str>) -> (Harness, Vec<Rec>, mpsc::Receiver<(usize, usize)>) {
+    cached_harness_with_file(prior.map(fixture), None)
+}
+
+fn cached_harness_with_file(
+    prior: Option<Value>,
+    cached_frame: Option<&str>,
+) -> (Harness, Vec<Rec>, mpsc::Receiver<(usize, usize)>) {
     let mut h = Harness::new();
     h.manager.sessions.clear();
     let path = h._dir.path().join("ABC1234567890/db");
-    seed_cache(&path, prior);
+    seed_cache(&path, prior.as_ref());
+    if let Some(frame) = cached_frame {
+        let version = prior.as_ref().unwrap()["version"].as_str().unwrap();
+        let key = crate::images::image_key("render", frame, "png", 1000);
+        let mut st = crate::open_store!(&path);
+        st.wtx(|tx| {
+            tx.upsert(
+                &Id::ImageBlob(key.clone()),
+                &Rec::ImageBlob(ImageBlobRec {
+                    key_hash: key.clone(),
+                    kind: "render".into(),
+                    subject: frame.into(),
+                    format: "png".into(),
+                    scale_milli: 1000,
+                    file_version: version.into(),
+                    bytes: vec![1],
+                }),
+            );
+            tx.upsert(
+                &Id::ImagePin(key),
+                &Rec::ImagePin(ImagePinRec {
+                    generation: crate::images::RENDER_PIN_GENERATION,
+                    file_version: version.into(),
+                }),
+            );
+        });
+    }
     let expected = cache_rows(&path);
     let (observed, scans) = mpsc::channel();
     let session = sessions::open_session_with_hooks(
@@ -99,17 +132,49 @@ fn unchanged_async_pulls_skip_both_cache_scans_with_large_images() {
 
 #[test]
 fn same_version_async_pulls_evict_images_when_metadata_or_records_change() {
-    for metadata_only in [false, true] {
-        let (mut h, rows, scans) = cached_harness(Some("1"));
+    for change in ["record", "metadata", "add_last_child", "remove_last_child"] {
+        let mut response = fixture("1");
+        let child = json!({"id":"1:3", "type":"RECTANGLE", "name":"Last child"});
+        let children = if change == "remove_last_child" {
+            json!([child.clone()])
+        } else {
+            json!([])
+        };
+        response["document"]["children"] = json!([
+            {"id":"1:0", "type":"CANVAS", "name":"Page", "children":[
+                {"id":"1:2", "type":"FRAME", "name":"Frame", "children": children}
+            ]}
+        ]);
+        let before = crate::flatten::flatten_file(&response).unwrap();
+        let (mut h, rows, scans) = cached_harness_with_file(Some(response.clone()), Some("1:2"));
+        let path = h._dir.path().join("ABC1234567890/db");
+        let frame_key = crate::images::image_key("render", "1:2", "png", 1000);
         let expected: Vec<_> = rows
             .into_iter()
             .filter(|rec| matches!(rec, Rec::ProxyCache(_)))
             .collect();
-        let mut response = fixture("1");
-        if metadata_only {
-            response["lastModified"] = json!("2026-01-01T12:01:00Z");
-        } else {
-            response["document"]["name"] = json!("Edited without a new version");
+        match change {
+            "metadata" => response["lastModified"] = json!("2026-01-01T12:01:00Z"),
+            "record" => response["document"]["name"] = json!("Edited without a new version"),
+            "add_last_child" => response["document"]["children"][0]["children"][0]["children"]
+                .as_array_mut()
+                .unwrap()
+                .push(child),
+            "remove_last_child" => {
+                response["document"]["children"][0]["children"][0]["children"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+            }
+            _ => unreachable!(),
+        }
+        if matches!(change, "add_last_child" | "remove_last_child") {
+            let after = crate::flatten::flatten_file(&response).unwrap();
+            for (id, previous) in &before.recs {
+                if let Some((_, current)) = after.recs.iter().find(|(key, _)| key == id) {
+                    assert_eq!(previous, current, "surviving record changed: {id:?}");
+                }
+            }
         }
         *h.api.response.lock().unwrap() = Ok(response);
         h.value("figmog_sync", json!({}));
@@ -118,12 +183,17 @@ fn same_version_async_pulls_evict_images_when_metadata_or_records_change() {
             "fetch"
         );
         h.release.send(()).unwrap();
-        h.wait_for("succeeded");
+        let status = h.wait_for("succeeded");
+        let churn = &status["pull"]["last_success"]["churn"];
+        assert_eq!(churn["changed"], usize::from(change == "record"));
+        assert_eq!(churn["added"], usize::from(change == "add_last_child"));
+        assert_eq!(churn["removed"], usize::from(change == "remove_last_child"));
         assert_eq!(scans.recv_timeout(Duration::from_secs(5)).unwrap(), (0, 1));
         h.manager.sessions.clear();
-        let path = h._dir.path().join("ABC1234567890/db");
         assert_eq!(cache_rows(&path), expected);
         let st = crate::open_store!(&path);
+        assert!(st.get(&Id::ImageBlob(frame_key.clone())).is_none());
+        assert!(st.get(&Id::ImagePin(frame_key)).is_none());
         assert_eq!(
             st.rtx(|(_, _, _, _, _, _, _, _, _, _, pins, _)| pins.iter().count()),
             0

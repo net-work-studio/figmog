@@ -260,15 +260,16 @@ whole pipeline — `unchanged` increments, no index writes happen. A
 spurious watch trigger or a repeated `pull` therefore costs exactly one
 Tier-1 fetch and nothing else downstream.
 
-**Version-keyed cache eviction** is a separate pass, not folded into
-`sync`'s sweep (its churn accounting stays untouched by this feature):
-after a sync whose file *version* actually moved, every `proxy_cache` row
-(`store::stale_cache_ids`) and every `images` row
-(`store::stale_image_ids`, which also yields each row's `image_pins`
-marker) tagged with the old version is removed through
-the one `store::evict_stale_cache` function. This runs after every
-`pull`/`figmog_sync`/watch-tick pull that changes the version, and is
-bundled into `pull --fresh`'s whole-store wipe too.
+**Cache eviction** is selected separately from the file-record sweep and
+does not contribute to churn. Direct, explicit-sync and watch pulls use
+`store::sync_with_cache_eviction` to apply the file and evict cache rows
+in the same write transaction. If the version moved, `stale_cache_ids`
+and `stale_image_ids` select mismatched proxy/image rows and orphan pins.
+If the version stayed the same but metadata or records changed, all
+images and pins are invalidated. Identical snapshots skip both cache
+scans. Interruption rolls back the snapshot and eviction together, so a
+retry cannot mistake a partially updated mirror for an unchanged one.
+`pull --fresh` also removes caches through its whole-store wipe.
 
 **Tree validation:** the shared flattener rejects document roots that are
 not objects with a non-empty string `id` and `type: "DOCUMENT"`. Every
@@ -329,7 +330,7 @@ One `figmog serve` process owns every mirrored file's store via a
 [`SessionManager`](../src/sessions.rs). Each `FileSession` has one background
 worker owning its only writer and watch watermarks. Dispatch reads an owning
 fold snapshot, independently of the writer. A new snapshot is published only
-after the whole fetch → flatten → atomic sync → cache eviction → geometry
+after the whole fetch → flatten → atomic sync and cache eviction → geometry
 persistence cycle succeeds. During every stage, existing readers see the
 previous complete mirror, including for the file being pulled. Other files
 have independent workers. No on-disk records or sink names change.
@@ -1055,7 +1056,9 @@ read as misses. With a file identity and credentials they are refetched
 and overwritten, spending API budget again on that first request.
 Without either, they return a distinct upgrade error and retain the
 existing bytes. For a file-keyed mirror without credentials, the error
-explains how to restore the token and retry the image request; an
+explains how to restore the token, restart any running `figmog serve`,
+and retry the image request. When using `FIGMA_TOKEN`, the restarted
+server must receive the updated environment. An
 explicit offline store instead needs a file-keyed mirror to refresh them.
 Fill rows need no marker: fills are addressed by content hash, and the fills endpoint
 takes no version. Rows tagged with an older version, and their markers,

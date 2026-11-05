@@ -203,8 +203,10 @@ store; it does not supply the store's file identity.
 Renders cached by older builds without a current-generation version pin need to be fetched
 again through a file-keyed mirror before this build can export them offline.
 That first refetch requires credentials and spends API budget again. If
-credentials are unavailable, the error explains how to restore them and
-retry; the existing cached bytes remain on disk.
+credentials are unavailable, the error explains how to restore them.
+Restart any running `figmog serve` with the updated environment when
+using `FIGMA_TOKEN`, then retry the image request. The existing cached
+bytes remain on disk.
 
 ### Freshness is polling, not push
 
