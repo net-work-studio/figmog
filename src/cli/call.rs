@@ -42,10 +42,18 @@ pub(super) fn cmd_import_variables(
         .iter()
         .filter(|(id, _)| matches!(id, Id::Variable(_)))
         .count();
-    // Previewing a new destination must not create a store just to discover
-    // that it contains no prior variables.
-    if dry_run && !db.path.exists() {
-        return write_json(&json!({"imported": imported, "removed": 0, "removed_ids": []}));
+    // A destination can exist without holding a store. Previewing a missing
+    // or empty directory must not initialize a database to discover no variables.
+    if dry_run {
+        let reading = |e| format!("reading store directory {}: {e}", db.path.display());
+        let empty = match std::fs::read_dir(&db.path) {
+            Ok(mut entries) => entries.next().transpose().map_err(reading)?.is_none(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => return Err(reading(e)),
+        };
+        if empty {
+            return write_json(&json!({"imported": imported, "removed": 0, "removed_ids": []}));
+        }
     }
     let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
     let prior = st.rtx(|(_, _, _, _, variables, collections, ..)| {

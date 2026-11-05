@@ -546,19 +546,31 @@ fn empty_import_needs_opt_in_and_dry_run_preserves_snapshot() {
 }
 
 #[test]
-fn dry_run_new_store_does_not_create_it() {
+fn dry_run_uninitialized_destination_does_not_create_a_store() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("new-db");
     let path = dir.path().join("valid.json");
     std::fs::write(&path, include_bytes!("fixtures/variables-export.json")).unwrap();
-    assert_eq!(
-        run_ok(
-            &db,
-            &["import-variables", path.to_str().unwrap(), "--dry-run"]
-        ),
-        json!({"imported": 3, "removed": 0, "removed_ids": []})
-    );
-    assert!(!db.exists());
+    for existing_directory in [false, true] {
+        if existing_directory {
+            std::fs::create_dir(&db).unwrap();
+        }
+        assert_eq!(
+            run_ok(
+                &db,
+                &["import-variables", path.to_str().unwrap(), "--dry-run"]
+            ),
+            json!({"imported": 3, "removed": 0, "removed_ids": []})
+        );
+        if existing_directory {
+            assert!(
+                std::fs::read_dir(&db).unwrap().next().is_none(),
+                "dry-run must leave an existing empty destination empty"
+            );
+        } else {
+            assert!(!db.exists());
+        }
+    }
 }
 
 #[test]
