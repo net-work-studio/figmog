@@ -818,8 +818,8 @@ pub fn vars<R: Readable>(
 /// root. The file is local, so an O(depth) walk per node is fine. Guards
 /// against a corrupted store with a `parent_id` cycle: once an id repeats,
 /// stop and report the depth counted so far rather than looping forever —
-/// this runs inside `figmog serve`'s single-threaded loop, where a hang
-/// would stall the whole server.
+/// this runs inside `figmog serve` (on a read worker), where a hang would
+/// pin a worker and its leased view forever.
 fn depth_of<R: Readable>(nodes: &TableReader<'_, R, String, NodeRec>, id: &str) -> usize {
     let mut depth = 0;
     let mut current = id.to_string();

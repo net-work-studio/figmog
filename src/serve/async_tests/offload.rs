@@ -26,7 +26,7 @@ fn connection(registry: &ConnRegistry, conn_id: u64) -> BufReader<UnixStream> {
     let (client, server) = UnixStream::pair().unwrap();
     client.set_read_timeout(Some(PROMPT)).unwrap();
     server.set_write_timeout(Some(PROMPT)).unwrap();
-    registry.lock().unwrap().insert(conn_id, server);
+    registry.register(conn_id, server).unwrap();
     BufReader::new(client)
 }
 
@@ -124,7 +124,11 @@ fn slow_desktop_call_does_not_delay_local_reads_and_answers_its_requester() {
             Instant::now() + Duration::from_secs(3600),
             rx,
             registry,
-            move |response| stdout_tx.send(response.clone()).is_ok(),
+            move |frame: &str| {
+                stdout_tx
+                    .send(serde_json::from_str::<Value>(frame).unwrap())
+                    .is_ok()
+            },
         )
     });
 
@@ -251,7 +255,11 @@ fn slow_image_download_does_not_delay_local_reads_and_answers_its_requester() {
             Instant::now() + Duration::from_secs(3600),
             rx,
             registry,
-            move |response| stdout_tx.send(response.clone()).is_ok(),
+            move |frame: &str| {
+                stdout_tx
+                    .send(serde_json::from_str::<Value>(frame).unwrap())
+                    .is_ok()
+            },
         )
     });
 
@@ -391,7 +399,11 @@ fn spawn_stdio_loop(
             Instant::now() + Duration::from_secs(3600),
             rx,
             Arc::default(),
-            move |response| stdout_tx.send(response.clone()).is_ok(),
+            move |frame: &str| {
+                stdout_tx
+                    .send(serde_json::from_str::<Value>(frame).unwrap())
+                    .is_ok()
+            },
         )
     });
     (tx, stdout, server)

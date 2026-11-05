@@ -22,7 +22,7 @@ use crate::flatten::flatten_file;
 use crate::ident::parse_file_ref;
 use crate::mcp::ToolOutput;
 use crate::model::Id;
-use crate::session_view::{SessionView, SharedPipeline};
+use crate::session_view::{ReadGate, ReadLease, SessionView, SharedPipeline};
 use crate::store::{self, Churn, collect_sweepable, collect_variable_ids};
 use crate::watch::{BACKOFF_START, Tick, Watcher};
 
@@ -145,7 +145,99 @@ pub(crate) struct FileSession {
     watch_retry_at: Option<Instant>,
     expedited_poll: bool,
     interval: Duration,
+    /// Admission for off-loop reads of `view` (NWS-2962 reset barrier).
+    gate: Arc<ReadGate>,
+    /// A close/reset waiting for this store's worker reads to drain; while
+    /// set, no new read is admitted and no worker command starts.
+    reset: Option<StoreReset>,
+    /// Reopens this store at the same path with the same key, credentials
+    /// and hooks — the reset barrier's step 4.
+    reopen: Reopen,
 }
+
+type Reopen = Arc<dyn Fn() -> Result<FileSession, String> + Send + Sync>;
+
+/// A store-level operation that must not run underneath live views; it
+/// waits behind the per-store reset barrier ([`ReadGate`]). Append-only:
+/// NWS-2963 adds its own variants (e.g. a fresh re-pull) here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // first constructed by NWS-2963's reset tool
+pub(crate) enum StoreReset {
+    /// Close the store and reopen it from disk, publishing a new session
+    /// (fresh job history, like a reopened mirror).
+    Reopen,
+}
+
+/// A status read captured on the loop and finished on a read worker: the
+/// lifecycle is the loop's state when the request arrived; the store part
+/// comes from the leased published view.
+pub(crate) struct StatusRead {
+    mirrored: bool,
+    lifecycle: Value,
+    lease: Option<ReadLease>,
+}
+
+impl StatusRead {
+    pub(crate) fn run(&self) -> Result<Value, String> {
+        status_value(
+            self.mirrored,
+            self.lifecycle.clone(),
+            self.lease.as_ref().map(ReadLease::view),
+        )
+    }
+}
+
+/// `figmog_files` captured on the loop, finished on a read worker.
+pub(crate) struct FilesRead(Vec<(String, bool, StatusRead)>);
+
+impl FilesRead {
+    pub(crate) fn run(&self) -> Value {
+        json!(self.0.iter().map(|(key, default, read)| {
+            let status = read.run().unwrap_or(Value::Null);
+            json!({"key": key, "name": status["name"], "version": status["version"], "nodes": status["nodes"],
+                "last_synced": status["synced_at_unix_ms"], "default": default,
+                "ready": read.mirrored, "pull": read.lifecycle})
+        }).collect::<Vec<_>>())
+    }
+}
+
+/// Answer one local read tool from a published view.
+pub(crate) fn read_tool(
+    view: &SessionView,
+    name: &str,
+    args: &Value,
+) -> Result<ToolOutput, String> {
+    view.with_dependent(|_, readers| {
+        dispatch::dispatch_read_tool(name, args, "", readers)
+            .ok_or_else(|| format!("unknown tool: {name}"))?
+            .map(ToolOutput::Json)
+    })
+}
+
+/// A session's status JSON. `view` is required for a mirrored session; a
+/// missing one (its store is resetting) is an error.
+fn status_value(
+    mirrored: bool,
+    lifecycle: Value,
+    view: Option<&SessionView>,
+) -> Result<Value, String> {
+    let mut value = match (mirrored, view) {
+        (true, Some(view)) => match read_tool(view, "figmog_status", &json!({}))? {
+            ToolOutput::Json(value) => value,
+            ToolOutput::Raw(_) | ToolOutput::Deferred(_) => {
+                unreachable!("local read tools return JSON")
+            }
+        },
+        (true, None) => return Err(RESETTING.to_string()),
+        (false, _) => json!({"name": null, "version": null, "last_modified": null,
+            "synced_at_unix_ms": null, "nodes": 0}),
+    };
+    value["ready"] = json!(mirrored);
+    value["pull"] = lifecycle;
+    Ok(value)
+}
+
+const RESETTING: &str = "this mirror's store is being reset; retry shortly";
 
 impl Drop for FileSession {
     fn drop(&mut self) {
@@ -170,35 +262,46 @@ impl FileSession {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn status(&self) -> Result<Value, String> {
-        let mut value = if self.mirrored {
-            match self.dispatch("figmog_status", &json!({}))? {
-                ToolOutput::Json(value) => value,
-                ToolOutput::Raw(_) | ToolOutput::Deferred(_) => {
-                    unreachable!("local read tools return JSON")
-                }
-            }
-        } else {
-            json!({"name": null, "version": null, "last_modified": null,
-                "synced_at_unix_ms": null, "nodes": 0})
-        };
-        value["ready"] = json!(self.mirrored);
-        value["pull"] = self.lifecycle();
-        Ok(value)
+        self.status_read().run()
     }
 
-    pub(crate) fn dispatch(&self, name: &str, args: &Value) -> Result<ToolOutput, String> {
-        if !self.mirrored && name != "figmog_status" {
+    /// Capture a status read for a read worker. A mirrored session whose
+    /// store is resetting captures no view; its status read then fails.
+    pub(crate) fn status_read(&self) -> StatusRead {
+        StatusRead {
+            mirrored: self.mirrored,
+            lifecycle: self.lifecycle(),
+            lease: self.mirrored.then(|| self.gate.admit(&self.view)).flatten(),
+        }
+    }
+
+    /// The not-ready and resetting refusals every data read shares.
+    pub(crate) fn check_readable(&self) -> Result<(), String> {
+        if !self.mirrored {
             return Err(format!(
                 "mirror {} is not ready; inspect figmog_status or figmog_files for pull progress and errors",
                 self.key
             ));
         }
-        self.view.with_dependent(|_, readers| {
-            dispatch::dispatch_read_tool(name, args, "", readers)
-                .ok_or_else(|| format!("unknown tool: {name}"))?
-                .map(ToolOutput::Json)
-        })
+        if self.gate.is_closed() {
+            return Err(format!("mirror {}: {RESETTING}", self.key));
+        }
+        Ok(())
+    }
+
+    /// Admit one off-loop data read of the published view (NWS-2962).
+    pub(crate) fn lease(&self) -> Result<ReadLease, String> {
+        self.check_readable()?;
+        self.gate
+            .admit(&self.view)
+            .ok_or_else(|| format!("mirror {}: {RESETTING}", self.key))
+    }
+
+    pub(crate) fn dispatch(&self, name: &str, args: &Value) -> Result<ToolOutput, String> {
+        self.check_readable()?;
+        read_tool(&self.view, name, args)
     }
 
     fn new_job(&mut self) -> Job {
@@ -260,7 +363,7 @@ impl FileSession {
     }
 
     fn start_if_ready_at(&mut self, now: Instant) {
-        if self.busy || now < self.retry_at {
+        if self.busy || self.reset.is_some() || now < self.retry_at {
             return;
         }
         let Some(geometry) = self
@@ -394,6 +497,7 @@ impl FileSession {
                 (job.reply)(Err(self.busy_message()));
             }
         } else if !self.busy
+            && self.reset.is_none()
             && let Some(job) = self.image_queue.pop_front()
         {
             self.start_images(job);
@@ -450,7 +554,7 @@ impl FileSession {
             // image request finishes, ahead of any queued one.
             self.poll_owed = true;
         }
-        if !self.busy && eligible {
+        if !self.busy && self.reset.is_none() && eligible {
             let expedited = std::mem::take(&mut self.expedited_poll);
             if self.send(Command::Poll { expedited }).is_err() {
                 return false;
@@ -508,6 +612,9 @@ impl FileSession {
         if self.busy && !self.imaging {
             return Err(self.busy_message());
         }
+        if self.reset.is_some() {
+            return Err(format!("mirror {}: {RESETTING}", self.key));
+        }
         let job = ImageJob {
             ids: ids.to_vec(),
             format: format.to_string(),
@@ -562,7 +669,7 @@ pub(crate) fn open_session_at(
 #[cfg(test)]
 type PhaseHook = Arc<dyn Fn(&str) + Send + Sync>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct WorkerHooks {
     #[cfg(test)]
     pub(crate) on_phase: Option<PhaseHook>,
@@ -593,6 +700,19 @@ pub(crate) fn open_session_with_hooks(
     api: Option<SessionApi>,
     hooks: WorkerHooks,
 ) -> Result<FileSession, String> {
+    let reopen: Reopen = {
+        let (path, key, network_key) = (path.clone(), key.clone(), network_key.map(str::to_string));
+        let (api, hooks) = (api.clone(), hooks.clone());
+        Arc::new(move || {
+            open_session_with_hooks(
+                path.clone(),
+                key.clone(),
+                network_key.as_deref(),
+                api.clone(),
+                hooks.clone(),
+            )
+        })
+    };
     let network_key = network_key.map(str::to_string);
     let pipeline = Arc::new(Mutex::new(crate::figmog_pipeline!()));
     let mut st = open_store_checked(&path, |path| {
@@ -779,6 +899,9 @@ pub(crate) fn open_session_with_hooks(
         watch_retry_at: None,
         expedited_poll: false,
         interval: Duration::from_secs(10),
+        gate: Arc::default(),
+        reset: None,
+        reopen,
     })
 }
 
@@ -856,13 +979,93 @@ impl SessionManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn list(&self) -> Value {
+        self.files_read().run()
+    }
+
+    /// Capture `figmog_files` for a read worker: each session's lifecycle
+    /// now, and a lease on its published view (none while it resets, which
+    /// lists that file's metadata as null).
+    pub(crate) fn files_read(&self) -> FilesRead {
         let default = self.effective_default_key();
-        json!(self.sessions.iter().map(|s| {
-            let status = s.status().unwrap_or(Value::Null);
-            json!({"key": s.key, "name": status["name"], "version": status["version"], "nodes": status["nodes"],
-                "last_synced": status["synced_at_unix_ms"], "default": default.as_deref() == Some(&s.key),
-                "ready": s.mirrored, "pull": s.lifecycle()})
-        }).collect::<Vec<_>>())
+        FilesRead(
+            self.sessions
+                .iter()
+                .map(|s| {
+                    (
+                        s.key.clone(),
+                        default.as_deref() == Some(&s.key),
+                        s.status_read(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Reset barrier steps 1–2 (NWS-2962): validate, then stop admitting
+    /// reads for `key`'s store only. Steps 3–5 run in
+    /// [`service_resets`](Self::service_resets) once its worker reads have
+    /// released their views and its worker is idle.
+    #[cfg_attr(not(test), allow(dead_code))] // first caller: NWS-2963's reset tool
+    pub(crate) fn begin_reset(&mut self, file_ref: &str, reset: StoreReset) -> Result<(), String> {
+        let key = parse_file_ref(file_ref)
+            .ok_or_else(|| format!("not a Figma file key or URL: {file_ref}"))?;
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.key == key)
+            .ok_or_else(|| format!("no open mirror {key}; see figmog_files"))?;
+        if session.reset.is_some() {
+            return Err(format!("mirror {key} is already being reset"));
+        }
+        session.gate.close();
+        session.reset = Some(reset);
+        Ok(())
+    }
+
+    /// Reset barrier steps 3–5, without blocking: every resetting store
+    /// whose admitted reads have all released their views and whose worker
+    /// is idle is closed, reset and reopened, and the new session (with an
+    /// open gate) published in the same position. Returns each finished
+    /// reset's key and outcome; a store that fails to reopen is dropped
+    /// from the session list (a later reference opens it again).
+    pub(crate) fn service_resets(&mut self) -> Vec<(String, Result<(), String>)> {
+        let mut finished = Vec::new();
+        let mut index = 0;
+        while index < self.sessions.len() {
+            let session = &self.sessions[index];
+            let ready = session.reset.is_some() && !session.busy && session.gate.outstanding() == 0;
+            if !ready {
+                index += 1;
+                continue;
+            }
+            let key = session.key.clone();
+            let reopen = session.reopen.clone();
+            // Closing the old session joins its idle worker and releases
+            // the store before it is reopened.
+            drop(self.sessions.remove(index));
+            match reopen() {
+                Ok(session) => {
+                    self.sessions.insert(index, session);
+                    index += 1;
+                    finished.push((key, Ok(())));
+                }
+                Err(error) => finished.push((key, Err(error))),
+            }
+        }
+        finished
+    }
+
+    /// Shutdown's close barrier: stop admitting reads on every store and
+    /// wait (until `deadline`) for admitted ones to release their views
+    /// before the sessions — and their stores — are dropped.
+    pub(crate) fn close_reads(&mut self, deadline: Instant) {
+        for session in &self.sessions {
+            session.gate.close();
+        }
+        for session in &self.sessions {
+            session.gate.wait_drained(deadline);
+        }
     }
 }

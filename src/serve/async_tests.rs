@@ -2,6 +2,8 @@
 use super::*;
 use crate::api::{ApiError, FigmaApi, FileMetaResp};
 use crate::store;
+use serde_json::json;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 fn fixture(version: &str) -> Value {
@@ -83,8 +85,17 @@ fn call_and_wait(
     tools: &[mcp::ToolDef],
     message: &Value,
 ) -> Value {
+    let live = Arc::new(AtomicBool::new(false));
     let mut handler = FnHandler(|name: &str, args: &Value| {
-        handle_tool_call(manager, offload, upstream_status, interval, name, args)
+        handle_tool_call(
+            manager,
+            offload,
+            &live,
+            upstream_status,
+            interval,
+            name,
+            args,
+        )
     });
     let reply = mcp::dispatch_message(
         &message.to_string(),
@@ -97,6 +108,7 @@ fn call_and_wait(
         Reply::Now(response) => return response,
         Reply::Later(call) => call,
     };
+    offload.park(&call);
     let mut deadline = Instant::now();
     loop {
         let done = offload
@@ -104,8 +116,8 @@ fn call_and_wait(
             .recv_timeout(Duration::from_secs(10))
             .expect("deferred call answers");
         if done.token == call.token() {
-            let output = apply_done(manager, no_watch, interval, &mut deadline, done);
-            return call.finish(output);
+            let answer = apply_done(manager, no_watch, interval, &mut deadline, done);
+            return serde_json::from_str(&answer_frame(answer, call)).unwrap();
         }
     }
 }
@@ -617,7 +629,7 @@ fn async_socket_cli_acknowledges_open_and_sync_before_worker_release() {
     let (listener, path) = bind_socket(&_dir.path().join(".figmog")).unwrap();
     let _socket_guard = SocketGuard::new(path).unwrap();
     let (tx, rx) = mpsc::channel();
-    let registry = Arc::new(Mutex::new(HashMap::new()));
+    let registry: ConnRegistry = Arc::default();
     spawn_socket_acceptor(listener, tx.clone(), registry.clone());
     let server = std::thread::spawn(move || {
         serve_loop(
@@ -721,7 +733,11 @@ fn async_stdio_open_acknowledges_and_accepts_requests_while_fetch_is_gated() {
             Instant::now() + Duration::from_secs(10),
             rx,
             Arc::default(),
-            |response| output.send(response.clone()).is_ok(),
+            move |frame: &str| {
+                output
+                    .send(serde_json::from_str::<Value>(frame).unwrap())
+                    .is_ok()
+            },
         )
     });
     let call = |id, name, arguments| {
@@ -1215,6 +1231,7 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 4);
 }
 
+mod isolation;
 mod offload;
 mod watch_and_cache;
 

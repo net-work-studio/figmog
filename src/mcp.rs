@@ -121,7 +121,7 @@ pub(crate) enum Reply {
 /// eventual response needs — the caller's JSON-RPC `id`, the tool name
 /// (for `structuredContent`) and the transport's error mode — so a late
 /// result is framed identically to an immediate one.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PendingCall {
     id: Value,
     name: String,

@@ -396,8 +396,52 @@ same asynchronous lifecycle, regardless of watch mode.
 one `mpsc` channel. The main loop handles due watch work and completions
 before each request, even under continuous traffic. It wakes at most 20ms
 later to consume worker completions, including under `--no-watch`.
-Stdout writes are manual (`writeln!` + flush), so a vanished stdio reader
-causes clean shutdown instead of a panic.
+Stdout writes are manual (`writeln!` + flush) on a stdout writer thread
+(NWS-2962), so a vanished stdio reader causes clean shutdown instead of a
+panic.
+
+**Slow clients and heavy reads (NWS-2962):** the loop never writes to a
+client and never runs a whole-mirror scan.
+
+- *Heavy reads run on read workers.* Every local read except the point
+  lookups `figmog_pages`, `figmog_node`, `figmog_path` and
+  `figmog_components` — i.e. `figmog_tree`, `figmog_subtree`,
+  `figmog_find`, `figmog_search`, `figmog_instances`, `figmog_styles`,
+  `figmog_uses`, `figmog_vars`, `figmog_stats`, `figmog_text`,
+  `figmog_where`, `figmog_at`, plus `figmog_status` and `figmog_files`
+  (their node count scans the mirror) — runs on a pool of
+  `min(4, available_parallelism)` read workers. Classification is by
+  measured cost on a synthetic 100k-node mirror: the inline four take
+  under 0.2 ms; status ~90 ms, stats ~0.5 s, a whole-document subtree
+  ~0.4 s (≈20 MB), vars ~0.3 s, tree/where ~0.2–0.4 s, the rest 25–150 ms
+  (`measure_read_costs`, an ignored test). Routing, the not-ready check
+  and status's `ready`/`pull` lifecycle (as of the request) are decided on
+  the loop; the worker reads a leased published view (no store lock),
+  then frames and serializes the response itself, so even a 20 MB answer
+  costs the loop one queue push. Responses are byte-identical to the
+  inline ones; they are delivered like other deferred responses (≤ 2 ms
+  polling while reads are outstanding) and may arrive out of request
+  order on one stream (match by id). Jobs run in arrival order.
+- *Per-requester bound.* A connection (or stdio) may have at most 32
+  calls pending (worker reads, images, desktop calls); a further
+  `tools/call` from it is refused at once with `too many pending
+  requests on this connection (limit 32); …` (socket `-32000`, stdio
+  `isError`).
+- *Dropped connections cost nothing more.* A read whose connection has
+  closed or been dropped is not started (if queued) or not accepted.
+- *Reset barrier (per store).* A store close or reset (1) validates its
+  input, (2) stops admitting reads for that store only (its data reads,
+  inline or worker, are refused with "this mirror's store is being reset;
+  retry shortly"; `figmog_files` lists it with null metadata; its worker
+  starts no new pull, poll or image request), (3) waits — polled each loop
+  iteration, never blocking other files — until every admitted worker read
+  has released its view and its worker is idle, then (4) closes, resets
+  and reopens the store and (5) publishes the new session in place. A
+  store is never deleted or reopened underneath a live view. Shutdown
+  applies steps 2–3 (bounded by the exit drain) before closing stores. No
+  tool resets a store yet; `SessionManager::begin_reset` /
+  `service_resets` are the mechanism NWS-2963 builds on (its only
+  operation today is a close-and-reopen, which starts fresh job history).
 
 **Off-loop images and desktop calls (NWS-2955):** `figmog_images` and
 proxied desktop calls are answered later instead of on the loop, so a slow
@@ -564,14 +608,26 @@ accepted directly, since dispatch treats every frame independently.
 An acceptor thread gives each connection its own reader
 thread, which tags frames with a connection id and forwards them into the
 same `mpsc` channel stdin feeds; the connection's write half is
-registered before its reader starts, so a response always has somewhere
-to route. Responses are written to the owning connection under a write
-timeout, so a client that stops reading is disconnected and dropped from
-the registry rather than stalling the single-threaded loop; a vanished
-client is a silent no-op. The store stays single-threaded throughout:
-socket traffic interleaves with MCP frames and watch ticks like any other
-request. Image and desktop responses are written when their off-loop work
-finishes (§6), to the connection that asked.
+registered, with its own writer thread, before its reader starts, so a
+response always has somewhere to route. Routing is by connection id and
+deferred token, never by JSON-RPC id.
+
+**Output (NWS-2962):** the loop only queues response frames; each
+connection's writer thread writes them in order. The queue is bounded at
+32 frames and 64 MiB (queued plus in flight; one larger frame is still
+accepted onto an empty queue), and each response has one overall 20 s
+write deadline from its first byte — the remaining time is re-applied
+before every 64 KiB write call, so a client that trickle-reads cannot
+renew it. A full queue or a missed deadline drops the connection: its
+socket is shut down, queued frames discarded, and its pending reads
+skipped. A client that closes its side has frames already queued flushed
+and later responses dropped; a vanished client is a silent no-op. Stdio
+has one client (the agent), so its writer thread has an unbounded queue
+and no drop policy (dropping it would be fatal); a broken stdout shuts
+serve down as before. Socket traffic interleaves with MCP frames and
+watch ticks like any other request; per-file writes stay on each file's
+worker. Image, desktop and worker-read responses are written when their
+off-loop work finishes (§6), to the connection that asked.
 
 **Shutdown with deferred work:** on stdin EOF (or the request channel
 closing) serve stops accepting requests and starts no new work, but still
@@ -579,7 +635,9 @@ writes the responses it owes, to stdio and to still-open sockets, for up to
 15 seconds (covering the desktop's 10-second timeout), so `printf
 '<request>\n' | figmog serve` gets its image or desktop response. Image
 requests still queued (not started) are answered with a shutting-down
-error. Responses not ready by then are dropped. A running image request
+error. Responses not ready by then are dropped. Worker reads still owed
+are answered within the same window; writer threads then get what is
+left of it to flush queued frames. A running image request
 still finishes before exit with its file's worker, like a running pull; the
 desktop worker is detached, its in-flight call bounded by the upstream
 timeout and its queued calls discarded.

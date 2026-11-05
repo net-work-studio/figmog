@@ -1,6 +1,7 @@
 //! Main's cache-scan and queued-watch invariants exercised with async workers.
 use super::*;
 use crate::model::{FileMeta, Id, ImageBlobRec, Rec};
+use std::collections::BTreeMap;
 
 fn seed_cache(path: &std::path::Path, prior_version: Option<&str>) {
     let mut st = crate::open_store!(path);
@@ -145,13 +146,23 @@ fn socket_request(id: u64, tool: &str) -> Incoming {
     )
 }
 
-fn response(reader: &mut BufReader<UnixStream>, id: u64) -> Value {
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    let frame: Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(frame["id"], id);
-    assert_eq!(frame["result"]["isError"], false, "{frame}");
-    serde_json::from_str(frame["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+/// Read `count` responses, keyed by JSON-RPC id: heavy reads answer from
+/// read workers (NWS-2962), so one stream's responses may arrive in any
+/// order.
+fn responses(reader: &mut BufReader<UnixStream>, count: u64) -> BTreeMap<u64, Value> {
+    (0..count)
+        .map(|_| {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(frame["result"]["isError"], false, "{frame}");
+            let text = frame["result"]["content"][0]["text"].as_str().unwrap();
+            (
+                frame["id"].as_u64().unwrap(),
+                serde_json::from_str(text).unwrap(),
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -176,7 +187,7 @@ fn overdue_watch_is_not_starved_by_prequeued_stdio_and_socket_traffic() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let registry: ConnRegistry = Arc::default();
-    registry.lock().unwrap().insert(1, socket);
+    registry.register(1, socket).unwrap();
     queue_requests(&tx, "figmog_status");
     let worker = std::thread::spawn(move || {
         serve_loop_with_output(
@@ -193,8 +204,12 @@ fn overdue_watch_is_not_starved_by_prequeued_stdio_and_socket_traffic() {
         )
     });
     let mut reader = BufReader::new(client);
-    for id in 1..=8 {
-        let status = response(&mut reader, id);
+    let first = responses(&mut reader, 8);
+    assert_eq!(
+        first.keys().copied().collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>()
+    );
+    for status in first.values() {
         assert_eq!(
             status["version"], "1",
             "gated refresh must retain the committed mirror"
@@ -217,7 +232,7 @@ fn overdue_watch_is_not_starved_by_prequeued_stdio_and_socket_traffic() {
     let deadline = Instant::now() + Duration::from_secs(5);
     for id in 9.. {
         tx.send(socket_request(id, "figmog_status")).unwrap();
-        let status = response(&mut reader, id);
+        let status = responses(&mut reader, 1).remove(&id).unwrap();
         if status["version"] == "2" {
             break;
         }
@@ -252,7 +267,7 @@ fn no_watch_answers_prequeued_requests_without_polling_an_overdue_deadline() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let registry: ConnRegistry = Arc::default();
-    registry.lock().unwrap().insert(1, socket);
+    registry.register(1, socket).unwrap();
     queue_requests(&tx, "figmog_files");
     tx.send(Incoming::StdinClosed).unwrap();
     serve_loop_with_output(
@@ -269,8 +284,13 @@ fn no_watch_answers_prequeued_requests_without_polling_an_overdue_deadline() {
     )
     .unwrap();
     let mut reader = BufReader::new(client);
-    for id in 1..=8 {
-        assert_eq!(response(&mut reader, id)[0]["version"], "1");
+    let files = responses(&mut reader, 8);
+    assert_eq!(
+        files.keys().copied().collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>()
+    );
+    for listed in files.values() {
+        assert_eq!(listed[0]["version"], "1");
     }
     assert!(matches!(
         entered.try_recv(),

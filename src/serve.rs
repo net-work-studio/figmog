@@ -17,6 +17,10 @@
 //! `figmog_images` and desktop proxy calls are answered later: their
 //! network work runs on the file's worker or the desktop worker, and the
 //! loop writes each response to its requester when it completes (NWS-2955).
+//! Heavy local reads run on a read-worker pool against a leased published
+//! view, and every response is written by a per-requester writer thread
+//! with a bounded queue and a per-response deadline, so neither a slow
+//! client nor a whole-mirror scan holds the loop (NWS-2962).
 //!
 //! **Desktop context:** the upstream answers for the file active in Figma,
 //! independently of the mirrors. It supplies no authoritative file/revision
@@ -35,24 +39,30 @@
 //! re-probe: an unreachable upstream at startup means local-only tools
 //! for the life of the process.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::dispatch;
 use crate::ident::parse_file_ref;
 use crate::mcp::{self, FnHandler, PendingCall, Reply, ToolErrorMode, ToolOutput};
 use crate::proxy;
 use crate::sessions::{self, SessionManager};
+
+mod output;
+mod reads;
+
 use crate::upstream::{HttpUpstream, UpstreamMcp};
+use output::{ConnRegistry, StdioWriter};
+use reads::{ReadPool, ReadTask, StagedRead};
 
 /// Default streamable-HTTP URL of Figma desktop app's Dev Mode MCP server
 /// (build design §12).
@@ -85,7 +95,8 @@ fn clamp_interval(interval: u64) -> Duration {
 // (`Incoming::Socket`) so the single-threaded main loop below can route
 // each response back to the connection that asked for it. The main loop
 // handles routing, scheduling and committed read views; per-file workers
-// own all writes and blocking pull/poll work.
+// own all writes and blocking pull/poll work; read workers run heavy
+// reads; writer threads (`output.rs`) write every response.
 
 /// One message the serve loop can receive from either its stdin reader
 /// thread or a socket connection's reader thread.
@@ -102,16 +113,6 @@ enum Incoming {
     /// One line from socket connection `conn_id`.
     Socket(u64, String),
 }
-
-/// Registry of a socket connection's write half, keyed by connection id —
-/// the main loop's only way to route a response back to the connection
-/// that asked for it (its own thread only ever *reads*; writing back
-/// happens from the main loop, which is the only place a `ToolHandler` may
-/// touch the store). An entry is removed the moment its reader thread ends
-/// (EOF or any read error — see [`spawn_socket_acceptor`]), so a client
-/// that vanishes mid-request simply has no entry left to write a response
-/// to by the time one's ready.
-type ConnRegistry = Arc<Mutex<HashMap<u64, UnixStream>>>;
 
 /// `<figmog_root>/serve.sock` — must match `cli::socket`'s own derivation
 /// exactly, since that's how the CLI finds this process.
@@ -279,18 +280,6 @@ impl Drop for SocketGuard {
 /// — is orders of magnitude smaller than this.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-/// Generous but bounded: a socket client that never reads what serve
-/// writes back (accidentally or maliciously) must not be able to stall
-/// this connection's response forever (review I1); well-behaved clients
-/// (the CLI's own `cli::socket`, any well-formed automation) read
-/// promptly and never come close to this. Set once per connection, at
-/// accept time, on a handle that's `dup()`-shared with every later
-/// `try_clone()` of the same connection (a unix-domain socket's send
-/// timeout is a property of the underlying OS socket, not of any one
-/// process-side handle to it), so [`write_socket_response`]'s later clones
-/// inherit it automatically.
-const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Read one newline-delimited frame from `reader`, capped at
 /// [`MAX_FRAME_BYTES`] (review m4). `Ok(None)` on a clean EOF with no
 /// partial data; `Err` on an oversized frame (no newline found within the
@@ -338,13 +327,13 @@ fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Strin
 /// Accept loop for the control-plane socket, on its own thread: each
 /// connection gets its own reader thread forwarding newline-delimited
 /// frames (bounded per [`read_bounded_line`]) into `tx` tagged with a
-/// fresh connection id, with its write half — a non-blocking-forever send
-/// timeout applied ([`SOCKET_WRITE_TIMEOUT`]) — stored in `registry` first
-/// (so a request that arrives and is answered before the *next* line is
-/// even read still has somewhere to route its response). An accept, clone,
-/// or timeout-configuration failure for one connection is skipped rather
-/// than tearing down the whole listener — a transient per-connection
-/// hiccup shouldn't take the control plane down.
+/// fresh connection id, with its write half registered (and its writer
+/// thread started, [`output::Connections::register`]) first — so a request
+/// that arrives and is answered before the *next* line is even read still
+/// has somewhere to route its response. An accept, clone, or registration
+/// failure for one connection is skipped rather than tearing down the
+/// whole listener — a transient per-connection hiccup shouldn't take the
+/// control plane down.
 fn spawn_socket_acceptor(
     listener: UnixListener,
     tx: mpsc::Sender<Incoming>,
@@ -357,14 +346,10 @@ fn spawn_socket_acceptor(
             let Ok(write_half) = stream.try_clone() else {
                 continue;
             };
-            if write_half
-                .set_write_timeout(Some(SOCKET_WRITE_TIMEOUT))
-                .is_err()
-            {
+            let conn_id = next_id.fetch_add(1, Ordering::Relaxed);
+            if registry.register(conn_id, write_half).is_err() {
                 continue;
             }
-            let conn_id = next_id.fetch_add(1, Ordering::Relaxed);
-            registry.lock().unwrap().insert(conn_id, write_half);
 
             let tx = tx.clone();
             let registry = registry.clone();
@@ -381,48 +366,13 @@ fn spawn_socket_acceptor(
                         Err(_) => break,
                     }
                 }
-                // The client disconnected (or sent something unreadable):
-                // drop its write half so a response computed just before
-                // this point (still in flight through `tx`) finds no entry
-                // to write to instead of writing into a dead socket.
-                registry.lock().unwrap().remove(&conn_id);
+                // The client disconnected, sent something unreadable, or
+                // was dropped by its writer: a response computed after this
+                // point finds no entry, and its pending reads are skipped.
+                registry.unregister(conn_id);
             });
         }
     });
-}
-
-/// Write one response frame back to `conn_id`'s socket connection, if it's
-/// still registered — a client that vanished mid-request (its reader
-/// thread already removed the entry) simply has nothing to write to,
-/// matching every other "vanished client" path in this file: the response
-/// is dropped, not a panic and not a wedged loop. A write failure (the
-/// connection died, or [`SOCKET_WRITE_TIMEOUT`] elapsed against a
-/// non-reading client) removes the now-dead entry too, so a later response
-/// for the same id doesn't retry a broken pipe.
-///
-/// Review I1: the actual (bounded, per [`SOCKET_WRITE_TIMEOUT`]) write
-/// happens on a handle cloned *out from behind* the registry lock — cloning
-/// a `UnixStream` is a cheap `dup()`, not I/O — rather than while holding
-/// it. Holding the lock across a blocking write would stall every other
-/// connection's registry bookkeeping (a new connection's accept-time
-/// `insert`, another connection's disconnect-time `remove`) behind however
-/// long this one write takes to time out, on top of the (unavoidable,
-/// single-threaded-loop) delay to every other queued message this causes
-/// regardless.
-fn write_socket_response(registry: &ConnRegistry, conn_id: u64, resp: &Value) {
-    let stream = {
-        let reg = registry.lock().unwrap();
-        match reg.get(&conn_id).and_then(|s| s.try_clone().ok()) {
-            Some(s) => s,
-            None => return,
-        }
-    };
-
-    let text = resp.to_string();
-    let ok = writeln!(&stream, "{text}").is_ok() && (&stream).flush().is_ok();
-    if !ok {
-        registry.lock().unwrap().remove(&conn_id);
-    }
 }
 
 /// How long to wait before the next watch tick, given how many sessions
@@ -469,7 +419,7 @@ pub(crate) fn run_serve(
     // for the rest of this function purely for its `Drop` impl (unlinking
     // the socket file) — every return point below drops it implicitly.
     let (tx, rx) = mpsc::channel::<Incoming>();
-    let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let registry: ConnRegistry = Arc::default();
     let _socket_guard: Option<SocketGuard> = if no_socket {
         None
     } else {
@@ -578,17 +528,18 @@ fn serve_loop(
         first_deadline,
         rx,
         registry,
-        |response| {
+        |frame| {
             let mut stdout = std::io::stdout();
-            writeln!(stdout, "{response}").is_ok() && stdout.flush().is_ok()
+            writeln!(stdout, "{frame}").is_ok() && stdout.flush().is_ok()
         },
     )
 }
 
-// ---- off-loop work (NWS-2955) ----
+// ---- off-loop work (NWS-2955, NWS-2962) ----
 //
-// Image requests run on their file's worker and desktop proxy calls on one
-// desktop worker thread. A handler that hands work off answers
+// Image requests run on their file's worker, desktop proxy calls on one
+// desktop worker thread, and heavy local reads on the read pool
+// (`reads.rs`). A handler that hands work off answers
 // `ToolOutput::Deferred(token)`; the loop parks the call's `PendingCall`
 // with where to answer it (stdio or a socket connection id) and writes the
 // response when the token's `Done` arrives on the completion channel, which
@@ -597,12 +548,24 @@ fn serve_loop(
 // other responses on the same stream; the CLI's socket client sends one
 // request per connection, so it never sees reordering. Two connections may
 // reuse the same id: routing is by token, never by JSON-RPC id.
+//
+// Nothing on the loop writes to a client: every response frame is queued
+// on its requester's writer thread (`output.rs`).
+
+/// What a deferred call produced.
+enum Answer {
+    /// A tool result the loop frames with its parked `PendingCall`.
+    Output(Result<ToolOutput, String>),
+    /// A complete newline-terminated response frame, framed and
+    /// serialized off the loop by a read worker.
+    Frame(String),
+}
 
 /// A deferred tool call's result, sent to the main loop's completion
 /// channel.
 struct Done {
     token: u64,
-    output: Result<ToolOutput, String>,
+    answer: Answer,
     /// A successful likely-write desktop call (spec §8): expedite every
     /// session's metadata poll on delivery.
     expedite_polls: bool,
@@ -612,50 +575,110 @@ struct Done {
 /// that died mid-request, or queued work discarded at shutdown — still
 /// answers, with an error, so no caller waits for a response that never
 /// comes. A send after the loop exited is silently dropped.
-struct DeferredReply {
+pub(crate) struct DeferredReply {
     token: u64,
     done: Option<mpsc::Sender<Done>>,
 }
 
 impl DeferredReply {
-    fn send(mut self, output: Result<ToolOutput, String>, expedite_polls: bool) {
+    fn answer(&mut self, answer: Answer, expedite_polls: bool) {
         if let Some(done) = self.done.take() {
             let _ = done.send(Done {
                 token: self.token,
-                output,
+                answer,
                 expedite_polls,
             });
         }
+    }
+
+    fn send(mut self, output: Result<ToolOutput, String>, expedite_polls: bool) {
+        self.answer(Answer::Output(output), expedite_polls);
+    }
+
+    fn send_frame(mut self, frame: String) {
+        self.answer(Answer::Frame(frame), false);
     }
 }
 
 impl Drop for DeferredReply {
     fn drop(&mut self) {
-        if let Some(done) = self.done.take() {
-            let _ = done.send(Done {
-                token: self.token,
-                output: Err("request abandoned: its worker stopped before answering".into()),
-                expedite_polls: false,
-            });
-        }
+        self.answer(
+            Answer::Output(Err(
+                "request abandoned: its worker stopped before answering".into(),
+            )),
+            false,
+        );
     }
 }
 
 /// Where a deferred call's response is written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ReplyTo {
     Stdio,
     Socket(u64),
 }
 
+/// Calls one requester may have pending (deferred and unanswered) at once.
+/// Beyond it, a further `tools/call` from that requester is refused
+/// immediately with a tool error rather than queued without bound.
+const MAX_PENDING_PER_REQUESTER: usize = 32;
+
+/// Deferred calls awaiting their `Done`, by token, with a per-requester
+/// count. Ordered maps: nothing here ever iterates a `HashMap` toward
+/// output.
+#[derive(Default)]
+struct Pending {
+    calls: BTreeMap<u64, (ReplyTo, PendingCall)>,
+    per_requester: BTreeMap<ReplyTo, usize>,
+}
+
+impl Pending {
+    fn insert(&mut self, to: ReplyTo, call: PendingCall) {
+        *self.per_requester.entry(to).or_default() += 1;
+        self.calls.insert(call.token(), (to, call));
+    }
+
+    fn remove(&mut self, token: u64) -> Option<(ReplyTo, PendingCall)> {
+        let (to, call) = self.calls.remove(&token)?;
+        if let Some(count) = self.per_requester.get_mut(&to) {
+            *count -= 1;
+            if *count == 0 {
+                self.per_requester.remove(&to);
+            }
+        }
+        Some((to, call))
+    }
+
+    fn count(&self, to: ReplyTo) -> usize {
+        self.per_requester.get(&to).copied().unwrap_or(0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+}
+
 /// The main loop's side of off-loop work: the completion channel, token
-/// allocation, and the desktop worker (if an upstream is attached).
+/// allocation, the read pool, and the desktop worker (if an upstream is
+/// attached).
 struct Offload {
     done_tx: mpsc::Sender<Done>,
     done_rx: mpsc::Receiver<Done>,
     next_token: u64,
     desktop: Option<DesktopWorker>,
+    reads: ReadPool,
+    /// A read the handler accepted, submitted once its `PendingCall` is
+    /// known ([`Offload::park`]).
+    staged: Option<StagedRead>,
+    /// Tokens of reads submitted to the pool and not yet answered: while
+    /// any is outstanding the loop polls for completions every
+    /// [`READ_POLL`] instead of every 20ms.
+    reads_in_flight: std::collections::BTreeSet<u64>,
 }
+
+/// Completion polling interval while worker reads are outstanding, so a
+/// read answered off the loop gains at most this much latency.
+const READ_POLL: Duration = Duration::from_millis(2);
 
 impl Offload {
     fn new(desktop: Option<DesktopWorker>) -> Self {
@@ -665,6 +688,9 @@ impl Offload {
             done_rx,
             next_token: 0,
             desktop,
+            reads: ReadPool::default(),
+            staged: None,
+            reads_in_flight: std::collections::BTreeSet::new(),
         }
     }
 
@@ -680,6 +706,38 @@ impl Offload {
                 done: Some(self.done_tx.clone()),
             },
         )
+    }
+
+    /// Accept `task` for the read pool. A requester that is already gone
+    /// gets nothing computed.
+    fn defer_read(
+        &mut self,
+        cancel: &Arc<AtomicBool>,
+        task: ReadTask,
+    ) -> Result<ToolOutput, String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled: its connection closed".into());
+        }
+        let (token, reply) = self.reply();
+        self.staged = Some(StagedRead {
+            token,
+            task,
+            reply,
+            cancel: cancel.clone(),
+        });
+        Ok(ToolOutput::Deferred(token))
+    }
+
+    /// Hand a staged read its `PendingCall` and submit it to the pool.
+    fn park(&mut self, call: &PendingCall) {
+        // A stale stage (another token) is dropped and answers an error
+        // to a token nobody parked.
+        if let Some(staged) = self.staged.take()
+            && staged.token == call.token()
+        {
+            self.reads_in_flight.insert(staged.token);
+            self.reads.submit(staged, call.clone());
+        }
     }
 }
 
@@ -757,78 +815,97 @@ impl Drop for DesktopWorker {
     }
 }
 
-/// Apply a deferred result's loop-side effects and return its tool output.
+/// Apply a deferred result's loop-side effects and return its answer.
 fn apply_done(
     manager: &mut SessionManager,
     no_watch: bool,
     interval: Duration,
     next_deadline: &mut Instant,
     done: Done,
-) -> Result<ToolOutput, String> {
+) -> Answer {
     if done.expedite_polls && !no_watch {
         manager.expedite_polls(interval);
         *next_deadline = Instant::now();
     }
-    done.output
+    done.answer
 }
 
-/// Write one response to its requester. `false` means the stdio reader is
-/// gone, which shuts the server down cleanly.
-fn deliver(
-    to: ReplyTo,
-    response: &Value,
-    registry: &ConnRegistry,
-    write_stdio: &mut impl FnMut(&Value) -> bool,
-) -> bool {
+/// One response as a newline-terminated frame (compact JSON, as always).
+fn frame(response: &Value) -> String {
+    let mut frame = response.to_string();
+    frame.push('\n');
+    frame
+}
+
+/// The response frame for a deferred call's answer.
+fn answer_frame(answer: Answer, call: PendingCall) -> String {
+    match answer {
+        Answer::Frame(frame) => frame,
+        Answer::Output(output) => frame(&call.finish(output)),
+    }
+}
+
+/// Queue one response frame for its requester. `false` means the stdio
+/// writer is gone, which shuts the server down cleanly.
+fn deliver(to: ReplyTo, frame: String, registry: &ConnRegistry, stdio: &StdioWriter) -> bool {
     match to {
-        ReplyTo::Stdio => write_stdio(response),
+        ReplyTo::Stdio => stdio.send(frame),
         ReplyTo::Socket(conn_id) => {
-            write_socket_response(registry, conn_id, response);
+            registry.send(conn_id, frame);
             true
         }
     }
 }
 
-/// How long stdin EOF waits for deferred responses still owed. Covers a
-/// desktop call (10s upstream timeout) with margin; an image request that
-/// runs longer loses its response (its file's worker still finishes it
-/// before exit, like a running pull).
+/// How long stdin EOF waits for deferred responses still owed (and then
+/// for writers to flush them). Covers a desktop call (10s upstream
+/// timeout) with margin; an image request that runs longer loses its
+/// response (its file's worker still finishes it before exit, like a
+/// running pull).
 const EXIT_DRAIN: Duration = Duration::from_secs(15);
 
 /// Shutdown: answer the deferred calls already accepted before exiting, so
 /// `printf '<request>\n' | figmog serve` still gets its response. Accepts
 /// no new requests and starts no new work (queued image requests are
-/// answered with an error); waits at most [`EXIT_DRAIN`]. A vanished
-/// stdout or closed socket just drops that response.
+/// answered with an error); waits until `deadline`. A vanished stdout or
+/// closed socket just drops that response.
 fn drain_on_exit(
     manager: &mut SessionManager,
     offload: &Offload,
-    pending: &mut BTreeMap<u64, (ReplyTo, PendingCall)>,
+    pending: &mut Pending,
     registry: &ConnRegistry,
-    write_stdio: &mut impl FnMut(&Value) -> bool,
+    stdio: &StdioWriter,
+    deadline: Instant,
 ) {
     for session in &mut manager.sessions {
         session.abandon_queued_images();
     }
-    let deadline = Instant::now() + EXIT_DRAIN;
     while !pending.is_empty() {
         let left = deadline.saturating_duration_since(Instant::now());
         let Ok(done) = offload.done_rx.recv_timeout(left) else {
             return;
         };
-        let Some((to, call)) = pending.remove(&done.token) else {
+        let Some((to, call)) = pending.remove(done.token) else {
             continue;
         };
         // No poll expedite: the server is exiting.
-        if !deliver(to, &call.finish(done.output), registry, write_stdio) {
+        if !deliver(to, answer_frame(done.answer, call), registry, stdio) {
             return;
         }
     }
 }
 
+/// Why the request loop returned.
+enum LoopExit {
+    /// Stdin EOF or the request channel closed: drain owed responses.
+    Drain,
+    /// Stdout is gone: nobody to drain to on stdio.
+    StdoutGone,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_loop_with_output(
-    mut manager: SessionManager,
+    manager: SessionManager,
     desktop: Option<DesktopWorker>,
     upstream_status: &'static str,
     no_watch: bool,
@@ -837,9 +914,88 @@ fn serve_loop_with_output(
     first_deadline: Instant,
     rx: mpsc::Receiver<Incoming>,
     registry: ConnRegistry,
-    mut write_stdio: impl FnMut(&Value) -> bool,
+    write_stdio: impl FnMut(&str) -> bool + Send + 'static,
 ) -> Result<(), String> {
-    let (tools, dropped) = match &desktop {
+    serve_loop_with_offload(
+        manager,
+        Offload::new(desktop),
+        upstream_status,
+        no_watch,
+        track_current,
+        interval_dur,
+        first_deadline,
+        rx,
+        registry,
+        write_stdio,
+    )
+}
+
+/// [`serve_loop_with_output`] with a caller-built [`Offload`] (tests set
+/// read-pool hooks on it).
+#[allow(clippy::too_many_arguments)]
+fn serve_loop_with_offload(
+    mut manager: SessionManager,
+    mut offload: Offload,
+    upstream_status: &'static str,
+    no_watch: bool,
+    track_current: bool,
+    interval_dur: Duration,
+    first_deadline: Instant,
+    rx: mpsc::Receiver<Incoming>,
+    registry: ConnRegistry,
+    write_stdio: impl FnMut(&str) -> bool + Send + 'static,
+) -> Result<(), String> {
+    let stdio = StdioWriter::spawn(write_stdio);
+    let mut pending = Pending::default();
+    let exit = request_loop(
+        &mut manager,
+        &mut offload,
+        &mut pending,
+        upstream_status,
+        no_watch,
+        track_current,
+        interval_dur,
+        first_deadline,
+        &rx,
+        &registry,
+        &stdio,
+    );
+    let deadline = Instant::now() + EXIT_DRAIN;
+    if matches!(exit, LoopExit::Drain) {
+        drain_on_exit(
+            &mut manager,
+            &offload,
+            &mut pending,
+            &registry,
+            &stdio,
+            deadline,
+        );
+    }
+    // Stop the read pool (queued reads are skipped; running ones finish
+    // and release their views), then close every store behind the reset
+    // barrier before the sessions drop.
+    drop(offload);
+    manager.close_reads(deadline);
+    registry.finish(deadline);
+    stdio.finish(deadline);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_loop(
+    manager: &mut SessionManager,
+    offload: &mut Offload,
+    pending: &mut Pending,
+    upstream_status: &'static str,
+    no_watch: bool,
+    track_current: bool,
+    interval_dur: Duration,
+    first_deadline: Instant,
+    rx: &mpsc::Receiver<Incoming>,
+    registry: &ConnRegistry,
+    stdio: &StdioWriter,
+) -> LoopExit {
+    let (tools, dropped) = match &offload.desktop {
         Some(d) => proxy::merge_registry(dispatch::tool_registry(), &d.tools),
         None => (dispatch::tool_registry(), Vec::new()),
     };
@@ -848,12 +1004,15 @@ fn serve_loop_with_output(
     }
 
     let mut watch = WatchScheduler::new(first_deadline);
-    let mut offload = Offload::new(desktop);
-    // Deferred calls awaiting their `Done`, by token. Ordered map: nothing
-    // here ever iterates a `HashMap` toward output.
-    let mut pending: BTreeMap<u64, (ReplyTo, PendingCall)> = BTreeMap::new();
+    // Stdio is never cancelled: it is the only client of its stream.
+    let stdio_live = Arc::new(AtomicBool::new(false));
 
     loop {
+        // A vanished stdio reader is a clean shutdown; accepted running
+        // pulls drain through FileSession's drop handler.
+        if stdio.gone() {
+            return LoopExit::StdoutGone;
+        }
         // Completions and due watch work run even under continuous traffic.
         // Polling this in-memory channel never waits on a pull or HTTP.
         let mut published = Vec::new();
@@ -862,71 +1021,77 @@ fn serve_loop_with_output(
                 published.push(session.key.clone());
             }
         }
+        for (key, outcome) in manager.service_resets() {
+            match outcome {
+                Ok(()) => published.push(key),
+                Err(error) => eprintln!("figmog: reopening {key} after a reset failed: {error}"),
+            }
+        }
         for key in published {
-            refresh_current(&manager, track_current, &key);
+            refresh_current(manager, track_current, &key);
         }
         // Deferred results go back to whoever asked. A token with no
         // pending entry was never parked (its call failed before
         // deferring), so its result has no requester.
         while let Ok(done) = offload.done_rx.try_recv() {
-            let Some((to, call)) = pending.remove(&done.token) else {
+            offload.reads_in_flight.remove(&done.token);
+            let Some((to, call)) = pending.remove(done.token) else {
                 continue;
             };
-            let output = apply_done(
-                &mut manager,
-                no_watch,
-                interval_dur,
-                &mut watch.next_round,
-                done,
-            );
-            if !deliver(to, &call.finish(output), &registry, &mut write_stdio) {
-                return Ok(());
+            let answer = apply_done(manager, no_watch, interval_dur, &mut watch.next_round, done);
+            if !deliver(to, answer_frame(answer, call), registry, stdio) {
+                return LoopExit::StdoutGone;
             }
         }
         if !no_watch {
-            watch.service_at(&mut manager, interval_dur, Instant::now());
+            watch.service_at(manager, interval_dur, Instant::now());
         }
-        let wait = Duration::from_millis(20).min(if no_watch {
+        let poll = if offload.reads_in_flight.is_empty() {
+            Duration::from_millis(20)
+        } else {
+            READ_POLL
+        };
+        let wait = poll.min(if no_watch {
             Duration::from_millis(20)
         } else {
             watch
-                .next_deadline(&manager)
+                .next_deadline(manager)
                 .saturating_duration_since(Instant::now())
         });
         let msg = match rx.recv_timeout(wait) {
             Ok(msg) => msg,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                drain_on_exit(
-                    &mut manager,
-                    &offload,
-                    &mut pending,
-                    &registry,
-                    &mut write_stdio,
-                );
-                return Ok(());
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return LoopExit::Drain,
         };
 
-        let (to, line, mode) = match msg {
-            Incoming::StdinClosed => {
-                drain_on_exit(
-                    &mut manager,
-                    &offload,
-                    &mut pending,
-                    &registry,
-                    &mut write_stdio,
-                );
-                return Ok(());
-            }
-            Incoming::Stdio(l) => (ReplyTo::Stdio, l, ToolErrorMode::McpContent),
-            Incoming::Socket(conn_id, l) => (ReplyTo::Socket(conn_id), l, ToolErrorMode::JsonRpc),
+        let (to, line, mode, cancel) = match msg {
+            Incoming::StdinClosed => return LoopExit::Drain,
+            Incoming::Stdio(l) => (
+                ReplyTo::Stdio,
+                l,
+                ToolErrorMode::McpContent,
+                stdio_live.clone(),
+            ),
+            Incoming::Socket(conn_id, l) => (
+                ReplyTo::Socket(conn_id),
+                l,
+                ToolErrorMode::JsonRpc,
+                registry.cancel_flag(conn_id),
+            ),
         };
 
+        let over_limit = pending.count(to) >= MAX_PENDING_PER_REQUESTER;
+        offload.staged = None;
         let mut handler = FnHandler(|name: &str, args: &Value| -> Result<ToolOutput, String> {
+            if over_limit {
+                return Err(format!(
+                    "too many pending requests on this connection (limit {MAX_PENDING_PER_REQUESTER}); wait for responses before sending more"
+                ));
+            }
             handle_tool_call(
-                &mut manager,
-                &mut offload,
+                manager,
+                offload,
+                &cancel,
                 upstream_status,
                 interval_dur,
                 name,
@@ -936,12 +1101,11 @@ fn serve_loop_with_output(
         match mcp::dispatch_message(&line, &tools, &mut handler, mode) {
             None => {}
             Some(Reply::Later(call)) => {
-                pending.insert(call.token(), (to, call));
+                offload.park(&call);
+                pending.insert(to, call);
             }
-            // A vanished stdio reader is a clean shutdown; accepted
-            // running pulls drain through FileSession's drop handler.
-            Some(Reply::Now(response)) if !deliver(to, &response, &registry, &mut write_stdio) => {
-                return Ok(());
+            Some(Reply::Now(response)) if !deliver(to, frame(&response), registry, stdio) => {
+                return LoopExit::StdoutGone;
             }
             Some(Reply::Now(_)) => {}
         }
@@ -1168,6 +1332,25 @@ fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
     }
 }
 
+/// spec §2b: note an explicit-file/URL-file disagreement on a failed call
+/// (almost always "no node ... in the mirror" — the node genuinely isn't in
+/// the file the explicit arg picked) rather than staying silent about why a
+/// URL that looks right didn't resolve. `explicit_key` is the explicit
+/// `file` argument's *normalized* key, not its raw text — it can itself be
+/// a full Figma URL (or a bare key) naming the very same file `url_key`
+/// already extracted, and a raw-string compare would false-positive on
+/// that (same file, different spelling). A `file` arg `parse_file_ref`
+/// can't make sense of at all falls back to the raw text so a genuine
+/// mismatch still shows.
+fn file_mismatch_note(msg: String, explicit_key: Option<&str>, url_key: Option<&str>) -> String {
+    match (explicit_key, url_key) {
+        (Some(ef), Some(uf)) if ef != uf => format!(
+            "{msg} (note: the id/under URL names file {uf}, but the explicit `file` argument {ef} was used instead)"
+        ),
+        _ => msg,
+    }
+}
+
 /// Route one `tools/call`. `figmog_files`/`figmog_open` aren't per-file
 /// and are handled first; every other local tool's optional `file`
 /// argument is extracted (and stripped before tool-specific arg parsing)
@@ -1179,16 +1362,23 @@ fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
 /// Images and desktop calls answer [`ToolOutput::Deferred`]: their network
 /// work runs off the loop (on the file's worker and the desktop worker) and
 /// their result arrives later through `offload`'s completion channel.
+///
+/// Heavy local reads, `figmog_status` and `figmog_files` (NWS-2962) also
+/// answer [`ToolOutput::Deferred`]: they run on the read pool against a
+/// leased published view; `cancel` (the requester's) lets the pool skip
+/// them once nobody is left to answer.
 fn handle_tool_call(
     manager: &mut SessionManager,
     offload: &mut Offload,
+    cancel: &Arc<AtomicBool>,
     upstream_status: &'static str,
     interval: Duration,
     name: &str,
     args: &Value,
 ) -> Result<ToolOutput, String> {
     if name == "figmog_files" {
-        return Ok(ToolOutput::Json(manager.list()));
+        let read = manager.files_read();
+        return offload.defer_read(cancel, ReadTask::Files(read));
     }
 
     if name == "figmog_open" {
@@ -1231,9 +1421,14 @@ fn handle_tool_call(
             return Ok(ToolOutput::Json(session.request_pull(false, interval)));
         }
         if name == "figmog_status" {
-            let mut status = session.status()?;
-            status["upstream"] = json!(upstream_status);
-            return Ok(ToolOutput::Json(status));
+            let read = session.status_read();
+            return offload.defer_read(
+                cancel,
+                ReadTask::Status {
+                    read,
+                    upstream: upstream_status,
+                },
+            );
         }
 
         if !session.mirrored {
@@ -1261,31 +1456,25 @@ fn handle_tool_call(
             return Ok(ToolOutput::Deferred(token));
         }
 
-        let result = session.dispatch(name, &call_args).map_err(|msg| {
-            // spec §2b: note an explicit-file/URL-file disagreement on a
-            // failed call (almost always "no node ... in the mirror" —
-            // the node genuinely isn't in the file the explicit arg
-            // picked) rather than staying silent about why a URL that
-            // looks right didn't resolve. `explicit_file` is compared by
-            // its *normalized* key, not its raw text — it can itself be a
-            // full Figma URL (or a bare key) naming the very same file
-            // `url_file_key` already extracted, and a raw-string compare
-            // would false-positive on that (same file, different spelling).
-            // A `file` arg `parse_file_ref` can't make sense of at all
-            // falls back to the raw text so a genuine mismatch still shows.
-            let explicit_key = explicit_file
-                .as_deref()
-                .map(|f| parse_file_ref(f).unwrap_or_else(|| f.to_string()));
-            match (&explicit_key, &url_file_key) {
-                (Some(ef), Some(uf)) if ef != uf => {
-                    format!(
-                        "{msg} (note: the id/under URL names file {uf}, but the explicit `file` argument {ef} was used instead)"
-                    )
-                }
-                _ => msg,
-            }
-        })?;
-        return Ok(result);
+        let explicit_key = explicit_file
+            .as_deref()
+            .map(|f| parse_file_ref(f).unwrap_or_else(|| f.to_string()));
+        if !reads::is_inline_read(name) {
+            let lease = session.lease()?;
+            return offload.defer_read(
+                cancel,
+                ReadTask::Tool {
+                    lease,
+                    name: name.to_string(),
+                    args: call_args,
+                    explicit_key,
+                    url_key: url_file_key,
+                },
+            );
+        }
+        return session.dispatch(name, &call_args).map_err(|msg| {
+            file_mismatch_note(msg, explicit_key.as_deref(), url_file_key.as_deref())
+        });
     }
 
     // Desktop context is independent of every mirror. Never route its
@@ -1313,6 +1502,7 @@ mod tests {
     use crate::api::{FigmaApi, UreqApi};
     use crate::mcp::ToolDef;
     use crate::upstream::FakeUpstream;
+    use serde_json::json;
 
     #[test]
     fn watch_tick_reconciles_once_despite_different_endpoint_timestamps() {
@@ -1465,8 +1655,8 @@ mod tests {
                 default_key: Some("ABC123".into()),
                 api: None,
             };
-            let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-            registry.lock().unwrap().insert(1, socket);
+            let registry: ConnRegistry = Arc::default();
+            registry.register(1, socket).unwrap();
             serve_loop(
                 manager,
                 None,
@@ -1679,17 +1869,17 @@ mod tests {
     }
 
     #[test]
-    fn write_socket_response_delivers_to_the_registered_connection() {
+    fn socket_response_is_delivered_to_the_registered_connection() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let client = UnixStream::connect(&path).unwrap();
         let (server_side, _) = listener.accept().unwrap();
 
-        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-        registry.lock().unwrap().insert(1, server_side);
+        let registry: ConnRegistry = Arc::default();
+        registry.register(1, server_side).unwrap();
 
-        write_socket_response(&registry, 1, &json!({"hello": "world"}));
+        registry.send(1, frame(&json!({"hello": "world"})));
 
         let mut reader = BufReader::new(client);
         let mut line = String::new();
@@ -1698,17 +1888,19 @@ mod tests {
         assert_eq!(v, json!({"hello": "world"}));
         // The write succeeded, so the entry is still there for a
         // subsequent response on the same connection.
-        assert!(registry.lock().unwrap().contains_key(&1));
+        assert!(registry.is_registered(1));
+        assert!(!registry.cancel_flag(1).load(Ordering::Relaxed));
     }
 
     #[test]
-    fn write_socket_response_for_an_unregistered_connection_is_a_silent_no_op() {
+    fn socket_response_for_an_unregistered_connection_is_a_silent_no_op() {
         // A response for a connection id that was never registered (or
         // whose entry was already removed — the client vanished) must not
         // panic; the response is simply dropped.
-        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-        write_socket_response(&registry, 999, &json!({"ignored": true}));
-        assert!(registry.lock().unwrap().is_empty());
+        let registry: ConnRegistry = Arc::default();
+        registry.send(999, frame(&json!({"ignored": true})));
+        assert!(!registry.is_registered(999));
+        assert!(registry.cancel_flag(999).load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1902,49 +2094,46 @@ mod tests {
     }
 
     #[test]
-    fn write_socket_response_disconnects_a_non_reading_client_within_a_bounded_time() {
-        // review I1: a client that never drains what serve writes back
-        // must not be able to hang `write_socket_response` (and therefore
-        // the single-threaded main loop) forever. A short write timeout —
-        // independent of the production `SOCKET_WRITE_TIMEOUT`, which
-        // stays generous for real clients — proves the *mechanism*
-        // (bounded write ⇒ disconnect ⇒ registry cleanup) without waiting
-        // out the production timeout in a unit test.
+    fn a_non_reading_client_is_dropped_without_blocking_the_sender() {
+        // review I1 / NWS-2962: a client that never drains what serve
+        // writes back can neither hang the loop (queueing never blocks)
+        // nor hold memory without bound: once its queue is full the
+        // connection is dropped, its socket shut down and its pending
+        // reads cancelled.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sock");
         let listener = UnixListener::bind(&path).unwrap();
-        let _client = UnixStream::connect(&path).unwrap(); // never read from
+        let client = UnixStream::connect(&path).unwrap(); // never read from
         let (server_side, _) = listener.accept().unwrap();
-        server_side
-            .set_write_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
 
-        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-        registry.lock().unwrap().insert(1, server_side);
+        let registry: ConnRegistry = Arc::default();
+        registry.register(1, server_side).unwrap();
+        let cancel = registry.cancel_flag(1);
 
-        // A sizeable payload, written repeatedly with nothing ever
-        // draining the client's receive buffer: the OS socket buffer WILL
-        // fill eventually (its exact size varies by platform, so this
-        // doesn't assume a specific threshold) and a subsequent write
-        // times out. Bounded overall by the loop's own deadline — if
-        // `write_socket_response` ever blocked indefinitely (the pre-fix
-        // behavior), this loop would hang the test past that deadline
-        // instead of completing.
-        let big = json!({"padding": "x".repeat(64 * 1024)});
+        let big = frame(&json!({"padding": "x".repeat(64 * 1024)}));
         let start = Instant::now();
-        while registry.lock().unwrap().contains_key(&1) && start.elapsed() < Duration::from_secs(10)
-        {
-            write_socket_response(&registry, 1, &big);
+        // The kernel's socket buffer absorbs a few frames before the
+        // writer blocks; the queue then fills behind it.
+        for _ in 0..1000 {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            registry.send(1, big.clone());
         }
-
         assert!(
-            !registry.lock().unwrap().contains_key(&1),
-            "a non-reading client's connection should eventually be dropped, not held forever"
+            start.elapsed() < Duration::from_secs(1),
+            "queueing a response must never wait on the client"
         );
         assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "write_socket_response must not block indefinitely on a non-reading client"
+            cancel.load(Ordering::Relaxed),
+            "a non-reading client's connection is dropped once its queue is full"
         );
+        // The socket was shut down: the client reads what was flushed, then EOF.
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut sink = Vec::new();
+        std::io::Read::read_to_end(&mut &client, &mut sink).unwrap();
     }
 }
 
