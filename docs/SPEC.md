@@ -241,6 +241,12 @@ subtrees. Other fields remain unknown-field-preserving.
 Node walks, variable-binding scans, and tree/subtree reconstruction use
 explicit work stacks. File responses and emitted trees are drained
 iteratively on cleanup; JSON parsing and printing use `serde_stacker`.
+Deserialization guards partial arrays/maps and replaced duplicate-key values,
+so malformed deep input returns an error instead of overflowing during cleanup.
+Stored raw JSON and component definitions use this same guarded parser across
+variable inference, styles, image-fill scanning, and inventory reads. `where`
+moves matched values and compares containers iteratively; pending results and
+subtree frames retain guards until response handoff, including error paths.
 
 **Dependency justification:** `serde_stacker` is needed because disabling
 serde_json's recursion limit alone exposes the CLI and the server's ordinary

@@ -75,3 +75,228 @@ fn search_ties_keep_order_and_top_k_after_a_broad_query_on_the_same_thread() {
         );
     });
 }
+
+#[test]
+fn deep_raw_record_features_remain_available() {
+    crate::test_support::small_stack(|| {
+        let payload = format!(
+            "{}null{}",
+            r#"{"layer":["#.repeat(5_000),
+            "]}".repeat(5_000)
+        );
+        let fixture = json!({
+            "name": "Raw consumers", "version": "1", "lastModified": "now",
+            "document": {"id":"0:0", "type":"DOCUMENT", "payload":"PAYLOAD", "resolved_variables":"PAYLOAD", "opacity":0.75,
+                "boundVariables": {"opacity":{"type":"VARIABLE_ALIAS", "id":"VariableID:opacity"},
+                    "payload":{"type":"VARIABLE_ALIAS", "id":"VariableID:payload"}},
+                "fills":[{"type":"IMAGE", "imageRef":"deep-fill", "payload":"PAYLOAD"}],
+                "styles":{"fill":"S:deep"},
+                "children":[{"id":"1:1", "type":"COMPONENT_SET", "componentPropertyDefinitions":{
+                    "Label":{"type":"TEXT", "defaultValue":"Hello", "payload":"PAYLOAD"}}}]},
+            "styles":{"S:deep":{"key":"deep-style", "name":"Deep style", "styleType":"FILL"}},
+            "componentSets":{"1:1":{"key":"deep-set", "name":"Deep set"}}
+        })
+        .to_string()
+        .replace("\"PAYLOAD\"", &payload);
+        let response = crate::deep_json::from_str(&fixture).unwrap();
+        let flattened = crate::flatten::flatten_file(&response).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::open_store!(&dir.path().join("db"));
+        crate::store::sync(&mut store, &Default::default(), &flattened, 0);
+        let scanned = store.rtx(
+            |(
+                (nodes, children, _, _, styled_by, _, _),
+                comps,
+                sets,
+                styles_table,
+                variables,
+                collections,
+                meta,
+                _,
+                _,
+                images,
+            )| {
+                let annotated = OwnedValue(
+                    node(
+                        &nodes,
+                        &children,
+                        &variables,
+                        &collections,
+                        "0:0".to_string(),
+                        false,
+                        true,
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(annotated["resolved_variables"].as_array().unwrap().len(), 2);
+                let inferred =
+                    crate::vars::infer_from_nodes(flattened.recs.iter().filter_map(|(_, rec)| {
+                        match rec {
+                            crate::model::Rec::Node(node) => Some(node),
+                            _ => None,
+                        }
+                    }));
+                assert_eq!(inferred[0].variable_id, "VariableID:opacity");
+                assert_eq!(inferred[0].observed, ["0.75"]);
+                assert_eq!(
+                    inferred[1].observed.as_slice(),
+                    std::slice::from_ref(&payload)
+                );
+                let inventory = OwnedValue(components(&nodes, &comps, &sets).unwrap());
+                assert_eq!(
+                    inventory["sets"][0]["property_definitions"]["Label"]["defaultValue"],
+                    "Hello"
+                );
+                assert_eq!(
+                    crate::deep_json::to_string(
+                        &inventory["sets"][0]["property_definitions"]["Label"]["payload"]
+                    )
+                    .unwrap(),
+                    payload
+                );
+                let style_values = OwnedValue(
+                    styles(
+                        &nodes,
+                        &styles_table,
+                        &styled_by,
+                        &variables,
+                        &collections,
+                        None,
+                        true,
+                        false,
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(style_values[0]["value"][0]["imageRef"], "deep-fill");
+                assert_eq!(
+                    crate::deep_json::to_string(&style_values[0]["value"][0]["payload"]).unwrap(),
+                    payload
+                );
+                crate::images::scan(&nodes, &meta, &images, &["0:0".to_string()], "png", 1000)
+            },
+        );
+        let items = crate::images::resolve(
+            &mut store,
+            scanned,
+            None,
+            &|_| panic!("no network"),
+            Some("unused"),
+            &["0:0".to_string()],
+            "png",
+            None,
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.kind == "fill" && item.subject == "deep-fill")
+        );
+    });
+}
+
+#[test]
+fn deep_where_queries_move_values_and_clean_up_all_exits() {
+    crate::test_support::small_stack(|| {
+        let payload = format!(
+            "{}null{}",
+            r#"{"layer":["#.repeat(5_000),
+            "]}".repeat(5_000)
+        );
+        let text = json!({
+            "name":"Where", "version":"1", "lastModified":"now",
+            "document":{"id":"0:0", "type":"DOCUMENT", "payload":"PAYLOAD",
+                "equal_cases":{"zero":-0.0,"integer":1,"null":null,
+                    "object":{"a":1,"b":2},"array":[true,{"key":1.25}]},
+                "children":[{"id":"9:9", "type":"TEXT"}]}
+        })
+        .to_string()
+        .replace("\"PAYLOAD\"", &payload);
+        let response = crate::deep_json::from_str(&text).unwrap();
+        let mut flattened = crate::flatten::flatten_file(&response).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::open_store!(&dir.path().join("db"));
+        crate::store::sync(&mut store, &Default::default(), &flattened, 0);
+        store.rtx(|((nodes, children, ..), ..)| {
+            for (pointer, equals, expected_count) in [
+                ("/id", None, 2),
+                ("/missing", None, 0),
+                ("/id", Some(json!("absent")), 0),
+            ] {
+                let rows =
+                    OwnedValue(where_(&nodes, &children, pointer, equals, None, None).unwrap());
+                assert_eq!(rows.as_array().unwrap().len(), expected_count);
+            }
+            for (pointer, equals, count) in [
+                ("/equal_cases/zero", json!(0.0), 1),
+                ("/equal_cases/integer", json!(1.0), 0),
+                ("/equal_cases/null", Value::Null, 1),
+                ("/equal_cases/object", json!({"b":2,"a":1}), 1),
+                ("/equal_cases/object", json!({"a":1,"c":2}), 0),
+                ("/equal_cases/object", json!({"a":1,"b":2,"c":3}), 0),
+                ("/equal_cases/array", json!([true,{"key":1.25}]), 1),
+                ("/equal_cases/array", json!([true]), 0),
+            ] {
+                let rows = OwnedValue(
+                    where_(&nodes, &children, pointer, Some(equals), None, None).unwrap(),
+                );
+                assert_eq!(rows.as_array().unwrap().len(), count, "{pointer}");
+            }
+            let rows = OwnedValue(where_(&nodes, &children, "/payload", None, None, None).unwrap());
+            assert_eq!(rows.as_array().unwrap().len(), 1);
+            assert_eq!(
+                crate::deep_json::to_string(&rows[0]["value"]).unwrap(),
+                payload
+            );
+            let equals = crate::deep_json::from_str(&payload).unwrap();
+            let rows = OwnedValue(
+                where_(
+                    &nodes,
+                    &children,
+                    "/payload",
+                    Some(equals.into_inner()),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            assert_eq!(rows.as_array().unwrap().len(), 1);
+            assert!(
+                where_(
+                    &nodes,
+                    &children,
+                    "invalid",
+                    Some(crate::deep_json::from_str(&payload).unwrap().into_inner()),
+                    None,
+                    None
+                )
+                .is_err()
+            );
+        });
+        // A malformed later record must safely dispose of the earlier deep match.
+        for (_, rec) in &mut flattened.recs {
+            if let crate::model::Rec::Node(node) = rec
+                && node.id == "9:9"
+            {
+                node.raw = "{invalid".to_string();
+            }
+        }
+        crate::store::sync(&mut store, &Default::default(), &flattened, 0);
+        store.rtx(
+            |((nodes, children, ..), _, _, _, variables, collections, ..)| {
+                assert!(where_(&nodes, &children, "/payload", None, None, None).is_err());
+                assert!(
+                    subtree(
+                        &nodes,
+                        &children,
+                        &variables,
+                        &collections,
+                        "0:0".to_string(),
+                        None,
+                        None,
+                        false
+                    )
+                    .is_err()
+                );
+            },
+        );
+    });
+}

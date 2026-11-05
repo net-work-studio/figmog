@@ -2852,7 +2852,13 @@ fn deep_tree_reads_over_socket_match_direct_cli() {
     const KEY: &str = "figmogdeepfixture01";
     let dir = tempfile::tempdir().unwrap();
     let response = dir.path().join("deep.json");
-    std::fs::write(&response, deep_file::file(500)).unwrap();
+    let payload = format!("{}null{}", r#"{"layer":["#.repeat(500), "]}".repeat(500));
+    let file = deep_file::file(500).replacen(
+        r#""type":"DOCUMENT","#,
+        &format!(r#""type":"DOCUMENT","payload":{payload},"#),
+        1,
+    );
+    std::fs::write(&response, file).unwrap();
     common::command()
         .current_dir(dir.path())
         .args(["pull", KEY, "--from-file"])
@@ -2860,7 +2866,13 @@ fn deep_tree_reads_over_socket_match_direct_cli() {
         .assert()
         .success();
     let mut direct = Vec::new();
-    for args in [vec!["tree"], vec!["dump", "0:0"]] {
+    for args in [
+        vec!["tree"],
+        vec!["dump", "0:0"],
+        vec!["where", "--pointer", "/id"],
+        vec!["where", "--pointer", "/missing"],
+        vec!["where", "--pointer", "/payload"],
+    ] {
         let output = common::command()
             .current_dir(dir.path())
             .args(&args)

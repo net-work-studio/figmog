@@ -184,7 +184,9 @@ fn send_and_recv(stream: UnixStream, frame: &Value) -> Result<Value, String> {
     if n == 0 {
         return Err("serve socket closed before responding".to_string());
     }
-    crate::deep_json::from_str(&line).map_err(|e| format!("serve socket sent invalid JSON: {e}"))
+    crate::deep_json::from_str(&line)
+        .map(crate::deep_json::OwnedValue::into_inner)
+        .map_err(|e| format!("serve socket sent invalid JSON: {e}"))
 }
 
 fn protocol_error_message(err: &Value) -> String {
@@ -234,6 +236,7 @@ fn interpret_call_response(tool: &str, resp: Value) -> Result<Value, String> {
         // text block holding figmog's own JSON (see `mcp::ToolOutput`).
         // Parse it back out for the CLI's established local read shape.
         Some(t) => crate::deep_json::from_str(&t)
+            .map(crate::deep_json::OwnedValue::into_inner)
             .map_err(|e| format!("serve returned non-JSON tool content: {e}")),
         // Preserve the existing fallback for a local result without text.
         None => Ok(std::mem::take(&mut result.0)),

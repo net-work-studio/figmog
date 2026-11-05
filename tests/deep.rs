@@ -201,3 +201,147 @@ fn deep_unknown_properties_and_variable_aliases_survive_import() {
         .assert()
         .success();
 }
+
+fn raw_feature_fixture() -> String {
+    let payload = format!("{}null{}", r#"{"layer":["#.repeat(500), "]}".repeat(500));
+    format!(
+        r#"{{"name":"Raw features","version":"1","lastModified":"now","document":{{"id":"0:0","type":"DOCUMENT","payload":{payload},"opacity":0.75,"boundVariables":{{"opacity":{{"type":"VARIABLE_ALIAS","id":"VariableID:deep"}}}},"fills":[{{"type":"IMAGE","imageRef":"deep-fill"}}],"styles":{{"fill":"S:deep"}},"children":[{{"id":"1:1","type":"COMPONENT_SET","componentPropertyDefinitions":{{"Label":{{"type":"TEXT","defaultValue":"Hello","payload":{payload}}}}}}}]}},"styles":{{"S:deep":{{"key":"deep-style","name":"Deep style","styleType":"FILL"}}}},"componentSets":{{"1:1":{{"key":"deep-set","name":"Deep set"}}}}}}"#
+    )
+}
+
+#[test]
+fn unrelated_deep_properties_do_not_hide_variable_observations() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("raw-features.json");
+    let db = dir.path().join("db");
+    std::fs::write(&response, raw_feature_fixture()).unwrap();
+    common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .assert()
+        .success();
+    let output = common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["vars", "VariableID:deep"])
+        .assert()
+        .success();
+    let vars: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(vars.as_array().unwrap().len(), 1);
+    assert_eq!(vars[0]["sites"], serde_json::json!([["0:0", "/opacity"]]));
+    assert_eq!(vars[0]["observed"], serde_json::json!(["0.75"]));
+}
+
+#[test]
+fn unrelated_deep_properties_do_not_hide_style_values_or_component_definitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("raw-features.json");
+    let db = dir.path().join("db");
+    std::fs::write(&response, raw_feature_fixture()).unwrap();
+    common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .assert()
+        .success();
+    let styles = common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["styles", "--values"])
+        .assert()
+        .success();
+    let styles: serde_json::Value = serde_json::from_slice(&styles.get_output().stdout).unwrap();
+    assert_eq!(styles[0]["value"][0]["imageRef"], "deep-fill");
+    let components = common::command()
+        .arg("--db")
+        .arg(&db)
+        .arg("components")
+        .assert()
+        .success();
+    let mut components = parse_deep(&components.get_output().stdout);
+    let mut definitions = components["sets"][0]["property_definitions"].take();
+    assert_eq!(definitions["Label"]["defaultValue"], "Hello");
+    let mut payload = definitions["Label"]["payload"].take();
+    for _ in 0..500 {
+        payload = payload["layer"][0].take();
+    }
+    assert!(payload.is_null());
+}
+
+#[test]
+fn deep_where_values_remain_readable_through_cli_and_mcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("raw-features.json");
+    let db = dir.path().join("db");
+    std::fs::write(&response, raw_feature_fixture()).unwrap();
+    common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .assert()
+        .success();
+    for (args, count) in [
+        (vec!["where", "--pointer", "/id"], 2),
+        (vec!["where", "--pointer", "/missing"], 0),
+        (
+            vec!["where", "--pointer", "/payload", "--equals", "null"],
+            0,
+        ),
+    ] {
+        let output = common::command()
+            .arg("--db")
+            .arg(&db)
+            .args(args)
+            .assert()
+            .success();
+        let rows: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), count);
+    }
+    let requests = [
+        (1, serde_json::json!({"pointer":"/id"})),
+        (2, serde_json::json!({"pointer":"/missing"})),
+        (3, serde_json::json!({"pointer":"/payload"})),
+    ]
+    .into_iter()
+    .map(|(id, args)| {
+        serde_json::json!({"jsonrpc":"2.0", "id":id,
+        "method":"tools/call", "params":{"name":"figmog_where", "arguments":args}})
+        .to_string()
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let output = common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["--no-socket", "serve", "--no-watch", "--no-upstream"])
+        .write_stdin(requests)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3);
+    for (index, (line, count)) in lines.into_iter().zip([2, 0, 1]).enumerate() {
+        let envelope: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(envelope["id"], index + 1);
+        assert_eq!(envelope["result"]["isError"], false);
+        let mut rows = parse_deep(
+            envelope["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        );
+        assert_eq!(rows.as_array().unwrap().len(), count);
+        if envelope["id"] == 3 {
+            let mut value = rows[0]["value"].take();
+            for _ in 0..500 {
+                value = value["layer"][0].take();
+            }
+            assert!(value.is_null());
+        }
+    }
+}

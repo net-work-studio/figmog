@@ -103,7 +103,7 @@ pub(super) fn do_pull(
                 .map_err(|e| format!("reading {}: {e}", path.display()))?;
             let resp = crate::deep_json::from_str(&content)
                 .map_err(|e| format!("parsing {}: {e}", path.display()))?;
-            (crate::deep_json::OwnedValue(resp), None)
+            (resp, None)
         }
         None => {
             let key = db

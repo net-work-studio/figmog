@@ -30,3 +30,6 @@ pub mod store;
 pub(crate) mod upstream;
 pub mod vars;
 pub(crate) mod watch;
+
+#[cfg(test)]
+mod test_support;

@@ -212,7 +212,7 @@ impl UreqApi {
         let response = self.http.get(&url, Some(&self.token))?;
         let reader = response.into_reader();
         let parsed = if deep {
-            crate::deep_json::from_reader(reader)
+            crate::deep_json::from_reader(reader).map(crate::deep_json::OwnedValue::into_inner)
         } else {
             serde_json::from_reader(reader)
         };
