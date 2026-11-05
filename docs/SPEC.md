@@ -925,8 +925,16 @@ with none it answers the "no file specified" error itself. A file whose
 mirror in this worktree is still in the old per-checkout location (§16) is
 refused with a pointer at `figmog migrate` (and a startup file fails the
 relay's start), never shadowed by a new shared mirror; the CLI likewise
-opens such a mirror directly instead of routing it. Desktop and management
-calls pass through unchanged.
+never routes such a mirror to the owner (an in-process serve's local socket
+still answers it, else it is opened directly). Nor does the CLI route a
+per-file call to the owner when the invoking worktree resolves no file
+(no explicit `file`, node URL or project default): it reports that
+worktree's "no mirror here" rather than another worktree's file. The owner
+itself never treats its one open session as a default. Desktop and
+management calls pass through unchanged. Every request a relay forwards
+goes to the owner under a relay-assigned id, mapped back to the agent's own
+id on the answer, so no agent id is ever mistaken for the relay's own
+(its replayed `initialize`).
 
 **Settings.** The owner runs with the watch, `--interval` and
 `--upstream`/`--no-upstream` settings of the relay that launched it, and

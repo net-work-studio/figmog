@@ -581,6 +581,7 @@ pub(crate) fn run_owner(
         root: StoreRoot::Fixed(paths.project.clone()),
         token,
         default_key: None,
+        sole_default: false,
         #[cfg(test)]
         api: None,
     };
@@ -1435,6 +1436,7 @@ fn build_sessions(
             root: store_root,
             token: token.clone(),
             default_key: Some(display_key),
+            sole_default: true,
             #[cfg(test)]
             api: None,
         };
@@ -1469,6 +1471,7 @@ fn build_sessions(
         root: store_root,
         token: token.clone(),
         default_key: None,
+        sole_default: true,
         #[cfg(test)]
         api: None,
     };
@@ -1851,6 +1854,7 @@ mod tests {
             root: dir.path().to_path_buf().into(),
             token: None,
             default_key: Some("ABC123".into()),
+            sole_default: true,
             api: None,
         };
         let mut next_idx = 0;
@@ -1955,6 +1959,7 @@ mod tests {
                 root: db.into(),
                 token: Some("synthetic-token".into()),
                 default_key: Some("ABC123".into()),
+                sole_default: true,
                 api: None,
             };
             let registry: ConnRegistry = Arc::default();
@@ -2122,6 +2127,7 @@ mod tests {
             root: dir.path().to_path_buf().into(),
             token: None,
             default_key: None,
+            sole_default: true,
             api: None,
         };
         let mut watch = WatchScheduler::new(Instant::now());
@@ -2136,6 +2142,38 @@ mod tests {
             );
             now = deadline;
         }
+    }
+
+    /// The shared owner (NWS-2953) holds every worktree's files: its one
+    /// open session is never a default for a request naming no file, while
+    /// an in-process serve keeps the sole-session rule.
+    #[test]
+    fn only_an_in_process_serve_defaults_to_its_sole_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "AAA1234567890".to_string();
+        let session =
+            sessions::open_session_at(dir.path().join("db"), key.clone(), None, None).unwrap();
+        let mut manager = SessionManager {
+            sessions: vec![session],
+            root: dir.path().to_path_buf().into(),
+            token: None,
+            default_key: None,
+            sole_default: true,
+            api: None,
+        };
+        assert_eq!(manager.effective_default_key(), Some(key.clone()));
+        assert_eq!(manager.resolve(None, Duration::ZERO).unwrap().key, key);
+        manager.sole_default = false;
+        assert_eq!(manager.effective_default_key(), None);
+        assert_eq!(
+            manager.resolve(None, Duration::ZERO).err().as_deref(),
+            Some(sessions::NO_DEFAULT_FILE_MSG)
+        );
+        assert_eq!(
+            manager.resolve(Some(&key), Duration::ZERO).unwrap().key,
+            key
+        );
+        manager.close_reads(Instant::now() + Duration::from_secs(5));
     }
 
     // ---- unix-socket control plane (v0.0.2 spec §1) ----

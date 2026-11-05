@@ -189,6 +189,7 @@ impl Harness {
             root: dir.path().to_path_buf().into(),
             token: None,
             default_key: Some("ABC1234567890".into()),
+            sole_default: true,
             api: Some(api.clone()),
         };
         Self {

@@ -466,20 +466,16 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             } else {
                 parsed_args
             };
-            if let Some(result) = routable(layout, &parsed_args)
-                .then(|| socket::try_call(root, tool, parsed_args.clone()))
-                .flatten()
-            {
+            let route = route_for(root, layout, &parsed_args, is_per_file_local_tool(tool));
+            if let Some(result) = socket::try_call(&route, tool, parsed_args.clone()) {
                 note_ignored_upstream_flags(upstream, *no_upstream);
                 return write_json(&result?);
             }
         } else if let Some(read) = read_command(&cli.cmd) {
             let (tool, tool_args) = read.to_tool_call();
             let tool_args = with_current_file(tool_args, layout)?;
-            if let Some(result) = routable(layout, &tool_args)
-                .then(|| socket::try_call(root, tool, tool_args.clone()))
-                .flatten()
-            {
+            let route = route_for(root, layout, &tool_args, true);
+            if let Some(result) = socket::try_call(&route, tool, tool_args.clone()) {
                 let result = result?;
                 // Not ready is an error, except for an import-only store
                 // (SPEC §9): its stored variable snapshot still answers.
@@ -504,11 +500,14 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         _ => None,
     };
     let db = resolve_db(&cli, layout)?;
-    // A mirror still in this checkout's old location is opened directly:
-    // the shared owner serves only the shared mirror root (NWS-2953).
-    let socket_root = socket_root.filter(|_| {
-        !matches!((&db.layout, &db.key), (Some(layout), Some(key))
-            if layout.legacy_store(key, &db.path).is_some())
+    // A mirror still in this checkout's old location is never the shared
+    // owner's (it serves only the shared mirror root, NWS-2953): only an
+    // in-process serve's socket is tried for it, else it is opened directly.
+    let socket_root = socket_root.map(|root| match (&db.layout, &db.key) {
+        (Some(layout), Some(key)) if layout.legacy_store(key, &db.path).is_some() => {
+            root.local_only()
+        }
+        _ => root,
     });
     // Writers through a running serve (NWS-2963): when its socket answers,
     // serve owns (or will open) this store, so `pull` and
@@ -620,8 +619,9 @@ pub(crate) fn is_per_file_local_tool(tool: &str) -> bool {
 /// auto-opens that session if serve hasn't touched it yet — a real
 /// Tier-1 pull only if the on-disk store isn't already mirrored (an
 /// already-pulled store never spends one; see `sessions::open_session_at`'s
-/// `mirrored: meta_present`). No project default ⇒ args unchanged,
-/// preserving today's serve-own-default behavior exactly.
+/// `mirrored: meta_present`). No project default ⇒ args unchanged: an
+/// in-process serve keeps its own-default behavior, while the shared
+/// background owner is not asked at all ([`route_for`]).
 ///
 /// Never applied to desktop tools or `figmog_files`, which have no mirror
 /// routing, nor to `figmog_open`: its own `file` argument names the file
@@ -646,21 +646,31 @@ fn with_current_file(mut args: Value, layout: &Layout) -> Result<Value, String> 
     Ok(args)
 }
 
-/// Whether a routed per-file call may go to a running serve: not when its
-/// file's mirror is still in this checkout's old per-checkout location,
-/// which the shared background owner never serves (NWS-2953) — that one
-/// is opened directly, like before. A call naming no file routes.
-fn routable(layout: &Layout, args: &Value) -> bool {
+/// Where a routed call may go. The shared background owner (NWS-2953)
+/// is skipped — leaving only an in-process serve's local socket, else the
+/// direct path — when the call's file mirror is still in this checkout's
+/// old per-checkout location (the owner never serves it), and when a
+/// per-file call names no file this worktree resolves: the owner holds
+/// every worktree's files and has no default, so the call must not land on
+/// another worktree's; the direct path reports this worktree's "no mirror
+/// here" instead. Management and desktop calls (`per_file` false) without
+/// a file route anywhere.
+fn route_for(root: &socket::Route, layout: &Layout, args: &Value, per_file: bool) -> socket::Route {
     let key = args
         .get("file")
         .and_then(Value::as_str)
         .and_then(parse_file_ref)
         .or_else(|| crate::dispatch::infer_file_from_node_ref(args));
-    match key {
+    let shared = match key {
         Some(key) => layout
             .active_store(&key)
             .is_ok_and(|store| !store.migration_pending),
-        None => true,
+        None => !per_file,
+    };
+    if shared {
+        root.clone()
+    } else {
+        root.local_only()
     }
 }
 
