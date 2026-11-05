@@ -1,0 +1,19 @@
+tests/deep.rs
+  s_f86dae47704432::t_1e9838f65bfab2 326-335
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "21fa6dddbcfb51bdc9b5eafa1433ec4341c67f32",
+  "prompts": {},
+  "sessions": {
+    "s_f86dae47704432": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1aca0-7145-7da3-9ca4-80397526240b",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
