@@ -452,7 +452,8 @@ pub fn subtree<R: Readable>(
 
 /// Binding-aware spec of the subtree rooted at `id` (NWS-2968): the
 /// [`subtree`] answer and the [`vars`] `{snapshot, variables}` answer,
-/// rendered by [`crate::spec::build`].
+/// rendered by [`crate::spec::build`] with the project's token `tokens`
+/// options (NWS-2948).
 pub fn spec<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
@@ -460,6 +461,7 @@ pub fn spec<R: Readable>(
     variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
     id: String,
+    tokens: &crate::tokens::ExportOptions,
 ) -> Result<Value, String> {
     let tree = subtree(
         nodes,
@@ -472,7 +474,7 @@ pub fn spec<R: Readable>(
         false,
     )?;
     let vars = vars(nodes, variables, variable_collections, snapshot, None, true)?;
-    Ok(crate::spec::build(&tree, &vars))
+    Ok(crate::spec::build(&tree, &vars, tokens))
 }
 
 /// Nodes by type, optionally within one page and/or scoped to `under`'s

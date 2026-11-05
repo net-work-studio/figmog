@@ -103,7 +103,7 @@
       "resolvedType": "FLOAT",
       "variableCollectionId": "VariableCollectionId:1:0",
       "valuesByMode": {
-        "1:0": 0.5
+        "1:0": 50
       },
       "description": "",
       "scopes": [

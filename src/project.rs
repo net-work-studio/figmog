@@ -630,6 +630,16 @@ pub(crate) struct TokenSettings {
     pub(crate) modes: BTreeMap<String, String>,
 }
 
+impl TokenSettings {
+    /// The renderer options these settings select.
+    pub(crate) fn export_options(&self) -> crate::tokens::ExportOptions {
+        crate::tokens::ExportOptions {
+            format: self.format,
+            modes: self.modes.clone(),
+        }
+    }
+}
+
 /// `[stack]`: what code figmog's output should be shaped for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StackSettings {

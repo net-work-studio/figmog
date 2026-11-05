@@ -401,6 +401,18 @@ impl Relay {
         if crate::serve::writes::is_internal(&name) || !crate::proxy::is_local_tool(&name) {
             return Ok(());
         }
+        // `figmog_spec` names tokens as this project's token file does
+        // (NWS-2948): its `[tokens]` settings, unless the agent passed some.
+        if name == "figmog_spec" {
+            let params = &mut frame["params"];
+            if !params["arguments"].is_object() {
+                params["arguments"] = json!({});
+            }
+            if params["arguments"].get("tokens").is_none_or(Value::is_null) {
+                params["arguments"]["tokens"] =
+                    self.layout.settings().tokens.export_options().to_json();
+            }
+        }
         let args = &frame["params"]["arguments"];
         let explicit = match args.get("file") {
             Some(Value::String(file)) => Some(file.clone()),

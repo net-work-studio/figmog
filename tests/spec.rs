@@ -211,3 +211,107 @@ fn unknown_node_is_the_standard_error() {
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(stderr.contains("no node 99:99 in the mirror"), "{stderr}");
 }
+
+/// NWS-2948 review: `figmog spec` names tokens as the project's token file
+/// does — figmog.toml's `[tokens.modes]` — instead of the default mapping,
+/// which here fails (a mode named `日本` has no default selector).
+#[test]
+fn spec_follows_the_projects_token_mode_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut variables: Value =
+        serde_json::from_str(&std::fs::read_to_string(fixtures().join("variables.json")).unwrap())
+            .unwrap();
+    variables["variableCollections"]["VariableCollectionId:2:0"]["modes"][1]["name"] =
+        json!("日本");
+    let vars_path = root.join("variables.json");
+    std::fs::write(&vars_path, variables.to_string()).unwrap();
+    let figmog = |args: &[&str]| -> Value {
+        let out = common::command()
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("--no-socket")
+            .args(args)
+            .assert()
+            .success();
+        serde_json::from_slice(&out.get_output().stdout).unwrap()
+    };
+    let config = "[files]\ndefault = \"figmogspecfixture123\"\n";
+    std::fs::write(root.join("figmog.toml"), config).unwrap();
+    figmog(&[
+        "pull",
+        "--from-file",
+        fixtures().join("card.json").to_str().unwrap(),
+    ]);
+    figmog(&["import-variables", vars_path.to_str().unwrap()]);
+
+    // The default mapping can't place `日本`: no CSS names at all.
+    let spec = figmog(&["spec", "1:1"]);
+    let unavailable = spec["tokens_snapshot"]["css_unavailable"].as_str().unwrap();
+    assert!(unavailable.contains("日本"), "{unavailable}");
+
+    // The project's mapping can, and spec uses it.
+    std::fs::write(
+        root.join("figmog.toml"),
+        format!("{config}[tokens.modes]\n\"Theme/日本\" = '[data-theme=\"dark\"]'\n"),
+    )
+    .unwrap();
+    let spec = figmog(&["spec", "1:1"]);
+    assert_eq!(spec["tokens_snapshot"]["css_unavailable"], Value::Null);
+    assert_eq!(
+        spec["tokens_snapshot"]["theme"],
+        json!({"collection": "Theme", "light_mode": "Light", "dark_mode": "日本"})
+    );
+    let mut all = Vec::new();
+    entries(&spec["node"], &mut all);
+    assert!(
+        all.iter().any(|(_, e)| e["css"] == "--color-brand"),
+        "no bound token carries its CSS name"
+    );
+
+    // Without a project (--db), `figmog_spec` takes the mapping as its
+    // `tokens` argument; omitted, the defaults apply.
+    let db = root.join("db");
+    let db = db.to_str().unwrap();
+    for args in [
+        vec![
+            "pull",
+            "--from-file",
+            fixtures().join("card.json").to_str().unwrap(),
+        ],
+        vec!["import-variables", vars_path.to_str().unwrap()],
+    ] {
+        common::command()
+            .args(["--db", db])
+            .args(&args)
+            .assert()
+            .success();
+    }
+    let call = |args: &str| -> Value {
+        let out = common::command()
+            .args([
+                "--db",
+                db,
+                "call",
+                "figmog_spec",
+                "--no-upstream",
+                "--args",
+                args,
+            ])
+            .assert()
+            .success();
+        serde_json::from_slice(&out.get_output().stdout).unwrap()
+    };
+    let plain = call(r#"{"id": "1:1"}"#);
+    assert!(plain["tokens_snapshot"]["css_unavailable"].is_string());
+    let mapped = call(r#"{"id": "1:1", "tokens": {"modes": {"Theme/日本": ".night"}}}"#);
+    assert_eq!(mapped["tokens_snapshot"]["css_unavailable"], Value::Null);
+    let bad = common::command()
+        .args(["--db", db, "call", "figmog_spec", "--no-upstream", "--args"])
+        .arg(r#"{"id": "1:1", "tokens": {"modes": {"Theme/日本": ".a, .b"}}}"#)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&bad.get_output().stderr).to_string();
+    assert!(stderr.contains("tokens.modes"), "{stderr}");
+}

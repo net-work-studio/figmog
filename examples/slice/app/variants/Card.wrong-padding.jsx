@@ -7,9 +7,9 @@
 //
 // Every value the spec binds to a token uses that token: a Tailwind utility
 // generated from the exported @theme (bg-surface, rounded-md, py-4, gap-4,
-// gap-2, bg-brand, text-text-primary) or, for tokens the export emits
-// unitless and without a theme entry (font sizes, weight, line height,
-// stroke width), the CSS variable itself. Values the spec flags
+// gap-2, bg-brand, text-text-primary) or, for tokens without a theme entry
+// (font sizes, line height and stroke width in px, the unitless weight),
+// the CSS variable itself. Values the spec flags
 // `untokenized` have no token to use and are written as arbitrary values,
 // each marked "untokenized" below.
 export function Card() {
@@ -24,7 +24,7 @@ export function Card() {
         "rounded-md", // radius/md
         "bg-surface", // surface
         // border/subtle + stroke/thin; strokeAlign INSIDE, so an inset box-shadow (no layout effect)
-        "ring-inset ring-border-subtle ring-[length:calc(var(--stroke-thin)*1px)]",
+        "ring-inset ring-border-subtle ring-[length:var(--stroke-thin)]",
         "font-[Inter,sans-serif]", // font/family/sans is a STRING token: not exported
       ].join(" ")}
     >
@@ -32,7 +32,7 @@ export function Card() {
         className={[
           "w-full",
           "text-text-primary", // text/primary
-          "text-[length:calc(var(--font-size-title)*1px)]", // font/size/title
+          "text-[length:var(--font-size-title)]", // font/size/title
           "font-[number:var(--font-weight-bold)]", // font/weight/bold
           "leading-[28px]", // untokenized: line height 28
           "tracking-[0px]", // untokenized: letter spacing 0
@@ -45,8 +45,8 @@ export function Card() {
           className={[
             "grow",
             "text-[#1a1a1f]", // untokenized fill (spec lists matches: ink/900, text/primary)
-            "text-[length:calc(var(--font-size-body)*1px)]", // font/size/body
-            "leading-[calc(var(--font-line-body)*1px)]", // font/line/body
+            "text-[length:var(--font-size-body)]", // font/size/body
+            "leading-[var(--font-line-body)]", // font/line/body
             "font-[number:400]", // untokenized: weight 400
             "tracking-[0px]", // untokenized: letter spacing 0
           ].join(" ")}

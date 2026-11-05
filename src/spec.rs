@@ -109,9 +109,11 @@ fn fill_prop(node_type: &str) -> Prop {
 }
 
 /// Build the spec. `tree` is the `figmog_subtree` answer for the node;
-/// `vars` the `figmog_vars {snapshot: true}` answer.
-pub fn build(tree: &Value, vars: &Value) -> Value {
-    let (css, theme, roots, css_unavailable) = match export_css(vars, &ExportOptions::default()) {
+/// `vars` the `figmog_vars {snapshot: true}` answer; `tokens` the token
+/// export options (the project's `[tokens]` settings), so the CSS names
+/// and root modes match the committed token file.
+pub fn build(tree: &Value, vars: &Value, tokens: &ExportOptions) -> Value {
+    let (css, theme, roots, css_unavailable) = match export_css(vars, tokens) {
         Ok(export) => (export.names, export.theme, export.root_modes, Value::Null),
         Err(e) => (BTreeMap::new(), None, BTreeMap::new(), Value::String(e)),
     };
@@ -774,7 +776,7 @@ mod tests {
                     {"type": "VARIABLE_ALIAS", "id": "V:2"}]}}],
             "children": []});
         let vars = json!({"snapshot": {"state": "none"}, "variables": []});
-        let spec = build(&tree, &vars);
+        let spec = build(&tree, &vars, &ExportOptions::default());
         assert!(spec["node"]["values"].get("fill").is_none(), "{spec}");
         assert_eq!(
             spec["unsupported"],
@@ -787,7 +789,7 @@ mod tests {
             .unwrap()
             .remove("boundVariables");
         tree["boundVariables"] = json!({"fills": [{"type": "VARIABLE_ALIAS", "id": "V:3"}]});
-        let spec = build(&tree, &vars);
+        let spec = build(&tree, &vars, &ExportOptions::default());
         assert_eq!(spec["node"]["values"]["fill"][0]["variable_id"], "V:3");
         assert_eq!(spec["unsupported"], json!([]));
     }
@@ -806,7 +808,7 @@ mod tests {
             "boundVariables": {"itemSpacing": {"type": "VARIABLE_ALIAS", "id": "V:9"}},
             "children": []});
         let vars = json!({"snapshot": {"state": "none"}, "variables": []});
-        let spec = build(&tree, &vars);
+        let spec = build(&tree, &vars, &ExportOptions::default());
         assert_eq!(
             spec["node"]["layout"]["gap"],
             json!({"token": null, "variable_id": "V:9", "css": null, "raw": 8})
