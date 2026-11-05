@@ -65,7 +65,7 @@ pub fn parse_variables_export(v: &Value) -> Result<Vec<(Id, Rec)>, ImportError> 
                     .map(|(mode, val)| {
                         (
                             mode.clone(),
-                            serde_json::to_string(val).expect("Value serializes"),
+                            crate::deep_json::to_string(val).expect("Value serializes"),
                         )
                     })
                     .collect()
@@ -117,7 +117,7 @@ pub fn infer_from_nodes<'a>(nodes: impl Iterator<Item = &'a NodeRec>) -> Vec<Var
     type VarData = (Vec<(String, String)>, Vec<String>);
     let mut by_var: BTreeMap<String, VarData> = BTreeMap::new();
     for node in nodes {
-        let raw: serde_json::Value = match serde_json::from_str(&node.raw) {
+        let raw = match crate::deep_json::from_str(&node.raw) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -127,7 +127,7 @@ pub fn infer_from_nodes<'a>(nodes: impl Iterator<Item = &'a NodeRec>) -> Vec<Var
             if let Some(v) = raw.pointer(pointer) {
                 entry
                     .1
-                    .push(serde_json::to_string(v).expect("Value serializes"));
+                    .push(crate::deep_json::to_string(v).expect("Value serializes"));
             }
         }
     }
@@ -165,7 +165,7 @@ pub fn style_value_pointer(style_type: &str) -> Option<&'static str> {
 /// Style definitions are not in the file JSON; consumers carry the
 /// resolved properties.
 pub fn style_value_from_consumer(style_type: &str, consumer_raw: &str) -> Option<Value> {
-    let raw: Value = serde_json::from_str(consumer_raw).ok()?;
+    let mut raw = crate::deep_json::from_str(consumer_raw).ok()?;
     let pointer = style_value_pointer(style_type)?;
-    raw.pointer(pointer).cloned()
+    raw.0.pointer_mut(pointer).map(std::mem::take)
 }

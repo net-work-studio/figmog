@@ -243,7 +243,7 @@ pub fn scan<R: Readable>(
     let mut fill_refs: BTreeSet<String> = BTreeSet::new();
     for id in node_ids {
         if let Some(n) = nodes.get(id)
-            && let Ok(raw) = serde_json::from_str::<Value>(&n.raw)
+            && let Ok(raw) = crate::deep_json::from_str(&n.raw)
         {
             fill_refs.extend(extract_image_refs(&raw));
         }

@@ -415,7 +415,7 @@ fn write_socket_response(registry: &ConnRegistry, conn_id: u64, resp: &Value) {
         }
     };
 
-    let text = resp.to_string();
+    let text = crate::deep_json::to_string(resp).expect("Value serializes");
     let ok = writeln!(&stream, "{text}").is_ok() && (&stream).flush().is_ok();
     if !ok {
         registry.lock().unwrap().remove(&conn_id);
@@ -577,7 +577,8 @@ fn serve_loop(
         registry,
         |response| {
             let mut stdout = std::io::stdout();
-            writeln!(stdout, "{response}").is_ok() && stdout.flush().is_ok()
+            let text = crate::deep_json::to_string(response).expect("Value serializes");
+            writeln!(stdout, "{text}").is_ok() && stdout.flush().is_ok()
         },
     )
 }
@@ -651,7 +652,7 @@ fn serve_loop_with_output(
                         )
                     });
                 if let Some(resp) = mcp::handle_socket_message(&l, &tools, &mut handler) {
-                    write_socket_response(&registry, conn_id, &resp);
+                    write_socket_response(&registry, conn_id, &crate::deep_json::OwnedValue(resp));
                 }
                 continue;
             }
@@ -671,7 +672,7 @@ fn serve_loop_with_output(
         });
 
         if let Some(response) = mcp::handle_message(&line, &tools, &mut handler)
-            && !write_stdio(&response)
+            && !write_stdio(&crate::deep_json::OwnedValue(response))
         {
             // A vanished stdio reader is a clean shutdown; accepted
             // running pulls drain through FileSession's drop handler.
@@ -944,10 +945,6 @@ fn handle_tool_call<U: UpstreamMcp>(
     let explicit_file = args.get("file").and_then(Value::as_str).map(str::to_string);
     let url_file_key = dispatch::infer_file_from_node_ref(args);
     let file_arg = explicit_file.clone().or_else(|| url_file_key.clone());
-    let mut call_args = args.clone();
-    if let Some(obj) = call_args.as_object_mut() {
-        obj.remove("file");
-    }
 
     if proxy::is_local_tool(name) {
         let session = manager.resolve(file_arg.as_deref(), interval)?;
@@ -975,7 +972,7 @@ fn handle_tool_call<U: UpstreamMcp>(
             return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
         }
 
-        let result = session.dispatch(name, &call_args).map_err(|msg| {
+        let result = session.dispatch(name, args).map_err(|msg| {
             // spec §2b: note an explicit-file/URL-file disagreement on a
             // failed call (almost always "no node ... in the mirror" —
             // the node genuinely isn't in the file the explicit arg

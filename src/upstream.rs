@@ -96,7 +96,10 @@ impl HttpUpstream {
     /// object (still containing its `result`/`error` wrapper — callers use
     /// [`extract_result`] to unwrap it). Captures `Mcp-Session-Id` from the
     /// response header, if present, for subsequent requests.
-    fn send_request(&mut self, body: &Value) -> Result<Value, UpstreamError> {
+    fn send_request(
+        &mut self,
+        body: &(impl serde::Serialize + ?Sized),
+    ) -> Result<Value, UpstreamError> {
         let (content_type, text) = self.post(body)?;
         parse_streamable_body(&content_type, &text)
     }
@@ -113,7 +116,12 @@ impl HttpUpstream {
     /// and return `(content_type, body_text)` for the caller to interpret.
     /// Both success and HTTP-error responses are read the same way — an
     /// MCP server can return a JSON-RPC `error` object on a non-2xx status.
-    fn post(&mut self, body: &Value) -> Result<(String, String), UpstreamError> {
+    fn post(
+        &mut self,
+        body: &(impl serde::Serialize + ?Sized),
+    ) -> Result<(String, String), UpstreamError> {
+        let body = crate::deep_json::to_string(body)
+            .map_err(|e| UpstreamError::Protocol(format!("failed to serialize request: {e}")))?;
         let mut req = self
             .agent
             .post(&self.url)
@@ -130,7 +138,7 @@ impl HttpUpstream {
         if let Some(protocol_version) = &self.protocol_version {
             req = req.set("MCP-Protocol-Version", protocol_version);
         }
-        let resp = match req.send_json(body.clone()) {
+        let resp = match req.send_bytes(body.as_bytes()) {
             Ok(resp) => resp,
             Err(ureq::Error::Status(_, resp)) => resp,
             Err(ureq::Error::Transport(e)) => {
@@ -198,13 +206,30 @@ impl UpstreamMcp for HttpUpstream {
     }
 
     fn call(&mut self, name: &str, args: &Value) -> Result<Value, UpstreamError> {
+        // Borrow deep arguments all the way to the growing-stack serializer.
+        // Field order retains the sorted JSON of the other request frames.
+        #[derive(serde::Serialize)]
+        struct Params<'a> {
+            arguments: &'a Value,
+            name: &'a str,
+        }
+        #[derive(serde::Serialize)]
+        struct Request<'a> {
+            id: u64,
+            jsonrpc: &'static str,
+            method: &'static str,
+            params: Params<'a>,
+        }
         let id = self.next_request_id();
-        let req = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": args},
-        });
+        let req = Request {
+            id,
+            jsonrpc: "2.0",
+            method: "tools/call",
+            params: Params {
+                arguments: args,
+                name,
+            },
+        };
         let resp = self.send_request(&req)?;
         extract_result(resp)
     }

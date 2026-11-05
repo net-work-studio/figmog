@@ -7,6 +7,8 @@
 
 use serde_json::Value;
 
+use crate::deep_json::OwnedValue;
+
 use fold::pipeline::terminal::{InvertedIndexReader, MultimapReader, TableReader};
 use fold::stream::Readable;
 
@@ -17,22 +19,22 @@ use crate::query::{self, TextReader};
 
 use super::write_json;
 
-fn print_value(v: &Value) -> Result<(), String> {
-    write_json(v)
+fn print_value(v: Value) -> Result<(), String> {
+    write_json(&crate::deep_json::OwnedValue(v))
 }
 
 pub(super) fn cmd_status<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     meta: &TableReader<'_, R, u8, FileMeta>,
 ) -> Result<(), String> {
-    print_value(&query::status(nodes, meta)?)
+    print_value(query::status(nodes, meta)?)
 }
 
 pub(super) fn cmd_pages<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     by_type: &InvertedIndexReader<'_, R, String, String>,
 ) -> Result<(), String> {
-    print_value(&query::pages(nodes, by_type)?)
+    print_value(query::pages(nodes, by_type)?)
 }
 
 pub(super) fn cmd_tree<R: Readable>(
@@ -42,7 +44,7 @@ pub(super) fn cmd_tree<R: Readable>(
     id: Option<String>,
     depth: Option<usize>,
 ) -> Result<(), String> {
-    print_value(&query::tree(nodes, children, by_type, id, depth)?)
+    print_value(query::tree(nodes, children, by_type, id, depth)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -55,7 +57,7 @@ pub(super) fn cmd_get<R: Readable>(
     with_children: bool,
     resolve_vars: bool,
 ) -> Result<(), String> {
-    print_value(&query::node(
+    print_value(query::node(
         nodes,
         children,
         variables,
@@ -77,7 +79,7 @@ pub(super) fn cmd_dump<R: Readable>(
     fields: Option<Vec<String>>,
     resolve_vars: bool,
 ) -> Result<(), String> {
-    print_value(&query::subtree(
+    print_value(query::subtree(
         nodes,
         children,
         variables,
@@ -97,7 +99,7 @@ pub(super) fn cmd_find<R: Readable>(
     page: Option<String>,
     under: Option<String>,
 ) -> Result<(), String> {
-    print_value(&query::find(
+    print_value(query::find(
         nodes, children, by_type, node_type, page, under,
     )?)
 }
@@ -112,7 +114,7 @@ pub(super) fn cmd_search<R: Readable>(
     limit: usize,
     under: Option<String>,
 ) -> Result<(), String> {
-    print_value(&query::search(text, nodes, children, &query, limit, under)?)
+    print_value(query::search(text, nodes, children, &query, limit, under)?)
 }
 
 pub(super) fn cmd_instances<R: Readable>(
@@ -122,7 +124,7 @@ pub(super) fn cmd_instances<R: Readable>(
     component_sets: &TableReader<'_, R, String, ComponentSetRec>,
     target: String,
 ) -> Result<(), String> {
-    print_value(&query::instances(
+    print_value(query::instances(
         nodes,
         components,
         component_sets,
@@ -136,7 +138,7 @@ pub(super) fn cmd_components<R: Readable>(
     components: &TableReader<'_, R, String, ComponentRec>,
     nodes: &TableReader<'_, R, String, NodeRec>,
 ) -> Result<(), String> {
-    print_value(&query::components(nodes, components, component_sets)?)
+    print_value(query::components(nodes, components, component_sets)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -150,7 +152,7 @@ pub(super) fn cmd_styles<R: Readable>(
     values: bool,
     resolve_vars: bool,
 ) -> Result<(), String> {
-    print_value(&query::styles(
+    print_value(query::styles(
         nodes,
         styles,
         styled_by,
@@ -168,7 +170,7 @@ pub(super) fn cmd_uses<R: Readable>(
     bound_to: &InvertedIndexReader<'_, R, String, String>,
     id: String,
 ) -> Result<(), String> {
-    print_value(&query::uses(nodes, styled_by, bound_to, &id)?)
+    print_value(query::uses(nodes, styled_by, bound_to, &id)?)
 }
 
 pub(super) fn cmd_vars<R: Readable>(
@@ -177,7 +179,7 @@ pub(super) fn cmd_vars<R: Readable>(
     variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     id: Option<String>,
 ) -> Result<(), String> {
-    print_value(&query::vars(nodes, variables, variable_collections, id)?)
+    print_value(query::vars(nodes, variables, variable_collections, id)?)
 }
 
 // ---- whole-file structural queries ----
@@ -188,7 +190,9 @@ pub(super) fn cmd_vars<R: Readable>(
 /// `figmog_where` call's `equals` argument identically to this module's own
 /// `cmd_where`.
 pub(super) fn parse_equals(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+    crate::deep_json::from_str(raw)
+        .map(OwnedValue::into_inner)
+        .unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 pub(super) fn cmd_stats<R: Readable>(
@@ -199,7 +203,7 @@ pub(super) fn cmd_stats<R: Readable>(
     variables: &TableReader<'_, R, String, VariableRec>,
     by_type: &InvertedIndexReader<'_, R, String, String>,
 ) -> Result<(), String> {
-    print_value(&query::stats(
+    print_value(query::stats(
         nodes,
         components,
         component_sets,
@@ -213,7 +217,7 @@ pub(super) fn cmd_path<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     id: String,
 ) -> Result<(), String> {
-    print_value(&query::path(nodes, id)?)
+    print_value(query::path(nodes, id)?)
 }
 
 pub(super) fn cmd_text<R: Readable>(
@@ -223,7 +227,7 @@ pub(super) fn cmd_text<R: Readable>(
     page: Option<String>,
     under: Option<String>,
 ) -> Result<(), String> {
-    print_value(&query::text(nodes, children, by_type, page, under)?)
+    print_value(query::text(nodes, children, by_type, page, under)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -235,9 +239,14 @@ pub(super) fn cmd_where<R: Readable>(
     page: Option<String>,
     under: Option<String>,
 ) -> Result<(), String> {
-    let equals = equals.as_deref().map(parse_equals);
-    print_value(&query::where_(
-        nodes, children, &pointer, equals, page, under,
+    let equals = equals.as_deref().map(|raw| OwnedValue(parse_equals(raw)));
+    print_value(query::where_(
+        nodes,
+        children,
+        &pointer,
+        equals.as_deref(),
+        page,
+        under,
     )?)
 }
 
@@ -250,5 +259,5 @@ pub(super) fn cmd_at<R: Readable>(
     under: Option<String>,
     limit: usize,
 ) -> Result<(), String> {
-    print_value(&query::at(nodes, children, x, y, page, under, limit)?)
+    print_value(query::at(nodes, children, x, y, page, under, limit)?)
 }

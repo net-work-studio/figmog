@@ -9,6 +9,7 @@ use fold::pipeline::terminal::search::Bm25Reader;
 use fold::pipeline::terminal::{InvertedIndexReader, MultimapReader, TableReader};
 use fold::stream::Readable;
 
+use crate::deep_json::OwnedValue;
 use crate::ident::normalize_node_ref;
 use crate::model::{
     ComponentRec, ComponentSetRec, FileMeta, NodeRec, StyleRec, VariableCollectionRec, VariableRec,
@@ -81,22 +82,23 @@ fn resolve_variable_binding<R: Readable>(
     match variables.get(&variable_id.to_string()) {
         Some(var) => {
             let collection = variable_collections.get(&var.collection_id);
-            let mut values_by_mode = serde_json::Map::new();
+            let mut values_by_mode = OwnedValue::object();
             for (mode_id, val_str) in &var.values_by_mode {
                 let mode_name = collection
                     .as_ref()
                     .and_then(|c| c.modes.iter().find(|(mid, _)| mid == mode_id))
                     .map(|(_, name)| name.clone())
                     .unwrap_or_else(|| mode_id.clone());
-                let val: Value = serde_json::from_str(val_str).unwrap_or(Value::Null);
+                let val = crate::deep_json::from_str(val_str).unwrap_or(OwnedValue(Value::Null));
                 values_by_mode.insert(mode_name, val);
             }
-            json!({
+            let mut row = OwnedValue(json!({
                 "pointer": pointer,
                 "variable_id": variable_id,
                 "variable_name": var.name,
-                "values_by_mode": Value::Object(values_by_mode),
-            })
+            }));
+            row.insert("values_by_mode".to_string(), values_by_mode);
+            row.into_inner()
         }
         None => json!({
             "pointer": pointer,
@@ -114,13 +116,16 @@ fn resolved_variables<R: Readable>(
     variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     bound_variables: &[(String, String)],
 ) -> Value {
-    let arr: Vec<Value> = bound_variables
-        .iter()
-        .map(|(pointer, vid)| {
-            resolve_variable_binding(variables, variable_collections, pointer, vid)
-        })
-        .collect();
-    Value::Array(arr)
+    let mut arr = OwnedValue::array();
+    for (pointer, vid) in bound_variables {
+        arr.push(OwnedValue(resolve_variable_binding(
+            variables,
+            variable_collections,
+            pointer,
+            vid,
+        )));
+    }
+    arr.into_inner()
 }
 
 /// File name, version, last modified, node count.
@@ -176,32 +181,68 @@ pub fn build_tree<R: Readable>(
     node: &NodeRec,
     depth: Option<usize>,
 ) -> TreeNode {
-    let mut kids = Vec::new();
-    if depth != Some(0) {
-        let mut edges = children.get(&node.id);
+    let make = |n: &NodeRec| TreeNode {
+        id: n.id.clone(),
+        name: n.name.clone(),
+        node_type: n.node_type.clone(),
+        children: Vec::new(),
+    };
+    let edges = |id: &String, depth| {
+        let mut edges = if depth == Some(0) {
+            Vec::new()
+        } else {
+            children.get(id)
+        };
         edges.sort();
-        let next_depth = depth.map(|d| d - 1);
-        for (_, child_id) in edges {
-            if let Some(child) = nodes.get(&child_id) {
-                kids.push(build_tree(nodes, children, &child, next_depth));
+        edges.into_iter()
+    };
+    let mut stack = vec![(make(node), depth, edges(&node.id, depth))];
+    let mut ancestors = BTreeSet::from([node.id.clone()]);
+    loop {
+        let (_, depth, edges_iter) = stack.last_mut().expect("root frame");
+        if let Some((_, child_id)) = edges_iter.next() {
+            if let Some(child) = nodes.get(&child_id)
+                && ancestors.insert(child.id.clone())
+            {
+                let depth = depth.map(|d| d - 1);
+                stack.push((make(&child), depth, edges(&child.id, depth)));
+            }
+        } else {
+            let (finished, _, _) = stack.pop().expect("root frame");
+            ancestors.remove(&finished.id);
+            match stack.last_mut() {
+                Some((parent, _, _)) => parent.children.push(finished),
+                None => return finished,
             }
         }
     }
-    TreeNode {
-        id: node.id.clone(),
-        name: node.name.clone(),
-        node_type: node.node_type.clone(),
-        children: kids,
+}
+
+impl Drop for TreeNode {
+    fn drop(&mut self) {
+        let mut pending = std::mem::take(&mut self.children);
+        while let Some(mut child) = pending.pop() {
+            pending.append(&mut child.children);
+        }
     }
 }
 
 fn tree_to_json(t: &TreeNode) -> Value {
-    json!({
-        "id": t.id,
-        "name": t.name,
-        "type": t.node_type,
-        "children": t.children.iter().map(tree_to_json).collect::<Vec<_>>(),
-    })
+    let mut pending = vec![(t, false)];
+    let mut values = Vec::new();
+    while let Some((node, visited)) = pending.pop() {
+        if visited {
+            let children = values.split_off(values.len() - node.children.len());
+            // Move the child array. json! on a Value would clone it recursively.
+            let mut value = json!({"id": node.id, "name": node.name, "type": node.node_type});
+            value["children"] = Value::Array(children);
+            values.push(value);
+        } else {
+            pending.push((node, true));
+            pending.extend(node.children.iter().rev().map(|child| (child, false)));
+        }
+    }
+    values.pop().expect("root value")
 }
 
 /// Resolve the root (default: the DOCUMENT node) and build its outline as a
@@ -258,7 +299,7 @@ pub fn node<R: Readable>(
     let n = nodes
         .get(&id)
         .ok_or_else(|| format!("no node {id} in the mirror"))?;
-    let mut value: Value = serde_json::from_str(&n.raw).map_err(|e| e.to_string())?;
+    let mut value = crate::deep_json::from_str(&n.raw).map_err(|e| e.to_string())?;
 
     if with_children {
         let mut edges = children.get(&id);
@@ -271,19 +312,23 @@ pub fn node<R: Readable>(
                     .map(|n| json!({"id": n.id, "name": n.name, "type": n.node_type}))
             })
             .collect();
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("children".to_string(), Value::Array(kids));
+        if value.is_object() {
+            value.insert("children".to_string(), OwnedValue(Value::Array(kids)));
         }
     }
 
-    if resolve_vars && let Some(obj) = value.as_object_mut() {
-        obj.insert(
+    if resolve_vars && value.is_object() {
+        value.insert(
             "resolved_variables".to_string(),
-            resolved_variables(variables, variable_collections, &n.bound_variables),
+            OwnedValue(resolved_variables(
+                variables,
+                variable_collections,
+                &n.bound_variables,
+            )),
         );
     }
 
-    Ok(value)
+    Ok(value.into_inner())
 }
 
 /// Top-level raw fields a `fields` projection keeps regardless of whether
@@ -298,16 +343,25 @@ const SUBTREE_ALWAYS_FIELDS: [&str; 3] = ["id", "name", "type"];
 /// always-kept set. Unknown field names are simply absent, not an error —
 /// spec §2's "agents probe freely" contract. A non-object `value` (should
 /// never happen for a real Figma node) passes through unchanged.
-fn project_raw_fields(mut value: Value, fields: &[String]) -> Value {
-    if let Value::Object(ref mut map) = value {
-        map.retain(|k, _| {
-            SUBTREE_ALWAYS_FIELDS.contains(&k.as_str()) || fields.iter().any(|f| f == k)
-        });
+fn project_raw_fields(mut value: OwnedValue, fields: &[String]) -> OwnedValue {
+    if let Some(map) = value.0.as_object_mut() {
+        let discarded: Vec<_> = map
+            .keys()
+            .filter(|k| {
+                !SUBTREE_ALWAYS_FIELDS.contains(&k.as_str()) && !fields.iter().any(|f| f == *k)
+            })
+            .cloned()
+            .collect();
+        for key in discarded {
+            if let Some(value) = map.remove(&key) {
+                drop(crate::deep_json::OwnedValue(value));
+            }
+        }
     }
     value
 }
 
-/// Recursive worker behind [`subtree`]: raw JSON of `n`, fields-projected,
+/// Iterative worker behind [`subtree`]: raw JSON of `n`, fields-projected,
 /// with `children` nested in child-index order and (when requested)
 /// `resolved_variables` — both inserted *after* projection so they always
 /// survive a `fields` filter, matching `id`/`name`/`type`.
@@ -322,43 +376,58 @@ fn build_subtree<R: Readable>(
     fields: Option<&[String]>,
     resolve_vars: bool,
 ) -> Result<Value, String> {
-    let mut value: Value = serde_json::from_str(&n.raw).map_err(|e| e.to_string())?;
-    if let Some(fs) = fields {
-        value = project_raw_fields(value, fs);
-    }
-
-    let mut kids_json = Vec::new();
-    if depth != Some(0) {
-        let mut edges = children.get(&n.id);
-        edges.sort();
-        let next_depth = depth.map(|d| d - 1);
-        for (_, child_id) in edges {
-            if let Some(child) = nodes.get(&child_id) {
-                kids_json.push(build_subtree(
-                    nodes,
-                    children,
+    let prepare = |n: &NodeRec, depth| -> Result<_, String> {
+        let mut value = crate::deep_json::from_str(&n.raw).map_err(|e| e.to_string())?;
+        if let Some(fs) = fields {
+            value = project_raw_fields(value, fs);
+        }
+        if resolve_vars && value.is_object() {
+            value.insert(
+                "resolved_variables".to_string(),
+                OwnedValue(resolved_variables(
                     variables,
                     variable_collections,
-                    &child,
-                    next_depth,
-                    fields,
-                    resolve_vars,
-                )?);
+                    &n.bound_variables,
+                )),
+            );
+        }
+        let mut edges = if depth == Some(0) {
+            Vec::new()
+        } else {
+            children.get(&n.id)
+        };
+        edges.sort();
+        Ok((
+            n.id.clone(),
+            value,
+            depth,
+            edges.into_iter(),
+            OwnedValue::array(),
+        ))
+    };
+    let mut stack = vec![prepare(n, depth)?];
+    let mut ancestors = BTreeSet::from([n.id.clone()]);
+    loop {
+        let (_, _, depth, edges, _) = stack.last_mut().expect("root frame");
+        if let Some((_, child_id)) = edges.next() {
+            if let Some(child) = nodes.get(&child_id)
+                && ancestors.insert(child.id.clone())
+            {
+                let depth = depth.map(|d| d - 1);
+                stack.push(prepare(&child, depth)?);
+            }
+        } else {
+            let (id, mut value, _, _, kids) = stack.pop().expect("root frame");
+            ancestors.remove(&id);
+            if value.is_object() {
+                value.insert("children".to_string(), kids);
+            }
+            match stack.last_mut() {
+                Some((_, _, _, _, kids)) => kids.push(value),
+                None => return Ok(value.into_inner()),
             }
         }
     }
-
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("children".to_string(), Value::Array(kids_json));
-        if resolve_vars {
-            obj.insert(
-                "resolved_variables".to_string(),
-                resolved_variables(variables, variable_collections, &n.bound_variables),
-            );
-        }
-    }
-
-    Ok(value)
 }
 
 /// Subtree dump rooted at `id` (spec §2): the node's full raw JSON with
@@ -551,36 +620,36 @@ pub fn components<R: Readable>(
     let mut all_components: Vec<(String, ComponentRec)> = components.iter().collect();
     all_components.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let sets_json: Vec<Value> = sets
-        .iter()
-        .map(|(set_id, set)| {
-            let variants: Vec<Value> = all_components
-                .iter()
-                .filter(|(_, c)| c.component_set_id.as_deref() == Some(set_id.as_str()))
-                .map(|(cid, c)| json!({"node_id": cid, "name": c.name, "key": c.key}))
-                .collect();
-            let property_definitions: Value = nodes
-                .get(set_id)
-                .and_then(|n| n.property_definitions.clone())
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(Value::Null);
-            json!({
-                "node_id": set_id,
-                "name": set.name,
-                "key": set.key,
-                "variants": variants,
-                "property_definitions": property_definitions,
-            })
-        })
-        .collect();
-
+    let mut sets_json = OwnedValue::array();
+    for (set_id, set) in &sets {
+        let variants: Vec<Value> = all_components
+            .iter()
+            .filter(|(_, c)| c.component_set_id.as_deref() == Some(set_id.as_str()))
+            .map(|(cid, c)| json!({"node_id": cid, "name": c.name, "key": c.key}))
+            .collect();
+        let property_definitions = nodes
+            .get(set_id)
+            .and_then(|n| n.property_definitions)
+            .and_then(|s| crate::deep_json::from_str(&s).ok())
+            .unwrap_or(OwnedValue(Value::Null));
+        let mut row = OwnedValue(
+            json!({"node_id": set_id, "name": set.name, "key": set.key, "variants": variants}),
+        );
+        row.insert("property_definitions".to_string(), property_definitions);
+        sets_json.push(row);
+    }
     let standalone: Vec<Value> = all_components
         .iter()
         .filter(|(_, c)| c.component_set_id.is_none())
         .map(|(cid, c)| json!({"node_id": cid, "name": c.name, "key": c.key}))
         .collect();
-
-    Ok(json!({"sets": sets_json, "components": standalone}))
+    let mut inventory = OwnedValue::object();
+    inventory.insert("sets".to_string(), sets_json);
+    inventory.insert(
+        "components".to_string(),
+        OwnedValue(Value::Array(standalone)),
+    );
+    Ok(inventory.into_inner())
 }
 
 /// Styles with usage counts; `values` derives definitions from consumers.
@@ -605,45 +674,45 @@ pub fn styles<R: Readable>(
         rows.retain(|(_, s)| s.style_type.eq_ignore_ascii_case(t));
     }
 
-    let out: Vec<Value> = rows
-        .iter()
-        .map(|(style_id, s)| {
-            let mut consumers = styled_by.search(style_id);
-            consumers.sort();
-            let mut obj = json!({
-                "style_id": style_id,
-                "name": s.name,
-                "key": s.key,
-                "type": s.style_type,
-                "uses": consumers.len(),
-            });
-            if values {
-                let consumer = consumers.first().and_then(|nid| nodes.get(nid));
-                let value = consumer
-                    .as_ref()
-                    .and_then(|n| crate::vars::style_value_from_consumer(&s.style_type, &n.raw))
-                    .unwrap_or(Value::Null);
-                obj["value"] = value;
+    let mut out = OwnedValue::array();
+    for (style_id, s) in &rows {
+        let mut consumers = styled_by.search(style_id);
+        consumers.sort();
+        let mut obj = OwnedValue(json!({
+            "style_id": style_id,
+            "name": s.name,
+            "key": s.key,
+            "type": s.style_type,
+            "uses": consumers.len(),
+        }));
+        if values {
+            let consumer = consumers.first().and_then(|nid| nodes.get(nid));
+            let value = consumer
+                .as_ref()
+                .and_then(|n| crate::vars::style_value_from_consumer(&s.style_type, &n.raw))
+                .unwrap_or(Value::Null);
+            obj.insert("value".to_string(), OwnedValue(value));
 
-                if resolve_vars {
-                    let prefix = crate::vars::style_value_pointer(&s.style_type);
-                    let bound: Vec<(String, String)> = consumer
-                        .map(|n| {
-                            n.bound_variables
-                                .iter()
-                                .filter(|(p, _)| prefix.is_some_and(|pre| p.starts_with(pre)))
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    obj["resolved_variables"] =
-                        resolved_variables(variables, variable_collections, &bound);
-                }
+            if resolve_vars {
+                let prefix = crate::vars::style_value_pointer(&s.style_type);
+                let bound: Vec<(String, String)> = consumer
+                    .map(|n| {
+                        n.bound_variables
+                            .iter()
+                            .filter(|(p, _)| prefix.is_some_and(|pre| p.starts_with(pre)))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                obj.insert(
+                    "resolved_variables".to_string(),
+                    OwnedValue(resolved_variables(variables, variable_collections, &bound)),
+                );
             }
-            obj
-        })
-        .collect();
-    Ok(Value::Array(out))
+        }
+        out.push(obj);
+    }
+    Ok(out.into_inner())
 }
 
 /// Nodes using a style id or bound to a variable id.
@@ -688,45 +757,45 @@ pub fn vars<R: Readable>(
         all_ids.retain(|v| v == target);
     }
 
-    let rows: Vec<Value> = all_ids
-        .iter()
-        .map(|vid| {
-            let usage = inferred_by_id.remove(vid);
-            let (sites, observed) = usage.map(|u| (u.sites, u.observed)).unwrap_or_default();
+    let mut rows = OwnedValue::array();
+    for vid in &all_ids {
+        let usage = inferred_by_id.remove(vid);
+        let (sites, observed) = usage.map(|u| (u.sites, u.observed)).unwrap_or_default();
 
-            if let Some(var) = variables.get(vid) {
-                let collection = variable_collections.get(&var.collection_id);
-                let mut values_by_mode = serde_json::Map::new();
-                for (mode_id, val_str) in &var.values_by_mode {
-                    let mode_name = collection
-                        .as_ref()
-                        .and_then(|c| c.modes.iter().find(|(mid, _)| mid == mode_id))
-                        .map(|(_, name)| name.clone())
-                        .unwrap_or_else(|| mode_id.clone());
-                    let val: Value = serde_json::from_str(val_str).unwrap_or(Value::Null);
-                    values_by_mode.insert(mode_name, val);
-                }
-                json!({
-                    "variable_id": vid,
-                    "source": "imported",
-                    "name": var.name,
-                    "resolved_type": var.resolved_type,
-                    "collection": collection.map(|c| c.name),
-                    "values_by_mode": Value::Object(values_by_mode),
-                    "sites": sites,
-                    "observed": observed,
-                })
-            } else {
-                json!({
-                    "variable_id": vid,
-                    "source": "inferred",
-                    "sites": sites,
-                    "observed": observed,
-                })
+        let row = if let Some(var) = variables.get(vid) {
+            let collection = variable_collections.get(&var.collection_id);
+            let mut values_by_mode = OwnedValue::object();
+            for (mode_id, val_str) in &var.values_by_mode {
+                let mode_name = collection
+                    .as_ref()
+                    .and_then(|c| c.modes.iter().find(|(mid, _)| mid == mode_id))
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| mode_id.clone());
+                let val = crate::deep_json::from_str(val_str).unwrap_or(OwnedValue(Value::Null));
+                values_by_mode.insert(mode_name, val);
             }
-        })
-        .collect();
-    Ok(Value::Array(rows))
+            let mut row = OwnedValue(json!({
+                "variable_id": vid,
+                "source": "imported",
+                "name": var.name,
+                "resolved_type": var.resolved_type,
+                "collection": collection.map(|c| c.name),
+                "sites": sites,
+                "observed": observed,
+            }));
+            row.insert("values_by_mode".to_string(), values_by_mode);
+            row
+        } else {
+            OwnedValue(json!({
+                "variable_id": vid,
+                "source": "inferred",
+                "sites": sites,
+                "observed": observed,
+            }))
+        };
+        rows.push(row);
+    }
+    Ok(rows.into_inner())
 }
 
 // ---- whole-file structural queries ----
@@ -877,7 +946,7 @@ pub fn where_<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
     pointer: &str,
-    equals: Option<Value>,
+    equals: Option<&Value>,
     page: Option<String>,
     under: Option<String>,
 ) -> Result<Value, String> {
@@ -889,7 +958,8 @@ pub fn where_<R: Readable>(
     let page = page.as_deref().map(normalize_node_ref);
     let scope = resolve_under(nodes, children, under)?;
 
-    let mut rows: Vec<(String, String, String, String, Value)> = Vec::new();
+    // Keep completed matches guarded if a later stored record fails to parse.
+    let mut rows: Vec<(String, OwnedValue)> = Vec::new();
     for (_, n) in nodes.iter() {
         if page.as_deref().is_some_and(|p| n.page_id != p) {
             continue;
@@ -897,24 +967,58 @@ pub fn where_<R: Readable>(
         if !scope.as_ref().is_none_or(|s| s.contains(&n.id)) {
             continue;
         }
-        let raw: Value = serde_json::from_str(&n.raw).map_err(|e| e.to_string())?;
-        let Some(v) = raw.pointer(pointer) else {
+        let mut raw = crate::deep_json::from_str(&n.raw).map_err(|e| e.to_string())?;
+        let Some(value) = raw.0.pointer_mut(pointer) else {
             continue;
         };
-        if equals.as_ref().is_some_and(|want| v != want) {
+        if equals.is_some_and(|want| !json_values_equal(value, want)) {
             continue;
         }
-        rows.push((n.id, n.name, n.node_type, n.page_id, v.clone()));
+        let value = OwnedValue(std::mem::take(value));
+        let mut row = OwnedValue(
+            json!({"id": n.id, "name": n.name, "type": n.node_type, "page_id": n.page_id}),
+        );
+        row.insert("value".to_string(), value);
+        rows.push((n.id, row));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut result = OwnedValue::array();
+    for (_, row) in rows {
+        result.push(row);
+    }
+    Ok(result.into_inner())
+}
 
-    let arr: Vec<Value> = rows
-        .into_iter()
-        .map(|(id, name, node_type, page_id, value)| {
-            json!({"id": id, "name": name, "type": node_type, "page_id": page_id, "value": value})
-        })
-        .collect();
-    Ok(Value::Array(arr))
+/// Value's scalar equality semantics, without recursive container comparisons.
+fn json_values_equal(a: &Value, b: &Value) -> bool {
+    let mut pending = vec![(a, b)];
+    while let Some((a, b)) = pending.pop() {
+        match (a, b) {
+            (Value::Array(a), Value::Array(b)) => {
+                if a.len() != b.len() {
+                    return false;
+                }
+                pending.extend(a.iter().zip(b));
+            }
+            (Value::Object(a), Value::Object(b)) => {
+                if a.len() != b.len() {
+                    return false;
+                }
+                for ((a_key, a_value), (b_key, b_value)) in a.iter().zip(b) {
+                    if a_key != b_key {
+                        return false;
+                    }
+                    pending.push((a_value, b_value));
+                }
+            }
+            _ => {
+                if a != b {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Default output cap for point lookups, shared by the CLI and MCP.

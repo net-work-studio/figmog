@@ -97,11 +97,11 @@ pub(super) fn do_pull(
     // `vars_resp` is only ever `Some` on the network path — `--from-file`
     // ingests a saved `GET /v1/files/:key` response and never touches the
     // network at all, so it never calls `variables_local` either.
-    let (resp, vars_resp): (Value, Option<Value>) = match from_file {
+    let (resp, vars_resp): (crate::deep_json::OwnedValue, Option<Value>) = match from_file {
         Some(path) => {
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("reading {}: {e}", path.display()))?;
-            let resp = serde_json::from_str(&content)
+            let resp = crate::deep_json::from_str(&content)
                 .map_err(|e| format!("parsing {}: {e}", path.display()))?;
             (resp, None)
         }
@@ -134,7 +134,7 @@ pub(super) fn do_pull(
             };
             let request_geometry = store::effective_geometry(geometry, stored_geometry);
             let api = UreqApi::new(token);
-            let resp = api.file(&key, request_geometry)?;
+            let resp = crate::deep_json::OwnedValue(api.file(&key, request_geometry)?);
             // Opportunistic Enterprise variables sync (spec §12): `Ok(None)`
             // on non-Enterprise plans is not an error — v1 behavior
             // (import/inference, sweep-exempt) holds unchanged below.
