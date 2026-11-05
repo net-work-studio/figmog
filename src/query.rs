@@ -832,6 +832,9 @@ pub fn vars<R: Readable>(
                     "name": var.name,
                     "resolved_type": var.resolved_type,
                     "collection": collection.as_ref().map(|c| c.name.clone()),
+                    // The collection's id: with the variable id, a token's
+                    // stable identity in `figmog tokens` (NWS-2948).
+                    "collection_id": var.collection_id,
                     // The collection's default mode, by name (mode id when
                     // the collection doesn't name it), and the variable's
                     // Figma scopes — what `figmog tokens export` needs to
