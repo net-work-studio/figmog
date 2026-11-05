@@ -77,21 +77,7 @@ impl FigmaApi for DocApi {
 
 /// A session whose store holds a `nodes`-node synthetic mirror.
 fn mirrored(dir: &std::path::Path, key: &str, nodes: usize) -> FileSession {
-    let mut session = sessions::open_session_with_api(
-        dir.join(key).join("db"),
-        key.into(),
-        Some(key),
-        Some(Arc::new(DocApi(synthetic_document(nodes)))),
-    )
-    .unwrap();
-    session.request_pull(false, Duration::ZERO);
-    let deadline = Instant::now() + Duration::from_secs(300);
-    while !session.mirrored {
-        session.maintain(true);
-        assert!(Instant::now() < deadline, "synthetic pull timed out");
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    session
+    mirrored_doc(dir, key, synthetic_document(nodes))
 }
 
 fn manager_of(dir: &std::path::Path, sessions: Vec<FileSession>) -> SessionManager {
@@ -648,4 +634,137 @@ fn pending_requests_are_bounded_per_connection_and_closed_connections_are_skippe
         "closed connection got {line:?}"
     );
     server.stop();
+}
+
+/// A synthetic component library: `sets` component sets of `variants`
+/// variants each, one page.
+fn synthetic_library(sets: usize, variants: usize) -> Value {
+    let mut children = Vec::new();
+    let mut components = serde_json::Map::new();
+    let mut component_sets = serde_json::Map::new();
+    for set in 0..sets {
+        let set_id = format!("{}:0", set + 10);
+        let kids: Vec<Value> = (0..variants)
+            .map(|v| {
+                let id = format!("{}:{}", set + 10, v + 1);
+                components.insert(
+                    id.clone(),
+                    json!({"key": format!("k{set}-{v}"), "name": format!("Variant={v}"),
+                        "description": "", "componentSetId": set_id, "remote": false}),
+                );
+                json!({"id": id, "name": format!("Variant={v}"), "type": "COMPONENT", "children": []})
+            })
+            .collect();
+        component_sets.insert(
+            set_id.clone(),
+            json!({"key": format!("ks{set}"), "name": format!("Set {set}"), "description": "", "remote": false}),
+        );
+        children.push(
+            json!({"id": set_id, "name": format!("Set {set}"), "type": "COMPONENT_SET",
+            "componentPropertyDefinitions": {"Variant": {"type": "VARIANT", "defaultValue": "0"}},
+            "children": kids}),
+        );
+    }
+    json!({"name": "Library", "version": "1", "lastModified": "2026-01-01T12:00:00Z",
+        "document": {"id": "0:0", "name": "Document", "type": "DOCUMENT", "children": [
+            {"id": "0:1", "name": "Components", "type": "CANVAS", "children": children}]},
+        "components": components, "componentSets": component_sets})
+}
+
+fn mirrored_doc(dir: &std::path::Path, key: &str, doc: Value) -> FileSession {
+    let mut session = sessions::open_session_with_api(
+        dir.join(key).join("db"),
+        key.into(),
+        Some(key),
+        Some(Arc::new(DocApi(doc))),
+    )
+    .unwrap();
+    session.request_pull(false, Duration::ZERO);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while !session.mirrored {
+        session.maintain(true);
+        assert!(Instant::now() < deadline, "synthetic pull timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    session
+}
+
+/// `figmog_components` is O(sets × components): on a 2k-set × 20k-component
+/// library it is far too slow for the loop, which is why it runs on a
+/// read worker: `cargo test --lib measure_components_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_components_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = mirrored_doc(dir.path(), KEY_A, synthetic_library(2_000, 10));
+    for (name, args) in [
+        ("figmog_components", json!({})),
+        ("figmog_pages", json!({})),
+        ("figmog_node", json!({"id": "1500:0", "children": true})),
+        ("figmog_path", json!({"id": "1500:3"})),
+    ] {
+        let start = Instant::now();
+        let out = session.dispatch(name, &args);
+        let bytes = match &out {
+            Ok(ToolOutput::Json(v)) => v.to_string().len(),
+            _ => 0,
+        };
+        eprintln!("{name} {args}: {:?}, {bytes} B", start.elapsed());
+    }
+}
+
+/// `figmog_components` runs on a read worker, never inline.
+#[test]
+fn components_runs_on_a_read_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = mirrored_doc(dir.path(), KEY_A, synthetic_library(20, 5));
+    let line = request(json!(1), "figmog_components", json!({}));
+    let expected = inline_frame(&a, &line, ToolErrorMode::McpContent);
+    let mut manager = manager_of(dir.path(), vec![a]);
+    let (mut offload, seen, release) = gated_offload("figmog_components");
+    let call = begin(&mut manager, &mut offload, &line).expect("components is deferred");
+    assert_eq!(
+        seen.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "figmog_components"
+    );
+    release.send(()).unwrap();
+    assert_eq!(finish(&offload, call), expected);
+}
+
+/// A read still running when the exit deadline passes does not hold
+/// shutdown: serve returns within the deadline plus a small margin, the
+/// read is detached with its own lease, and nothing reopens its store.
+#[test]
+fn shutdown_is_bounded_by_the_exit_deadline_despite_a_stalled_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = mirrored(dir.path(), KEY_A, 500);
+    let (mut offload, seen, release) = gated_offload("figmog_stats");
+    let drain = Duration::from_millis(300);
+    offload.exit_drain = drain;
+    let server = Server::start(manager_of(dir.path(), vec![a]), offload);
+    let mut client = server.connect(1);
+    server.send(1, request(json!(1), "figmog_stats", json!({})));
+    assert_eq!(
+        seen.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "figmog_stats"
+    );
+    let start = Instant::now();
+    server.stop();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < drain + Duration::from_millis(700),
+        "shutdown took {elapsed:?} with a {drain:?} exit deadline"
+    );
+    // The stalled read's response was not owed past the deadline.
+    client
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut line = String::new();
+    assert!(
+        client.read_line(&mut line).map_or(true, |n| n == 0),
+        "{line:?}"
+    );
+    // The detached read still completes against its own leased view.
+    release.send(()).unwrap();
 }

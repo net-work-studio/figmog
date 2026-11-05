@@ -407,15 +407,17 @@ panic.
 client and never runs a whole-mirror scan.
 
 - *Heavy reads run on read workers.* Every local read except the point
-  lookups `figmog_pages`, `figmog_node`, `figmog_path` and
-  `figmog_components` — i.e. `figmog_tree`, `figmog_subtree`,
+  lookups `figmog_pages`, `figmog_node` and `figmog_path` (bounded by the
+  page count, one node with its direct children and bindings, and its
+  depth) — i.e. `figmog_components`, `figmog_tree`, `figmog_subtree`,
   `figmog_find`, `figmog_search`, `figmog_instances`, `figmog_styles`,
   `figmog_uses`, `figmog_vars`, `figmog_stats`, `figmog_text`,
   `figmog_where`, `figmog_at`, plus `figmog_status` and `figmog_files`
   (their node count scans the mirror) — runs on a pool of
   `min(4, available_parallelism)` read workers. Classification is by
-  measured cost on a synthetic 100k-node mirror: the inline four take
-  under 0.2 ms; status ~90 ms, stats ~0.5 s, a whole-document subtree
+  measured cost on a synthetic 100k-node mirror: the inline three take
+  under 0.2 ms; `figmog_components` is O(sets × components) — 0.34 s on
+  a 2k-set × 20k-component library (`measure_components_cost`); status ~90 ms, stats ~0.5 s, a whole-document subtree
   ~0.4 s (≈20 MB), vars ~0.3 s, tree/where ~0.2–0.4 s, the rest 25–150 ms
   (`measure_read_costs`, an ignored test). Routing, the not-ready check
   and status's `ready`/`pull` lifecycle (as of the request) are decided on
@@ -441,7 +443,10 @@ client and never runs a whole-mirror scan.
   has released its view and its worker is idle, then (4) closes, resets
   and reopens the store and (5) publishes the new session in place. A
   store is never deleted or reopened underneath a live view. Shutdown
-  applies steps 2–3 (bounded by the exit drain) before closing stores. No
+  applies steps 2–3 (bounded by the exit drain) before closing stores; a
+  worker read still running at the exit deadline is detached with its own
+  lease rather than awaited, so shutdown stays within the deadline and no
+  store is reset or reopened under it. No
   tool resets a store yet; `SessionManager::begin_reset` /
   `service_resets` are the mechanism NWS-2963 builds on (its only
   operation today is a close-and-reopen, which starts fresh job history).

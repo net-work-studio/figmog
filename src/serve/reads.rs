@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -20,17 +21,15 @@ use crate::sessions::{self, FilesRead, StatusRead};
 
 use super::DeferredReply;
 
-/// Local reads answered inline on the loop: point lookups whose cost is
-/// bounded by one node and its direct children (measured at well under a
-/// millisecond on a 100k-node mirror), plus the component list. Every
-/// other local read — and `figmog_status`/`figmog_files`, whose node count
-/// scans the mirror — runs on a read worker.
-const INLINE_READS: &[&str] = &[
-    "figmog_pages",
-    "figmog_node",
-    "figmog_path",
-    "figmog_components",
-];
+/// Local reads answered inline on the loop: point lookups bounded by the
+/// page count (`pages`: one `by_type` index lookup), one node, its direct
+/// children and bound variables (`node`), or its depth (`path`) —
+/// measured at well under a millisecond on a 100k-node mirror. Every other
+/// local read runs on a read worker, including `figmog_components` (it
+/// scans both component tables and filters all components per set:
+/// O(sets × components)) and `figmog_status`/`figmog_files` (their node
+/// count scans the mirror).
+const INLINE_READS: &[&str] = &["figmog_pages", "figmog_node", "figmog_path"];
 
 pub(crate) fn is_inline_read(name: &str) -> bool {
     INLINE_READS.contains(&name)
@@ -113,8 +112,9 @@ struct ReadJob {
 pub(crate) type ReadHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The read worker pool, spawned on first use. Jobs run in arrival order.
-/// Dropping it skips queued jobs (each answers with an error) and joins the
-/// workers after their running read finishes, releasing every lease.
+/// Stopping it ([`ReadPool::shutdown`] or drop) skips queued jobs (each
+/// answers with an error); a running read finishes and releases its lease
+/// on its own thread.
 #[derive(Default)]
 pub(crate) struct ReadPool {
     jobs: Option<mpsc::Sender<ReadJob>>,
@@ -194,12 +194,33 @@ impl ReadPool {
     }
 }
 
-impl Drop for ReadPool {
-    fn drop(&mut self) {
+impl ReadPool {
+    /// Shutdown: skip queued reads and wait until `deadline` for running
+    /// ones. A read still running then is detached, not awaited: its thread
+    /// keeps its own lease (and so its `Arc`'d view and store snapshot)
+    /// alive until it finishes or the process exits. Nothing here closes,
+    /// resets or reopens a store, so no store is touched under that view.
+    pub(crate) fn shutdown(&mut self, deadline: Instant) {
         self.stop.store(true, Ordering::Relaxed);
         self.jobs.take();
         for worker in self.workers.drain(..) {
-            let _ = worker.join();
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+            // Otherwise dropping the handle detaches the worker.
         }
+    }
+}
+
+impl Drop for ReadPool {
+    /// Never blocks: queued reads are skipped and running ones detached
+    /// (each finishes on its own, then its worker exits).
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.jobs.take();
+        self.workers.clear();
     }
 }

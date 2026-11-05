@@ -674,6 +674,8 @@ struct Offload {
     /// any is outstanding the loop polls for completions every
     /// [`READ_POLL`] instead of every 20ms.
     reads_in_flight: std::collections::BTreeSet<u64>,
+    /// How long shutdown may take: [`EXIT_DRAIN`] (tests shorten it).
+    exit_drain: Duration,
 }
 
 /// Completion polling interval while worker reads are outstanding, so a
@@ -691,6 +693,7 @@ impl Offload {
             reads: ReadPool::default(),
             staged: None,
             reads_in_flight: std::collections::BTreeSet::new(),
+            exit_drain: EXIT_DRAIN,
         }
     }
 
@@ -985,7 +988,7 @@ fn serve_loop_with_offload(
         &registry,
         &stdio,
     );
-    let deadline = Instant::now() + EXIT_DRAIN;
+    let deadline = Instant::now() + offload.exit_drain;
     if matches!(exit, LoopExit::Drain) {
         drain_on_exit(
             &mut manager,
@@ -996,9 +999,11 @@ fn serve_loop_with_offload(
             deadline,
         );
     }
-    // Stop the read pool (queued reads are skipped; running ones finish
-    // and release their views), then close every store behind the reset
-    // barrier before the sessions drop.
+    // Stop the read pool within the deadline (queued reads are skipped; a
+    // read still running then is detached with its own lease), then close
+    // every store behind the reset barrier — waiting at most until the
+    // same deadline — before the sessions drop. Nothing reopens a store.
+    offload.reads.shutdown(deadline);
     drop(offload);
     manager.close_reads(deadline);
     registry.finish(deadline);

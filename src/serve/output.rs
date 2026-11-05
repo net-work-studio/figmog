@@ -259,6 +259,19 @@ impl Connections {
     }
 }
 
+impl Drop for Connections {
+    /// Never blocks: every still-registered connection is closed, so its
+    /// writer flushes what is queued (within each response's deadline),
+    /// exits and releases the socket, instead of waiting for frames that
+    /// can no longer arrive.
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        for conn in std::mem::take(&mut state.conns).into_values() {
+            conn.close();
+        }
+    }
+}
+
 /// The stdio writer thread. Frames are written in the order queued.
 pub(crate) struct StdioWriter {
     frames: Option<mpsc::Sender<String>>,
@@ -379,5 +392,24 @@ mod tests {
             assert_eq!(&line, frame);
         }
         conns.finish(Instant::now() + Duration::from_secs(5));
+    }
+
+    /// Dropping a registry without `finish` still releases every writer
+    /// thread and its socket.
+    #[test]
+    fn dropping_the_registry_releases_writers_and_sockets() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let conns = Connections::default();
+        conns.register(1, server).unwrap();
+        conns.send(1, "queued\n".into());
+        drop(conns);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut received = String::new();
+        client
+            .read_to_string(&mut received)
+            .expect("EOF once the writer exits and drops the socket");
+        assert_eq!(received, "queued\n");
     }
 }
