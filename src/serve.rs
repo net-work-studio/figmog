@@ -1785,8 +1785,9 @@ mod tests {
         .unwrap();
         crate::store::sync(&mut st, &std::collections::BTreeSet::new(), &flattened, 0);
 
-        let result =
-            st.rtx(|r| dispatch::dispatch_read_tool("figmog_status", &json!({}), "connected", &r));
+        let result = st.rtx(|r| {
+            dispatch::dispatch_read_tool("figmog_status", &json!({}), "connected", &r, None)
+        });
         let value = result
             .expect("figmog_status is a recognized local tool")
             .unwrap();
@@ -1796,7 +1797,7 @@ mod tests {
         // dispatcher — proving the namespace rule routes it away from the
         // local path without needing a live upstream to demonstrate it.
         let result =
-            st.rtx(|r| dispatch::dispatch_read_tool("get_code", &json!({}), "connected", &r));
+            st.rtx(|r| dispatch::dispatch_read_tool("get_code", &json!({}), "connected", &r, None));
         assert!(result.is_none());
     }
 

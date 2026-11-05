@@ -413,13 +413,18 @@ client and never runs a whole-mirror scan.
   `figmog_find`, `figmog_search`, `figmog_instances`, `figmog_styles`,
   `figmog_uses`, `figmog_vars`, `figmog_stats`, `figmog_text`,
   `figmog_where`, `figmog_at`, plus `figmog_status` and `figmog_files`
-  (their node count scans the mirror) — runs on a pool of
-  `min(4, available_parallelism)` read workers. Classification is by
-  measured cost on a synthetic 100k-node mirror: the inline three take
-  under 0.2 ms; `figmog_components` is O(sets × components) — 0.34 s on
-  a 2k-set × 20k-component library (`measure_components_cost`); status ~90 ms, stats ~0.5 s, a whole-document subtree
-  ~0.4 s (≈20 MB), vars ~0.3 s, tree/where ~0.2–0.4 s, the rest 25–150 ms
-  (`measure_read_costs`, an ignored test). Routing, the not-ready check
+  — runs on a pool of `min(4, available_parallelism)` read workers.
+  Classification is by measured cost on a synthetic 100k-node mirror: the
+  inline three take under 0.2 ms; `figmog_components` is linear in sets +
+  components (NWS-2942) — 65 ms on a 2k-set × 20k-component library
+  (`measure_components_cost`); a whole-document subtree ~0.4 s (≈20 MB),
+  stats ~0.2 s, vars ~0.1 s, tree/where ~0.2–0.4 s, the rest 25–150 ms
+  (`measure_read_costs`, an ignored test). Status and files are O(1) in
+  the mirror's size: each published view carries its node count in
+  memory (from the pull that published it, or counted once by the
+  session worker when an existing mirror is opened), so a status poll
+  never scans the `nodes` table. Direct CLI `figmog status` still counts
+  the table (one-shot). Routing, the not-ready check
   and status's `ready`/`pull` lifecycle (as of the request) are decided on
   the loop; the worker reads a leased published view (no store lock),
   then frames and serializes the response itself, so even a 20 MB answer

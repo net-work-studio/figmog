@@ -208,8 +208,10 @@ pub(crate) fn read_tool(
     name: &str,
     args: &Value,
 ) -> Result<ToolOutput, String> {
+    // Only status reads the node count; don't count for anything else.
+    let node_count = (name == "figmog_status").then(|| view.node_count());
     view.with_dependent(|_, readers| {
-        dispatch::dispatch_read_tool(name, args, "", readers)
+        dispatch::dispatch_read_tool(name, args, "", readers, node_count)
             .ok_or_else(|| format!("unknown tool: {name}"))?
             .map(ToolOutput::Json)
     })
@@ -778,18 +780,26 @@ pub(crate) fn open_session_with_hooks(
             SharedPipeline(pipeline.clone()),
         )
     })?;
-    let make_view = move |snapshot| {
-        Arc::new(SessionView::new(snapshot, |snapshot| {
-            pipeline.lock().unwrap().reader(snapshot)
-        }))
+    let make_view = move |snapshot, node_count| {
+        Arc::new(SessionView::new(
+            snapshot,
+            |snapshot| pipeline.lock().unwrap().reader(snapshot),
+            node_count,
+        ))
     };
-    let view = make_view(st.rtx(|(snapshot, _)| snapshot.clone()));
+    let view = make_view(st.rtx(|(snapshot, _)| snapshot.clone()), None);
     let mirrored =
         view.with_dependent(|_, (_, _, _, _, _, _, meta, _, _, _, _, _)| meta.get(&0).is_some());
     let geometry = view.with_dependent(|_, (.., config, _, _, _)| store::read_geometry(config));
     let (commands, work) = mpsc::sync_channel(1);
     let (done, completions) = mpsc::channel();
+    let opened = view.clone();
     let worker = std::thread::spawn(move || {
+        // Count the opened mirror's nodes here, once, so the first status
+        // poll doesn't pay for it (NWS-2942). A read racing this waits for
+        // the same count rather than starting its own.
+        opened.node_count();
+        drop(opened);
         let mut watcher = Watcher::new(None);
         while let Ok(command) = work.recv() {
             match command {
@@ -846,6 +856,10 @@ pub(crate) fn open_session_with_hooks(
                                 meta.get(&0).map(|meta| meta.version.clone())
                             });
                         let churn = store::sync(&mut st, &prior, &flattened, now_ms());
+                        // After a sync the `nodes` table holds exactly the
+                        // flattened nodes, so the new view's count is known
+                        // without a scan (NWS-2942).
+                        let node_count = store::flattened_node_count(&flattened);
                         let version = flattened.file.version.clone();
                         // Match direct pulls: unchanged versions avoid decoding
                         // potentially large image blobs merely to evict none.
@@ -863,7 +877,8 @@ pub(crate) fn open_session_with_hooks(
                         }
                         store::upsert_mirror_config(&mut st, geometry);
                         phase(PullPhase::Publishing);
-                        let view = make_view(st.rtx(|(snapshot, _)| snapshot.clone()));
+                        let view =
+                            make_view(st.rtx(|(snapshot, _)| snapshot.clone()), Some(node_count));
                         watcher.note_pull_success();
                         Ok((
                             PullOutcome {

@@ -265,6 +265,21 @@ pub struct Churn {
     pub unchanged: usize,
 }
 
+/// How many rows [`sync`] leaves in the `nodes` table for `flattened`:
+/// its distinct node ids (the table is keyed by node id, and `sync` sweeps
+/// every node the pull no longer carries).
+pub fn flattened_node_count(flattened: &Flattened) -> usize {
+    flattened
+        .recs
+        .iter()
+        .filter_map(|(_, rec)| match rec {
+            Rec::Node(n) => Some(n.id.as_str()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
 /// Apply a flattened file in one atomic transaction: upsert every record
 /// and the meta row, then remove previously-stored ids that vanished. The
 /// meta row is always exempt from the sweep; variables and collections are

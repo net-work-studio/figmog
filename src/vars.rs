@@ -247,6 +247,10 @@ pub fn infer_from_nodes<'a>(nodes: impl Iterator<Item = &'a NodeRec>) -> Vec<Var
     type VarData = (Vec<(String, String)>, Vec<String>);
     let mut by_var: BTreeMap<String, VarData> = BTreeMap::new();
     for node in nodes {
+        // An unbound node contributes nothing: skip parsing its raw JSON.
+        if node.bound_variables.is_empty() {
+            continue;
+        }
         let raw: serde_json::Value = match serde_json::from_str(&node.raw) {
             Ok(v) => v,
             Err(_) => continue,

@@ -26,9 +26,9 @@ use super::DeferredReply;
 /// children and bound variables (`node`), or its depth (`path`) —
 /// measured at well under a millisecond on a 100k-node mirror. Every other
 /// local read runs on a read worker, including `figmog_components` (it
-/// scans both component tables and filters all components per set:
-/// O(sets × components)) and `figmog_status`/`figmog_files` (their node
-/// count scans the mirror).
+/// scans both component tables) and `figmog_status`/`figmog_files` (cheap
+/// since NWS-2942 — the view carries its node count — but they still lease
+/// views, and stay off the loop with the other leased reads).
 const INLINE_READS: &[&str] = &["figmog_pages", "figmog_node", "figmog_path"];
 
 pub(crate) fn is_inline_read(name: &str) -> bool {

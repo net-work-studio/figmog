@@ -136,7 +136,7 @@ pub(super) fn cmd_call(
         // `file` is routing (already resolved into `db`), so dispatch never
         // reads it; still reject a wrong-typed one as serve does (NWS-2944).
         dispatch::arg_str(&args, "file")?;
-        match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, &r)) {
+        match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, &r, None)) {
             Some(r) => r,
             None => Err(format!("unknown tool: {tool}")),
         }

@@ -25,7 +25,7 @@ pub type TextReader<'tx, R> = Bm25Reader<'tx, R, String, fn(&str, &mut Vec<u8>)>
 /// BFS the `children` index from `scope_root` (inclusive), collecting the
 /// descendant id set — the shared engine behind `--under` scoping (spec
 /// §3). Cycle-safe via the visited set, same discipline as `path`/
-/// `depth_of`'s `parent_id` walks: a corrupted store with a `children`
+/// `depths`'s `parent_id` walks: a corrupted store with a `children`
 /// cycle can't loop forever, it just stops re-queuing an id it's already
 /// visited. Unknown `scope_root` is the caller's job to reject (via
 /// `nodes.get` before calling this) so the error message names the right
@@ -132,19 +132,25 @@ fn resolved_variables<R: Readable>(
 /// fields are null and `nodes` is the stored count (0), mirroring
 /// `figmog serve`'s not-yet-mirrored status shape. Only a store with no
 /// meta row *and* snapshot state `none` is the "no mirror here" error.
+///
+/// `node_count` is the snapshot's node count when the caller already knows
+/// it (serve keeps one per published view, NWS-2942); `None` counts the
+/// `nodes` table here, decoding every row — fine for a one-shot CLI read,
+/// too slow for a status poll.
 pub fn status<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     meta: &TableReader<'_, R, u8, FileMeta>,
     variables: &TableReader<'_, R, String, VariableRec>,
     variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
+    node_count: Option<usize>,
 ) -> Result<Value, String> {
     let vars = variable_snapshot(variables, variable_collections, snapshot);
     let m = meta.get(&0);
     if m.is_none() && vars["state"] == "none" {
         return Err("no mirror here — run `figmog pull <file-url>` first".to_string());
     }
-    let count = nodes.iter().count();
+    let count = node_count.unwrap_or_else(|| nodes.iter().count());
     Ok(json!({
         "name": m.as_ref().map(|m| m.name.clone()),
         "version": m.as_ref().map(|m| m.version.clone()),
@@ -601,14 +607,22 @@ pub fn components<R: Readable>(
     let mut all_components: Vec<(String, ComponentRec)> = components.iter().collect();
     all_components.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // Group variants by set once (NWS-2942: was a scan of every component
+    // per set). Pushed in component-id order, so each group keeps it.
+    let mut variants_by_set: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for (cid, c) in &all_components {
+        if let Some(set_id) = c.component_set_id.as_deref() {
+            variants_by_set
+                .entry(set_id)
+                .or_default()
+                .push(json!({"node_id": cid, "name": c.name, "key": c.key}));
+        }
+    }
+
     let sets_json: Vec<Value> = sets
         .iter()
         .map(|(set_id, set)| {
-            let variants: Vec<Value> = all_components
-                .iter()
-                .filter(|(_, c)| c.component_set_id.as_deref() == Some(set_id.as_str()))
-                .map(|(cid, c)| json!({"node_id": cid, "name": c.name, "key": c.key}))
-                .collect();
+            let variants = variants_by_set.remove(set_id.as_str()).unwrap_or_default();
             let property_definitions: Value = nodes
                 .get(set_id)
                 .and_then(|n| n.property_definitions.clone())
@@ -740,8 +754,15 @@ pub fn vars<R: Readable>(
                 .map(|i| &s.variables[i])
         })
     };
-    let owned_nodes: Vec<NodeRec> = nodes.iter().map(|(_, n)| n).collect();
-    let inferred = crate::vars::infer_from_nodes(owned_nodes.iter());
+    // Stream the table rather than holding every node: only the bound ones
+    // are kept, and `infer_from_nodes` never parses an unbound node's raw
+    // JSON (NWS-2942).
+    let bound_nodes: Vec<NodeRec> = nodes
+        .iter()
+        .map(|(_, n)| n)
+        .filter(|n| !n.bound_variables.is_empty())
+        .collect();
+    let inferred = crate::vars::infer_from_nodes(bound_nodes.iter());
     let mut inferred_by_id: HashMap<String, crate::vars::VarUsage> = inferred
         .into_iter()
         .map(|u| (u.variable_id.clone(), u))
@@ -814,26 +835,68 @@ pub fn vars<R: Readable>(
 // The local mirror's unfair advantage: full-file scans/joins no
 // rate-limited API surface could offer, all answered from the local store.
 
-/// Depth of `id` counting the root as 0, by walking `parent_id` up to the
-/// root. The file is local, so an O(depth) walk per node is fine. Guards
-/// against a corrupted store with a `parent_id` cycle: once an id repeats,
-/// stop and report the depth counted so far rather than looping forever —
-/// this runs inside `figmog serve` (on a read worker), where a hang would
-/// pin a worker and its leased view forever.
-fn depth_of<R: Readable>(nodes: &TableReader<'_, R, String, NodeRec>, id: &str) -> usize {
-    let mut depth = 0;
-    let mut current = id.to_string();
-    let mut visited: BTreeSet<String> = BTreeSet::new();
-    while let Some(n) = nodes.get(&current) {
-        if !visited.insert(current.clone()) {
-            break; // parent cycle: depth-so-far is the best available answer
+/// Every node's depth (root = 0) along its `parent_id` chain, keyed by
+/// node id, in one pass over `parents` (id → parent id, NWS-2942: was a
+/// store walk per node, O(nodes × depth)). Iterative, so documents of any
+/// depth are fine; each id's depth is memoized and reused by its
+/// descendants.
+///
+/// Matches a per-node walk exactly, corrupted stores included: a parent
+/// missing from the table still counts as one level; a `parent_id` cycle
+/// stops at the first repeated id, so each cycle member's depth is the
+/// cycle's length and a node leading into a cycle adds its distance to it.
+/// A cycle must not hang: this runs inside `figmog serve` (on a read
+/// worker), where a hang would pin a worker and its leased view forever.
+fn depths<'a>(parents: &HashMap<&'a str, Option<&'a str>>) -> HashMap<&'a str, usize> {
+    let mut depth: HashMap<&'a str, usize> = HashMap::with_capacity(parents.len());
+    let mut path: Vec<&'a str> = Vec::new();
+    let mut on_path: HashMap<&'a str, usize> = HashMap::new();
+    for &start in parents.keys() {
+        if depth.contains_key(start) {
+            continue;
         }
-        match n.parent_id {
-            Some(parent) => {
-                depth += 1;
-                current = parent;
+        path.clear();
+        on_path.clear();
+        let mut current = start;
+        // Depth of the node just above `path`'s last entry, and the index
+        // `path[cycle..]` of a cycle when one closed the walk.
+        let (above, cycle): (Option<usize>, Option<usize>) = loop {
+            if let Some(&d) = depth.get(current) {
+                break (Some(d), None);
             }
-            None => break,
+            let Some(&parent) = parents.get(current) else {
+                // A missing parent: the edge to it still counts one level.
+                break (Some(0), None);
+            };
+            if let Some(&i) = on_path.get(current) {
+                break (None, Some(i));
+            }
+            on_path.insert(current, path.len());
+            path.push(current);
+            match parent {
+                Some(parent) => current = parent,
+                None => break (None, None),
+            }
+        };
+        let len = path.len();
+        match (above, cycle) {
+            (_, Some(i)) => {
+                let cycle_len = len - i;
+                for (j, id) in path.iter().enumerate() {
+                    depth.insert(id, cycle_len + i.saturating_sub(j));
+                }
+            }
+            (Some(d), None) => {
+                for (j, id) in path.iter().enumerate() {
+                    depth.insert(id, d + (len - j));
+                }
+            }
+            // Ended at a root: the last entry is depth 0.
+            (None, None) => {
+                for (j, id) in path.iter().enumerate() {
+                    depth.insert(id, len - 1 - j);
+                }
+            }
         }
     }
     depth
@@ -854,15 +917,19 @@ pub fn stats<R: Readable>(
 
     let mut by_type_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_page_counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut max_depth = 0usize;
     for n in &all {
         *by_type_counts.entry(n.node_type.clone()).or_insert(0) += 1;
         // DOCUMENT/CANVAS nodes are pages/roots, not page contents.
         if n.node_type != "DOCUMENT" && n.node_type != "CANVAS" {
             *by_page_counts.entry(n.page_id.clone()).or_insert(0) += 1;
         }
-        max_depth = max_depth.max(depth_of(nodes, &n.id));
     }
+    let parents: HashMap<&str, Option<&str>> = all
+        .iter()
+        .map(|n| (n.id.as_str(), n.parent_id.as_deref()))
+        .collect();
+    // Only the maximum leaves this function, never the map's order.
+    let max_depth = depths(&parents).into_values().max().unwrap_or(0);
 
     let text_nodes = by_type.search(&"TEXT".to_string()).len();
 
@@ -882,7 +949,7 @@ pub fn stats<R: Readable>(
 
 /// Ancestor chain root→node, as `[{id, name, type}]`. Unknown id → Err.
 /// A `parent_id` cycle (a corrupted store) is also an `Err` rather than an
-/// infinite loop — see `depth_of`'s doc comment for why that matters here.
+/// infinite loop — see `depths`'s doc comment for why that matters here.
 pub fn path<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     id: String,
