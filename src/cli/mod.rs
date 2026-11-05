@@ -533,7 +533,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 return write_json(&result?);
             }
         } else if let Some(read) = read_command(&cli.cmd) {
-            let (tool, tool_args) = read.to_tool_call();
+            let (tool, tool_args) = with_project_tokens(read, Some(layout)).to_tool_call();
             let tool_args = with_current_file(tool_args, layout)?;
             if let Some(route) = route_for(root, layout, &tool_args, true)
                 && let Some(result) = socket::try_call(&route, tool, tool_args.clone())
@@ -618,6 +618,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let Some(read) = read_command(&other) else {
                 unreachable!("every non-read command is handled above")
             };
+            let read = with_project_tokens(read, db.layout.as_ref());
             // `open_store!`'s pipeline type contains fn items and can't be
             // named, so the store must be opened at this concrete call
             // site; the reader tuple itself is nameable (`RootReaders`), so
@@ -628,6 +629,19 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             drop(st);
             write_read(&other, &result, db.layout.as_ref())
         }
+    }
+}
+
+/// `figmog spec` names tokens exactly as the project's token file does:
+/// the project's `[tokens]` settings ride along as `figmog_spec`'s
+/// `tokens` argument (NWS-2948). With `--db` (no project): the defaults.
+fn with_project_tokens(read: ReadCommand, layout: Option<&Layout>) -> ReadCommand {
+    match read {
+        ReadCommand::Spec { id, tokens: None } => ReadCommand::Spec {
+            id,
+            tokens: layout.map(|l| l.settings().tokens.export_options()),
+        },
+        other => other,
     }
 }
 
@@ -866,7 +880,10 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
             under: under.clone(),
         },
         Cmd::At { x, y } => ReadCommand::At { x: *x, y: *y },
-        Cmd::Spec { id } => ReadCommand::Spec { id: id.clone() },
+        Cmd::Spec { id } => ReadCommand::Spec {
+            id: id.clone(),
+            tokens: None,
+        },
         Cmd::Tokens { .. } => tokens::read(),
         Cmd::Version
         | Cmd::Auth { .. }

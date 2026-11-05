@@ -325,6 +325,10 @@ pub(crate) enum ReadCommand {
     /// `figmog_spec` (NWS-2968): binding-aware layout/value spec of a subtree.
     Spec {
         id: String,
+        /// How the token names and root modes are derived: the project's
+        /// `[tokens]` settings (NWS-2948), injected by the CLI and the
+        /// stdio relay; `None` is the default mapping.
+        tokens: Option<crate::tokens::ExportOptions>,
     },
 }
 
@@ -402,6 +406,10 @@ impl ReadCommand {
             },
             "figmog_spec" => Self::Spec {
                 id: require_str(args, "id")?,
+                tokens: match args.get("tokens") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(crate::tokens::ExportOptions::from_json(v)?),
+                },
             },
             _ => return Ok(None),
         }))
@@ -514,8 +522,11 @@ impl ReadCommand {
                 args = json!({"x": x, "y": y});
                 "figmog_at"
             }
-            Self::Spec { id } => {
+            Self::Spec { id, tokens } => {
                 args = json!({"id": id});
+                if let Some(tokens) = tokens {
+                    args["tokens"] = tokens.to_json();
+                }
                 "figmog_spec"
             }
         };
@@ -645,13 +656,14 @@ impl ReadCommand {
                 under,
             } => query::where_(nodes, children, &pointer, equals, page, under),
             Self::At { x, y } => query::at(nodes, x, y),
-            Self::Spec { id } => query::spec(
+            Self::Spec { id, tokens } => query::spec(
                 nodes,
                 children,
                 variables,
                 variable_collections,
                 variable_snapshot,
                 id,
+                &tokens.unwrap_or_default(),
             ),
         }
     }
@@ -919,7 +931,15 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Root node id (12:34 or 12-34 form, or a Figma URL)."}
+                    "id": {"type": "string", "description": "Root node id (12:34 or 12-34 form, or a Figma URL)."},
+                    "tokens": {
+                        "type": "object",
+                        "description": "How token CSS names and root modes are derived, as figmog.toml's [tokens]: {format: \"tailwind\"|\"css\", modes: {\"<collection>/<mode>\": \"<selector>\"}}. The figmog CLI and stdio relay pass the project's settings; omit for the default mapping.",
+                        "properties": {
+                            "format": {"type": "string", "enum": ["tailwind", "css"]},
+                            "modes": {"type": "object", "additionalProperties": {"type": "string"}}
+                        }
+                    }
                 },
                 "required": ["id"]
             }),

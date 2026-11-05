@@ -35,9 +35,9 @@ Figma: ![figma](correct/390/figma.png) before: ![before](correct/390/before.png)
 - Figma file: `examples/slice/figma/card-file.json` "Synthetic card (vertical slice)", version **4243** (mirrored with `figmog pull --from-file`)
 - Figma render: stand-in for version 4243, `examples/slice/figma/card-render.json`
 - Token snapshot: `tests/fixtures/spec/variables.json` digest `fnv1a64:fd631e535712b153` (exported_at 2026-11-02T09:00:00Z)
-- Token CSS: `examples/slice/app/src/tokens.css` sha256 `e93ad00bdcda5672`
-- Build `before`: card `examples/slice/app/baseline/Card.jsx`, commit `3a4f478a8548`, tree sha256 `f61789bb6dcba66c` (8 files)
-- Build `after`: card `examples/slice/app/src/Card.jsx`, commit `3a4f478a8548`, tree sha256 `78595d5aa820902a` (8 files)
-- Build `broken`: card `examples/slice/app/variants/Card.wrong-padding.jsx`, commit `3a4f478a8548`, tree sha256 `c81174f45258da41` (8 files)
+- Token CSS: `examples/slice/app/src/tokens.css` sha256 `06d51aab01d30d9b`
+- Build `before`: card `examples/slice/app/baseline/Card.jsx`, commit `ce887d022ad9` (dirty), tree sha256 `1903f5cdc1899e48` (8 files)
+- Build `after`: card `examples/slice/app/src/Card.jsx`, commit `ce887d022ad9` (dirty), tree sha256 `3455ed7a112be4f5` (8 files)
+- Build `broken`: card `examples/slice/app/variants/Card.wrong-padding.jsx`, commit `ce887d022ad9` (dirty), tree sha256 `86ceccf29172a727` (8 files)
 - Contract: viewports 1440x900, 390x844; light mode, default state, local only; selector `[data-testid="slice-card"]`
 - Full record: `examples/slice/evidence/evidence.json`

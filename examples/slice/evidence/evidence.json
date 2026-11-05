@@ -2,29 +2,29 @@
   "builds": {
     "after": {
       "card": "examples/slice/app/src/Card.jsx",
-      "commit": "3a4f478a8548d1c7ef51bf99e16b7195d6eb7bd3",
-      "dirty": false,
+      "commit": "ce887d022ad964b752bafb7e9de1fd8f28b185b9",
+      "dirty": true,
       "tree": {
         "files": 8,
-        "sha256": "78595d5aa820902a186a113cf7fbc34b7ff917eae4a24f7ae05b02396be5bdd5"
+        "sha256": "3455ed7a112be4f5c24dad122bb65f41f9eae80b47d3d6139344f1d00e8a8607"
       }
     },
     "before": {
       "card": "examples/slice/app/baseline/Card.jsx",
-      "commit": "3a4f478a8548d1c7ef51bf99e16b7195d6eb7bd3",
-      "dirty": false,
+      "commit": "ce887d022ad964b752bafb7e9de1fd8f28b185b9",
+      "dirty": true,
       "tree": {
         "files": 8,
-        "sha256": "f61789bb6dcba66c74430cf069b7a5e61b2e47ab7478ec6ed0587bdf8767364c"
+        "sha256": "1903f5cdc1899e48430b8cde302c81ce068b3475f8225f6218353d6e8bf5cfa3"
       }
     },
     "broken": {
       "card": "examples/slice/app/variants/Card.wrong-padding.jsx",
-      "commit": "3a4f478a8548d1c7ef51bf99e16b7195d6eb7bd3",
-      "dirty": false,
+      "commit": "ce887d022ad964b752bafb7e9de1fd8f28b185b9",
+      "dirty": true,
       "tree": {
         "files": 8,
-        "sha256": "c81174f45258da41b5730052f32adc41d7e678b26da6bcd7cbbc0f266ed31a25"
+        "sha256": "86ceccf29172a727059881928d38fe3639dd156fef9e177909eb703a0f457e9c"
       }
     }
   },
@@ -216,7 +216,7 @@
   "tokens": {
     "css": {
       "path": "examples/slice/app/src/tokens.css",
-      "sha256": "e93ad00bdcda567267874b977d716bec584fc4abba087e6e132312e522c8da80"
+      "sha256": "06d51aab01d30d9b0a495141bc06fcc5a64b87e21c00ce02ba66b373ae62c021"
     },
     "snapshot": {
       "digest": "fnv1a64:fd631e535712b153",

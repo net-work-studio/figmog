@@ -343,12 +343,16 @@ and, in the default `tailwind` format, a Tailwind v4 `@theme` (`@theme
 inline` for aliases), so `bg-brand` or `p-card` follow every mode, nested
 or not. Aliases stay `var()` references; names come from each variable's
 WEB code syntax, else its kebab-cased path; a name collision, cycle or
-unresolved remote alias is never silently papered over. `--format css`
+unresolved remote alias is never silently papered over; FLOAT units come
+from the variable's scopes (px, `%` for opacity). `--format css`
 writes plain CSS variables. `figmog tokens diff` lists the tokens added,
 removed or changed since the committed file, and `figmog tokens check`
 exits 1 in CI unless the committed file matches the last published
-snapshot (it prints that snapshot's provenance; it does not look at the
-live Figma file). See `docs/SPEC.md` §9 "Token export, diff and check".
+snapshot byte for byte (it prints that snapshot's provenance; it does not
+look at the live Figma file, and a re-import with new provenance but the
+same values counts as stale until you re-export). `export` refuses to
+overwrite a file it didn't generate unless `--force`, and never writes
+through a symlink. See `docs/SPEC.md` §9 "Token export, diff and check".
 
 ### A spec of one component
 

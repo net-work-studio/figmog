@@ -8,9 +8,9 @@
   --border-subtle: #e0e3e6;
   --color-brand: var(--ocean-500);
   --color-text-primary: var(--ink-900);
-  --font-line-body: 24;
-  --font-size-body: 16;
-  --font-size-title: 20;
+  --font-line-body: 24px;
+  --font-size-body: 16px;
+  --font-size-title: 20px;
   --font-weight-bold: 700;
   --ink-50: #fafafc;
   --ink-900: #1a1a1f;
@@ -19,7 +19,7 @@
   --radius-md: 12px;
   --spacing-2: 8px;
   --spacing-4: 16px;
-  --stroke-thin: 1;
+  --stroke-thin: 1px;
   --surface: var(--ink-50);
 }
 
