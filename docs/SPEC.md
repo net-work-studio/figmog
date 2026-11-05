@@ -1446,7 +1446,8 @@ an MCP client), `src/cli/images.rs` (`images`, §15),
 `settings`, §16), `src/cli/doctor.rs` (`doctor`, §16), and
 `src/cli/tokens.rs` (`tokens export|diff|check`, §9 — mapped onto the
 `figmog_vars` read, then rendered as CSS and compared with the token
-file).
+file), and `src/cli/map.rs` (`map check|coverage`, §18 — `coverage` mapped
+onto the `figmog_components` read, then compared with `figmog.map.json`).
 `src/cli/auth.rs` handles credential commands and hidden terminal input;
 `src/auth.rs` owns credential resolution and native storage.
 
@@ -2088,7 +2089,7 @@ Exit 0 unless a check failed; then the report is still printed and
 ## 17. Code-ready spec (NWS-2968, NWS-2947)
 
 `figmog spec <node> [--tailwind | --no-tailwind]` and the
-`figmog_spec {id, tokens?, tailwind?}` tool describe one subtree — a
+`figmog_spec {id, tokens?, tailwind?, map?}` tool describe one subtree — a
 card, a page section — the way a developer builds it. Source:
 `src/spec.rs` (pure) and `src/spec/css.rs` (the CSS declarations and the
 Tailwind hint), composed in `query::spec`. NWS-2968 was the slice (one
@@ -2112,10 +2113,15 @@ figmog.toml's `[tokens]`/`[tokens.modes]`). The Tailwind class hint
 (`tailwind: true`) is on when the project's `[stack] styling` is
 `tailwind` (§16; v1's only styling, so on in every project), and
 `--tailwind`/`--no-tailwind` (or an explicit `tailwind` argument)
-override it. `figmog spec` in a project and the stdio relay (`figmog
-serve`'s default shape) fill in whichever of the two the caller left out;
-with `--db`, `figmog call`, or an MCP client of an in-process serve, an
-omitted `tokens` is the default mapping and an omitted `tailwind` is off.
+override it. The Figma → code component map (§18) is the optional `map`
+argument: the content of `figmog.map.json`, validated exactly like the
+file. `figmog spec` in a project and the stdio relay (`figmog serve`'s
+default shape) fill in whichever of the three the caller left out (`map`
+from the project root's `figmog.map.json`, read on every call; when there
+is none, no map; when it is invalid, the call fails naming the file and
+JSON path); with `--db`, `figmog call`, or an MCP client of an in-process
+serve, an omitted `tokens` is the default mapping, an omitted `tailwind`
+is off and an omitted `map` is none.
 
 **Output.** One JSON object, every key sorted (`serde_json` without
 `preserve_order`); byte-identical across runs for the same mirror:
@@ -2277,10 +2283,13 @@ disappears silently.
 - `instance` (INSTANCE nodes): `{component_id, component: {name, key,
   remote} | null, component_set: {id, name, key} | null, variant: {name:
   value} (VARIANT properties), properties: {name: {type, value, token?}}
-  (the other component properties, `token` a bound entry), code_component:
-  null}`. `code_component` is the hook for the Figma → code component map
-  (NWS-2949): null until that map exists. A component missing from the
-  mirror is listed under `unsupported`.
+  (the other component properties, `token` a bound entry), code_component}`.
+  `code_component` is the code component the map (§18) gives the
+  instance's component or its set — `{figma, path, export, props, jsx,
+  coverage, unmapped_properties, unmapped_overrides, unknown_props}` — or
+  null when there is no map or no entry for it. A component missing from
+  the mirror is listed under `unsupported`. The instance's children are
+  still specified in full either way.
 
 ### The CSS layer
 
@@ -2383,3 +2392,156 @@ node's `css` inline, and its Tailwind hint compiled by Tailwind v4 against
 half a pixel, except nodes under a position-related `unsupported` entry
 and the width of a hugging text node (font-dependent); and that bound
 tokens, clipping, truncation and run styles resolve.
+
+## 18. Figma → code component map (NWS-2949)
+
+Source: `src/map.rs` (pure: validation, the per-instance
+`code_component`, coverage), `src/cli/map.rs` (`figmog map`). Agents
+should reuse a project's existing components instead of rebuilding them
+from rectangles; the map records which code component implements which
+Figma component.
+
+**The file.** `figmog.map.json` at the project root (§16), committed, small
+and hand-confirmed (v1 has no `map suggest` and no Code Connect import):
+
+```
+{
+  "version": 1,
+  "components": [
+    {
+      "figma": {"component_set": "<key>"},          // or {"component": "<key>"}
+      "code": {"path": "src/components/PricingCard.tsx", "export": "PricingCard"},
+      "props": {                                     // optional
+        "Tier":  {"prop": "tier", "values": {"Free": "free", "Pro": "pro"}},
+        "Title": {"prop": "title"},
+        "Badge": {"prop": "badge"}
+      }
+    }
+  ]
+}
+```
+
+- **Identity: the Figma key.** An entry names a component (a variant or a
+  standalone component) or a component set by its `key` from the file's
+  `components`/`componentSets` maps (the `components` and
+  `component_sets` sinks, §4), never by node id: the key is what Figma
+  publishes, survives renames and moves, and is the same in the library
+  and in every file that uses the component, while an instance's
+  `componentId` is a file-local node id. A `component` entry wins over its
+  set's `component_set` entry. Keys come from `figmog components`.
+- `code.path`: relative to the project root, `/`-separated, no `..`, not
+  absolute (the same rule as `[stack] tokens`); figmog never reads the
+  file, `map coverage` only checks that it exists inside the project (a
+  symlink leading out of it reads `outside_project`). `code.export`: a
+  JS identifier starting with an uppercase letter (a JSX component).
+- `props`: Figma property name → `{prop, values?}`. The name is a
+  variant property (`Tier`) or another component property, written with
+  or without Figma's `#id` suffix (`Title` matches `Title#11:0` unless
+  two properties share the base name — then the full name is needed).
+  `prop` is a JSX attribute name (a JS identifier, `-` allowed after the
+  first character); two Figma properties can't share one. `values` maps
+  the Figma value as text (`"Pro"`, `"true"`; for an instance swap, the
+  swapped-in component's key) to the code value — a string, number,
+  boolean, or `null` (leave the prop out: the code default). Without
+  `values` the Figma value passes through (a string, or a boolean); an
+  instance swap without `values` renders the swapped-in component's own
+  mapped element (`icon={<StarIcon />}`).
+- **Strict.** Unknown keys anywhere, a missing or other `version`, a
+  duplicate target, a bad path, export or prop name are errors, each
+  naming the file and the JSON path:
+  `figmog.map.json: components[0].props["Tier"].prop: "1tier" is not a
+  prop name …`. A map key naming no property is not a file error (the
+  file is checked without the mirror): `spec` and `coverage` list it
+  under `unknown_props`.
+
+**In the spec** (§17). Each INSTANCE whose component or set has an entry
+gets `instance.code_component`:
+
+```
+{
+  "figma": {"component_set": "<key>"},           // the entry that matched
+  "path": "src/components/PricingCard.tsx",
+  "export": "PricingCard",
+  "props": {"badge": true, "tier": "pro", "title": "Pro"},
+  "jsx": "<PricingCard badge tier=\"pro\" title=\"Pro\" />",
+  "coverage": "full" | "partial",
+  "unmapped_properties": [{name, type, value, reason}],   // by name
+  "unmapped_overrides": [{id, name, field}],              // by id, field
+  "unknown_props": ["<map key>"]                          // sorted
+}
+```
+
+`jsx` lists the props in name order: a string as `"…"` (or `{"…"}` when it
+holds `"`, `\`, `&`, braces, angle brackets or a control character), `true`
+as the bare name, other values as `{…}`, a swapped-in element as
+`{<Export />}`; `null` props are left out. **`coverage` is `"full"` only
+when nothing is listed under `unmapped_*`** — the map never claims an
+instance it can't express:
+
+- `unmapped_properties`: an instance property the map has no prop for; a
+  value not listed in `values`; an instance swap to a component with no
+  entry; a property bound to a variable (the map would pass a literal);
+  an ambiguous suffix match.
+- `unmapped_overrides`: every `overrides[].overriddenFields` entry, on the
+  instance and on every nested instance, that a mapped property doesn't
+  explain — explained means the overridden node's
+  `componentPropertyReferences` names, for that field (`characters`,
+  `visible`, `mainComponent` for `componentId`), a property of this
+  instance that the map expressed. Text overrides, swaps and style
+  changes made by hand are therefore listed; so is every override on a
+  nested instance (figmog can't tell whether the main component or this
+  instance made it, so it errs towards partial), and slot content (a
+  `SLOT` descendant with children, field `slot`). The instance's own
+  `componentProperties` override is covered by the property check.
+- `unknown_props` (map keys naming no property of the instance — a stale
+  entry) is a warning only and doesn't make the mapping partial.
+
+**`figmog map check`** validates the file (exit 1 with the file and JSON
+path; a missing file is an error) without reading the mirror:
+`{"map": "figmog.map.json", "components": <entries>}`.
+
+**`figmog map coverage`** compares the map with the mirror's design-system
+inventory (the `figmog_components` read, socket-routed or direct like any
+read) and the project's files. A missing map file is an empty map; an
+invalid one fails.
+
+```
+{
+  "map": {"path": "figmog.map.json", "present": bool},
+  "summary": {mapped, unmapped, not_in_mirror, code_files_not_present},
+  "mapped": [{"figma": {kind, key, name, node_ids}, "code": {path, export},
+              "code_file": "present" | "missing" | "outside_project",
+              "unknown_props": [...] | null}],      // by kind, then key
+  "unmapped": [{kind, key, name, node_id, variants?, variants_mapped?}],
+                                                    // by name, key, node id
+  "not_in_mirror": [{"figma": {...}, "code": {...}}]   // by kind, then key
+}
+```
+
+`unmapped` lists each component set that neither has an entry nor has
+every variant mapped (with its `variants` and `variants_mapped` counts),
+and each standalone component without an entry. `not_in_mirror` lists
+entries whose key this mirror doesn't have (a removed component, or one
+from another file of the project). `unknown_props` checks the map's
+property names against the set's `componentPropertyDefinitions` (for a
+set or a variant entry); it is null for a standalone component, whose
+definitions `figmog_components` doesn't report. Both `map` commands read
+the project's map, so neither takes `--db`. Listing code components with
+no Figma counterpart (scanning the code), `map suggest` and Code Connect
+import come later.
+
+**MCP.** The map reaches agents only through `figmog_spec`
+(`code_component`); there is no separate map tool. The stdio relay
+injects the project's map per call (an agent's own `map` argument wins).
+
+**Tests.** `src/map.rs` unit tests (every validation error's file and
+path, JSX rendering and escaping, partial reasons, nested overrides and
+slots, the suffix ambiguity); `tests/map.rs` on the synthetic
+`tests/fixtures/map/pricing.json` + `figmog.map.json` (the done-when:
+`spec` emits `<PricingCard badge tier="pro" title="Pro" />` for the
+covered instance and a partial mapping naming the hand-edited price for
+the other, byte-identical across runs and against `figmog call
+figmog_spec` with the same `map`; `coverage` reports the unmapped
+components, the entry that's not in the mirror, a stale prop and a
+missing code file; invalid maps fail `check`, `coverage` and `spec` with
+the file and path); `tests/owner.rs` covers the relay's injection.

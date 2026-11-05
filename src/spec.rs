@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value, json};
 
+use crate::map::CodeMap;
 use crate::tokens::{ExportOptions, color, export_css};
 use css::{Css, CssVal, num, px};
 
@@ -233,13 +234,16 @@ const HANDLED_BINDINGS: [&str; 31] = [
 /// component id to `{name, key, remote, component_set}` for the subtree's
 /// instances ([`component_ids`]); `tokens` the token export options (the
 /// project's `[tokens]` settings), so the CSS names and root modes match
-/// the committed token file; `tailwind` adds the per-node class hint.
+/// the committed token file; `tailwind` adds the per-node class hint;
+/// `map` is the project's Figma → code component map (NWS-2949), which
+/// fills each mapped instance's `code_component`.
 pub fn build(
     tree: &Value,
     vars: &Value,
     components: &Value,
     tokens: &ExportOptions,
     tailwind: bool,
+    map: Option<&CodeMap>,
 ) -> Value {
     let (css, theme, theme_names, roots, css_unavailable) = match export_css(vars, tokens) {
         Ok(export) => (
@@ -262,6 +266,7 @@ pub fn build(
         tokens: &tokens,
         components,
         tailwind,
+        map,
         unsupported: BTreeSet::new(),
     };
     let node = cx.node(
@@ -287,14 +292,22 @@ pub fn build(
     })
 }
 
-/// The component ids of every INSTANCE in `tree`, for the component
-/// records [`build`] takes.
+/// The component ids of every INSTANCE in `tree`, and of every component
+/// an instance-swap property swaps in, for the component records [`build`]
+/// takes.
 pub fn component_ids(tree: &Value) -> BTreeSet<String> {
     fn walk(n: &Value, out: &mut BTreeSet<String>) {
-        if n["type"] == "INSTANCE"
-            && let Some(id) = n["componentId"].as_str()
-        {
-            out.insert(id.to_string());
+        if n["type"] == "INSTANCE" {
+            if let Some(id) = n["componentId"].as_str() {
+                out.insert(id.to_string());
+            }
+            for (_, p) in n["componentProperties"].as_object().into_iter().flatten() {
+                if p["type"] == "INSTANCE_SWAP"
+                    && let Some(id) = p["value"].as_str()
+                {
+                    out.insert(id.to_string());
+                }
+            }
         }
         for child in n["children"].as_array().into_iter().flatten() {
             walk(child, out);
@@ -303,13 +316,6 @@ pub fn component_ids(tree: &Value) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     walk(tree, &mut out);
     out
-}
-
-/// The code component an instance maps to. The hook for NWS-2949's
-/// Figma-component → code-component map: until that map exists every
-/// instance answers `null`, so consumers can already read the field.
-fn code_component(_component_id: &str, _component: &Value) -> Value {
-    Value::Null
 }
 
 impl Tokens {
@@ -543,6 +549,7 @@ struct Cx<'a> {
     tokens: &'a Tokens,
     components: &'a Value,
     tailwind: bool,
+    map: Option<&'a CodeMap>,
     unsupported: BTreeSet<(String, String)>,
 }
 
@@ -1981,7 +1988,7 @@ impl Cx<'_> {
     }
 
     /// An INSTANCE: its component, variant and other properties, and the
-    /// code component (NWS-2949's hook).
+    /// code component the project's map names (NWS-2949), else `null`.
     fn instance(&mut self, n: &Value, id: &str) -> Value {
         let component_id = n["componentId"].as_str().unwrap_or_default();
         let component = &self.components[component_id];
@@ -2033,7 +2040,7 @@ impl Cx<'_> {
             "component_set": component["component_set"],
             "variant": variant,
             "properties": properties,
-            "code_component": code_component(component_id, component),
+            "code_component": crate::map::code_component(self.map, n, component, self.components),
         })
     }
 }
@@ -2092,7 +2099,14 @@ mod tests {
 
     fn spec(tree: &Value) -> Value {
         let vars = json!({"snapshot": {"state": "none"}, "variables": []});
-        build(tree, &vars, &json!({}), &ExportOptions::default(), false)
+        build(
+            tree,
+            &vars,
+            &json!({}),
+            &ExportOptions::default(),
+            false,
+            None,
+        )
     }
 
     #[test]
