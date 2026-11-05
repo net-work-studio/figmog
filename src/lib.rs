@@ -20,6 +20,7 @@ pub mod images;
 pub(crate) mod mcp;
 pub mod model;
 mod private_dir;
+pub(crate) mod project;
 mod proxy;
 pub(crate) mod query;
 mod serve;

@@ -186,7 +186,7 @@ impl Harness {
         .unwrap();
         let manager = SessionManager {
             sessions: vec![session],
-            root: dir.path().to_path_buf(),
+            root: dir.path().to_path_buf().into(),
             token: None,
             default_key: Some("ABC1234567890".into()),
             api: Some(api.clone()),
@@ -433,7 +433,9 @@ fn async_malformed_document_pull_preserves_the_readable_mirror() {
         // Reopen the worker's store to prove the rejected pull never reached
         // the persisted mirror, even if a previous published snapshot survived.
         h.manager.sessions.clear();
-        let reopened = sessions::open_session(h._dir.path(), "ABC1234567890", None).unwrap();
+        let reopened =
+            sessions::open_session(&h._dir.path().to_path_buf().into(), "ABC1234567890", None)
+                .unwrap();
         let status = reopened.status().unwrap();
         assert_eq!(status["version"], "1");
         assert_eq!(status["nodes"], 3);

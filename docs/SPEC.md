@@ -600,7 +600,9 @@ type like `get_screenshot`'s image block).
 
 ## 6a. The unix-socket control plane
 
-`figmog serve` binds `<figmog-root>/serve.sock` (mode 0600, inside a root
+`figmog serve` binds `<figmog-root>/serve.sock` — by default the project
+root's per-checkout `.figmog/` (§16); `--db` serves keep the
+working-directory-relative `.figmog/` — (mode 0600, inside a root
 tightened to 0700) before it opens any session store, and unlinks it on
 exit through a guard held for `run_serve`'s whole scope. A pre-existing
 socket file is probed with a connect first (`serve::classify_probe`):
@@ -868,8 +870,9 @@ mapping of the 17 read-only query commands onto `dispatch::ReadCommand`),
 `src/cli/call.rs`
 (`tools`, `call`, `import-variables` — the desktop-proxy CLI parity
 surface, so every tool `figmog serve` would expose is reachable without
-an MCP client), `src/cli/images.rs` (`images`, §15), and
-`src/cli/socket.rs` (the client half of the control plane, §6a).
+an MCP client), `src/cli/images.rs` (`images`, §15),
+`src/cli/socket.rs` (the client half of the control plane, §6a), and
+`src/cli/migrate.rs` (`migrate`, §16).
 `src/cli/auth.rs` handles credential commands and hidden terminal input;
 `src/auth.rs` owns credential resolution and native storage.
 
@@ -879,7 +882,15 @@ requires a resolved mirror — no established `.figmog/current` and no
 `--db` needed. `figmog call` does need one, since local tool dispatch
 reads the store.
 
-Default mirror paths are `.figmog/<key>/db`. Persisted `.figmog/current`
+Default mirror paths come from the project layout (§16): the key's
+*active store* — `<mirror root>/<key>/db`, or an old
+`<project>/.figmog/<key>/db` that hasn't been migrated yet. The default
+file is `figmog.toml`'s `[files] default`, else `.figmog/current` (in the
+project root). Every command except `version`, `auth` and `--db`
+invocations discovers the project first, so a malformed `figmog.toml` or
+`figmog.local.toml` fails every such command with `<file>:<line>: <message>`.
+`figmog migrate [FILE]` (§16) moves old mirrors into the shared root.
+Persisted `.figmog/current`
 contents are trimmed and must be a bare key of at least 10 ASCII
 alphanumeric characters; nonempty malformed contents fail before opening
 or deleting a store, including during socket routing. Path construction
@@ -1179,3 +1190,103 @@ the socket reachable it routes through serve's own `figmog_images` tool
 (serve owns the caching); with `--no-socket` or no server listening it
 fetches and writes directly, like `pull`. `--db` always bypasses the socket
 and opens the explicit store, including for cached-image extraction.
+
+## 16. Project config and mirror roots
+
+Source: `src/project.rs` (discovery, config, active-store rules),
+`src/cli/migrate.rs` (`figmog migrate`).
+
+**Project root.** The nearest directory containing a regular file named
+`figmog.toml`, walking up from the working directory but never past the
+Git top level (a stray `figmog.toml` above a repository is ignored); else
+the Git top level; else the working directory. Its `.figmog/` is the
+*local root*: per checkout, it holds `current` and serve's `serve.sock`.
+
+**Mirror root.** Inside Git: `<git-common-dir>/figmog/`, from one
+`git rev-parse --path-format=absolute --show-toplevel --git-common-dir`
+(run via `std::process::Command` in the working directory; the path is
+then canonicalized). The common dir is the same for the main worktree, its
+subdirectories and every linked worktree, so all of them share one mirror
+per file key; Git never tracks it, so it needs no ignore entry. Git older
+than 2.31 echoes the unknown `--path-format=absolute` back and prints the
+common dir relative to the working directory: the echo is dropped and the
+relative path resolved against that directory. If Git is missing or the
+directory isn't in a work tree (including bare repositories), figmog is
+outside Git and the mirror root is the local root, `<project>/.figmog/`.
+
+**Config.** `figmog.toml` and an optional `figmog.local.toml` beside it
+(machine-specific; `pull` adds it to `.gitignore` alongside `.figmog/` when
+the project has a `figmog.toml`). Both use the same hand-parsed TOML subset
+(no `toml` dependency):
+
+```toml
+[files]
+default = "AbCdEf1234"                                  # file key or Figma URL
+design-system = "https://www.figma.com/design/XYZ/..."  # named entry
+```
+
+Supported: `#` comments, blank lines, `[table]` headers, and inside
+`[files]` only `key = "string"` (bare or quoted keys; basic strings with
+`\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings). Every
+`[files]` value must be a file key or Figma URL and is stored as its key.
+Other tables, top-level keys and `[[array]]` tables are skipped unparsed
+(reserved for later settings, never an error). Errors — unterminated
+headers or strings, a missing `=`, a non-string value, trailing text, an
+invalid file reference, a duplicate key or a second `[files]` table — read
+`figmog.toml:<line>: <message>` (or `figmog.local.toml:...`). Local entries
+replace same-named ones. Only `default` has meaning today: it is the file
+every command uses when none is given, ahead of `.figmog/current`, which
+remains the fallback (and is still written by `pull` and serve's default
+session). Named entries are parsed and validated but not yet addressable.
+
+**Active store.** The mirror root is where mirrors *should* live; the
+active store is where a key's mirror *is*. Outside Git both are the same
+directory. Inside Git, for each key:
+
+| `.figmog/<key>/db` (old) | `<mirror root>/<key>/db` (shared) | result |
+|---|---|---|
+| exists | absent | use the old store; stderr `{"warning": "migration pending: ..."}` |
+| absent | exists | use the shared store |
+| absent | absent | new mirror in the shared store |
+| exists | exists | error naming both paths (never a silent pick) |
+
+With both present and a `migrated-from` marker in the shared `<key>/`,
+the error instead says a `figmog migrate` was interrupted and to rerun it.
+The warning is printed by every direct CLI command that resolves the old
+store and by serve when a session opens it; JSON outputs are unchanged.
+`--db` bypasses all of this. `figmog serve --figmog-root <dir>` (hidden,
+for tests) pins the socket and every store to `<dir>`/`<dir>/<key>/db`.
+
+**Socket location.** Deliberately unchanged in spirit: the socket stays in
+the per-checkout `.figmog/` (now anchored at the project root rather than
+the raw working directory), not the shared mirror root. A shared,
+repository-wide background serve is future work; until then two
+worktrees' serves that open the same shared mirror contend on its store
+lock exactly like two serves on one store always have.
+
+**`figmog migrate [FILE]`.** Moves each old `.figmog/<key>/` directory
+(all of it: today that is `db/`, whose image cache is an in-store sink) to
+`<mirror root>/<key>/`; with no `FILE`, every old mirror plus every
+interrupted move, in sorted key order. Prints
+`{"mirror_root", "migrated": [{"file", "from", "to", "resumed"}]}`.
+Outside Git it is a no-op. Per key:
+
+1. Refuse if `<mirror root>/<key>` already exists.
+2. Open the old store through `open_store_checked` — its ownership anchor
+   *and* fjall's own writer lock, so a running serve (even an older binary)
+   fails this with the standard "store is locked" error — then close the
+   database but keep the anchor.
+3. Remove any staging dir `<mirror root>/.<key>.migrating` left by an
+   interrupted run, copy the old directory into it (regular files and
+   directories only, fsynced; the lock anchor is not copied), take a fresh
+   anchor on the staged `db/`, and write `migrated-from` naming the source.
+4. Atomically rename the staging dir to `<mirror root>/<key>`; the staged
+   anchor (still held) moves with it, so the destination is owned the
+   moment it appears.
+5. Remove the old directory, then the marker.
+
+A crash during 3 leaves the old store intact and active (the staging dir
+is ignored and redone on rerun). A crash after 4 leaves the marker, which
+the active-store rules report and a rerun finishes by doing 5 while holding
+both stores' anchors. A crash after 5's first step leaves only the marker,
+which a rerun removes.

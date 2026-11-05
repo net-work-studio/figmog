@@ -36,8 +36,7 @@ use super::{Db, open_store_checked, socket, write_json};
 
 pub(super) fn cmd_images(
     db: &Db,
-    no_socket: bool,
-    db_given: bool,
+    socket_root: Option<&Path>,
     ids: Vec<String>,
     format: String,
     scale: Option<f64>,
@@ -45,10 +44,9 @@ pub(super) fn cmd_images(
 ) -> Result<(), String> {
     let out_dir = out.unwrap_or_else(|| PathBuf::from("figmog-images"));
 
-    let fetched = if !no_socket
-        && !db_given
+    let fetched = if let Some(root) = socket_root
         && let Some(result) = socket::try_images_call(
-            Path::new(socket::DEFAULT_ROOT),
+            root,
             json!({"ids": ids, "format": format, "scale": scale, "file": db.key}),
         ) {
         from_socket_result(result?)?

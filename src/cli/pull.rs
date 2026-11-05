@@ -59,10 +59,16 @@ pub(super) fn cmd_pull(
             message
         }
     })?;
-    if db.key.is_some() {
-        let ignored = std::env::current_dir()
-            .map_err(|error| error.to_string())
-            .and_then(|cwd| super::gitignore::ignore_local_mirror(&cwd));
+    if db.key.is_some()
+        && let Some(layout) = &db.layout
+    {
+        let ignored = super::gitignore::ignore_local_mirror(
+            &layout.project_root,
+            layout
+                .project_root
+                .join(crate::project::CONFIG_FILE)
+                .is_file(),
+        );
         if let Err(error) = ignored {
             // Sync already succeeded. A read-only/invalid ignore file
             // must not turn that into a failed pull or corrupt stdout.
@@ -220,8 +226,8 @@ fn apply_pull(
     let stored_now = st.rtx(|(.., mirror_config, _, _, _)| store::read_geometry(&mirror_config));
     store::upsert_mirror_config(&mut st, store::effective_geometry(geometry, stored_now));
 
-    if let Some(key) = &db.key {
-        write_current(key)?;
+    if let (Some(key), Some(layout)) = (&db.key, &db.layout) {
+        write_current(&layout.local_root, key)?;
     }
 
     Ok((
@@ -262,8 +268,10 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub(crate) fn write_current(key: &str) -> Result<(), String> {
-    let root = crate::private_dir::ensure(std::path::Path::new(".figmog"))?;
+/// Record `key` in `<local_root>/current` (the project's per-checkout
+/// `.figmog`), the fallback default file when `figmog.toml` names none.
+pub(crate) fn write_current(local_root: &std::path::Path, key: &str) -> Result<(), String> {
+    let root = crate::private_dir::ensure(local_root)?;
     std::fs::write(root.join("current"), key).map_err(|e| e.to_string())
 }
 
@@ -278,6 +286,7 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let file = serde_json::json!({
             "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
@@ -326,6 +335,7 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let file = synthetic_file();
         let vars = variables_export();
@@ -365,6 +375,7 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let file = synthetic_file();
         let vars = variables_export();
@@ -401,6 +412,7 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let mut vars = variables_export();
         vars["meta"]["variables"]["VariableID:999"] = serde_json::json!(7);

@@ -59,7 +59,7 @@ use crate::ident::parse_file_ref;
 use crate::mcp::FnHandler;
 use crate::mcp::{self, PendingCall, Reply, ToolErrorMode, ToolOutput};
 use crate::proxy;
-use crate::sessions::{self, SessionManager};
+use crate::sessions::{self, SessionManager, StoreRoot};
 
 mod desktop;
 mod output;
@@ -411,11 +411,25 @@ pub(crate) fn run_serve(
     no_watch: bool,
     upstream_url: String,
     no_upstream: bool,
-    figmog_root: PathBuf,
+    figmog_root: Option<PathBuf>,
+    layout: Option<crate::project::Layout>,
     no_socket: bool,
 ) -> Result<(), String> {
     let interval_dur = clamp_interval(interval);
     let token = crate::auth::token()?;
+    // `--figmog-root` pins both the socket and every store to one fixed
+    // directory; otherwise the socket stays in the project's per-checkout
+    // `.figmog` and stores follow the active-store rules (spec §16).
+    // `--db` (no layout) keeps the cwd-relative `.figmog` socket.
+    let socket_root = figmog_root
+        .clone()
+        .or_else(|| layout.as_ref().map(|l| l.local_root.clone()))
+        .unwrap_or_else(|| PathBuf::from(crate::project::LOCAL_DIR));
+    let store_root = match (figmog_root, layout) {
+        (Some(root), _) => StoreRoot::Fixed(root),
+        (None, Some(layout)) => StoreRoot::Project(layout),
+        (None, None) => StoreRoot::Fixed(PathBuf::from(crate::project::LOCAL_DIR)),
+    };
 
     // Bind the control-plane socket (spec §1) before anything else touches
     // the filesystem for this run: a stale-probe conflict ("another figmog
@@ -429,7 +443,7 @@ pub(crate) fn run_serve(
     let _socket_guard: Option<SocketGuard> = if no_socket {
         None
     } else {
-        let (listener, path) = bind_socket(&figmog_root)?;
+        let (listener, path) = bind_socket(&socket_root)?;
         let guard = SocketGuard::new(path)?;
         spawn_socket_acceptor(listener, tx.clone(), registry.clone());
         Some(guard)
@@ -461,7 +475,7 @@ pub(crate) fn run_serve(
         &files,
         no_watch,
         &token,
-        &figmog_root,
+        store_root,
         interval_dur,
     )?;
 
@@ -1143,7 +1157,7 @@ fn build_sessions(
     files: &[String],
     no_watch: bool,
     token: &Option<String>,
-    figmog_root: &Path,
+    store_root: StoreRoot,
     interval: Duration,
 ) -> Result<(SessionManager, bool), String> {
     if let Some(path) = db_override {
@@ -1176,7 +1190,7 @@ fn build_sessions(
         )?;
         let mut manager = SessionManager {
             sessions: vec![session],
-            root: figmog_root.to_path_buf(),
+            root: store_root,
             token: token.clone(),
             default_key: Some(display_key),
             #[cfg(test)]
@@ -1210,7 +1224,7 @@ fn build_sessions(
 
     let mut manager = SessionManager {
         sessions: Vec::new(),
-        root: figmog_root.to_path_buf(),
+        root: store_root,
         token: token.clone(),
         default_key: None,
         #[cfg(test)]
@@ -1350,7 +1364,7 @@ fn watch_tick_at(
 /// shape that used to do this (`figmog serve <file>`, no `--db`).
 fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
     if track && manager.effective_default_key().as_deref() == Some(key) {
-        let _ = crate::cli::write_current(key);
+        let _ = crate::cli::write_current(&manager.root.local_root(), key);
     }
 }
 
@@ -1568,7 +1582,7 @@ mod tests {
         .unwrap();
         let mut manager = SessionManager {
             sessions: vec![session],
-            root: dir.path().to_path_buf(),
+            root: dir.path().to_path_buf().into(),
             token: None,
             default_key: Some("ABC123".into()),
             api: None,
@@ -1672,7 +1686,7 @@ mod tests {
             .unwrap();
             let manager = SessionManager {
                 sessions: vec![session],
-                root: db,
+                root: db.into(),
                 token: Some("synthetic-token".into()),
                 default_key: Some("ABC123".into()),
                 api: None,

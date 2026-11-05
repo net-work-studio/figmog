@@ -107,17 +107,50 @@ can drop the file argument. Read commands never touch the network and print
 JSON on stdout; failures print `{"error": ...}` on stderr and exit 1. Every
 command is documented in [`docs/SPEC.md`](docs/SPEC.md) §10.
 
-After a successful `pull` into the default `.figmog/` directory inside a
-Git repository, figmog adds `.figmog/` to the closest existing `.gitignore`
-between the current directory and the repository root, or creates the
-root `.gitignore` if none exists. Existing ignore rules are respected.
-Custom `--db` locations are left to you. A failure to update `.gitignore`
-prints a warning and keeps the successful pull result.
+### Where mirrors live, and `figmog.toml`
 
-Commit that ignore rule to keep mirrors out of future commits. Ignore
-rules do not untrack files already committed, and ignored files are not
-copied between worktrees: each worktree keeps its own mirror. Your saved
-credential is shared independently through the system credential store.
+figmog works per *project*: the nearest directory with a `figmog.toml`
+(searching up from the current directory, but not past the Git top level),
+else the Git top level, else the current directory. A project can name the
+Figma file(s) it mirrors:
+
+```toml
+# figmog.toml — commit this
+[files]
+default = "https://www.figma.com/design/<key>/<name>"   # or a bare file key
+# design-system = "<key-or-url>"                        # named entries (reserved)
+```
+
+`default` is the file every command uses when you don't pass one; without
+it, `.figmog/current` (the last pulled file) still applies. A
+`figmog.local.toml` beside it, in the same format, overrides entries for
+your machine only. Other tables and keys are ignored, so later settings
+won't break older binaries. A malformed file is an error naming the file
+and line (`figmog.toml:3: ...`).
+
+Inside Git, mirrors live in the repository's Git directory,
+`<git-common-dir>/figmog/<key>/db` (for example `.git/figmog/`), shared by
+every worktree of the repository, so a new worktree needs no re-pull. Git
+never tracks that directory. Outside Git, mirrors live in the project's
+`.figmog/<key>/db`. The per-checkout `.figmog/` still holds `current` and
+serve's socket.
+
+Mirrors that earlier versions put in a checkout's `.figmog/<key>/db` keep
+working in place, with a "migration pending" warning on stderr. Run
+`figmog migrate` to move them into the shared root. It holds both store locks
+(so it fails cleanly while `figmog serve` has the mirror open), never
+overwrites an existing mirror, and can be rerun to finish an interrupted
+move. If a file has a mirror in both places, figmog stops with an error
+naming both paths rather than picking one.
+
+After a successful `pull` inside a Git repository, figmog adds `.figmog/`
+(and, in a project with a `figmog.toml`, `figmog.local.toml`) to the
+closest existing `.gitignore` between the project root and the repository
+root, or creates the root `.gitignore` if none exists. Existing ignore
+rules are respected. Custom `--db` locations are left to you. A failure to
+update `.gitignore` prints a warning and keeps the successful pull result.
+Commit that ignore rule. Your saved credential is shared independently
+through the system credential store.
 
 ## figmog against the API
 
@@ -139,7 +172,7 @@ free.
 ### Reads work while the server runs
 
 `figmog serve` owns the store, and it listens on a unix socket at
-`.figmog/serve.sock`. Read commands, `figmog tools` and `figmog call` connect
+`.figmog/serve.sock` in the project root. Read commands, `figmog tools` and `figmog call` connect
 there first and answer from the running server's live view; with no server
 listening they open the store directly. `--no-socket` forces direct mode on
 both sides. `pull` is a writer and always opens the store itself, so while a

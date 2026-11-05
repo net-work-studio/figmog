@@ -6,7 +6,7 @@
 //! cannot acknowledge a fetch that preceded it.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ use crate::flatten::flatten_file;
 use crate::ident::parse_file_ref;
 use crate::mcp::ToolOutput;
 use crate::model::Id;
+use crate::project::Layout;
 use crate::session_view::{ReadGate, ReadLease, SessionView, SharedPipeline};
 use crate::store::{self, Churn, collect_sweepable, collect_variable_ids};
 use crate::watch::{BACKOFF_START, Tick, Watcher};
@@ -660,17 +661,54 @@ impl FileSession {
     }
 }
 
+/// Where serve's sessions keep their stores (spec §16).
+#[derive(Debug, Clone)]
+pub(crate) enum StoreRoot {
+    /// Every store at `<root>/<key>/db` (`--figmog-root`, `--db` serves,
+    /// tests); `current` stays the cwd-relative `.figmog/current`.
+    Fixed(PathBuf),
+    /// The discovered project: the active-store rules of
+    /// [`Layout::active_store`] pick each key's store.
+    Project(Layout),
+}
+
+impl From<PathBuf> for StoreRoot {
+    fn from(root: PathBuf) -> Self {
+        StoreRoot::Fixed(root)
+    }
+}
+
+impl StoreRoot {
+    /// The store `key` opens. An old per-checkout mirror is used where it
+    /// is (with a stderr note); two copies are an error.
+    pub(crate) fn store_path(&self, key: &str) -> Result<PathBuf, String> {
+        match self {
+            StoreRoot::Fixed(root) => Ok(root.join(key).join("db")),
+            StoreRoot::Project(layout) => {
+                let store = layout.active_store(key)?;
+                if store.migration_pending {
+                    eprintln!("{}", crate::project::migration_pending_warning(key, &store));
+                }
+                Ok(store.path)
+            }
+        }
+    }
+
+    /// The directory holding the `current` pointer.
+    pub(crate) fn local_root(&self) -> PathBuf {
+        match self {
+            StoreRoot::Fixed(_) => PathBuf::from(crate::project::LOCAL_DIR),
+            StoreRoot::Project(layout) => layout.local_root.clone(),
+        }
+    }
+}
+
 pub(crate) fn open_session(
-    root: &Path,
+    root: &StoreRoot,
     key: &str,
     api_token: Option<&str>,
 ) -> Result<FileSession, String> {
-    open_session_at(
-        root.join(key).join("db"),
-        key.to_string(),
-        Some(key),
-        api_token,
-    )
+    open_session_at(root.store_path(key)?, key.to_string(), Some(key), api_token)
 }
 
 pub(crate) fn open_session_at(
@@ -927,7 +965,7 @@ pub(crate) fn open_session_with_hooks(
 /// Sessions remain in open order; startup selection is independent of it.
 pub(crate) struct SessionManager {
     pub(crate) sessions: Vec<FileSession>,
-    pub(crate) root: PathBuf,
+    pub(crate) root: StoreRoot,
     pub(crate) token: Option<String>,
     pub(crate) default_key: Option<String>,
     #[cfg(test)]
@@ -946,7 +984,7 @@ impl SessionManager {
         #[cfg(test)]
         let session = match &self.api {
             Some(api) => open_session_with_api(
-                self.root.join(&key).join("db"),
+                self.root.store_path(&key)?,
                 key.clone(),
                 Some(&key),
                 Some(api.clone()),

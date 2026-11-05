@@ -84,7 +84,7 @@ fn manager_of(dir: &std::path::Path, sessions: Vec<FileSession>) -> SessionManag
     SessionManager {
         default_key: Some(sessions[0].key.clone()),
         sessions,
-        root: dir.to_path_buf(),
+        root: dir.to_path_buf().into(),
         token: None,
         api: None,
     }

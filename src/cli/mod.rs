@@ -16,11 +16,13 @@ use serde_json::{Value, json};
 
 use crate::dispatch::{DEFAULT_SEARCH_LIMIT, ReadCommand};
 use crate::ident::{is_file_key, parse_file_ref};
+use crate::project::Layout;
 
 mod auth;
 mod call;
 mod gitignore;
 mod images;
+mod migrate;
 mod pull;
 mod socket;
 mod store_lock;
@@ -36,7 +38,9 @@ pub(crate) use pull::{PullError, now_ms, pull_failure_wait, write_current};
     about = "fold-backed local mirror of a Figma file"
 )]
 struct Cli {
-    /// Store directory (default: .figmog/<file-key>/db).
+    /// Store directory (default: the file's mirror under the mirror root —
+    /// `<git-common-dir>/figmog/<file-key>/db` inside Git, else
+    /// `.figmog/<file-key>/db`; see `figmog.toml` in the README).
     #[arg(long, global = true)]
     db: Option<PathBuf>,
     /// Don't try the running serve's unix-socket control plane (spec §1):
@@ -97,11 +101,18 @@ enum Cmd {
         #[arg(long)]
         no_upstream: bool,
         /// Root directory for multi-file session stores (`<root>/<key>/db`
-        /// — spec §14). Hidden: testability knob so e2e tests can point
-        /// startup files at pre-built fixture stores under a temp dir
-        /// instead of the real `.figmog`.
-        #[arg(long, default_value = ".figmog", hide = true)]
-        figmog_root: PathBuf,
+        /// — spec §14) and the control socket. Hidden: testability knob so
+        /// e2e tests can point startup files at pre-built fixture stores
+        /// under a temp dir instead of the discovered mirror root.
+        #[arg(long, hide = true)]
+        figmog_root: Option<PathBuf>,
+    },
+    /// Move old per-checkout mirrors (`.figmog/<key>/`) into the shared
+    /// mirror root (inside Git: `<git-common-dir>/figmog/`). Resumable;
+    /// never overwrites an existing mirror; fails while a store is open.
+    Migrate {
+        /// File key or figma.com URL (default: every old mirror found).
+        file: Option<String>,
     },
     /// List every tool figmog would serve: the local registry, plus
     /// upstream tools when reachable.
@@ -332,6 +343,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         figmog_root,
     } = &cli.cmd
     {
+        // `--db` serves one fixed store: no project discovery at all.
+        let layout = match cli.db {
+            Some(_) => None,
+            None => Some(Layout::discover_cwd()?),
+        };
         return crate::serve::run_serve(
             cli.db.clone(),
             files.clone(),
@@ -340,8 +356,27 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             upstream.clone(),
             *no_upstream,
             figmog_root.clone(),
+            layout,
             cli.no_socket,
         );
+    }
+
+    // Every other command without `--db` works inside the discovered
+    // project (spec §16); a malformed `figmog.toml` fails here, clearly.
+    let layout = match cli.db {
+        Some(_) => None,
+        None => Some(Layout::discover_cwd()?),
+    };
+
+    if let Cmd::Migrate { file } = &cli.cmd {
+        let Some(layout) = &layout else {
+            return Err("migrate works on the project's mirrors and does not take --db".into());
+        };
+        let key = file
+            .as_deref()
+            .map(|f| parse_file_ref(f).ok_or_else(|| format!("not a Figma file key or URL: {f}")))
+            .transpose()?;
+        return write_json(&migrate::cmd_migrate(layout, key)?);
     }
 
     // `figmog tools` never reads the store — it only needs an upstream
@@ -361,8 +396,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     } = &cli.cmd
     {
         if !cli.no_socket
-            && cli.db.is_none()
-            && let Some(result) = socket::try_tools_list(Path::new(socket::DEFAULT_ROOT))
+            && let Some(layout) = &layout
+            && let Some(result) = socket::try_tools_list(&layout.local_root)
         {
             let tools = result?;
             note_ignored_upstream_flags(upstream, *no_upstream);
@@ -380,8 +415,10 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     // bypasses the whole multi-file root concept (an arbitrary store path
     // has no `<root>/serve.sock` to speak of), so this is skipped whenever
     // `cli.db` was given, exactly like `--no-socket`.
-    if !cli.no_socket && cli.db.is_none() {
-        let root = Path::new(socket::DEFAULT_ROOT);
+    if !cli.no_socket
+        && let Some(layout) = &layout
+    {
+        let root = layout.local_root.as_path();
         if let Cmd::Call {
             tool,
             args,
@@ -393,7 +430,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // Only per-file local tools use mirror routing. Desktop
             // arguments and management calls pass through unchanged.
             let parsed_args = if is_per_file_local_tool(tool) {
-                with_current_file(parsed_args)?
+                with_current_file(parsed_args, layout)?
             } else {
                 parsed_args
             };
@@ -403,7 +440,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             }
         } else if let Some(read) = read_command(&cli.cmd) {
             let (tool, tool_args) = read.to_tool_call();
-            let tool_args = with_current_file(tool_args)?;
+            let tool_args = with_current_file(tool_args, layout)?;
             if let Some(result) = socket::try_call(root, tool, tool_args) {
                 let result = result?;
                 // Not ready is an error, except for an import-only store
@@ -424,9 +461,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         }
     }
 
-    let db_given = cli.db.is_some();
-    let db = resolve_db(&cli)?;
-    let no_socket = cli.no_socket;
+    let socket_root = match (&layout, cli.no_socket) {
+        (Some(layout), false) => Some(layout.local_root.clone()),
+        _ => None,
+    };
+    let db = resolve_db(&cli, layout)?;
     match cli.cmd {
         Cmd::Pull {
             file,
@@ -440,7 +479,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             format,
             scale,
             out,
-        } => images::cmd_images(&db, no_socket, db_given, ids, format, scale, out),
+        } => images::cmd_images(&db, socket_root.as_deref(), ids, format, scale, out),
         Cmd::Call {
             tool,
             args,
@@ -486,7 +525,7 @@ fn note_ignored_upstream_flags(upstream: &str, no_upstream: bool) {
 /// session routing. Validation of an explicit file ref happens when the
 /// chosen mirror is resolved; an invalid explicit ref never falls back.
 /// A present-but-non-string `file` is a type error (NWS-2944), never a
-/// silent fall-through to `.figmog/current`; `null` counts as omitted.
+/// silent fall-through to the project default; `null` counts as omitted.
 fn requested_file(args: &Value) -> Result<Option<String>, String> {
     Ok(crate::dispatch::arg_str(args, "file")?
         .or_else(|| crate::dispatch::infer_file_from_node_ref(args)))
@@ -498,13 +537,14 @@ fn is_per_file_local_tool(tool: &str) -> bool {
     crate::proxy::is_local_tool(tool) && !matches!(tool, "figmog_open" | "figmog_files")
 }
 
-/// For per-file local tools, inject `.figmog/current`'s key as the routed
-/// `file` argument when one is established, no explicit non-null `file`
+/// For per-file local tools, inject the project default's key
+/// ([`Layout::default_key`]: `figmog.toml`'s `[files] default`, else
+/// `.figmog/current`) as the routed `file` argument when one is established, no explicit non-null `file`
 /// was supplied, and no node URL selects a file (review C1): without this,
 /// a socket-routed call carries no `file` at all, so serve answers from
 /// *its own* default session (`SessionManager::effective_default_key`) —
 /// which can silently diverge
-/// from the mirror `.figmog/current` (and thus direct mode) actually
+/// from the mirror the project default (and thus direct mode) actually
 /// targets, or, in the zero-startup-file quick-start shape, doesn't exist
 /// at all (serve has no sessions yet), producing a hard "no default
 /// mirrored file" error even though a mirror is clearly established on
@@ -513,7 +553,7 @@ fn is_per_file_local_tool(tool: &str) -> bool {
 /// auto-opens that session if serve hasn't touched it yet — a real
 /// Tier-1 pull only if the on-disk store isn't already mirrored (an
 /// already-pulled store never spends one; see `sessions::open_session_at`'s
-/// `mirrored: meta_present`). `.figmog/current` unset ⇒ args unchanged,
+/// `mirrored: meta_present`). No project default ⇒ args unchanged,
 /// preserving today's serve-own-default behavior exactly.
 ///
 /// Never applied to desktop tools or `figmog_files`, which have no mirror
@@ -524,7 +564,7 @@ fn is_per_file_local_tool(tool: &str) -> bool {
 /// (no `--args`) succeed over the socket while the exact same invocation
 /// fails direct, breaking the very byte-compatibility this routing exists
 /// to preserve (see `read_command`'s socket caller).
-fn with_current_file(mut args: Value) -> Result<Value, String> {
+fn with_current_file(mut args: Value, layout: &Layout) -> Result<Value, String> {
     // Preserve explicit non-null values for the local tool's own argument
     // handling, even when they cannot select a mirror.
     let has_file = args.get("file").is_some_and(|value| !value.is_null());
@@ -532,7 +572,7 @@ fn with_current_file(mut args: Value) -> Result<Value, String> {
     if let Some(obj) = args.as_object_mut()
         && !has_file
         && url_file.is_none()
-        && let Some(key) = read_current_key()?
+        && let Some(key) = layout.default_key()?
     {
         obj.insert("file".to_string(), json!(key));
     }
@@ -654,7 +694,8 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
         | Cmd::Tools { .. }
         | Cmd::Call { .. }
         | Cmd::ImportVariables { .. }
-        | Cmd::Images { .. } => return None,
+        | Cmd::Images { .. }
+        | Cmd::Migrate { .. } => return None,
     })
 }
 
@@ -667,42 +708,40 @@ fn parse_equals(raw: &str) -> Value {
 
 // ---- config / db resolution ----
 
-/// The store to open plus (when known) the file key it mirrors.
+/// The store to open plus (when known) the file key it mirrors and the
+/// project it belongs to (`None` exactly when `--db` was given).
 struct Db {
     path: PathBuf,
     key: Option<String>,
+    layout: Option<Layout>,
 }
 
-const CURRENT_FILE: &str = ".figmog/current";
-
-fn resolve_db(cli: &Cli) -> Result<Db, String> {
-    if let Some(path) = &cli.db {
+fn resolve_db(cli: &Cli, layout: Option<Layout>) -> Result<Db, String> {
+    let Some(layout) = layout else {
+        let path = cli.db.clone().expect("only --db skips project discovery");
         return Ok(Db {
-            path: path.clone(),
+            path,
             key: None,
+            layout: None,
         });
-    }
+    };
 
     // pull with an explicit file ref establishes the key for this run.
     // `.figmog/current` is only written after a successful sync (see
     // `pull::do_pull`), so a failed pull never repoints later commands.
     // `serve` never reaches here — it's handled, `Db`-free, before this
     // function is even called (see `dispatch`).
-    if let Cmd::Pull { file: Some(f), .. } = &cli.cmd {
-        let key = parse_file_ref(f).ok_or_else(|| format!("not a Figma file key or URL: {f}"))?;
-        return Ok(Db {
-            path: db_path_for(&key)?,
-            key: Some(key),
-        });
-    }
-
-    // A per-file local call's explicit file wins over URL inference;
-    // current is only a fallback. Desktop calls keep the current mirror
-    // regardless of their arguments, since they cannot select the
-    // desktop's open file. Reuse the read command's tool arguments so
-    // `id`, `under`, and `target` follow the socket/server URL inference.
-    // `figmog_open` and `figmog_files` keep their management semantics.
+    //
+    // Otherwise a per-file local call's explicit file wins over URL
+    // inference; the project default (`figmog.toml`, then
+    // `.figmog/current`) is only a fallback. Desktop calls keep the
+    // default mirror regardless of their arguments, since they cannot
+    // select the desktop's open file. Reuse the read command's tool
+    // arguments so `id`, `under`, and `target` follow the socket/server
+    // URL inference. `figmog_open` and `figmog_files` keep their
+    // management semantics.
     let file = match &cli.cmd {
+        Cmd::Pull { file: Some(f), .. } => Some(f.clone()),
         Cmd::Call { tool, args, .. } if is_per_file_local_tool(tool) => {
             requested_file(&call::parse_args(args.as_deref())?)?
         }
@@ -715,35 +754,21 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
         Some(file) => {
             parse_file_ref(&file).ok_or_else(|| format!("not a Figma file key or URL: {file}"))?
         }
-        None => read_current_key()?.ok_or_else(|| no_mirror_msg(cli))?,
+        None => layout.default_key()?.ok_or_else(|| no_mirror_msg(cli))?,
     };
-    Ok(Db {
-        path: db_path_for(&key)?,
-        key: Some(key),
-    })
-}
-
-/// Best-effort read of `.figmog/current` — `Ok(None)` on any I/O error or an
-/// empty file (the same "no established mirror" cases [`resolve_db`]
-/// turns into an error; socket routing instead treats `None` as "let
-/// serve's own default apply, unchanged" — see [`with_current_file`]).
-/// Shared so both call sites derive the current mirror identically.
-/// Nonempty contents must be a bare key, never a URL or filesystem path;
-/// corruption is an error even when socket routing could use a default.
-fn read_current_key() -> Result<Option<String>, String> {
-    let Ok(key) = std::fs::read_to_string(CURRENT_FILE) else {
-        return Ok(None);
-    };
-    let key = key.trim();
-    if key.is_empty() {
-        Ok(None)
-    } else if !is_file_key(key) {
-        Err(format!(
-            "invalid mirror key in {CURRENT_FILE}: expected at least 10 ASCII alphanumeric characters"
-        ))
-    } else {
-        Ok(Some(key.to_string()))
+    check_key(&key)?;
+    let store = layout.active_store(&key)?;
+    if store.migration_pending {
+        eprintln!(
+            "{}",
+            crate::project::migration_pending_warning(&key, &store)
+        );
     }
+    Ok(Db {
+        path: store.path,
+        key: Some(key),
+        layout: Some(layout),
+    })
 }
 
 /// `pull --from-file` with neither a file ref nor an established key has
@@ -765,7 +790,7 @@ fn no_mirror_msg(cli: &Cli) -> String {
 
 /// Keys must stay one normal component at the path-construction boundary,
 /// even if a future caller bypasses file-reference or persisted-key parsing.
-fn db_path_for(key: &str) -> Result<PathBuf, String> {
+fn check_key(key: &str) -> Result<(), String> {
     let mut components = Path::new(key).components();
     if !is_file_key(key)
         || !matches!(
@@ -775,7 +800,7 @@ fn db_path_for(key: &str) -> Result<PathBuf, String> {
     {
         return Err("invalid mirror key: expected a single bare Figma file key".to_string());
     }
-    Ok(PathBuf::from(".figmog").join(key).join("db"))
+    Ok(())
 }
 
 /// The clean, user-facing error every CLI store-opening call site below
@@ -991,7 +1016,9 @@ mod tests {
     #[test]
     fn with_current_file_never_overrides_an_explicit_non_null_file() {
         // No filesystem dependency either way: an explicit `file` short-
-        // circuits before `read_current_key` is ever consulted.
+        // circuits before the project default is ever consulted.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::discover(dir.path()).unwrap();
         for file in [
             json!("explicitkey12345678"),
             json!({"path": "synthetic-file"}),
@@ -1000,7 +1027,7 @@ mod tests {
             json!([]),
         ] {
             let args = json!({"id": "1:1", "file": file});
-            assert_eq!(with_current_file(args.clone()).unwrap(), args);
+            assert_eq!(with_current_file(args.clone(), &layout).unwrap(), args);
         }
     }
 

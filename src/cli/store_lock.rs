@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-const LOCK_NAME: &str = ".figmog-lock";
+pub(super) const LOCK_NAME: &str = ".figmog-lock";
 
 pub(super) struct StoreOwner {
     pub(super) path: PathBuf,
@@ -99,6 +99,15 @@ pub(crate) struct OwnedStore<T> {
 impl<T> OwnedStore<T> {
     pub(super) fn new(store: T, owner: StoreOwner) -> Self {
         Self { store, owner }
+    }
+
+    /// Close the store but keep ownership: no other figmog can open it
+    /// until the returned owner drops (used by `figmog migrate`, which
+    /// copies a closed store's files while holding its lock).
+    pub(super) fn into_owner(self) -> StoreOwner {
+        let Self { store, owner } = self;
+        drop(store);
+        owner
     }
 
     /// The initial open already checked fjall's own lock, including stores
