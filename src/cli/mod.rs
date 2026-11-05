@@ -517,7 +517,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // site; the reader tuple itself is nameable (`RootReaders`), so
             // the query runs through the same `ReadCommand::execute` arm
             // every tool adapter uses (NWS-2902).
-            let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+            let st = db.open(|path| crate::open_store!(path))?;
             write_json(&st.rtx(|r| read.execute(&r))?)
         }
     }
@@ -739,6 +739,22 @@ struct Db {
     layout: Option<Layout>,
 }
 
+impl Db {
+    /// Open this command's store: [`open_store_resolved`], so an old
+    /// per-checkout store moved by a concurrent `figmog migrate` is never
+    /// recreated.
+    fn open<T>(
+        &self,
+        open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
+    ) -> Result<OwnedStore<T>, String> {
+        let legacy = match (&self.layout, &self.key) {
+            (Some(layout), Some(key)) => layout.legacy_store(key, &self.path),
+            _ => None,
+        };
+        open_store_resolved(&self.path, legacy.as_ref(), open)
+    }
+}
+
 fn resolve_db(cli: &Cli, layout: Option<Layout>) -> Result<Db, String> {
     let Some(layout) = layout else {
         let path = cli.db.clone().expect("only --db skips project discovery");
@@ -920,15 +936,37 @@ pub(crate) fn open_store_checked<T>(
     open_store_owned(StoreOwner::acquire(path)?, open)
 }
 
+/// [`open_store_checked`] for a resolved store (NWS-2964). A store in the
+/// old per-checkout location (`legacy`) is never created: its directory
+/// must still exist when locked, and once owned it must still be the
+/// active store — otherwise a `figmog migrate` moved it after resolution,
+/// and the command fails asking for a rerun (which resolves the shared
+/// store) instead of recreating the old one beside the moved mirror.
+pub(crate) fn open_store_resolved<T>(
+    path: &Path,
+    legacy: Option<&crate::project::LegacyStore>,
+    open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
+) -> Result<OwnedStore<T>, String> {
+    let Some(legacy) = legacy else {
+        return open_store_checked(path, open);
+    };
+    let owner = StoreOwner::acquire_existing(path)?.ok_or_else(|| legacy.moved_msg())?;
+    // Holding the anchor excludes a migration of this store (it takes the
+    // same anchor first and keeps it until the old copy is gone).
+    legacy.still_active()?;
+    open_store_owned(owner, open)
+}
+
 /// Open the store at `path` emptied (`pull --fresh` through a running
 /// serve, NWS-2963): like [`OwnedStore::reset`] — the first open checks
 /// fjall's own lock too — but returns the cleared store opened by `open`
 /// under the same ownership, with no window for another opener.
 pub(crate) fn open_store_cleared<T>(
     path: &Path,
+    legacy: Option<&crate::project::LegacyStore>,
     open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
 ) -> Result<OwnedStore<T>, String> {
-    let owner = open_store_checked(path, |path| crate::open_store!(path))?.into_owner();
+    let owner = open_store_resolved(path, legacy, |path| crate::open_store!(path))?.into_owner();
     owner.clear_contents()?;
     open_store_owned(owner, open)
 }

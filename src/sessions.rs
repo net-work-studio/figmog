@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::api::{FigmaApi, UreqApi};
-use crate::cli::{PullError, now_ms, open_store_checked, pull_failure_wait};
+use crate::cli::{PullError, now_ms, pull_failure_wait};
 use crate::dispatch;
 use crate::flatten::flatten_file;
 use crate::ident::parse_file_ref;
@@ -938,15 +938,26 @@ impl From<PathBuf> for StoreRoot {
 impl StoreRoot {
     /// The store `key` opens. An old per-checkout mirror is used where it
     /// is (with a stderr note); two copies are an error.
+    #[cfg(test)]
     pub(crate) fn store_path(&self, key: &str) -> Result<PathBuf, String> {
+        self.store_target(key).map(|(path, _)| path)
+    }
+
+    /// [`Self::store_path`] plus, for an old per-checkout store, what
+    /// opening it must re-check ([`crate::cli::open_store_resolved`]).
+    fn store_target(
+        &self,
+        key: &str,
+    ) -> Result<(PathBuf, Option<crate::project::LegacyStore>), String> {
         match self {
-            StoreRoot::Fixed(root) => Ok(root.join(key).join("db")),
+            StoreRoot::Fixed(root) => Ok((root.join(key).join("db"), None)),
             StoreRoot::Project(layout) => {
                 let store = layout.active_store(key)?;
                 if store.migration_pending {
                     eprintln!("{}", crate::project::migration_pending_warning(key, &store));
                 }
-                Ok(store.path)
+                let legacy = layout.legacy_store(key, &store.path);
+                Ok((store.path, legacy))
             }
         }
     }
@@ -965,7 +976,17 @@ pub(crate) fn open_session(
     key: &str,
     api_token: Option<&str>,
 ) -> Result<FileSession, String> {
-    open_session_at(root.store_path(key)?, key.to_string(), Some(key), api_token)
+    let (path, legacy) = root.store_target(key)?;
+    let api = api_token.map(|token| Arc::new(UreqApi::new(token.to_string())) as SessionApi);
+    open_session_inner(
+        path,
+        legacy,
+        key.to_string(),
+        Some(key),
+        api,
+        WorkerHooks::default(),
+        false,
+    )
 }
 
 pub(crate) fn open_session_at(
@@ -1014,13 +1035,14 @@ pub(crate) fn open_session_with_hooks(
     api: Option<SessionApi>,
     hooks: WorkerHooks,
 ) -> Result<FileSession, String> {
-    open_session_inner(path, key, network_key, api, hooks, false)
+    open_session_inner(path, None, key, network_key, api, hooks, false)
 }
 
 /// Open (with `fresh`: clear, then open) one session's store and start its
 /// worker.
 fn open_session_inner(
     path: PathBuf,
+    legacy: Option<crate::project::LegacyStore>,
     key: String,
     network_key: Option<&str>,
     api: Option<SessionApi>,
@@ -1029,10 +1051,11 @@ fn open_session_inner(
 ) -> Result<FileSession, String> {
     let reopen: Reopen = {
         let (path, key, network_key) = (path.clone(), key.clone(), network_key.map(str::to_string));
-        let (api, hooks) = (api.clone(), hooks.clone());
+        let (legacy, api, hooks) = (legacy.clone(), api.clone(), hooks.clone());
         Arc::new(move |fresh| {
             open_session_inner(
                 path.clone(),
+                legacy.clone(),
                 key.clone(),
                 network_key.as_deref(),
                 api.clone(),
@@ -1050,9 +1073,9 @@ fn open_session_inner(
         )
     };
     let mut st = if fresh {
-        crate::cli::open_store_cleared(&path, open)?
+        crate::cli::open_store_cleared(&path, legacy.as_ref(), open)?
     } else {
-        open_store_checked(&path, open)?
+        crate::cli::open_store_resolved(&path, legacy.as_ref(), open)?
     };
     let make_view = move |snapshot, node_count| {
         Arc::new(SessionView::new(

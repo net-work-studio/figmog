@@ -1305,8 +1305,11 @@ Supported: `#` comments, blank lines, `[table]` headers, and inside
 `\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings). Every
 `[files]` value must be a file key or Figma URL and is stored as its key.
 Other tables, top-level keys and `[[array]]` tables are skipped unparsed
-(reserved for later settings, never an error). Errors — unterminated
-headers or strings, a missing `=`, a non-string value, trailing text, an
+(reserved for later settings, never an error), except that multi-line
+strings (`"""` and `'''`) in skipped values are tracked so a `[files]`
+line inside one is content, not the table; multi-line values inside
+`[files]` itself are an error. Errors — unterminated
+headers, strings or multi-line strings, a missing `=`, a non-string value, trailing text, an
 invalid file reference, a duplicate key or a second `[files]` table — read
 `figmog.toml:<line>: <message>` (or `figmog.local.toml:...`). Local entries
 replace same-named ones. Only `default` has meaning today: it is the file
@@ -1329,6 +1332,12 @@ With both present and a `migrated-from` marker in the shared `<key>/`,
 the error instead says a `figmog migrate` was interrupted and to rerun it.
 The warning is printed by every direct CLI command that resolves the old
 store and by serve when a session opens it; JSON outputs are unchanged.
+The old store is resolved before its lock is taken, so opening it never
+creates it: once its lock is held it must still exist and still be the
+active store, otherwise (a `figmog migrate` moved it meanwhile) the
+command fails asking for a rerun, which resolves the shared store. A
+missing old store is never recreated; new mirrors always go to the shared
+root.
 `--db` bypasses all of this. `figmog serve --figmog-root <dir>` (hidden,
 for tests) pins the socket and every store to `<dir>`/`<dir>/<key>/db`.
 
@@ -1346,13 +1355,18 @@ interrupted move, in sorted key order. Prints
 `{"mirror_root", "migrated": [{"file", "from", "to", "resumed"}]}`.
 Outside Git it is a no-op. Per key:
 
+0. Take the repository-wide migration lock
+   `<mirror root>/<key>.migrate.lock` (every worktree shares the
+   destination and staging dir), held until the end; while another
+   migration of the key holds it — from any worktree — this one is
+   refused with a message to rerun once it finishes.
 1. Refuse if `<mirror root>/<key>` already exists.
 2. Open the old store through `open_store_checked` — its ownership anchor
    *and* fjall's own writer lock, so a running serve (even an older binary)
    fails this with the standard "store is locked" error — then close the
    database but keep the anchor.
 3. Remove any staging dir `<mirror root>/.<key>.migrating` left by an
-   interrupted run, copy the old directory into it (regular files and
+   interrupted run (safe: the migration lock excludes a live one), copy the old directory into it (regular files and
    directories only, fsynced; the lock anchor is not copied), take a fresh
    anchor on the staged `db/`, and write `migrated-from` naming the source.
 4. Atomically rename the staging dir to `<mirror root>/<key>`; the staged
@@ -1363,5 +1377,10 @@ Outside Git it is a no-op. Per key:
 A crash during 3 leaves the old store intact and active (the staging dir
 is ignored and redone on rerun). A crash after 4 leaves the marker, which
 the active-store rules report and a rerun finishes by doing 5 while holding
-both stores' anchors. A crash after 5's first step leaves only the marker,
-which a rerun removes.
+both stores' anchors *and* fjall writer locks (as in 2, so an older
+binary's serve on either store refuses it). The marker names the source
+checkout's old directory, and only a rerun from that checkout removes it:
+another worktree's own old mirror is an independent copy, so there the
+rerun refuses, naming the checkout that must finish — unless the recorded
+source is already gone, when it just removes the marker. A crash after
+5's first step leaves only the marker, which a rerun removes.

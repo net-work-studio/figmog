@@ -15,7 +15,9 @@
 //! The config format is a deliberately tiny TOML subset parsed by hand (no
 //! `toml` dependency): `#` comments, blank lines, table headers, and
 //! `key = "string"` pairs inside `[files]`. Everything outside `[files]`
-//! is skipped unparsed so later settings never break this binary.
+//! is skipped unparsed so later settings never break this binary — except
+//! that multi-line strings there are tracked, so a `[files]` line inside
+//! one is never mistaken for the table.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -62,8 +64,15 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
     // their possibly multi-line values), a `[`-led line may be a value
     // continuation rather than a header, so a malformed one is skipped too.
     let mut skipping = false;
+    // Inside a skipped multi-line string (and the line it opened on): its
+    // lines are content, never headers or keys.
+    let mut multiline: Option<(Multiline, usize)> = None;
     for (index, raw) in text.lines().enumerate() {
         let err = |message: String| format!("{name}:{}: {message}", index + 1);
+        if let Some((open, line)) = multiline {
+            multiline = skip_strings(raw, Some(open)).map(|open| (open, line));
+            continue;
+        }
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -77,7 +86,12 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
         if line.starts_with('[') {
             let header = match parse_header(line) {
                 Ok(header) => header,
-                Err(_) if skipping => continue,
+                Err(_) if skipping => {
+                    // A value continuation (e.g. inside an array), which
+                    // may open a multi-line string.
+                    multiline = skip_strings(raw, None).map(|open| (open, index));
+                    continue;
+                }
                 Err(message) => return Err(err(message)),
             };
             in_files = header == "files";
@@ -92,8 +106,11 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
         }
         if !in_files {
             // Top-level keys and other tables belong to later features;
-            // skipped unparsed, including multi-line values.
+            // skipped unparsed, including multi-line values — but a
+            // multi-line string's lines are tracked so a `[files]` inside
+            // one is never taken for the table.
             skipping = true;
+            multiline = skip_strings(raw, None).map(|open| (open, index));
             continue;
         }
         let (key, rest) = parse_key(line).map_err(err)?;
@@ -115,7 +132,87 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
             return Err(err(format!("duplicate key files.{key}")));
         }
     }
+    if let Some((_, line)) = multiline {
+        return Err(format!(
+            "{name}:{}: unterminated multi-line string",
+            line + 1
+        ));
+    }
     Ok(config)
+}
+
+/// The kind of multi-line string a skipped line left open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Multiline {
+    /// `"""...""" ` (backslash escapes apply).
+    Basic,
+    /// `'''...'''`.
+    Literal,
+}
+
+/// Scan one skipped line for strings, starting inside `open` (if any), and
+/// return the multi-line string still open at its end. Single-line strings
+/// and a trailing `#` comment are passed over, so their quotes never count.
+fn skip_strings(line: &str, mut open: Option<Multiline>) -> Option<Multiline> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    // A closing delimiter may be followed by up to two more quotes that
+    // belong to the string's content (`""""` ends with one `"` of content).
+    let close = |i: usize, quote: u8| {
+        let mut end = i + 3;
+        while end < bytes.len() && end < i + 5 && bytes[end] == quote {
+            end += 1;
+        }
+        end
+    };
+    while i < bytes.len() {
+        match open {
+            Some(Multiline::Basic) => match bytes[i] {
+                b'\\' => i += 2,
+                b'"' if bytes[i..].starts_with(b"\"\"\"") => {
+                    i = close(i, b'"');
+                    open = None;
+                }
+                _ => i += 1,
+            },
+            Some(Multiline::Literal) => {
+                if bytes[i..].starts_with(b"'''") {
+                    i = close(i, b'\'');
+                    open = None;
+                } else {
+                    i += 1;
+                }
+            }
+            None => match bytes[i] {
+                b'#' => return None,
+                b'"' if bytes[i..].starts_with(b"\"\"\"") => {
+                    open = Some(Multiline::Basic);
+                    i += 3;
+                }
+                b'\'' if bytes[i..].starts_with(b"'''") => {
+                    open = Some(Multiline::Literal);
+                    i += 3;
+                }
+                b'"' => {
+                    // Single-line basic string: to the unescaped closing quote.
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                }
+                b'\'' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+        }
+    }
+    open
 }
 
 /// `[name]` (optionally followed by a comment) → `name`.
@@ -328,6 +425,47 @@ impl Layout {
     }
 }
 
+/// A store resolved to the old per-checkout location (NWS-2964). The path
+/// was chosen before the command took the store's lock, and a `figmog
+/// migrate` may have moved the store away since: opening one never creates
+/// it, and re-checks under its lock that it is still the active store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyStore {
+    layout: Layout,
+    key: String,
+}
+
+impl Layout {
+    /// `Some` exactly when `path` is `key`'s old per-checkout store.
+    pub(crate) fn legacy_store(&self, key: &str, path: &Path) -> Option<LegacyStore> {
+        (self.has_legacy_root() && path == self.legacy_dir(key).join("db")).then(|| LegacyStore {
+            layout: self.clone(),
+            key: key.to_string(),
+        })
+    }
+}
+
+impl LegacyStore {
+    /// The store vanished between resolution and opening.
+    pub(crate) fn moved_msg(&self) -> String {
+        format!(
+            "the mirror for {} moved while this command started (did `figmog migrate` run?); \
+             nothing was written — rerun the command",
+            self.key
+        )
+    }
+
+    /// Under the store's lock: the old store is still the active one.
+    pub(crate) fn still_active(&self) -> Result<(), String> {
+        let store = self.layout.active_store(&self.key)?;
+        if store.path == self.layout.legacy_dir(&self.key).join("db") {
+            Ok(())
+        } else {
+            Err(self.moved_msg())
+        }
+    }
+}
+
 /// One-line stderr note for a mirror still in the old location.
 pub(crate) fn migration_pending_warning(key: &str, store: &ActiveStore) -> String {
     serde_json::json!({
@@ -492,6 +630,47 @@ mod tests {
         assert_eq!(
             parse_config("", CONFIG_FILE).unwrap(),
             ProjectConfig::default()
+        );
+    }
+
+    /// NWS-2964 finding 5: a `[files]` line inside a skipped multi-line
+    /// string is content, not the table.
+    #[test]
+    fn headers_inside_skipped_multiline_strings_are_content() {
+        for (open, close) in [
+            (r#"""""#, r#"""""#),
+            ("'''", "'''"),
+            (r#"""""#, r#"\""""""#),
+        ] {
+            let text = format!(
+                "[settings]\nnotes = {open}\n[files]\ndefault = \"{OTHER}\"\n{close}\n\
+                 quoted = \"{open}\" # {open}\n\
+                 [files]\ndefault = \"{KEY}\"\n"
+            );
+            let config = parse_config(&text, CONFIG_FILE).unwrap();
+            assert_eq!(
+                config.files,
+                BTreeMap::from([("default".to_string(), KEY.to_string())]),
+                "{text}"
+            );
+        }
+        // Opened and closed on one line, and inside a skipped array.
+        let text = format!(
+            "a = \"\"\"x\"\"\"\nlist = [\n  '''\n[files]\n''',\n]\n[files]\ndefault = '{KEY}'\n"
+        );
+        assert_eq!(
+            parse_config(&text, CONFIG_FILE).unwrap().default_key(),
+            Some(KEY)
+        );
+        // Never closed: an error at the opening line.
+        let error = parse_config("[x]\n\nv = '''\n[files]\n", CONFIG_FILE).unwrap_err();
+        assert_eq!(error, "figmog.toml:3: unterminated multi-line string");
+        // Multi-line values in [files] itself stay a clear error.
+        let error =
+            parse_config("[files]\ndefault = \"\"\"\nx\n\"\"\"\n", CONFIG_FILE).unwrap_err();
+        assert!(
+            error.contains("multi-line strings are not supported"),
+            "{error}"
         );
     }
 

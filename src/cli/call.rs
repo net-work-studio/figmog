@@ -12,7 +12,7 @@ use crate::proxy;
 use crate::upstream::{HttpUpstream, UpstreamMcp};
 
 use super::pull::do_pull;
-use super::{Db, open_store_checked, write_json};
+use super::{Db, write_json};
 
 /// `figmog import-variables <export.json>`: replace the stored variable
 /// snapshot (NWS-2961). The file is read, parsed and validated before the
@@ -22,7 +22,7 @@ use super::{Db, open_store_checked, write_json};
 /// collections absent from the new export.
 pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String> {
     let (_, parsed) = load_import(&path)?;
-    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let mut st = db.open(|path| crate::open_store!(path))?;
     let prior = st.rtx(|(_, _, _, _, variables, collections, ..)| {
         crate::store::collect_variable_ids(&variables, &collections)
     });
@@ -162,7 +162,7 @@ pub(super) fn cmd_call(
     }
 
     let (mut upstream, upstream_status) = attach_upstream(upstream_url, no_upstream);
-    let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let st = db.open(|path| crate::open_store!(path))?;
 
     let result: Result<Value, String> = if proxy::is_local_tool(&tool) {
         match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, &r, None)) {

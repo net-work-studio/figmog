@@ -14,7 +14,7 @@ use crate::ident::parse_file_ref;
 use crate::store::{self, Churn, collect_sweepable, collect_variable_ids, sync};
 use crate::watch::BACKOFF_CAP;
 
-use super::{Db, open_store_checked, write_json};
+use super::{Db, write_json};
 
 /// Errors from [`do_pull`]: either a typed API failure (so callers can act
 /// on rate limits) or any other pull-mechanics failure. `Display` matches
@@ -168,7 +168,7 @@ pub(super) fn do_pull(
             let stored_geometry = if fresh || !db.path.exists() {
                 false
             } else {
-                open_store_checked(&db.path, |path| crate::open_store!(path))
+                db.open(|path| crate::open_store!(path))
                     .map(|st| {
                         st.rtx(|(.., mirror_config, _, _, _)| store::read_geometry(&mirror_config))
                     })
@@ -223,7 +223,7 @@ fn apply_pull(
             .extend(crate::vars::enterprise_snapshot_recs(v).map_err(|e| e.to_string())?);
     }
 
-    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let mut st = db.open(|path| crate::open_store!(path))?;
     if fresh {
         st = st.reset(|path| crate::open_store!(path))?;
     }
@@ -348,7 +348,7 @@ mod tests {
         assert!(!db.path.exists(), "invalid data must not create a store");
 
         apply_pull(&db, &file, None, false, true).unwrap();
-        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        let st = db.open(|path| crate::open_store!(path)).unwrap();
         let meta = st.get(&crate::model::Id::Meta);
         let config = st.get(&crate::model::Id::MirrorConfig);
         // Holding the store also proves validation precedes ownership checks:
@@ -371,7 +371,7 @@ mod tests {
     }
 
     fn snapshot_source(db: &Db) -> Option<String> {
-        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        let st = db.open(|path| crate::open_store!(path)).unwrap();
         st.rtx(|(.., snapshot)| snapshot.get(&0).map(|s| s.source))
     }
 
@@ -430,7 +430,7 @@ mod tests {
         let vars = variables_export();
         let (plain, ..) = apply_pull(&db, &file, None, false, false).unwrap();
         {
-            let mut st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            let mut st = db.open(|path| crate::open_store!(path)).unwrap();
             let recs = crate::vars::parse_variables_export(&vars).unwrap();
             st.wtx(|tx| {
                 for (id, rec) in &recs {

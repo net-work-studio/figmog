@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 use crate::api::{FigmaApi, UreqApi};
 use crate::images;
 
-use super::{Db, open_store_checked, socket, write_json};
+use super::{Db, socket, write_json};
 
 pub(super) fn cmd_images(
     db: &Db,
@@ -120,7 +120,7 @@ fn fetch_direct(
 ) -> Result<Vec<Fetched>, String> {
     let node_ids = images::normalize_ids(ids);
     let scale_m = images::scale_milli(scale);
-    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let mut st = db.open(|path| crate::open_store!(path))?;
     let scanned = st.rtx(
         |((nodes, ..), _, _, _, _, _, meta, _, _, images_table, pins, _)| {
             images::scan(

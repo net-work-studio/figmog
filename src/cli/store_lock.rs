@@ -15,56 +15,89 @@ pub(super) struct StoreOwner {
     lock: File,
 }
 
+/// Why [`lock_file`] could not take its lock.
+enum Failure {
+    /// Held by another opener, with its owner record if it left one.
+    Locked(Option<String>),
+    Failed(String),
+}
+
+/// Open (creating if needed, never following a symlink) and exclusively
+/// lock `lock_path`, a regular, unshared file owned by the current user,
+/// then record this process as its owner. Never blocks.
+fn lock_file(lock_path: &Path) -> Result<File, Failure> {
+    use Failure::{Failed, Locked};
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(lock_path)
+        .map_err(|e| Failed(e.to_string()))?;
+    let metadata = file.metadata().map_err(|e| Failed(e.to_string()))?;
+    // SAFETY: geteuid has no preconditions or side effects.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != uid {
+        return Err(Failed(
+            "lock must be a regular, unshared file owned by the current user".into(),
+        ));
+    }
+    if let Err(e) = file.try_lock() {
+        return Err(match e {
+            TryLockError::WouldBlock => Locked(owner_record(&file)),
+            TryLockError::Error(e) => Failed(e.to_string()),
+        });
+    }
+    // Name this process as the owner (NWS-2963): a serve records
+    // itself so another command can say who holds the store; any
+    // other opener clears a record a previous owner left behind.
+    let record = super::OWNER_RECORD.get().map_or("", String::as_str);
+    file.set_len(0)
+        .and_then(|()| file.write_all_at(record.as_bytes(), 0))
+        .map_err(|e| Failed(e.to_string()))?;
+    Ok(file)
+}
+
 impl StoreOwner {
     pub(super) fn acquire(path: &Path) -> Result<Self, String> {
-        enum Failure {
-            /// Held by another opener, with its owner record if it left one.
-            Locked(Option<String>),
-            Failed(String),
-        }
-        use Failure::{Failed, Locked};
         let path = crate::private_dir::ensure(path)?;
+        Self::lock(path)
+    }
+
+    /// [`Self::acquire`] for a store that must already exist: never creates
+    /// the store directory or any ancestor. `Ok(None)` when the directory
+    /// is missing — before the lock, or unlinked by the time it was taken
+    /// (a `figmog migrate` that moved it away).
+    pub(super) fn acquire_existing(path: &Path) -> Result<Option<Self>, String> {
+        let path = match crate::private_dir::existing(path)? {
+            Some(path) => path,
+            None => return Ok(None),
+        };
+        let owner = match Self::lock(path.clone()) {
+            Ok(owner) => owner,
+            Err(_) if std::fs::symlink_metadata(&path).is_err() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // The anchor must still be linked where it was opened: a remover
+        // that held it until after unlinking leaves us an orphaned inode.
+        let held = owner.lock.metadata().map_err(|e| e.to_string())?;
+        match std::fs::symlink_metadata(owner.path.join(LOCK_NAME)) {
+            Ok(linked) if same_file(&held, &linked) => Ok(Some(owner)),
+            _ => Ok(None),
+        }
+    }
+
+    fn lock(path: PathBuf) -> Result<Self, String> {
         if path.parent().is_none() {
             return Err("the filesystem root cannot be a mirror directory".into());
         }
         let lock_path = path.join(LOCK_NAME);
-        let acquire = || -> Result<File, Failure> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&lock_path)
-                .map_err(|e| Failed(e.to_string()))?;
-            let metadata = file.metadata().map_err(|e| Failed(e.to_string()))?;
-            // SAFETY: geteuid has no preconditions or side effects.
-            let uid = unsafe { libc::geteuid() };
-            if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != uid {
-                return Err(Failed(
-                    "lock must be a regular, unshared file owned by the current user".into(),
-                ));
-            }
-            if let Err(e) = file.try_lock() {
-                return Err(match e {
-                    TryLockError::WouldBlock => Locked(owner_record(&file)),
-                    TryLockError::Error(e) => Failed(e.to_string()),
-                });
-            }
-            // Name this process as the owner (NWS-2963): a serve records
-            // itself so another command can say who holds the store; any
-            // other opener clears a record a previous owner left behind.
-            let record = super::OWNER_RECORD.get().map_or("", String::as_str);
-            file.set_len(0)
-                .and_then(|()| file.write_all_at(record.as_bytes(), 0))
-                .map_err(|e| Failed(e.to_string()))?;
-            Ok(file)
-        };
-        let lock = acquire().map_err(|e| match e {
-            Locked(Some(owner)) => super::store_owned_msg(&owner),
-            Locked(None) => super::STORE_LOCKED_MSG.to_string(),
-            Failed(e) => format!("locking {}: {e}", lock_path.display()),
+        let lock = lock_file(&lock_path).map_err(|e| match e {
+            Failure::Locked(Some(owner)) => super::store_owned_msg(&owner),
+            Failure::Locked(None) => super::STORE_LOCKED_MSG.to_string(),
+            Failure::Failed(e) => format!("locking {}: {e}", lock_path.display()),
         })?;
         Ok(Self { path, lock })
     }
@@ -95,6 +128,27 @@ impl StoreOwner {
             Ok(())
         };
         clear().map_err(|e| format!("resetting {}: {e}", self.path.display()))
+    }
+}
+
+/// Repository-wide exclusion for one key's `figmog migrate` (NWS-2964): an
+/// exclusive lock on a regular file in the shared mirror root, held from
+/// before the destination is checked until the final cleanup, so two
+/// worktrees can never stage, publish or clean up the same key at once.
+pub(super) struct MigrationLock {
+    _lock: File,
+}
+
+impl MigrationLock {
+    /// Take the lock at `path` (a file; created if missing and left in
+    /// place afterwards) without waiting; `busy` is the error when another
+    /// migration holds it.
+    pub(super) fn acquire(path: &Path, busy: impl FnOnce() -> String) -> Result<Self, String> {
+        match lock_file(path) {
+            Ok(lock) => Ok(Self { _lock: lock }),
+            Err(Failure::Locked(_)) => Err(busy()),
+            Err(Failure::Failed(e)) => Err(format!("locking {}: {e}", path.display())),
+        }
     }
 }
 
