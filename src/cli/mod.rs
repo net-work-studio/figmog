@@ -205,7 +205,15 @@ enum Cmd {
     },
     /// Import a variables export (REST or plugin-console shape), replacing
     /// the previous variable snapshot.
-    ImportVariables { path: PathBuf },
+    ImportVariables {
+        path: PathBuf,
+        /// Permit an empty export to replace the stored variable snapshot.
+        #[arg(long)]
+        allow_empty: bool,
+        /// Validate and report the replacement without changing the store.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Node counts by type and page, table totals, text-node count, max tree depth.
     Stats,
     /// Ancestor chain root→node for one id.
@@ -413,11 +421,17 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             if let Some(result) = socket::try_call(root, tool, tool_args) {
                 let result = result?;
                 // Not ready is an error, except for an import-only store
-                // (SPEC §9): its stored variable snapshot still answers.
+                // (SPEC §9) with no pull attempted. Once a pull is in
+                // progress or failed, report its lifecycle before stripping it.
                 if tool == "figmog_status"
                     && result["ready"] == false
-                    && !has_variable_state(&result)
+                    && (!has_variable_state(&result) || !result["pull"]["job"].is_null())
                 {
+                    if let Some(error) = result["pull"]["last_completed"]["error"].as_str() {
+                        return Err(format!(
+                            "mirror is not ready — pull failed: {error}; inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors"
+                        ));
+                    }
                     return Err("mirror is not ready — inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors".to_string());
                 }
                 let result = if tool == "figmog_status" {
@@ -440,7 +454,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             fresh,
             geometry,
         } => pull::cmd_pull(&db, file, from_file, fresh, geometry),
-        Cmd::ImportVariables { path } => call::cmd_import_variables(&db, path),
+        Cmd::ImportVariables {
+            path,
+            allow_empty,
+            dry_run,
+        } => call::cmd_import_variables(&db, path, allow_empty, dry_run),
         Cmd::Images {
             ids,
             format,

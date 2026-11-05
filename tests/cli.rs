@@ -903,7 +903,7 @@ fn import_variables_upgrades_vars_to_authoritative() {
 /// is exactly `{"imported": N, "removed": M}`, `imported` counting only
 /// `Variable` records — `variables-export.json` has 3 variables across 2
 /// collections, so `imported` must be 3, not 5 — and `removed` the
-/// variables + collections the replacing snapshot swept (NWS-2961).
+/// variables the replacing snapshot swept (NWS-3001).
 #[test]
 fn import_variables_output_shape_is_the_variable_count_alone() {
     let (dir, db) = fixture_db();
@@ -1945,6 +1945,53 @@ fn images_with_db_exports_cached_bytes_without_a_file_key_or_token() {
     assert_eq!(std::fs::read(out_dir.join("render-1-2.svg")).unwrap(), svg);
     assert!(out.get_output().stderr.is_empty());
     assert!(!dir.path().join(".figmog/current").exists());
+}
+
+#[test]
+fn images_with_db_explains_legacy_unverified_renders_and_preserves_the_bytes() {
+    use figmog::model::{Id, ImageBlobRec, Rec};
+
+    let (dir, db) = fixture_db();
+    let svg = b"<svg><rect/></svg>";
+    let key = figmog::images::image_key("render", "1:2", "svg", 1000);
+    let legacy = ImageBlobRec {
+        key_hash: key.clone(),
+        kind: "render".into(),
+        subject: "1:2".into(),
+        format: "svg".into(),
+        scale_milli: 1000,
+        file_version: "100".into(),
+        bytes: svg.to_vec(),
+    };
+    {
+        let mut st = figmog::open_store!(&db);
+        st.wtx(|tx| {
+            tx.upsert(&Id::ImageBlob(key.clone()), &Rec::ImageBlob(legacy.clone()));
+        });
+    }
+    let out_dir = dir.path().join("legacy-export");
+    let out = common::command()
+        .current_dir(dir.path())
+        .args(["--db", &db, "images", "1:2", "--format", "svg", "--out"])
+        .arg(&out_dir)
+        .assert()
+        .failure()
+        .code(1);
+    let manifest: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let row = &manifest[0];
+    let error = row["error"].as_str().unwrap();
+    assert!(
+        error.contains("cached render bytes lack a valid version pin"),
+        "{error}"
+    );
+    assert!(error.contains("before this upgrade"), "{error}");
+    assert!(error.contains("without --db"), "{error}");
+    assert_eq!(row["cached"], false);
+    assert_eq!(row["bytes"], 0);
+    assert!(row.get("path").is_none());
+    assert!(!out_dir.join("render-1-2.svg").exists());
+    let st = figmog::open_store!(&db);
+    assert_eq!(st.get(&Id::ImageBlob(key)), Some(Rec::ImageBlob(legacy)));
 }
 
 #[test]

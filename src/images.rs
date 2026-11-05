@@ -55,7 +55,9 @@ pub const FILL: &str = "fill";
 /// so the bytes really are that version's render. Render rows an older
 /// binary stored (requested unpinned — possibly showing a newer design
 /// than their label) have no marker and read as misses, so they get
-/// refetched and overwritten. Fill rows never need a marker.
+/// refetched and overwritten when the file key and credentials are
+/// available. Explicit stores cannot refresh these unverified renders;
+/// they return an upgrade-specific error. Fill rows never need a marker.
 pub const RENDER_PIN_GENERATION: u32 = 1;
 
 /// A caller with no Figma API token still gets every cache hit for free
@@ -63,6 +65,9 @@ pub const RENDER_PIN_GENERATION: u32 = 1;
 /// every miss gets this exact per-item manifest error instead of a wasted
 /// (guaranteed-401) network attempt.
 const NO_TOKEN_MSG: &str = "FIGMA_TOKEN is unset or empty and no saved token is available — required for image downloads; an empty FIGMA_TOKEN disables saved credentials, so unset it to use saved credentials; run `figmog auth login` or set FIGMA_TOKEN";
+
+/// Distinguish an upgrade's unverified bytes from a genuinely absent row.
+const UNVERIFIED_RENDER_MSG: &str = "cached render bytes lack a valid version pin (for example, cached before this upgrade), so their mirrored version cannot be verified; --db cannot refresh them without a file key. Run `figmog pull <file-key-or-url>`, then `figmog images <node-id>...` without --db to fetch a verified render; the existing bytes remain on disk";
 
 /// An explicit store can serve cached bytes, but its records do not
 /// establish the file key needed to fetch a miss safely.
@@ -186,6 +191,7 @@ impl ImageItem {
 pub struct Scanned {
     version: String,
     render_hits: BTreeMap<String, ImageItem>,
+    unverified_renders: BTreeSet<String>,
     fill_refs: BTreeSet<String>,
     fill_hits: BTreeMap<String, ImageItem>,
 }
@@ -235,15 +241,19 @@ pub fn scan<R: Readable>(
     let version = meta.get(&0).map(|m| m.version.clone()).unwrap_or_default();
 
     let mut render_hits: BTreeMap<String, ImageItem> = BTreeMap::new();
+    let mut unverified_renders = BTreeSet::new();
     for id in node_ids {
         let key = image_key(RENDER, id, format, scale_milli);
         if let Some(rec) = images.get(&key)
             && rec.file_version == version
             && matches_identity(&rec, RENDER, id, format, scale_milli)
-            && pins.get(&key).is_some_and(|pin| {
-                pin.generation == RENDER_PIN_GENERATION && pin.file_version == rec.file_version
-            })
         {
+            if !pins.get(&key).is_some_and(|pin| {
+                pin.generation == RENDER_PIN_GENERATION && pin.file_version == rec.file_version
+            }) {
+                unverified_renders.insert(id.clone());
+                continue;
+            }
             render_hits.insert(
                 id.clone(),
                 ImageItem {
@@ -291,6 +301,7 @@ pub fn scan<R: Readable>(
     Scanned {
         version,
         render_hits,
+        unverified_renders,
         fill_refs,
         fill_hits,
     }
@@ -320,6 +331,7 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
     let Scanned {
         version,
         mut render_hits,
+        unverified_renders,
         fill_refs,
         mut fill_hits,
     } = scanned;
@@ -349,7 +361,12 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
                             RENDER,
                             id,
                             format.to_string(),
-                            unavailable_reason.to_string(),
+                            if file_key.is_none() && unverified_renders.contains(id) {
+                                UNVERIFIED_RENDER_MSG
+                            } else {
+                                unavailable_reason
+                            }
+                            .to_string(),
                         ),
                     );
                 }
@@ -399,7 +416,26 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
                         }
                     }
                     Err(e) => {
-                        let msg = e.to_string();
+                        let msg = match pinned_version {
+                            Some(version) => {
+                                let mut message = format!(
+                                    "render request for file {key:?} at mirrored version {version:?} failed: {e}"
+                                );
+                                if matches!(
+                                    &e,
+                                    ApiError::Http {
+                                        status: 400 | 404,
+                                        ..
+                                    }
+                                ) {
+                                    message.push_str(&format!(
+                                        "; no unpinned fallback is attempted. Check that this version belongs to the file and is still available, or run `figmog pull {key}` before retrying"
+                                    ));
+                                }
+                                message
+                            }
+                            None => e.to_string(),
+                        };
                         for id in &render_misses {
                             render_hits.insert(
                                 id.clone(),
@@ -1224,6 +1260,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scan_rejects_wrong_pin_generation_and_version_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        insert_meta(&mut st, "100");
+        let ids = vec!["1:2".to_string()];
+        let key = image_key(RENDER, "1:2", "png", 1000);
+        store_image(&mut st, &key, RENDER, "1:2", "png", 1000, "100", &[1], true);
+
+        for (generation, version, expect_hit) in [
+            (RENDER_PIN_GENERATION, "100", true),
+            (RENDER_PIN_GENERATION + 1, "100", false),
+            (RENDER_PIN_GENERATION, "99", false),
+        ] {
+            st.wtx(|tx| {
+                tx.upsert(
+                    &Id::ImagePin(key.clone()),
+                    &Rec::ImagePin(ImagePinRec {
+                        generation,
+                        file_version: version.to_string(),
+                    }),
+                );
+            });
+            let scanned = st.rtx(
+                |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
+                    scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
+                },
+            );
+            assert_eq!(
+                scanned.render_hits.contains_key("1:2"),
+                expect_hit,
+                "pin generation={generation}, version={version}"
+            );
+        }
+    }
+
     /// `scan` then `resolve`, exactly the two-step call every production
     /// call site makes (this module's own doc comment) — the one seam
     /// this test suite proves end to end.
@@ -1447,6 +1519,86 @@ mod tests {
                 file_version: "100".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn resolve_without_a_mirrored_version_never_writes_a_pin_or_reuses_the_render() {
+        for has_meta in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut st = crate::open_store!(dir.path().join("db"));
+            if has_meta {
+                insert_meta(&mut st, "");
+            }
+            let key = image_key(RENDER, "1:2", "png", 1000);
+            // A previous marker must be cleared when an unpinned fetch
+            // overwrites its row, as well as not being created afresh.
+            st.wtx(|tx| {
+                tx.upsert(
+                    &Id::ImagePin(key.clone()),
+                    &Rec::ImagePin(ImagePinRec {
+                        generation: RENDER_PIN_GENERATION,
+                        file_version: "100".to_string(),
+                    }),
+                );
+            });
+            let script = Script::new();
+            for _ in 0..2 {
+                script
+                    .render_responses
+                    .borrow_mut()
+                    .push(Ok(json!({"images": {"1:2": "https://s3/latest.png"}})));
+            }
+            let (download, calls) = downloader(HashMap::from([(
+                "https://s3/latest.png".to_string(),
+                vec![9],
+            )]));
+            let ids = vec!["1:2".to_string()];
+            for _ in 0..2 {
+                let items = scan_and_resolve!(st, Some(&script), &download, &ids, "png", None);
+                assert_eq!(items[0].bytes, vec![9]);
+                assert!(!items[0].cached);
+                let (row, pin) = st.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, _)| {
+                    (images.get(&key), pins.get(&key))
+                });
+                assert_eq!(row.unwrap().file_version, "");
+                assert_eq!(pin, None, "an unpinned response cannot gain a valid pin");
+            }
+            assert_eq!(*script.render_versions.borrow(), vec![None, None]);
+            assert_eq!(*calls.borrow(), 2);
+        }
+    }
+
+    #[test]
+    fn a_rejected_pinned_render_reports_the_version_without_retrying_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        insert_meta(&mut st, "unavailable-version");
+        let script = Script::new();
+        script
+            .render_responses
+            .borrow_mut()
+            .push(Err(ApiError::Http {
+                status: 400,
+                msg: "version not found".to_string(),
+            }));
+        let (download, calls) = downloader(HashMap::new());
+        let ids = vec!["1:2".to_string()];
+        let items = scan_and_resolve!(st, Some(&script), &download, &ids, "png", None);
+        let error = items[0].error.as_deref().unwrap();
+        assert!(error.contains("file \"FILE\""), "{error}");
+        assert!(error.contains("unavailable-version"), "{error}");
+        assert!(error.contains("version not found"), "{error}");
+        assert!(error.contains("no unpinned fallback"), "{error}");
+        assert!(error.contains("figmog pull FILE"), "{error}");
+        assert!(items[0].bytes.is_empty());
+        assert_eq!(*calls.borrow(), 0);
+        assert_eq!(
+            *script.render_versions.borrow(),
+            vec![Some("unavailable-version".to_string())]
+        );
+        let key = image_key(RENDER, "1:2", "png", 1000);
+        assert!(st.get(&Id::ImageBlob(key.clone())).is_none());
+        assert!(st.get(&Id::ImagePin(key)).is_none());
     }
 
     /// NWS-2960 upgrade path: a render row an older binary stored (fetched

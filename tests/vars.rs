@@ -183,7 +183,7 @@ fn reimport_removes_deleted_token_and_collection() {
         .unwrap()
         .remove("VariableCollectionId:2");
     let third = import(dir.path(), &db, "c.json", &serde_json::to_vec(&v).unwrap());
-    assert_eq!(third, json!({"imported": 1, "removed": 2}));
+    assert_eq!(third, json!({"imported": 1, "removed": 1}));
     let out = run_ok(&db, &["vars", "--snapshot"]);
     assert_eq!(out["snapshot"]["variables"], 1);
     assert_eq!(out["snapshot"]["collections"], 1);
@@ -303,13 +303,13 @@ fn snapshot_states_reported_in_vars_and_status() {
     );
     assert_eq!(state(&db), "current");
 
-    let empty = import(
-        dir.path(),
+    let path = dir.path().join("empty.json");
+    std::fs::write(&path, br#"{"variables": {}, "variableCollections": {}}"#).unwrap();
+    let empty = run_ok(
         &db,
-        "empty.json",
-        br#"{"variables": {}, "variableCollections": {}}"#,
+        &["import-variables", path.to_str().unwrap(), "--allow-empty"],
     );
-    assert_eq!(empty, json!({"imported": 0, "removed": 5}));
+    assert_eq!(empty, json!({"imported": 0, "removed": 3}));
     assert_eq!(state(&db), "empty");
     let status = run_ok(&db, &["status"]);
     assert_eq!(status["variables"]["source"], "file");
@@ -457,4 +457,146 @@ fn import_only_store_reports_snapshot_in_status() {
     let call = run_ok(&db, &["call", "figmog_status", "--no-upstream"]);
     assert_eq!(call["variables"], status["variables"]);
     assert_eq!(call["name"], Value::Null);
+}
+
+#[test]
+fn invalid_import_contents_are_rejected_before_opening_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("must-not-exist");
+    for (pointer, invalid) in [
+        ("/meta/variables/VariableID:100", json!({})),
+        ("/meta/variables/VariableID:100/name", json!("")),
+        ("/meta/variables/VariableID:100/resolvedType", json!(5)),
+        (
+            "/meta/variables/VariableID:100/variableCollectionId",
+            json!("missing"),
+        ),
+        (
+            "/meta/variables/VariableID:100/valuesByMode",
+            json!({"unknown-mode": 1}),
+        ),
+        (
+            "/meta/variableCollections/VariableCollectionId:1/name",
+            json!(""),
+        ),
+        (
+            "/meta/variableCollections/VariableCollectionId:1/defaultModeId",
+            json!("missing"),
+        ),
+        (
+            "/meta/variables/VariableID:100/codeSyntax",
+            json!({"WEB": 5}),
+        ),
+        ("/meta/variables/VariableID:100/codeSyntax", json!([])),
+        (
+            "/meta/variables/VariableID:100/hiddenFromPublishing",
+            json!("false"),
+        ),
+        ("/meta/variables/VariableID:100/remote", json!(0)),
+    ] {
+        let mut bad = export();
+        *bad.pointer_mut(pointer).unwrap() = invalid;
+        import_err(
+            dir.path(),
+            &db,
+            "invalid.json",
+            &serde_json::to_vec(&bad).unwrap(),
+        );
+        assert!(
+            !db.exists(),
+            "invalid content at {pointer} must not create a store"
+        );
+    }
+}
+
+#[test]
+fn empty_import_needs_opt_in_and_dry_run_preserves_snapshot() {
+    let (dir, db) = common::fixture_db();
+    import(
+        dir.path(),
+        &db,
+        "good.json",
+        include_bytes!("fixtures/variables-export.json"),
+    );
+    let before = run_ok(&db, &["vars", "--snapshot"]);
+    let empty = br#"{"variables":{},"variableCollections":{}}"#;
+    import_err(dir.path(), &db, "empty.json", empty);
+    assert_eq!(run_ok(&db, &["vars", "--snapshot"]), before);
+
+    let path = dir.path().join("empty.json");
+    let preview = run_ok(
+        &db,
+        &["import-variables", path.to_str().unwrap(), "--dry-run"],
+    );
+    assert_eq!(
+        preview,
+        json!({"imported": 0, "removed": 3,
+        "removed_ids": ["VariableID:100", "VariableID:101", "VariableID:200"]})
+    );
+    assert_eq!(run_ok(&db, &["vars", "--snapshot"]), before);
+    let applied = run_ok(
+        &db,
+        &["import-variables", path.to_str().unwrap(), "--allow-empty"],
+    );
+    assert_eq!(applied, json!({"imported": 0, "removed": 3}));
+    assert_eq!(
+        run_ok(&db, &["vars", "--snapshot"])["snapshot"]["state"],
+        "empty"
+    );
+}
+
+#[test]
+fn dry_run_new_store_does_not_create_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("new-db");
+    let path = dir.path().join("valid.json");
+    std::fs::write(&path, include_bytes!("fixtures/variables-export.json")).unwrap();
+    assert_eq!(
+        run_ok(
+            &db,
+            &["import-variables", path.to_str().unwrap(), "--dry-run"]
+        ),
+        json!({"imported": 3, "removed": 0, "removed_ids": []})
+    );
+    assert!(!db.exists());
+}
+
+#[test]
+fn unreadable_import_has_invalid_file_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("new-db");
+    let missing = dir.path().join("missing.json");
+    let result = common::command()
+        .args([
+            "import-variables",
+            missing.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&result.get_output().stderr).contains("invalid variables file")
+    );
+    assert!(!db.exists());
+}
+
+/// JSON objects retain their last duplicate key, as documented for imports.
+#[test]
+fn duplicate_import_ids_use_the_last_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let mut value = export();
+    let original = serde_json::to_string(&value["meta"]["variables"]["VariableID:100"]).unwrap();
+    value["meta"]["variables"]["VariableID:100"]["name"] = json!("last name");
+    let last = serde_json::to_string(&value["meta"]["variables"]["VariableID:100"]).unwrap();
+    let body = serde_json::to_string(&value).unwrap().replace(
+        &format!("\"VariableID:100\":{last}"),
+        &format!("\"VariableID:100\":{original},\"VariableID:100\":{last}"),
+    );
+    import(dir.path(), &db, "duplicate.json", body.as_bytes());
+    assert_eq!(
+        row(&run_ok(&db, &["vars"]), "VariableID:100").unwrap()["name"],
+        "last name"
+    );
 }

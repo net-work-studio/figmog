@@ -75,12 +75,14 @@ $ claude mcp remove figma
 ```
 
 Run one or the other, not both. figmog forwards the tools of Figma's
-**desktop** MCP server (uncached, verbatim) when the Figma desktop app is
-running with Dev Mode MCP enabled. Two limits: figmog checks for the
+**desktop** MCP server when the Figma desktop app is running with Dev Mode
+MCP enabled. Calls are uncached and results pass through verbatim; tool
+descriptions get a `[via Figma desktop] ` prefix. figmog checks for the
 desktop app only once, when `figmog serve` starts, so start the desktop
-app before your agent (or restart the agent after opening it); and only
-the desktop server's tools are forwarded — Figma's remote MCP server is
-not. Keep both connections and the agent sees two overlapping Figma
+app before your agent (or restart the agent after opening it). By default
+only the desktop server's tools are forwarded. `--upstream-url` can target
+another HTTP MCP server, but sends no authentication for Figma's remote
+server. Keep both connections and the agent sees two overlapping Figma
 servers, then picks tools badly.
 
 ### 4. Ask for something
@@ -195,6 +197,8 @@ misses produce per-item errors. To fetch missing images, run
 `figmog pull <file-key-or-url>`, then `figmog images <node-id>...` without
 `--db`. A node URL in the images arguments selects a node within the chosen
 store; it does not supply the store's file identity.
+Renders cached by older builds without a version pin need to be fetched
+again through a file-keyed mirror before this build can export them offline.
 
 ### Freshness is polling, not push
 
@@ -215,6 +219,8 @@ snapshot, so tokens deleted in Figma disappear on re-import; an invalid
 file is rejected and the last good snapshot kept. `figmog vars --snapshot`
 and `figmog status` report the snapshot's state and provenance. See
 `docs/SPEC.md` §9.
+Use `--dry-run` to preview import counts; replacing existing variables
+with an empty export requires `--allow-empty`.
 
 ### The tools
 

@@ -162,9 +162,8 @@ pub fn status<R: Readable>(
 
 /// The variable snapshot's state and provenance (NWS-2961). `state` is:
 /// - `"none"`: no snapshot row and no variables/collections stored;
-/// - `"legacy"`: variables or collections stored without a snapshot row
-///   (imported or pulled before provenance was recorded) — provenance
-///   fields are null;
+/// - `"legacy"`: variables or collections stored without a matching snapshot
+///   row (including older-binary writes) — provenance fields are null;
 /// - `"empty"`: a snapshot row whose export held no variables;
 /// - `"current"`: a snapshot row with at least one variable.
 ///
@@ -177,7 +176,7 @@ pub fn variable_snapshot<R: Readable>(
 ) -> Value {
     let var_count = variables.iter().count();
     let collection_count = variable_collections.iter().count();
-    let snap = snapshot.get(&0);
+    let snap = matching_variable_snapshot(variables, snapshot);
     let state = match (&snap, var_count, collection_count) {
         (Some(_), 0, _) => "empty",
         (Some(_), _, _) => "current",
@@ -193,6 +192,23 @@ pub fn variable_snapshot<R: Readable>(
         "digest": snap.as_ref().map(|s| s.digest.clone()),
         "variables": var_count,
         "collections": collection_count,
+    })
+}
+
+/// Older binaries do not maintain provenance. An id mismatch proves the row
+/// no longer describes these variables; same-id edits cannot be detected.
+fn matching_variable_snapshot<R: Readable>(
+    variables: &TableReader<'_, R, String, VariableRec>,
+    snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
+) -> Option<VariableSnapshotRec> {
+    snapshot.get(&0).filter(|snap| {
+        // Table iteration follows postcard-encoded keys, which sort strings
+        // by their encoded length before their contents. Compare decoded ids.
+        let stored_ids: BTreeSet<_> = variables.iter().map(|(id, _)| id).collect();
+        snap.variables
+            .iter()
+            .map(|code| &code.id)
+            .eq(stored_ids.iter())
     })
 }
 
@@ -800,7 +816,7 @@ pub fn vars<R: Readable>(
     id_filter: Option<String>,
     with_snapshot: bool,
 ) -> Result<Value, String> {
-    let snap = snapshot.get(&0);
+    let snap = matching_variable_snapshot(variables, snapshot);
     let code_of = |vid: &str| {
         snap.as_ref().and_then(|s| {
             s.variables

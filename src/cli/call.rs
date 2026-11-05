@@ -20,9 +20,14 @@ use super::{Db, open_store_checked, write_json};
 /// previous snapshot untouched; a valid one replaces it atomically
 /// (`store::replace_variable_snapshot`), removing variables and
 /// collections absent from the new export.
-pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String> {
+pub(super) fn cmd_import_variables(
+    db: &Db,
+    path: PathBuf,
+    allow_empty: bool,
+    dry_run: bool,
+) -> Result<(), String> {
     let invalid = |e: String| format!("invalid variables file {}: {e}", path.display());
-    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let bytes = std::fs::read(&path).map_err(|e| invalid(e.to_string()))?;
     let v: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
     crate::vars::check_import_entries(&v).map_err(|e| invalid(e.to_string()))?;
     let parsed = crate::vars::parse_variables_snapshot(
@@ -32,19 +37,41 @@ pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String>
     )
     .map_err(|e| invalid(e.to_string()))?;
 
-    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
-    let prior = st.rtx(|(_, _, _, _, variables, collections, ..)| {
-        crate::store::collect_variable_ids(&variables, &collections)
-    });
-    let churn =
-        crate::store::replace_variable_snapshot(&mut st, &prior, &parsed.recs, parsed.snapshot);
-
     let imported = parsed
         .recs
         .iter()
         .filter(|(id, _)| matches!(id, Id::Variable(_)))
         .count();
-    write_json(&json!({"imported": imported, "removed": churn.removed}))
+    // Previewing a new destination must not create a store just to discover
+    // that it contains no prior variables.
+    if dry_run && !db.path.exists() {
+        return write_json(&json!({"imported": imported, "removed": 0, "removed_ids": []}));
+    }
+    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let prior = st.rtx(|(_, _, _, _, variables, collections, ..)| {
+        crate::store::collect_variable_ids(&variables, &collections)
+    });
+    let live: std::collections::BTreeSet<_> = parsed.recs.iter().map(|(id, _)| id).collect();
+    let removed_ids: Vec<_> = prior
+        .iter()
+        .filter_map(|id| match id {
+            Id::Variable(id_string) if !live.contains(id) => Some(id_string.clone()),
+            _ => None,
+        })
+        .collect();
+    if dry_run {
+        return write_json(
+            &json!({"imported": imported, "removed": removed_ids.len(), "removed_ids": removed_ids}),
+        );
+    }
+    if imported == 0 && !allow_empty && prior.iter().any(|id| matches!(id, Id::Variable(_))) {
+        return Err(invalid(
+            "empty export would remove stored variables; pass --allow-empty to replace them"
+                .to_string(),
+        ));
+    }
+    crate::store::replace_variable_snapshot(&mut st, &prior, &parsed.recs, parsed.snapshot);
+    write_json(&json!({"imported": imported, "removed": removed_ids.len()}))
 }
 
 /// Probe `upstream_url` unless `no_upstream`, matching `figmog serve`'s own

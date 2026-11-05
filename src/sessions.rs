@@ -163,7 +163,8 @@ impl FileSession {
             // status query then answers with null file fields plus the
             // `variables` summary. Readiness stays false either way — a
             // snapshot is not a mirrored file. With no variable state the
-            // query reports "no mirror here", so keep the bare shape.
+            // query reports "no mirror here", so retain the lifecycle
+            // shape and include the same empty variable summary.
             self.dispatch("figmog_status", &json!({}))
                 .ok()
                 .and_then(|output| match output {
@@ -172,7 +173,8 @@ impl FileSession {
                 })
                 .unwrap_or_else(|| {
                     json!({"name": null, "version": null, "last_modified": null,
-                        "synced_at_unix_ms": null, "nodes": 0})
+                        "synced_at_unix_ms": null, "nodes": 0,
+                        "variables": self.variable_snapshot()})
                 })
         };
         value["ready"] = json!(self.mirrored);
@@ -181,7 +183,10 @@ impl FileSession {
     }
 
     pub(crate) fn dispatch(&self, name: &str, args: &Value) -> Result<ToolOutput, String> {
-        if !self.mirrored && name != "figmog_status" {
+        if !self.mirrored
+            && name != "figmog_status"
+            && !(name == "figmog_vars" && self.has_variable_state())
+        {
             return Err(format!(
                 "mirror {} is not ready; inspect figmog_status or figmog_files for pull progress and errors",
                 self.key
@@ -192,6 +197,18 @@ impl FileSession {
                 .ok_or_else(|| format!("unknown tool: {name}"))?
                 .map(ToolOutput::Json)
         })
+    }
+
+    fn variable_snapshot(&self) -> Value {
+        self.view.with_dependent(
+            |_, (_, _, _, _, variables, collections, _, _, _, _, _, snapshot)| {
+                crate::query::variable_snapshot(variables, collections, snapshot)
+            },
+        )
+    }
+
+    pub(crate) fn has_variable_state(&self) -> bool {
+        self.variable_snapshot()["state"] != "none"
     }
 
     fn new_job(&mut self) -> Job {
@@ -588,9 +605,9 @@ pub(crate) fn open_session_with_hooks(
                         // potentially large image blobs merely to evict none.
                         if prior_version.as_deref() != Some(version.as_str()) {
                             let mut stale =
-                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, _, _))| {
+                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, pins, _))| {
                                     let mut ids = store::stale_cache_ids(&cache, &version);
-                                    ids.extend(store::stale_image_ids(&images, &version));
+                                    ids.extend(store::stale_image_ids(&images, &pins, &version));
                                     ids
                                 });
                             if !stale.is_empty() {
@@ -743,7 +760,10 @@ impl SessionManager {
                 .find(|s| s.key == key)
                 .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?
         };
-        if !session.mirrored && session.job.is_none() {
+        // Imported variables already answer status/vars without a file
+        // pull. Data reads still request the missing mirror in serve's
+        // tool handler; status alone must not create a failed pull job.
+        if !session.mirrored && session.job.is_none() && !session.has_variable_state() {
             session.request_pull(false, interval);
         }
         Ok(session)

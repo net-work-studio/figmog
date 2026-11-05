@@ -272,7 +272,8 @@ pub struct Churn {
 /// (`collect_variable_ids`, spec §12 — an Enterprise `variables_local`
 /// pull makes them file state for that cycle).
 /// A [`Id::VariableSnapshot`] row in `flattened.recs` is written but
-/// excluded from the returned [`Churn`] (NWS-2961).
+/// excluded from added/unchanged counts. A change to its per-variable code
+/// metadata increments `changed` once; provenance-only changes do not.
 pub fn sync<P: Push<Keyed<Id, Rec>>>(
     st: &mut KeyedStream<Id, Rec, P>,
     prior_sweepable: &BTreeSet<Id>,
@@ -291,12 +292,15 @@ pub fn sync<P: Push<Keyed<Id, Rec>>>(
     st.wtx(|tx| {
         for (id, rec) in &flattened.recs {
             let previous = tx.upsert(id, rec);
-            // The variable-snapshot provenance row (NWS-2961) is written in
-            // this same transaction but, like the meta row, is bookkeeping
-            // about the records rather than one of them: it never counts in
-            // churn, so an Enterprise pull's numbers mean what they did
-            // before the row existed.
-            if matches!(id, Id::VariableSnapshot) {
+            // Code names and publishing flags are user-visible variable state.
+            // Count a metadata edit once while excluding provenance-only changes
+            // and the first snapshot row (including upgrades) from churn.
+            if let Rec::VariableSnapshot(new) = rec {
+                if let Some(Rec::VariableSnapshot(old)) = previous
+                    && old.variables != new.variables
+                {
+                    churn.changed += 1;
+                }
                 continue;
             }
             match previous {
@@ -449,8 +453,11 @@ pub fn stale_cache_ids<R: fold::stream::Readable>(
 /// Each stale key yields both its `ImageBlob` row and its `ImagePin`
 /// marker id (NWS-2960) so markers never outlive the row they mark;
 /// removing an absent marker (fill rows, legacy renders) is a no-op.
+/// Also collects orphaned markers and markers whose version differs from
+/// their image row, which older binaries can leave behind.
 pub fn stale_image_ids<R: fold::stream::Readable>(
     images: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImageBlobRec>,
+    pins: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImagePinRec>,
     current_version: &str,
 ) -> Vec<Id> {
     #[cfg(test)]
@@ -458,11 +465,18 @@ pub fn stale_image_ids<R: fold::stream::Readable>(
         let (cache, images) = counts.get();
         counts.set((cache, images + 1));
     });
-    images
+    let mut stale: BTreeSet<Id> = images
         .iter()
         .filter(|(_, rec)| rec.file_version != current_version)
         .flat_map(|(k, _)| [Id::ImageBlob(k.clone()), Id::ImagePin(k)])
-        .collect()
+        .collect();
+    // An older binary can evict/rewrite image rows without maintaining pins.
+    // Remove their orphaned or mismatched markers on the next version sweep.
+    stale.extend(pins.iter().filter_map(|(key, pin)| match images.get(&key) {
+        Some(image) if image.file_version == pin.file_version => None,
+        _ => Some(Id::ImagePin(key)),
+    }));
+    stale.into_iter().collect()
 }
 
 /// Remove `stale` rows in one write transaction. Never touches variables,
