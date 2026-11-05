@@ -14,25 +14,36 @@ use crate::upstream::{HttpUpstream, UpstreamMcp};
 use super::pull::do_pull;
 use super::{Db, open_store_checked, write_json};
 
+/// `figmog import-variables <export.json>`: replace the stored variable
+/// snapshot (NWS-2961). The file is read, parsed and validated before the
+/// store is opened, so an unreadable or invalid file is rejected with the
+/// previous snapshot untouched; a valid one replaces it atomically
+/// (`store::replace_variable_snapshot`), removing variables and
+/// collections absent from the new export.
 pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String> {
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let v: Value =
-        serde_json::from_str(&content).map_err(|e| format!("parsing {}: {e}", path.display()))?;
-    let recs = crate::vars::parse_variables_export(&v).map_err(|e| e.to_string())?;
+    let invalid = |e: String| format!("invalid variables file {}: {e}", path.display());
+    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    let parsed = crate::vars::parse_variables_snapshot(
+        &v,
+        crate::vars::SOURCE_FILE,
+        crate::vars::snapshot_digest(&bytes),
+    )
+    .map_err(|e| invalid(e.to_string()))?;
 
     let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
-    st.wtx(|tx| {
-        for (id, rec) in &recs {
-            tx.upsert(id, rec);
-        }
+    let prior = st.rtx(|(_, _, _, _, variables, collections, ..)| {
+        crate::store::collect_variable_ids(&variables, &collections)
     });
+    let churn =
+        crate::store::replace_variable_snapshot(&mut st, &prior, &parsed.recs, parsed.snapshot);
 
-    let imported = recs
+    let imported = parsed
+        .recs
         .iter()
         .filter(|(id, _)| matches!(id, Id::Variable(_)))
         .count();
-    write_json(&json!({"imported": imported}))
+    write_json(&json!({"imported": imported, "removed": churn.removed}))
 }
 
 /// Probe `upstream_url` unless `no_upstream`, matching `figmog serve`'s own

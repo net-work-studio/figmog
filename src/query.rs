@@ -12,6 +12,7 @@ use fold::stream::Readable;
 use crate::ident::normalize_node_ref;
 use crate::model::{
     ComponentRec, ComponentSetRec, FileMeta, NodeRec, StyleRec, VariableCollectionRec, VariableRec,
+    VariableSnapshotRec,
 };
 
 #[cfg(test)]
@@ -123,10 +124,14 @@ fn resolved_variables<R: Readable>(
     Value::Array(arr)
 }
 
-/// File name, version, last modified, node count.
+/// File name, version, last modified, node count, and the variable
+/// snapshot summary ([`variable_snapshot`]) under `variables`.
 pub fn status<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     meta: &TableReader<'_, R, u8, FileMeta>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
 ) -> Result<Value, String> {
     let m = meta
         .get(&0)
@@ -138,7 +143,44 @@ pub fn status<R: Readable>(
         "last_modified": m.last_modified,
         "synced_at_unix_ms": m.synced_at_unix_ms,
         "nodes": count,
+        "variables": variable_snapshot(variables, variable_collections, snapshot),
     }))
+}
+
+/// The variable snapshot's state and provenance (NWS-2961). `state` is:
+/// - `"none"`: no snapshot row and no variables/collections stored;
+/// - `"legacy"`: variables or collections stored without a snapshot row
+///   (imported or pulled before provenance was recorded) — provenance
+///   fields are null;
+/// - `"empty"`: a snapshot row whose export held no variables;
+/// - `"current"`: a snapshot row with at least one variable.
+///
+/// A rejected (invalid) import never reaches the store, so it has no
+/// state of its own: the previous snapshot's state stands.
+pub fn variable_snapshot<R: Readable>(
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
+) -> Value {
+    let var_count = variables.iter().count();
+    let collection_count = variable_collections.iter().count();
+    let snap = snapshot.get(&0);
+    let state = match (&snap, var_count, collection_count) {
+        (Some(_), 0, _) => "empty",
+        (Some(_), _, _) => "current",
+        (None, 0, 0) => "none",
+        (None, _, _) => "legacy",
+    };
+    json!({
+        "state": state,
+        "source": snap.as_ref().map(|s| s.source.clone()),
+        "format": snap.as_ref().map(|s| s.format.clone()),
+        "format_version": snap.as_ref().and_then(|s| s.format_version.clone()),
+        "exported_at": snap.as_ref().and_then(|s| s.exported_at.clone()),
+        "digest": snap.as_ref().map(|s| s.digest.clone()),
+        "variables": var_count,
+        "collections": collection_count,
+    })
 }
 
 /// List pages, ordered by document child index.
@@ -669,12 +711,27 @@ pub fn uses<R: Readable>(
 }
 
 /// Variables: authoritative if imported, else inferred from bindings.
+/// Authoritative rows also carry `code_syntax`, `hidden_from_publishing`
+/// and `remote` from the snapshot row (null for a legacy snapshot). With
+/// `with_snapshot`, the result is `{snapshot, variables}` — the
+/// [`variable_snapshot`] summary next to the usual row array.
 pub fn vars<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     variables: &TableReader<'_, R, String, VariableRec>,
     variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
     id_filter: Option<String>,
+    with_snapshot: bool,
 ) -> Result<Value, String> {
+    let snap = snapshot.get(&0);
+    let code_of = |vid: &str| {
+        snap.as_ref().and_then(|s| {
+            s.variables
+                .binary_search_by(|c| c.id.as_str().cmp(vid))
+                .ok()
+                .map(|i| &s.variables[i])
+        })
+    };
     let owned_nodes: Vec<NodeRec> = nodes.iter().map(|(_, n)| n).collect();
     let inferred = crate::vars::infer_from_nodes(owned_nodes.iter());
     let mut inferred_by_id: HashMap<String, crate::vars::VarUsage> = inferred
@@ -706,9 +763,18 @@ pub fn vars<R: Readable>(
                     let val: Value = serde_json::from_str(val_str).unwrap_or(Value::Null);
                     values_by_mode.insert(mode_name, val);
                 }
+                let code = code_of(vid);
                 json!({
                     "variable_id": vid,
                     "source": "imported",
+                    "code_syntax": code.map(|c| {
+                        c.code_syntax
+                            .iter()
+                            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                            .collect::<serde_json::Map<_, _>>()
+                    }),
+                    "hidden_from_publishing": code.map(|c| c.hidden_from_publishing),
+                    "remote": code.map(|c| c.remote),
                     "name": var.name,
                     "resolved_type": var.resolved_type,
                     "collection": collection.map(|c| c.name),
@@ -726,6 +792,12 @@ pub fn vars<R: Readable>(
             }
         })
         .collect();
+    if with_snapshot {
+        return Ok(json!({
+            "snapshot": variable_snapshot(variables, variable_collections, snapshot),
+            "variables": rows,
+        }));
+    }
     Ok(Value::Array(rows))
 }
 

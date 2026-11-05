@@ -124,7 +124,7 @@ fn fetch_direct(
     let scale_m = images::scale_milli(scale);
     let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
     let scanned = st.rtx(
-        |((nodes, ..), _, _, _, _, _, meta, _, _, images_table, pins)| {
+        |((nodes, ..), _, _, _, _, _, meta, _, _, images_table, pins, _)| {
             images::scan(
                 &nodes,
                 &meta,

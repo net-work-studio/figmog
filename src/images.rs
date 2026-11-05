@@ -1159,9 +1159,11 @@ mod tests {
         });
 
         let ids = vec![requested_id.clone()];
-        let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images, pins)| {
-            scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
-        });
+        let scanned = st.rtx(
+            |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
+                scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
+            },
+        );
         assert!(
             !scanned.render_hits.contains_key(&requested_id),
             "a key-hash collision must never be served as a cache hit"
@@ -1195,9 +1197,11 @@ mod tests {
         });
 
         let ids = vec![requested_id.clone()];
-        let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images, pins)| {
-            scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
-        });
+        let scanned = st.rtx(
+            |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
+                scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
+            },
+        );
         assert!(
             !scanned.render_hits.contains_key(&requested_id),
             "a format/scale mismatch under the same key must never be served"
@@ -1209,17 +1213,19 @@ mod tests {
     /// this test suite proves end to end.
     macro_rules! scan_and_resolve {
         ($st:expr, $api:expr, $download:expr, $ids:expr, $format:expr, $scale:expr) => {{
-            let scanned = $st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images, pins)| {
-                scan(
-                    &nodes,
-                    &meta,
-                    &images,
-                    &pins,
-                    $ids,
-                    $format,
-                    scale_milli($scale),
-                )
-            });
+            let scanned = $st.rtx(
+                |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
+                    scan(
+                        &nodes,
+                        &meta,
+                        &images,
+                        &pins,
+                        $ids,
+                        $format,
+                        scale_milli($scale),
+                    )
+                },
+            );
             resolve(
                 &mut $st,
                 scanned,
@@ -1415,8 +1421,8 @@ mod tests {
         );
 
         let key = image_key(RENDER, "1:2", "png", 1000);
-        let (row, pin) =
-            st.rtx(|(_, _, _, _, _, _, _, _, _, images, pins)| (images.get(&key), pins.get(&key)));
+        let (row, pin) = st
+            .rtx(|(_, _, _, _, _, _, _, _, _, images, pins, _)| (images.get(&key), pins.get(&key)));
         assert_eq!(row.unwrap().file_version, "100");
         assert_eq!(
             pin,

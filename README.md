@@ -208,7 +208,11 @@ On Enterprise, every pull also fetches `variables/local` and folds those
 records in. Elsewhere figmog inverts the `boundVariables` references Figma
 bakes into the file JSON, which covers each variable's default-mode value.
 `figmog import-variables <export.json>` takes a full-fidelity export from
-Figma's plugin console on any plan. See `docs/SPEC.md` §9.
+Figma's plugin console on any plan. Each import replaces the previous
+snapshot, so tokens deleted in Figma disappear on re-import; an invalid
+file is rejected and the last good snapshot kept. `figmog vars --snapshot`
+and `figmog status` report the snapshot's state and provenance. See
+`docs/SPEC.md` §9.
 
 ### The tools
 

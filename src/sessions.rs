@@ -508,8 +508,8 @@ pub(crate) fn open_session_with_hooks(
     };
     let view = make_view(st.rtx(|(snapshot, _)| snapshot.clone()));
     let mirrored =
-        view.with_dependent(|_, (_, _, _, _, _, _, meta, _, _, _, _)| meta.get(&0).is_some());
-    let geometry = view.with_dependent(|_, (.., config, _, _)| store::read_geometry(config));
+        view.with_dependent(|_, (_, _, _, _, _, _, meta, _, _, _, _, _)| meta.get(&0).is_some());
+    let geometry = view.with_dependent(|_, (.., config, _, _, _)| store::read_geometry(config));
     let (commands, work) = mpsc::sync_channel(1);
     let (done, completions) = mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -542,7 +542,7 @@ pub(crate) fn open_session_with_hooks(
                             PullError::from(crate::auth::missing_token("network pulls"))
                         })?;
                         let stored =
-                            st.rtx(|(_, (.., config, _, _))| store::read_geometry(&config));
+                            st.rtx(|(_, (.., config, _, _, _))| store::read_geometry(&config));
                         let geometry = store::effective_geometry(geometry, stored);
                         phase(PullPhase::Fetching);
                         let response = api.file(key, geometry)?;
@@ -556,7 +556,7 @@ pub(crate) fn open_session_with_hooks(
                             });
                         if let Some(vars) = vars {
                             flattened.recs.extend(
-                                crate::vars::parse_variables_export(&vars)
+                                crate::vars::enterprise_snapshot_recs(&vars)
                                     .map_err(|e| PullError::from(e.to_string()))?,
                             );
                             prior.extend(st.rtx(|(_, (_, _, _, _, vars, collections, ..))| {
@@ -564,16 +564,17 @@ pub(crate) fn open_session_with_hooks(
                             }));
                         }
                         phase(PullPhase::Applying);
-                        let prior_version = st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _))| {
-                            meta.get(&0).map(|meta| meta.version.clone())
-                        });
+                        let prior_version =
+                            st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _, _))| {
+                                meta.get(&0).map(|meta| meta.version.clone())
+                            });
                         let churn = store::sync(&mut st, &prior, &flattened, now_ms());
                         let version = flattened.file.version.clone();
                         // Match direct pulls: unchanged versions avoid decoding
                         // potentially large image blobs merely to evict none.
                         if prior_version.as_deref() != Some(version.as_str()) {
                             let mut stale =
-                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, _))| {
+                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, _, _))| {
                                     let mut ids = store::stale_cache_ids(&cache, &version);
                                     ids.extend(store::stale_image_ids(&images, &version));
                                     ids
@@ -614,7 +615,7 @@ pub(crate) fn open_session_with_hooks(
                 } => {
                     let node_ids = crate::images::normalize_ids(&ids);
                     let scanned = st.rtx(
-                        |(_, ((nodes, ..), _, _, _, _, _, meta, _, _, images, pins))| {
+                        |(_, ((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _))| {
                             crate::images::scan(
                                 &nodes,
                                 &meta,

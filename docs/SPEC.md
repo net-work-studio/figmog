@@ -43,7 +43,7 @@ Two commands spend Figma's API budget deliberately and explicitly: `pull`
                          │  store.rs                │  figmog_pipeline! (fold)
                          │  sync() — upsert + sweep │  KeyedStream<Id, Rec, _>
                          └────────────┬─────────────┘
-                                      │ 16 materialized sinks (frozen names)
+                                      │ 18 materialized sinks (frozen names)
                                       ▼
                          ┌─────────────────────────┐
                          │  query.rs                 │  one source of truth for
@@ -109,12 +109,13 @@ matching [`Rec`](../src/model.rs) variant:
 | `MirrorConfig` | `MirrorConfigRec` | one row: this mirror's sticky pull settings (§14) |
 | `ImageBlob(String)` | `ImageBlobRec` | cached render and fill bytes (§15) |
 | `ImagePin(String)` | `ImagePinRec` | version-pin marker for one cached render row (§15) |
+| `VariableSnapshot` | `VariableSnapshotRec` | one row: provenance and code names of the stored variable snapshot (§9) |
 
 `Id`/`Rec` are **append-only enums** — postcard encodes variant indices
 positionally, so inserting a new variant anywhere but the end would
-silently corrupt every existing on-disk store. `ImagePin` is the most
-recent addition and sits last in both enums (`ImageBlob` immediately
-before it); the next new record kind goes after `ImagePin`, never
+silently corrupt every existing on-disk store. `VariableSnapshot` is the
+most recent addition and sits last in both enums (`ImagePin` immediately
+before it); the next new record kind goes after `VariableSnapshot`, never
 between existing variants. The same rule is why a new setting arrives as
 a new record kind rather than a new field on an existing `Rec` struct:
 struct fields are positional too, so widening `FileMeta` would break
@@ -157,6 +158,20 @@ whose `file_version` equals the row's. It is a separate record kind
 rather than a new `ImageBlobRec` field for the same reason as
 `MirrorConfig`. Fill rows carry no marker.
 
+`VariableSnapshotRec` (§9): `source` (`"file"` for `import-variables`,
+`"enterprise_rest"` for a pull's `variables/local` fetch), `format`
+(detected export shape: `"rest"` for `{meta: …}`, `"bare"` for the
+plugin-console object), `format_version` and `exported_at` (the export's
+top-level `formatVersion`/`exportedAt`, `None` when absent — no current
+exporter emits them), `digest` (`fnv1a64:<hex>` over the raw file bytes,
+or over a pulled response's canonical JSON — a change detector, not an
+integrity proof), and `variables`: one `VariableCodeRec { id,
+code_syntax, hidden_from_publishing, remote }` per variable, sorted by
+id, with `code_syntax` as sorted `(platform, name)` pairs from
+`codeSyntax`. It is written in the same transaction as the snapshot it
+describes. A separate record kind rather than new `VariableRec` fields
+for the same reason as `MirrorConfig`.
+
 **Determinism contract:** every map-shaped field is a sorted `Vec` of
 pairs; every canonical-JSON string comes from `serde_json` without
 `preserve_order` (`serde_json::Value` is `BTreeMap`-backed here, so
@@ -167,7 +182,7 @@ detector. No `HashMap` iteration ever reaches an output boundary.
 
 ## 4. Pipeline and sinks
 
-`store::figmog_pipeline!()` wires the flattened records into 16
+`store::figmog_pipeline!()` wires the flattened records into 18
 `fold` terminal sinks, keyed off `store.rs`'s pure branch functions
 (`node_only`, `child_edge`, `text_doc`, `instance_edge`, `style_edges`,
 `variable_edges`, `type_edge`, plus one `rec_branch!`-generated filter per
@@ -193,12 +208,14 @@ is a breaking store-format change:
 | `mirror_config` | Table | `0u8` (one row, like `meta`) | sticky pull settings (§14) |
 | `images` | Table | image cache key hash | render/fill byte caching (§15) |
 | `image_pins` | Table | image cache key hash | render version-pin markers (§15) |
+| `variable_snapshot` | Table | `0u8` (one row, like `meta`) | variable snapshot state and provenance (§9) |
 
-`mirror_config`, `images` and `image_pins` are appended at the pipeline
-root's tail, so the reader tuple grows at the end and older stores keep
-decoding (a store created before `image_pins` existed opens with that
-sink empty). All three sit outside `collect_sweepable` (§5): a file sync never removes a config
-row, and image rows are evicted by version instead.
+`mirror_config`, `images`, `image_pins` and `variable_snapshot` are
+appended at the pipeline root's tail, so the reader tuple grows at the
+end and older stores keep decoding (a store created before `image_pins`
+or `variable_snapshot` existed opens with that sink empty). All four sit
+outside `collect_sweepable` (§5): a file sync never removes a config or
+snapshot row, and image rows are evicted by version instead.
 
 `bound_to`'s edges are deliberately not deduped before feeding the
 inverted index: `InvertedIndex` is set-semantic, so duplicate `(node,
@@ -220,8 +237,10 @@ that cycle via `collect_variable_ids` — i.e. only on a pull that actually
 fetched an Enterprise `variables/local` export this time. On a
 non-Enterprise or `--from-file` pull, stored variables sit entirely
 outside `sync`'s live/sweep accounting: manually imported records persist
-across ordinary pulls indefinitely (§9). The meta row is never
-sweepable.
+across ordinary pulls until the next import replaces them (§9). The meta
+row is never sweepable. `import-variables` uses the same
+`collect_variable_ids` sweep set in its own transaction
+(`store::replace_variable_snapshot`).
 
 **Idempotence:** re-syncing byte-identical records is a no-op through the
 whole pipeline — `unchanged` increments, no index writes happen. A
@@ -455,7 +474,8 @@ zero Figma API cost; `figmog_sync` and `figmog_open` schedule pulls, and `figmog
 those three are the local tools that spend Figma's rate budget.
 `figmog_status`'s result also carries
 `upstream: "connected" | "unreachable" | "disabled"`, spliced in at the
-call site that knows it (never inside `query::status` itself).
+call site that knows it (never inside `query::status` itself), and the
+variable snapshot summary under `variables` (§9).
 `figmog_open` also takes an optional `geometry` boolean (§14).
 
 The 19 per-file tools each carry the optional `file` property described
@@ -582,7 +602,10 @@ Three layers, each covering what the one above can't:
    records into the same sync, kept live (swept like any other file
    state, §5). `Ok(None)` (403/404 on a non-Enterprise plan) is not an
    error and is silently skipped, falling through to the two paths below.
-   `--from-file` pulls never call it (no network involved).
+   `--from-file` pulls never call it (no network involved). A `Some`
+   pull also writes the `VariableSnapshot` row (`source:
+   "enterprise_rest"`) into the same sync, so it counts in that pull's
+   churn like any other record.
 2. **Mirrored bindings + inference (always on).** Every node's
    `bound_variables` plus Figma's own baked-in resolved value are scanned
    at read time (`vars::infer_from_nodes`) into per-variable usage
@@ -590,16 +613,49 @@ Three layers, each covering what the one above can't:
    default-mode value only; a non-default mode's value is visible only
    where a frame explicitly overrides that mode.
 3. **Manual import (optional).** `figmog import-variables <export.json>`
-   (`vars::parse_variables_export`) upserts the same full-fidelity
+   (`vars::parse_variables_snapshot`) writes the same full-fidelity
    records auto-sync would, from either the Enterprise REST shape or the
    bare object a Figma plugin-console export produces (any plan, via the
-   Plugin API run from Figma's own developer console). Unlike auto-synced
-   records, manually imported ones are **not** swept by a later pull with
-   no Enterprise export of its own — they persist until re-imported or
+   Plugin API run from Figma's own developer console). **An import is one
+   atomic snapshot that replaces the previous one:** in a single write
+   transaction it upserts every record and the `VariableSnapshot` row
+   (`source: "file"`) and removes every stored variable and collection
+   absent from the new export — whether it came from an earlier import,
+   an Enterprise pull, or a pre-snapshot store. It prints `{"imported":
+   <variables>, "removed": <variables + collections swept>}`. A later
+   pull with no Enterprise export of its own never sweeps imported
+   records; they persist until the next import, an Enterprise pull, or
    `pull --fresh` (which wipes the whole store, imports included).
+
+   **Invalid files are rejected whole.** The file is read, parsed and
+   validated (top-level `variables` and `variableCollections` objects,
+   every entry an object) before the store is opened; an unreadable,
+   non-JSON or wrongly shaped file exits 1 with `invalid variables file
+   …` and leaves the previous snapshot — records and provenance —
+   untouched. A rejected attempt is not persisted, so "invalid" is the
+   import command's error, never a stored state.
+
+**Snapshot states** (`query::variable_snapshot`), reported as
+`variables` in `figmog status`/`figmog_status` and as `snapshot` by
+`figmog vars --snapshot`/`figmog_vars {snapshot: true}`:
+
+| `state` | meaning |
+|---|---|
+| `none` | no snapshot row and no variables or collections stored |
+| `legacy` | variables or collections stored without a snapshot row (written before provenance existed); provenance fields are null |
+| `empty` | a snapshot row whose export held no variables |
+| `current` | a snapshot row with at least one variable |
+
+Each summary also carries `source`, `format`, `format_version`,
+`exported_at`, `digest` (null without a snapshot row) and the stored
+`variables`/`collections` counts.
 
 `figmog vars`/`figmog_vars` prefer an authoritative record (auto-synced
 or imported) over inference whenever one exists for a given variable id.
+Authoritative rows also carry `code_syntax` (platform → name object),
+`hidden_from_publishing` and `remote` from the snapshot row — null for a
+legacy snapshot. Without `--snapshot`/`snapshot: true` the result stays
+the plain row array; with it, `{snapshot, variables}`.
 
 ## 10. CLI surface
 

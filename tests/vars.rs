@@ -110,3 +110,278 @@ fn style_values_come_from_consumers() {
         "no fills on the text node"
     );
 }
+
+// ---- NWS-2961: imports replace the previous snapshot, with provenance ----
+
+use serde_json::{Value, json};
+
+fn run_ok(db: &std::path::Path, args: &[&str]) -> Value {
+    let out = common::command()
+        .args(args)
+        .args(["--db", db.to_str().unwrap()])
+        .assert()
+        .success();
+    serde_json::from_slice(&out.get_output().stdout).unwrap()
+}
+
+fn import(dir: &std::path::Path, db: &std::path::Path, name: &str, body: &[u8]) -> Value {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    run_ok(db, &["import-variables", path.to_str().unwrap()])
+}
+
+fn import_err(dir: &std::path::Path, db: &std::path::Path, name: &str, body: &[u8]) {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    let out = common::command()
+        .args(["import-variables", path.to_str().unwrap()])
+        .args(["--db", db.to_str().unwrap()])
+        .assert()
+        .failure();
+    let err = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(err.contains("invalid variables file"), "{err}");
+}
+
+fn row<'a>(vars: &'a Value, id: &str) -> Option<&'a Value> {
+    vars.as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["variable_id"] == id)
+}
+
+#[test]
+fn reimport_removes_deleted_token_and_collection() {
+    let (dir, db) = common::fixture_db();
+    let first = import(
+        dir.path(),
+        &db,
+        "a.json",
+        include_bytes!("fixtures/variables-export.json"),
+    );
+    assert_eq!(first, json!({"imported": 3, "removed": 0}));
+
+    // Delete one token (VariableID:101) — re-import must drop it.
+    let mut v = export();
+    v["meta"]["variables"]
+        .as_object_mut()
+        .unwrap()
+        .remove("VariableID:101");
+    let second = import(dir.path(), &db, "b.json", &serde_json::to_vec(&v).unwrap());
+    assert_eq!(second, json!({"imported": 2, "removed": 1}));
+    let vars = run_ok(&db, &["vars"]);
+    assert!(row(&vars, "VariableID:101").is_none(), "deleted token gone");
+    assert_eq!(row(&vars, "VariableID:100").unwrap()["source"], "imported");
+
+    // Delete a whole collection and its only variable. VariableID:200 is
+    // still bound in the mirrored file, so it falls back to inference.
+    v["meta"]["variables"]
+        .as_object_mut()
+        .unwrap()
+        .remove("VariableID:200");
+    v["meta"]["variableCollections"]
+        .as_object_mut()
+        .unwrap()
+        .remove("VariableCollectionId:2");
+    let third = import(dir.path(), &db, "c.json", &serde_json::to_vec(&v).unwrap());
+    assert_eq!(third, json!({"imported": 1, "removed": 2}));
+    let out = run_ok(&db, &["vars", "--snapshot"]);
+    assert_eq!(out["snapshot"]["variables"], 1);
+    assert_eq!(out["snapshot"]["collections"], 1);
+    assert_eq!(
+        row(&out["variables"], "VariableID:200").unwrap()["source"],
+        "inferred"
+    );
+}
+
+#[test]
+fn invalid_file_leaves_previous_snapshot_untouched() {
+    let (dir, db) = common::fixture_db();
+    import(
+        dir.path(),
+        &db,
+        "good.json",
+        include_bytes!("fixtures/variables-export.json"),
+    );
+    let before = run_ok(&db, &["vars", "--snapshot"]);
+    let status_before = run_ok(&db, &["status"]);
+
+    import_err(dir.path(), &db, "notjson.json", b"{ not json");
+    import_err(dir.path(), &db, "shape.json", br#"{"variables": {}}"#);
+    import_err(
+        dir.path(),
+        &db,
+        "entry.json",
+        br#"{"variables": {"VariableID:1": 7}, "variableCollections": {}}"#,
+    );
+
+    assert_eq!(run_ok(&db, &["vars", "--snapshot"]), before);
+    assert_eq!(run_ok(&db, &["status"]), status_before);
+    assert_eq!(before["snapshot"]["state"], "current");
+}
+
+#[test]
+fn provenance_and_code_names_are_readable_in_vars() {
+    let (dir, db) = common::fixture_db();
+    let mut bare = export()["meta"].clone();
+    bare["exportedAt"] = json!("2026-10-01T12:00:00Z");
+    bare["formatVersion"] = json!(1);
+    let bytes = serde_json::to_vec(&bare).unwrap();
+    import(dir.path(), &db, "bare.json", &bytes);
+
+    let out = run_ok(&db, &["vars", "--snapshot"]);
+    let snap = &out["snapshot"];
+    assert_eq!(snap["state"], "current");
+    assert_eq!(snap["source"], "file");
+    assert_eq!(snap["format"], "bare");
+    assert_eq!(snap["format_version"], "1");
+    assert_eq!(snap["exported_at"], "2026-10-01T12:00:00Z");
+    assert_eq!(
+        snap["digest"],
+        figmog::vars::snapshot_digest(&bytes),
+        "digest covers the raw file bytes"
+    );
+
+    let v100 = row(&out["variables"], "VariableID:100").unwrap();
+    assert_eq!(
+        v100["code_syntax"],
+        json!({"ANDROID": "color_surface_primary", "WEB": "--color-surface-primary",
+               "iOS": "colorSurfacePrimary"})
+    );
+    assert_eq!(v100["hidden_from_publishing"], false);
+    assert_eq!(v100["remote"], false);
+    let v101 = row(&out["variables"], "VariableID:101").unwrap();
+    assert_eq!(v101["code_syntax"], json!({}));
+    assert_eq!(v101["hidden_from_publishing"], true);
+
+    // The REST shape (no timestamp) records its own format and no time.
+    import(
+        dir.path(),
+        &db,
+        "rest.json",
+        include_bytes!("fixtures/variables-export.json"),
+    );
+    let snap = run_ok(&db, &["vars", "--snapshot"])["snapshot"].clone();
+    assert_eq!(snap["format"], "rest");
+    assert_eq!(snap["exported_at"], Value::Null);
+    assert_eq!(snap["format_version"], Value::Null);
+
+    // The MCP tool path answers identically.
+    let call = run_ok(
+        &db,
+        &[
+            "call",
+            "figmog_vars",
+            "--no-upstream",
+            "--args",
+            r#"{"snapshot": true}"#,
+        ],
+    );
+    assert_eq!(call["snapshot"], snap);
+}
+
+#[test]
+fn snapshot_states_reported_in_vars_and_status() {
+    let (dir, db) = common::fixture_db();
+    let state = |db: &std::path::Path| {
+        let vars = run_ok(db, &["vars", "--snapshot"])["snapshot"]["state"].clone();
+        let status = run_ok(db, &["status"])["variables"]["state"].clone();
+        let call =
+            run_ok(db, &["call", "figmog_status", "--no-upstream"])["variables"]["state"].clone();
+        assert_eq!(vars, status);
+        assert_eq!(vars, call);
+        vars
+    };
+    assert_eq!(state(&db), "none");
+    // Plain `vars` keeps its array shape.
+    assert!(run_ok(&db, &["vars"]).is_array());
+
+    import(
+        dir.path(),
+        &db,
+        "a.json",
+        include_bytes!("fixtures/variables-export.json"),
+    );
+    assert_eq!(state(&db), "current");
+
+    let empty = import(
+        dir.path(),
+        &db,
+        "empty.json",
+        br#"{"variables": {}, "variableCollections": {}}"#,
+    );
+    assert_eq!(empty, json!({"imported": 0, "removed": 5}));
+    assert_eq!(state(&db), "empty");
+    let status = run_ok(&db, &["status"]);
+    assert_eq!(status["variables"]["source"], "file");
+    assert_eq!(status["variables"]["variables"], 0);
+}
+
+/// Old stores still open: variables written before the snapshot row
+/// existed read as `legacy` (provenance unknown, code names null), and the
+/// next import replaces them like any other snapshot.
+#[test]
+fn legacy_store_without_snapshot_row_reads_as_legacy() {
+    let (dir, db) = common::fixture_db();
+    {
+        let mut st = figmog::open_store!(&db);
+        let recs = parse_variables_export(&export()).unwrap();
+        st.wtx(|tx| {
+            for (id, rec) in &recs {
+                tx.upsert(id, rec);
+            }
+        });
+    }
+    let out = run_ok(&db, &["vars", "--snapshot"]);
+    assert_eq!(out["snapshot"]["state"], "legacy");
+    assert_eq!(out["snapshot"]["source"], Value::Null);
+    assert_eq!(out["snapshot"]["variables"], 3);
+    let v100 = row(&out["variables"], "VariableID:100").unwrap();
+    assert_eq!(v100["source"], "imported");
+    assert_eq!(v100["code_syntax"], Value::Null);
+    assert_eq!(run_ok(&db, &["status"])["variables"]["state"], "legacy");
+
+    let mut v = export();
+    v["meta"]["variables"]
+        .as_object_mut()
+        .unwrap()
+        .remove("VariableID:101");
+    let out = import(
+        dir.path(),
+        &db,
+        "new.json",
+        &serde_json::to_vec(&v).unwrap(),
+    );
+    assert_eq!(out, json!({"imported": 2, "removed": 1}));
+    assert_eq!(
+        run_ok(&db, &["vars", "--snapshot"])["snapshot"]["state"],
+        "current"
+    );
+}
+
+#[test]
+fn parses_code_names_into_snapshot() {
+    let parsed = figmog::vars::parse_variables_snapshot(&export(), "file", "d".into()).unwrap();
+    assert_eq!(parsed.recs, parse_variables_export(&export()).unwrap());
+    let s = parsed.snapshot;
+    assert_eq!(s.format, "rest");
+    let ids: Vec<&str> = s.variables.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["VariableID:100", "VariableID:101", "VariableID:200"]);
+    assert_eq!(
+        s.variables[0].code_syntax,
+        vec![
+            ("ANDROID".to_string(), "color_surface_primary".to_string()),
+            ("WEB".to_string(), "--color-surface-primary".to_string()),
+            ("iOS".to_string(), "colorSurfacePrimary".to_string()),
+        ]
+    );
+    assert!(s.variables[1].hidden_from_publishing);
+    assert!(!s.variables[2].remote);
+}
+
+#[test]
+fn non_object_entries_are_shape_errors() {
+    let bad = json!({"variables": {"V:1": "x"}, "variableCollections": {}});
+    assert!(parse_variables_export(&bad).is_err());
+    let bad = json!({"variables": {}, "variableCollections": {"C:1": []}});
+    assert!(parse_variables_export(&bad).is_err());
+}

@@ -31,9 +31,13 @@ pub enum Id {
     /// Render cache-generation marker for the [`Id::ImageBlob`] row under
     /// the same key (NWS-2960): present only for renders fetched with the
     /// request pinned to the mirrored file version. APPEND ONLY — see
-    /// [`Id::ProxyCache`]'s note; this must stay the last variant until
-    /// the next one is appended after it.
+    /// [`Id::ProxyCache`]'s note.
     ImagePin(String),
+    /// The single variable-snapshot provenance row (NWS-2961), one per
+    /// store, like [`Id::Meta`]. APPEND ONLY — see [`Id::ProxyCache`]'s
+    /// note; this must stay the last variant until the next one is
+    /// appended after it.
+    VariableSnapshot,
 }
 
 /// One mirrored record; variant always matches its [`Id`] variant.
@@ -54,6 +58,8 @@ pub enum Rec {
     ImageBlob(ImageBlobRec),
     /// See [`Id::ImagePin`]. APPEND ONLY — see [`Id::ProxyCache`]'s note.
     ImagePin(ImagePinRec),
+    /// See [`Id::VariableSnapshot`]. APPEND ONLY — see [`Id::ProxyCache`]'s note.
+    VariableSnapshot(VariableSnapshotRec),
 }
 
 /// One node of the document tree (children stripped from `raw`).
@@ -118,7 +124,8 @@ pub struct StyleRec {
     pub remote: bool,
 }
 
-/// Authoritative variable definition (from `import-variables` only).
+/// Authoritative variable definition (from `import-variables` or an
+/// Enterprise `variables/local` pull).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VariableRec {
     pub id: String,
@@ -131,7 +138,8 @@ pub struct VariableRec {
     pub scopes: Vec<String>,
 }
 
-/// Authoritative variable collection (from `import-variables` only).
+/// Authoritative variable collection (from `import-variables` or an
+/// Enterprise `variables/local` pull).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VariableCollectionRec {
     pub id: String,
@@ -240,6 +248,47 @@ pub struct ImagePinRec {
     pub file_version: String,
 }
 
+/// Provenance of the variable snapshot currently in the `variables` /
+/// `variable_collections` tables (key [`Id::VariableSnapshot`], NWS-2961),
+/// plus the per-variable publishing metadata the token pipeline needs.
+/// Written in the same transaction as the snapshot it describes — by
+/// `import-variables` (which replaces the previous snapshot) and by a
+/// network pull that fetched an Enterprise `variables/local` export. An
+/// absent row with variables stored means a pre-NWS-2961 ("legacy")
+/// snapshot of unknown provenance.
+///
+/// A separate record kind rather than new [`VariableRec`] fields, for the
+/// same reason as [`MirrorConfigRec`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariableSnapshotRec {
+    /// Where the snapshot came from: `"enterprise_rest"` (a pull's
+    /// `variables/local` fetch) or `"file"` (`import-variables`).
+    pub source: String,
+    /// Detected export shape: `"rest"` (`{meta: {...}}`, the REST
+    /// response) or `"bare"` (the plugin-console object).
+    pub format: String,
+    /// The export's top-level `formatVersion`, when it carries one.
+    pub format_version: Option<String>,
+    /// The export's top-level `exportedAt`, when it carries one.
+    pub exported_at: Option<String>,
+    /// `fnv1a64:<16 hex>` over the raw file bytes (`import-variables`) or
+    /// the response's canonical JSON (pulls). Non-cryptographic: a change
+    /// detector, not an integrity proof.
+    pub digest: String,
+    /// One entry per variable in the snapshot, sorted by id.
+    pub variables: Vec<VariableCodeRec>,
+}
+
+/// Publishing metadata for one variable of a [`VariableSnapshotRec`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariableCodeRec {
+    pub id: String,
+    /// `codeSyntax` as sorted (platform, name) pairs, e.g. `("WEB", "--x")`.
+    pub code_syntax: Vec<(String, String)>,
+    pub hidden_from_publishing: bool,
+    pub remote: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,7 +357,7 @@ mod tests {
     /// index (it would corrupt every existing cache row's discriminant on
     /// decode), and each new variant must land at the next free index (8
     /// for `MirrorConfig`, 9 for the later-appended `ImageBlob`, 10 for
-    /// `ImagePin`). A
+    /// `ImagePin`, 11 for `VariableSnapshot`). A
     /// pre-change build isn't available to literally round-trip against,
     /// so this pins the concrete bytes instead — the same guarantee the
     /// append-only doc comments on `Id`/`Rec` assert, made checkable.
@@ -343,7 +392,33 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&Id::ImagePin("k".into())).unwrap()[0],
             10,
-            "Id::ImagePin is the newly appended Id variant"
+            "Id::ImagePin's variant index must not move"
+        );
+
+        let snap = Rec::VariableSnapshot(VariableSnapshotRec {
+            source: "file".into(),
+            format: "bare".into(),
+            format_version: None,
+            exported_at: Some("2026-01-01T00:00:00Z".into()),
+            digest: "fnv1a64:0000000000000000".into(),
+            variables: vec![VariableCodeRec {
+                id: "VariableID:1".into(),
+                code_syntax: vec![("WEB".into(), "--x".into())],
+                hidden_from_publishing: true,
+                remote: false,
+            }],
+        });
+        let bytes = postcard::to_allocvec(&snap).unwrap();
+        assert_eq!(
+            bytes[0], 11,
+            "VariableSnapshot is the newly appended variant"
+        );
+        let back: Rec = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(snap, back);
+        assert_eq!(
+            postcard::to_allocvec(&Id::VariableSnapshot).unwrap()[0],
+            11,
+            "Id::VariableSnapshot is the newly appended Id variant"
         );
     }
 

@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::flatten::Flattened;
 use crate::model::{
     FileMeta, Id, ImageBlobRec, ImagePinRec, MirrorConfigRec, NodeRec, ProxyCacheRec, Rec,
+    VariableSnapshotRec,
 };
 
 // ---- pipeline branch functions (pure; fold requires determinism) ----
@@ -161,6 +162,15 @@ pub fn image_pin_only(d: &Keyed<Id, Rec>) -> Option<Keyed<String, ImagePinRec>> 
     }
 }
 
+/// Feeds the `variable_snapshot` table: the single [`VariableSnapshotRec`]
+/// row (NWS-2961), keyed by `0u8` — same reasoning as [`meta_only`].
+pub fn variable_snapshot_only(d: &Keyed<Id, Rec>) -> Option<Keyed<u8, VariableSnapshotRec>> {
+    match &d.val {
+        Rec::VariableSnapshot(r) => Some(Keyed::new(0u8, r.clone())),
+        _ => None,
+    }
+}
+
 /// The full figmog pipeline. Sink names are frozen on-disk schema.
 #[macro_export]
 macro_rules! figmog_pipeline {
@@ -224,6 +234,10 @@ macro_rules! figmog_pipeline {
             FilterMap::new(
                 $crate::store::image_pin_only,
                 terminal::Table::new("image_pins"),
+            ),
+            FilterMap::new(
+                $crate::store::variable_snapshot_only,
+                terminal::Table::new("variable_snapshot"),
             ),
         )
     }};
@@ -324,8 +338,10 @@ pub fn collect_sweepable<R: fold::stream::Readable>(
 /// an Enterprise variables export *this cycle* — the `variables_local` call
 /// returned `Some(..)` and its records were flattened into the same
 /// `flattened.recs` passed to `sync`. On the `Ok(None)` (non-Enterprise or
-/// import-only) path, callers must not call this — stored variables then
-/// stay outside `sync`'s live/sweep accounting entirely, exactly as v1.
+/// `--from-file`) pull path, callers must not call this — stored variables
+/// then stay outside `sync`'s live/sweep accounting entirely, exactly as
+/// v1. Its other caller is `import-variables`, as the `prior` of
+/// [`replace_variable_snapshot`] (NWS-2961).
 pub fn collect_variable_ids<R: fold::stream::Readable>(
     variables: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::VariableRec>,
     collections: &fold::pipeline::terminal::TableReader<
@@ -339,6 +355,41 @@ pub fn collect_variable_ids<R: fold::stream::Readable>(
     out.extend(variables.iter().map(|(k, _)| Id::Variable(k)));
     out.extend(collections.iter().map(|(k, _)| Id::VariableCollection(k)));
     out
+}
+
+/// Replace the stored variable snapshot with `recs` + `snapshot` in one
+/// write transaction (`import-variables`, NWS-2961): upsert every record
+/// and the provenance row, then remove every stored variable and
+/// collection in `prior` absent from `recs`. `prior` must be
+/// [`collect_variable_ids`] read just before — the same sweep set an
+/// Enterprise pull uses. Never touches nodes, styles, meta or any other
+/// table. `churn.removed` counts swept variables + collections.
+pub fn replace_variable_snapshot<P: Push<Keyed<Id, Rec>>>(
+    st: &mut KeyedStream<Id, Rec, P>,
+    prior: &BTreeSet<Id>,
+    recs: &[(Id, Rec)],
+    snapshot: VariableSnapshotRec,
+) -> Churn {
+    let live: BTreeSet<&Id> = recs.iter().map(|(id, _)| id).collect();
+    let mut churn = Churn::default();
+    st.wtx(|tx| {
+        for (id, rec) in recs {
+            debug_assert!(matches!(id, Id::Variable(_) | Id::VariableCollection(_)));
+            match tx.upsert(id, rec) {
+                None => churn.added += 1,
+                Some(old) if old == *rec => churn.unchanged += 1,
+                Some(_) => churn.changed += 1,
+            }
+        }
+        tx.upsert(&Id::VariableSnapshot, &Rec::VariableSnapshot(snapshot));
+        for id in prior {
+            debug_assert!(matches!(id, Id::Variable(_) | Id::VariableCollection(_)));
+            if !live.contains(id) && tx.remove(id).is_some() {
+                churn.removed += 1;
+            }
+        }
+    });
+    churn
 }
 
 // ---- proxy cache eviction (spec §12) ----
@@ -492,11 +543,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut st = crate::open_store!(&dir.path().join("db"));
 
-        let absent = st.rtx(|(.., mirror_config, _, _)| read_geometry(&mirror_config));
+        let absent = st.rtx(|(.., mirror_config, _, _, _)| read_geometry(&mirror_config));
         assert!(!absent, "no row upserted yet ⇒ geometry defaults false");
 
         upsert_mirror_config(&mut st, true);
-        let now_true = st.rtx(|(.., mirror_config, _, _)| read_geometry(&mirror_config));
+        let now_true = st.rtx(|(.., mirror_config, _, _, _)| read_geometry(&mirror_config));
         assert!(now_true, "the upserted flag must be what a later read sees");
 
         // Sweep-exempt: `mirror_config` isn't among `collect_sweepable`'s
@@ -514,7 +565,7 @@ mod tests {
             collect_sweepable(&nodes, &components, &component_sets, &styles)
         });
         sync(&mut st, &prior, &flattened, 0);
-        let still_true = st.rtx(|(.., mirror_config, _, _)| read_geometry(&mirror_config));
+        let still_true = st.rtx(|(.., mirror_config, _, _, _)| read_geometry(&mirror_config));
         assert!(still_true, "mirror_config must survive an unrelated sweep");
     }
 }

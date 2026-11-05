@@ -145,7 +145,7 @@ fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
     {
         let st = figmog::open_store!(&db_path);
         let stored =
-            st.rtx(|(.., mirror_config, _, _)| figmog::store::read_geometry(&mirror_config));
+            st.rtx(|(.., mirror_config, _, _, _)| figmog::store::read_geometry(&mirror_config));
         assert!(stored, "the --geometry pull must persist the flag");
     }
 
@@ -162,7 +162,7 @@ fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
     {
         let st = figmog::open_store!(&db_path);
         let still_stored =
-            st.rtx(|(.., mirror_config, _, _)| figmog::store::read_geometry(&mirror_config));
+            st.rtx(|(.., mirror_config, _, _, _)| figmog::store::read_geometry(&mirror_config));
         assert!(still_stored, "a plain re-pull must not turn geometry off");
     }
 }
@@ -206,7 +206,8 @@ fn pull_fresh_turns_geometry_back_off() {
         .success();
 
     let st = figmog::open_store!(&db_path);
-    let stored = st.rtx(|(.., mirror_config, _, _)| figmog::store::read_geometry(&mirror_config));
+    let stored =
+        st.rtx(|(.., mirror_config, _, _, _)| figmog::store::read_geometry(&mirror_config));
     assert!(!stored, "--fresh must reset the sticky geometry flag");
 }
 
@@ -283,7 +284,7 @@ fn pull_fresh_invalid_response_preserves_every_existing_store_file() {
         for id in ids {
             assert!(st.get(&id).is_some(), "lost {id:?}");
         }
-        st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, config, _, _)| {
+        st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, config, _, _, _)| {
             assert_eq!(nodes.iter().count(), 12);
             assert_eq!(meta.get(&0).unwrap().version, "100");
             assert!(figmog::store::read_geometry(&config));
@@ -420,7 +421,7 @@ fn pull_fresh_resets_file_imports_config_and_same_version_caches() {
         assert!(st.get(&id).is_none(), "fresh retained {id:?}");
     }
     st.rtx(
-        |((nodes, _, text, ..), components, sets, styles, _, _, meta, _, config, _, _)| {
+        |((nodes, _, text, ..), components, sets, styles, _, _, meta, _, config, _, _, _)| {
             assert_eq!(nodes.iter().count(), 3);
             assert!(nodes.get(&"1:2".into()).is_none());
             assert!(text.search("garden", 5).is_empty());
@@ -767,9 +768,10 @@ fn import_variables_upgrades_vars_to_authoritative() {
 }
 
 /// M6 (spec §4 debt ledger): `figmog import-variables`' JSON output shape
-/// is exactly `{"imported": N}`, counting only `Variable` records —
-/// `variables-export.json` has 3 variables across 2 collections, so
-/// `imported` must be 3, not 5.
+/// is exactly `{"imported": N, "removed": M}`, `imported` counting only
+/// `Variable` records — `variables-export.json` has 3 variables across 2
+/// collections, so `imported` must be 3, not 5 — and `removed` the
+/// variables + collections the replacing snapshot swept (NWS-2961).
 #[test]
 fn import_variables_output_shape_is_the_variable_count_alone() {
     let (dir, db) = fixture_db();
@@ -781,7 +783,7 @@ fn import_variables_output_shape_is_the_variable_count_alone() {
         .assert()
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(v, serde_json::json!({"imported": 3}));
+    assert_eq!(v, serde_json::json!({"imported": 3, "removed": 0}));
 }
 
 /// M6 (spec §4 debt ledger): `figmog tools`' JSON output shape — an array
@@ -1150,7 +1152,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
             &serde_json::json!({"cached": true}),
         )
         .unwrap();
-        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _, _)| {
+        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _, _, _)| {
             cache::lookup(&cache_reader, "get_code", "{}", "100")
         });
         assert!(
@@ -1179,7 +1181,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
         .success();
 
     let st = figmog::open_store!(&db);
-    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _, _)| {
+    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _, _, _)| {
         cache::lookup(&cache_reader, "get_code", "{}", "100")
     });
     assert_eq!(

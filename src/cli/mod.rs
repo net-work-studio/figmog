@@ -196,8 +196,15 @@ enum Cmd {
     /// Nodes using a style id or bound to a variable id.
     Uses { id: String },
     /// Variables: authoritative if imported, else inferred from bindings.
-    Vars { id: Option<String> },
-    /// Import a variables export (REST or plugin-console shape).
+    Vars {
+        id: Option<String>,
+        /// Return `{snapshot, variables}`: the variable snapshot's state
+        /// and provenance next to the rows.
+        #[arg(long)]
+        snapshot: bool,
+    },
+    /// Import a variables export (REST or plugin-console shape), replacing
+    /// the previous variable snapshot.
     ImportVariables { path: PathBuf },
     /// Node counts by type and page, table totals, text-node count, max tree depth.
     Stats,
@@ -442,8 +449,27 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
             match other {
                 Cmd::Status => st.rtx(
-                    |((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _, _, _)| {
-                        read::cmd_status(&nodes, &meta)
+                    |(
+                        (nodes, _, _, _, _, _, _),
+                        _,
+                        _,
+                        _,
+                        variables,
+                        variable_collections,
+                        meta,
+                        _,
+                        _,
+                        _,
+                        _,
+                        snapshot,
+                    )| {
+                        read::cmd_status(
+                            &nodes,
+                            &meta,
+                            &variables,
+                            &variable_collections,
+                            &snapshot,
+                        )
                     },
                 ),
                 Cmd::Pages => st
@@ -546,9 +572,29 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 Cmd::Uses { id } => st.rtx(|((nodes, _, _, _, styled_by, bound_to, _), ..)| {
                     read::cmd_uses(&nodes, &styled_by, &bound_to, id)
                 }),
-                Cmd::Vars { id } => st.rtx(
-                    |((nodes, ..), _, _, _, variables, variable_collections, _, _, _, _, _)| {
-                        read::cmd_vars(&nodes, &variables, &variable_collections, id)
+                Cmd::Vars { id, snapshot } => st.rtx(
+                    |(
+                        (nodes, ..),
+                        _,
+                        _,
+                        _,
+                        variables,
+                        variable_collections,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        snap,
+                    )| {
+                        read::cmd_vars(
+                            &nodes,
+                            &variables,
+                            &variable_collections,
+                            &snap,
+                            id,
+                            snapshot,
+                        )
                     },
                 ),
                 Cmd::Stats => st.rtx(
@@ -757,7 +803,9 @@ fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
             json!({"type": style_type, "values": values, "resolve_vars": resolve_vars}),
         )),
         Cmd::Uses { id } => Some(("figmog_uses", json!({"id": id}))),
-        Cmd::Vars { id } => Some(("figmog_vars", json!({"id": id}))),
+        Cmd::Vars { id, snapshot } => {
+            Some(("figmog_vars", json!({"id": id, "snapshot": snapshot})))
+        }
         Cmd::Stats => Some(("figmog_stats", json!({}))),
         Cmd::Path { id } => Some(("figmog_path", json!({"id": id}))),
         Cmd::Text { page, under } => Some(("figmog_text", json!({"page": page, "under": under}))),
