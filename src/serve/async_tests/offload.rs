@@ -668,3 +668,101 @@ fn stdin_eof_stops_the_desktop_queue_but_delivers_the_in_flight_call() {
     // B never reached the upstream.
     assert!(desktop_entered.try_recv().is_err());
 }
+
+/// NWS-2955: a vanished stdout skips the drain, but serve still waits (up
+/// to the exit deadline) for a read worker still running. The desktop
+/// queue must stop before that wait: a queued, possibly mutating call
+/// queued behind an in-flight one never reaches the upstream.
+#[test]
+fn broken_stdout_stops_the_desktop_queue_before_waiting_for_reads() {
+    let h = mirrored_harness();
+    let (entered_tx, desktop_entered) = mpsc::channel();
+    let (desktop_release, gate) = mpsc::channel();
+    let result = json!({"content":[{"type":"text","text":"ok"}], "isError": false});
+    let desktop = DesktopWorker::spawn(GatedUpstream {
+        tools: vec![json!({"name":"set_node_name", "inputSchema":{"type":"object"}})],
+        results: [result.clone(), result].into(),
+        entered: entered_tx,
+        release: gate,
+    });
+    let Harness {
+        manager,
+        _dir: _dir_guard,
+        ..
+    } = h;
+    // A read worker that stalls until released.
+    let (read_seen_tx, read_seen) = mpsc::channel();
+    let (read_release, read_gate) = mpsc::channel::<()>();
+    let read_gate = Arc::new(Mutex::new(read_gate));
+    let mut offload = Offload::new(Some(desktop));
+    offload.exit_drain = Duration::from_secs(3);
+    offload.reads.before_read = Some(Arc::new(move |name: &str| {
+        let _ = read_seen_tx.send(name.to_string());
+        let _ = read_gate
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10));
+    }));
+    let (tx, rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        serve_loop_with_offload(
+            manager,
+            offload,
+            true,
+            false,
+            Duration::from_secs(3600),
+            Instant::now() + Duration::from_secs(3600),
+            rx,
+            Arc::default(),
+            // Stdout is broken: the first write fails.
+            |_: &str| false,
+        )
+    });
+    tx.send(Incoming::Stdio(frame(
+        json!("r"),
+        "figmog_stats",
+        json!({}),
+    )))
+    .unwrap();
+    assert_eq!(
+        read_seen.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "figmog_stats"
+    );
+    // Desktop call A blocks upstream; B (a possible write) queues behind.
+    tx.send(Incoming::Stdio(frame(
+        json!("a"),
+        "set_node_name",
+        json!({}),
+    )))
+    .unwrap();
+    assert_eq!(
+        desktop_entered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        "set_node_name"
+    );
+    tx.send(Incoming::Stdio(frame(
+        json!("b"),
+        "set_node_name",
+        json!({}),
+    )))
+    .unwrap();
+    // An immediate answer hits the broken stdout: the loop exits without
+    // draining and waits on the stalled read.
+    tx.send(Incoming::Stdio(
+        json!({"jsonrpc":"2.0", "id":"p", "method":"ping"}).to_string(),
+    ))
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    // A completes during that wait; B must not be sent upstream.
+    desktop_release.send(()).unwrap();
+    assert!(
+        desktop_entered
+            .recv_timeout(Duration::from_millis(700))
+            .is_err(),
+        "queued desktop call reached the upstream after stdout broke"
+    );
+    read_release.send(()).unwrap();
+    server.join().unwrap().unwrap();
+    assert!(desktop_entered.try_recv().is_err());
+}

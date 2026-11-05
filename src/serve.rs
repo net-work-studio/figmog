@@ -801,8 +801,9 @@ const EXIT_DRAIN: Duration = Duration::from_secs(15);
 /// Shutdown: answer the deferred calls already accepted before exiting, so
 /// `printf '<request>\n' | figmog serve` still gets its response. Accepts
 /// no new requests and starts no new work (queued image requests and
-/// queued desktop calls are answered with an error; running ones finish
-/// and answer); waits until `deadline`. A vanished stdout or closed socket
+/// queued desktop calls — the desktop queue was already stopped by the
+/// caller — are answered with an error; running ones finish and answer);
+/// waits until `deadline`. A vanished stdout or closed socket
 /// just drops that response.
 fn drain_on_exit(
     manager: &mut SessionManager,
@@ -812,11 +813,6 @@ fn drain_on_exit(
     stdio: &StdioWriter,
     deadline: Instant,
 ) {
-    // Before anything waits: the desktop worker must not pick up a queued
-    // (possibly mutating) call while in-flight work drains.
-    if let Some(desktop) = &offload.desktop {
-        desktop.stop_taking_jobs();
-    }
     for session in &mut manager.sessions {
         session.abandon_queued_images();
     }
@@ -896,6 +892,13 @@ fn serve_loop_with_offload(
         &registry,
         &stdio,
     );
+    // On every exit, before anything waits (the drain below, or the read
+    // pool's shutdown on a vanished stdout): the desktop worker must not
+    // pick up a queued (possibly mutating) call while in-flight work
+    // finishes. Queued calls get the shutting-down error.
+    if let Some(desktop) = &offload.desktop {
+        desktop.stop_taking_jobs();
+    }
     let deadline = Instant::now() + offload.exit_drain;
     if matches!(exit, LoopExit::Drain) {
         drain_on_exit(
