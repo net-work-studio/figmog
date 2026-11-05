@@ -48,7 +48,8 @@ pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String>
 /// validates again, replaces the snapshot on the file's worker and answers
 /// once it committed and was published; the output is the direct path's.
 pub(super) fn cmd_import_variables_routed(
-    stream: std::os::unix::net::UnixStream,
+    route: &super::socket::Route,
+    client: super::socket::Client,
     key: &str,
     path: PathBuf,
 ) -> Result<(), String> {
@@ -56,7 +57,8 @@ pub(super) fn cmd_import_variables_routed(
     let content = String::from_utf8(bytes)
         .map_err(|e| format!("invalid variables file {}: {e}", path.display()))?;
     let args = json!({"file": key, "content": content, "name": path.display().to_string()});
-    let done = super::socket::write_over(stream, crate::serve::writes::IMPORT_VARIABLES, args)?;
+    let done =
+        super::socket::write_over(route, client, crate::serve::writes::IMPORT_VARIABLES, args)?;
     write_json(&done["result"])
 }
 

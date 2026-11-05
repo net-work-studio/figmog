@@ -35,8 +35,14 @@ fn deep_working_directory() -> (tempfile::TempDir, std::path::PathBuf) {
 fn deep_working_directory_keeps_the_default_socket_address_short() {
     let (_dir, work) = deep_working_directory();
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("figmog"));
-    cmd.args(["serve", "--no-watch", "--no-upstream"])
-        .current_dir(&work);
+    cmd.args([
+        "serve",
+        "--no-watch",
+        "--no-upstream",
+        "--figmog-root",
+        ".figmog",
+    ])
+    .current_dir(&work);
     let (mut guard, mut stdin, rx) = spawn_child(cmd);
     handshake(&mut stdin, &rx);
     assert!(work.join(".figmog/serve.sock").exists());
@@ -61,7 +67,13 @@ fn deep_working_directory_preserves_an_existing_live_socket() {
     let before = std::fs::metadata(&socket).unwrap();
 
     let output = common::command()
-        .args(["serve", "--no-watch", "--no-upstream"])
+        .args([
+            "serve",
+            "--no-watch",
+            "--no-upstream",
+            "--figmog-root",
+            ".figmog",
+        ])
         .current_dir(&work)
         .output()
         .unwrap();
@@ -82,6 +94,26 @@ fn deep_working_directory_preserves_an_existing_live_socket() {
         listener.accept().is_ok(),
         "probe never reached the live listener"
     );
+}
+
+/// Wait until the background owner of `mirror_root` (NWS-2953) has idled
+/// out: it removes its discovery record only after closing its stores.
+fn wait_for_owner_exit(mirror_root: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while mirror_root.join("owner.json").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the background owner never exited"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The background owner's pid, from its discovery record.
+fn owner_pid(mirror_root: &std::path::Path) -> u64 {
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(mirror_root.join("owner.json")).unwrap()).unwrap();
+    record["pid"].as_u64().unwrap()
 }
 
 /// Kills the child on drop so a failed assertion (which unwinds past the
@@ -157,6 +189,7 @@ fn spawn_serve_multifile(
 fn spawn_child(mut cmd: Command) -> (ChildGuard, ChildStdin, Receiver<String>) {
     let mut child = cmd
         .env("FIGMA_TOKEN", "")
+        .env("FIGMOG_OWNER_IDLE_MS", "1000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1759,6 +1792,8 @@ fn assert_proxy_cli_preserves_args_and_current_mirror(args: Value, socket: bool)
     if let Some((mut guard, stdin)) = server {
         drop(stdin);
         assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+        // The background owner (NWS-2953) holds the stores until it idles out.
+        wait_for_owner_exit(&dir.path().join(".figmog"));
     }
     drop(other_store);
 
@@ -2023,6 +2058,18 @@ fn spawn_default_root_serve(
     spawn_default_root_serve_keys(cwd, &[key], extra_args)
 }
 
+/// [`spawn_default_root_serve`] served in this process rather than relayed
+/// to a background owner (NWS-2953): `--figmog-root .figmog` keeps the
+/// stores where the default root has them and binds the in-process socket
+/// at `.figmog/serve.sock`, which the CLI still finds. For the tests of
+/// that socket's own mechanics.
+fn spawn_in_process_serve(
+    cwd: &std::path::Path,
+    key: &str,
+) -> (ChildGuard, ChildStdin, Receiver<String>) {
+    spawn_default_root_serve_keys(cwd, &[key], &["--figmog-root", ".figmog"])
+}
+
 /// Zero-startup-files variant of [`spawn_default_root_serve`] (spec §14:
 /// the server starts empty and mirrors files as agents/commands reference
 /// them).
@@ -2224,7 +2271,7 @@ fn images_with_db_flag_bypasses_the_socket_even_when_serve_is_reachable() {
 fn clean_exit_removes_serve_sock() {
     const KEY: &str = "figmogsocketkeyddd444";
     let dir = default_root_fixture(KEY, common::fixture_v1());
-    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    let (mut guard, mut stdin, rx) = spawn_in_process_serve(dir.path(), KEY);
     handshake(&mut stdin, &rx);
 
     let sock_path = dir.path().join(".figmog").join("serve.sock");
@@ -2253,11 +2300,17 @@ fn clean_exit_removes_serve_sock() {
 fn second_serve_on_same_root_exits_with_clean_error() {
     const KEY: &str = "figmogsocketkeyeee555";
     let dir = default_root_fixture(KEY, common::fixture_v1());
-    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    let (mut guard, mut stdin, rx) = spawn_in_process_serve(dir.path(), KEY);
     handshake(&mut stdin, &rx);
 
     let out = common::command()
-        .args(["serve", "--no-watch", "--no-upstream"])
+        .args([
+            "serve",
+            "--no-watch",
+            "--no-upstream",
+            "--figmog-root",
+            ".figmog",
+        ])
         .current_dir(dir.path())
         .env("FIGMA_TOKEN", "")
         .assert()
@@ -2297,8 +2350,7 @@ fn stale_socket_file_is_unlinked_and_rebound() {
     let sock_path = figmog_dir.join("serve.sock");
     std::fs::write(&sock_path, b"not a socket, nothing listening here").unwrap();
 
-    let (mut guard, mut stdin, rx) =
-        spawn_default_root_serve(dir.path(), "figmogstalekeyfff666", &[]);
+    let (mut guard, mut stdin, rx) = spawn_in_process_serve(dir.path(), "figmogstalekeyfff666");
     handshake(&mut stdin, &rx);
 
     assert!(sock_path.exists(), "a real socket should now be bound");
@@ -2418,7 +2470,7 @@ fn socket_status_targets_the_current_mirror_with_zero_startup_files() {
 fn wedged_socket_client_does_not_freeze_stdio() {
     const KEY: &str = "figmogsockwedgedkey01";
     let dir = default_root_fixture(KEY, common::fixture_v1());
-    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    let (mut guard, mut stdin, rx) = spawn_in_process_serve(dir.path(), KEY);
     handshake(&mut stdin, &rx);
 
     let sock_path = dir.path().join(".figmog").join("serve.sock");
@@ -3004,7 +3056,8 @@ fn db_flag_at_a_serve_owned_store_names_the_owner() {
     let db = dir.path().join(".figmog").join(KEY).join("db");
     let response = dir.path().join("other.json");
     std::fs::write(&response, common::fixture_other().to_string()).unwrap();
-    let pid = guard.0.id().to_string();
+    // The store is held by the background owner the relay started.
+    let pid = owner_pid(&dir.path().join(".figmog")).to_string();
     let vars = dir.path().join("vars.json");
     std::fs::write(
         &vars,
@@ -3031,7 +3084,7 @@ fn db_flag_at_a_serve_owned_store_names_the_owner() {
         assert!(
             error.contains("store is locked by figmog serve")
                 && error.contains(&format!("pid {pid}"))
-                && error.contains("serve.sock"),
+                && error.contains(".sock"),
             "{args:?}: {error}"
         );
     }

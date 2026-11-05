@@ -85,13 +85,26 @@ pub(crate) struct Operations {
     retention: Duration,
 }
 
+/// This process's generation: its pid and start time (hex). Names its
+/// operations and, for a background owner (NWS-2953), the owner itself.
+pub(crate) fn new_generation() -> String {
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    format!("{:x}{:x}", std::process::id(), started)
+}
+
 impl Default for Operations {
     fn default() -> Self {
-        let started = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
+        Self::with_generation(new_generation())
+    }
+}
+
+impl Operations {
+    /// Operations named after `generation`.
+    pub(crate) fn with_generation(generation: String) -> Self {
         Self {
-            generation: format!("{:x}{:x}", std::process::id(), started),
+            generation,
             next_seq: 1,
             running: BTreeMap::new(),
             receipts: BTreeMap::new(),

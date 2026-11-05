@@ -637,6 +637,7 @@ fn async_socket_cli_acknowledges_open_and_sync_before_worker_release() {
         serve_loop(
             manager,
             None,
+            None,
             true,
             false,
             Duration::from_secs(10),

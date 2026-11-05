@@ -20,6 +20,7 @@ pub(crate) mod ident;
 pub mod images;
 pub(crate) mod mcp;
 pub mod model;
+pub(crate) mod owner;
 mod private_dir;
 pub(crate) mod project;
 mod proxy;

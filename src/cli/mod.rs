@@ -30,9 +30,11 @@ mod store_lock;
 pub(crate) use store_lock::Compaction;
 use store_lock::{OwnedStore, StoreOwner};
 
+#[cfg(test)]
+pub(crate) use pull::apply_pull_at;
 pub(crate) use pull::{PullError, now_ms, pull_failure_wait, write_current};
 #[cfg(test)]
-pub(crate) use {pull::apply_pull_at, socket::write_over};
+pub(crate) use socket::write_over_stream;
 
 #[derive(Parser)]
 #[command(
@@ -109,6 +111,10 @@ enum Cmd {
         /// under a temp dir instead of the discovered mirror root.
         #[arg(long, hide = true)]
         figmog_root: Option<PathBuf>,
+        /// Run as the repository's shared background owner (NWS-2953).
+        /// Hidden: started detached by `figmog serve` itself, never by hand.
+        #[arg(long, hide = true, conflicts_with_all = ["figmog_root", "files"])]
+        background: bool,
     },
     /// Move old per-checkout mirrors (`.figmog/<key>/`) into the shared
     /// mirror root (inside Git: `<git-common-dir>/figmog/`). Resumable;
@@ -344,8 +350,31 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         upstream,
         no_upstream,
         figmog_root,
+        background,
     } = &cli.cmd
     {
+        if *background {
+            if cli.db.is_some() || cli.no_socket {
+                return Err("--background takes neither --db nor --no-socket".into());
+            }
+            let settings = crate::owner::Settings {
+                watch: !no_watch,
+                interval: *interval,
+                upstream: (!no_upstream).then(|| upstream.clone()),
+            };
+            return crate::serve::run_owner(Layout::discover_cwd()?, settings);
+        }
+        // The default shape — no `--db`, `--figmog-root` or `--no-socket`
+        // — relays stdio to the repository's background owner, starting it
+        // if needed (NWS-2953). The others serve in this process.
+        if cli.db.is_none() && figmog_root.is_none() && !cli.no_socket {
+            let settings = crate::owner::Settings {
+                watch: !no_watch,
+                interval: *interval,
+                upstream: (!no_upstream).then(|| upstream.clone()),
+            };
+            return crate::serve::run_relay(Layout::discover_cwd()?, files, settings);
+        }
         // `--db` serves one fixed store: no project discovery at all.
         let layout = match cli.db {
             Some(_) => None,
@@ -400,7 +429,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     {
         if !cli.no_socket
             && let Some(layout) = &layout
-            && let Some(result) = socket::try_tools_list(&layout.local_root)
+            && let Some(result) = socket::try_tools_list(&socket::Route::new(layout))
         {
             let tools = result?;
             note_ignored_upstream_flags(upstream, *no_upstream);
@@ -421,7 +450,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     if !cli.no_socket
         && let Some(layout) = &layout
     {
-        let root = layout.local_root.as_path();
+        let root = &socket::Route::new(layout);
         if let Cmd::Call {
             tool,
             args,
@@ -437,14 +466,20 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             } else {
                 parsed_args
             };
-            if let Some(result) = socket::try_call(root, tool, parsed_args) {
+            if let Some(result) = routable(layout, &parsed_args)
+                .then(|| socket::try_call(root, tool, parsed_args.clone()))
+                .flatten()
+            {
                 note_ignored_upstream_flags(upstream, *no_upstream);
                 return write_json(&result?);
             }
         } else if let Some(read) = read_command(&cli.cmd) {
             let (tool, tool_args) = read.to_tool_call();
             let tool_args = with_current_file(tool_args, layout)?;
-            if let Some(result) = socket::try_call(root, tool, tool_args) {
+            if let Some(result) = routable(layout, &tool_args)
+                .then(|| socket::try_call(root, tool, tool_args.clone()))
+                .flatten()
+            {
                 let result = result?;
                 // Not ready is an error, except for an import-only store
                 // (SPEC §9): its stored variable snapshot still answers.
@@ -465,10 +500,16 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     }
 
     let socket_root = match (&layout, cli.no_socket) {
-        (Some(layout), false) => Some(layout.local_root.clone()),
+        (Some(layout), false) => Some(socket::Route::new(layout)),
         _ => None,
     };
     let db = resolve_db(&cli, layout)?;
+    // A mirror still in this checkout's old location is opened directly:
+    // the shared owner serves only the shared mirror root (NWS-2953).
+    let socket_root = socket_root.filter(|_| {
+        !matches!((&db.layout, &db.key), (Some(layout), Some(key))
+            if layout.legacy_store(key, &db.path).is_some())
+    });
     // Writers through a running serve (NWS-2963): when its socket answers,
     // serve owns (or will open) this store, so `pull` and
     // `import-variables` become its operations — same output, no lock
@@ -476,16 +517,19 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     // never route (no `socket_root`).
     if let (Some(root), Some(key)) = (&socket_root, &db.key)
         && matches!(cli.cmd, Cmd::Pull { .. } | Cmd::ImportVariables { .. })
-        && let Some(stream) = socket::connect(root)
+        && let Some(client) = socket::connect(root)
     {
+        let client = client?;
         return match cli.cmd {
             Cmd::Pull {
                 from_file,
                 fresh,
                 geometry,
                 ..
-            } => pull::cmd_pull_routed(&db, key, stream, from_file, fresh, geometry),
-            Cmd::ImportVariables { path } => call::cmd_import_variables_routed(stream, key, path),
+            } => pull::cmd_pull_routed(&db, key, root, client, from_file, fresh, geometry),
+            Cmd::ImportVariables { path } => {
+                call::cmd_import_variables_routed(root, client, key, path)
+            }
             _ => unreachable!("matched above"),
         };
     }
@@ -502,7 +546,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             format,
             scale,
             out,
-        } => images::cmd_images(&db, socket_root.as_deref(), ids, format, scale, out),
+        } => images::cmd_images(&db, socket_root.as_ref(), ids, format, scale, out),
         Cmd::Call {
             tool,
             args,
@@ -556,7 +600,7 @@ fn requested_file(args: &Value) -> Result<Option<String>, String> {
 
 /// Management tools don't target an existing mirror, and desktop tools
 /// use the desktop's own context rather than local mirror routing.
-fn is_per_file_local_tool(tool: &str) -> bool {
+pub(crate) fn is_per_file_local_tool(tool: &str) -> bool {
     crate::proxy::is_local_tool(tool) && !matches!(tool, "figmog_open" | "figmog_files")
 }
 
@@ -600,6 +644,24 @@ fn with_current_file(mut args: Value, layout: &Layout) -> Result<Value, String> 
         obj.insert("file".to_string(), json!(key));
     }
     Ok(args)
+}
+
+/// Whether a routed per-file call may go to a running serve: not when its
+/// file's mirror is still in this checkout's old per-checkout location,
+/// which the shared background owner never serves (NWS-2953) — that one
+/// is opened directly, like before. A call naming no file routes.
+fn routable(layout: &Layout, args: &Value) -> bool {
+    let key = args
+        .get("file")
+        .and_then(Value::as_str)
+        .and_then(parse_file_ref)
+        .or_else(|| crate::dispatch::infer_file_from_node_ref(args));
+    match key {
+        Some(key) => layout
+            .active_store(&key)
+            .is_ok_and(|store| !store.migration_pending),
+        None => true,
+    }
 }
 
 /// Whether a status result carries a variable snapshot summary with

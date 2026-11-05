@@ -8,9 +8,11 @@
 //! * **Mirror root:** inside Git, `<git-common-dir>/figmog`, shared by every
 //!   worktree of the repository; outside Git, `<project root>/.figmog`.
 //! * **Local root:** `<project root>/.figmog`, per checkout. It holds the
-//!   `current` pointer and serve's control socket, and was where every
-//!   mirror lived before the shared root existed (the "legacy" location
-//!   [`Layout::active_store`] still honors).
+//!   `current` pointer (and an in-process `--figmog-root` serve's socket),
+//!   and was where every mirror lived before the shared root existed (the
+//!   "legacy" location [`Layout::active_store`] still honors). The shared
+//!   background owner's lock, discovery record and log live in the mirror
+//!   root ([`crate::owner`]).
 //!
 //! The config format is a deliberately tiny TOML subset parsed by hand (no
 //! `toml` dependency): `#` comments, blank lines, table headers, and
@@ -302,7 +304,7 @@ pub(crate) struct Layout {
     pub(crate) config: ProjectConfig,
     /// Where mirrors should live: shared by every worktree inside Git.
     pub(crate) mirror_root: PathBuf,
-    /// `<project root>/.figmog`: `current`, `serve.sock`, legacy mirrors.
+    /// `<project root>/.figmog`: `current`, legacy mirrors.
     pub(crate) local_root: PathBuf,
 }
 

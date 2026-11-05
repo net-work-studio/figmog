@@ -1,6 +1,7 @@
 //! Unix-socket control-plane client (spec §1): every read command, `tools`,
-//! and `call` become clients of a running `figmog serve` process reachable
-//! at `<figmog-root>/serve.sock`, instead of opening the store directly —
+//! and `call` become clients of a running `figmog serve` process (the
+//! repository's background owner) over its socket, instead of opening the
+//! store directly —
 //! always-fresh answers, no single-writer lock contention, and (for `call
 //! figmog_sync`) a pull that reaches the *owning* process rather than
 //! failing against a store `serve` already holds locked. The writers
@@ -8,16 +9,13 @@
 //! [`write_over`] (NWS-2963): one request, an operation-id notification,
 //! then the answer once the write committed and was published.
 //!
-//! Socket routing only applies when the root is knowable at all: `--db`
-//! bypasses the whole multi-file root concept (an arbitrary store path has
-//! no `<root>/serve.sock` to speak of), so callers in `super::dispatch`
-//! only reach this module when `cli.db.is_none()`. The root is the
-//! project's per-checkout `.figmog` directory
-//! ([`crate::project::Layout::local_root`]) — the same directory
-//! `figmog serve` binds by default — so a command run from any
-//! subdirectory of the project reaches that checkout's serve. (The socket
-//! deliberately stays per checkout rather than moving to the shared mirror
-//! root; spec §16.)
+//! Socket routing only applies when the project is knowable at all: `--db`
+//! bypasses it (an arbitrary store path has no owner to speak of), so
+//! callers in `super::dispatch` only reach this module when
+//! `cli.db.is_none()`. A command looks for the repository's background
+//! owner first ([`crate::owner`], NWS-2953: discovery in the mirror root,
+//! then the handshake) — the same process from every worktree — and then
+//! for an in-process serve's `<local root>/serve.sock`.
 //!
 //! Every function here returns `None` (not `Some(Err(..))`) for "no serve
 //! reachable at this root" — a plain connection failure — so the caller
@@ -29,14 +27,112 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::owner::{self, OwnerPaths, Probe};
+use crate::project::Layout;
+
+/// Where a command looks for a running serve: the repository's background
+/// owner (NWS-2953), found through its discovery record in the mirror
+/// root, and then an in-process serve's `<local root>/serve.sock`
+/// (`--figmog-root`, test setups).
+#[derive(Clone, Debug)]
+pub(super) struct Route {
+    mirror_root: PathBuf,
+    local_root: PathBuf,
+}
+
+impl Route {
+    pub(super) fn new(layout: &Layout) -> Self {
+        Self {
+            mirror_root: layout.mirror_root.clone(),
+            local_root: layout.local_root.clone(),
+        }
+    }
+}
+
+/// An open connection to a serve (handshaken, for the owner).
+pub(crate) struct Client {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
+
+impl Client {
+    fn new(stream: UnixStream) -> std::io::Result<Self> {
+        Ok(Self {
+            writer: stream.try_clone()?,
+            reader: BufReader::new(stream),
+        })
+    }
+}
+
+/// Why a call over the socket failed.
+enum Failure {
+    /// The owner is shutting down and did not accept the request (nothing
+    /// was started): reconnect and retry.
+    NotAccepted,
+    Error(String),
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Failure::Error(message)
+    }
+}
+
+/// How often a command reconnects after "not accepted" answers before it
+/// gives up.
+const MAX_RECONNECTS: u32 = 5;
+
 /// `<root>/serve.sock` — must match [`crate::serve::socket_path`] exactly.
-fn socket_path(root: &Path) -> PathBuf {
+fn socket_path(root: &std::path::Path) -> PathBuf {
     root.join("serve.sock")
+}
+
+/// Connect to the running serve on `route`, if any. A background owner
+/// that is shutting down is waited out (it may be followed by a new one);
+/// `None` means none is running. An owner that refuses the handshake (a
+/// different figmog build) is an error, never a silent direct open.
+pub(super) fn connect(route: &Route) -> Option<Result<Client, String>> {
+    if let Some(paths) = OwnerPaths::existing(&route.mirror_root) {
+        match owner::probe_after_close(&paths, None, owner::START_TIMEOUT) {
+            Ok(Probe::Ready(conn)) => {
+                return Some(Ok(Client {
+                    reader: conn.reader,
+                    writer: conn.writer,
+                }));
+            }
+            Ok(Probe::Absent | Probe::Closing) => {}
+            Err(error) => return Some(Err(error)),
+        }
+    }
+    let stream = UnixStream::connect(socket_path(&route.local_root)).ok()?;
+    Some(Client::new(stream).map_err(|e| e.to_string()))
+}
+
+/// Run `call` on a connection, reconnecting for each "not accepted" answer.
+/// `None`: no serve is running (any more).
+fn with_client<T>(
+    route: &Route,
+    mut call: impl FnMut(Client) -> Result<T, Failure>,
+) -> Option<Result<T, String>> {
+    for _ in 0..MAX_RECONNECTS {
+        let client = match connect(route)? {
+            Ok(client) => client,
+            Err(error) => return Some(Err(error)),
+        };
+        match call(client) {
+            Ok(value) => return Some(Ok(value)),
+            Err(Failure::NotAccepted) => continue,
+            Err(Failure::Error(error)) => return Some(Err(error)),
+        }
+    }
+    Some(Err(
+        "the background figmog kept refusing new requests while shutting down; retry".into(),
+    ))
 }
 
 /// A running serve answers a `tools/call` against its own already-open
@@ -45,14 +141,13 @@ fn socket_path(root: &Path) -> PathBuf {
 /// hang indefinitely.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Send one `tools/call` for `tool`/`args` over `<root>/serve.sock` and
+/// Send one `tools/call` for `tool`/`args` to the running serve and
 /// translate the response into the same `Result<Value, String>` shape
 /// every direct-mode command already returns (spec §1: "same JSON on
 /// stdout, same error shapes"). See this module's doc comment for the
 /// `None` vs `Some` contract.
-pub(super) fn try_call(root: &Path, tool: &str, args: Value) -> Option<Result<Value, String>> {
-    let stream = UnixStream::connect(socket_path(root)).ok()?;
-    Some(call_over(stream, tool, args))
+pub(super) fn try_call(route: &Route, tool: &str, args: Value) -> Option<Result<Value, String>> {
+    with_client(route, |client| call_over(client, tool, args.clone()))
 }
 
 /// Like [`try_call`], but for `tools/list` — used by `figmog tools`'s own
@@ -61,9 +156,8 @@ pub(super) fn try_call(root: &Path, tool: &str, args: Value) -> Option<Result<Va
 /// `--upstream`/`--no-upstream` flags — see this module's doc comment:
 /// once the socket is reachable, the command is answered by serve's own
 /// state).
-pub(super) fn try_tools_list(root: &Path) -> Option<Result<Vec<Value>, String>> {
-    let stream = UnixStream::connect(socket_path(root)).ok()?;
-    Some(tools_list_over(stream))
+pub(super) fn try_tools_list(route: &Route) -> Option<Result<Vec<Value>, String>> {
+    with_client(route, tools_list_over)
 }
 
 /// Build the `figmog tools` row shape (`{name, source, cacheable}`) from a
@@ -95,30 +189,22 @@ pub(super) fn tools_rows(tools: &[Value]) -> Value {
 /// every other local tool returns, so `cli::images` (the only caller)
 /// needs the whole array to decode the payload blocks and write files
 /// itself.
-pub(super) fn try_images_call(root: &Path, args: Value) -> Option<Result<Value, String>> {
-    let stream = UnixStream::connect(socket_path(root)).ok()?;
-    let resp = send_and_recv(
-        stream,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "figmog_images", "arguments": args},
-        }),
-    );
-    Some(resp.and_then(|resp| {
+pub(super) fn try_images_call(route: &Route, args: Value) -> Option<Result<Value, String>> {
+    with_client(route, |client| {
+        let resp = send_and_recv(
+            client,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "figmog_images", "arguments": args.clone()},
+            }),
+        )?;
         if let Some(err) = resp.get("error") {
-            return Err(protocol_error_message(err));
+            return Err(Failure::Error(protocol_error_message(err)));
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
-    }))
-}
-
-/// Connect to the running serve at `root`, if one is reachable — for the
-/// writers (NWS-2963), which prepare their request only once routing is
-/// known.
-pub(super) fn connect(root: &Path) -> Option<UnixStream> {
-    UnixStream::connect(socket_path(root)).ok()
+    })
 }
 
 /// How long a routed write may take to report: it may queue behind other
@@ -127,13 +213,20 @@ pub(super) fn connect(root: &Path) -> Option<UnixStream> {
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Run one write operation (`crate::serve::writes`) on the serve at the
-/// other end of `stream`, waiting on this connection for its answer —
+/// other end of `client`, waiting on this connection for its answer —
 /// `{"operation": id, "result": ...}`, sent once the write committed and
 /// was published. A serve-side failure is that failure's error (nothing was
 /// applied). If the connection ends first (serve killed or stopped), the
 /// write is reported as **outcome unknown**, naming the operation id serve
-/// announced when it accepted the write; it is never retried.
-pub(crate) fn write_over(stream: UnixStream, tool: &str, args: Value) -> Result<Value, String> {
+/// announced when it accepted the write; it is never retried. Only a write
+/// the background owner explicitly did not accept (it is shutting down,
+/// NWS-2953) is sent again, on a new connection from `route`.
+pub(crate) fn write_over(
+    route: &Route,
+    client: Client,
+    tool: &str,
+    args: Value,
+) -> Result<Value, String> {
     let frame = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -148,20 +241,59 @@ pub(crate) fn write_over(stream: UnixStream, tool: &str, args: Value) -> Result<
             crate::serve::MAX_FRAME_BYTES / (1024 * 1024)
         ));
     }
-    stream
+    let mut client = client;
+    for _ in 0..MAX_RECONNECTS {
+        match write_once(client, tool, &frame) {
+            Err(Failure::NotAccepted) => {}
+            Err(Failure::Error(error)) => return Err(error),
+            Ok(value) => return Ok(value),
+        }
+        client = match connect(route) {
+            Some(Ok(client)) => client,
+            Some(Err(error)) => return Err(error),
+            None => {
+                return Err(
+                    "figmog serve shut down before accepting this write; nothing was applied — rerun the command".into(),
+                );
+            }
+        };
+    }
+    Err("the background figmog kept refusing new requests while shutting down; nothing was applied — rerun the command".into())
+}
+
+/// [`write_over`] on an already-connected stream that is never
+/// reconnected (tests drive a serve loop or a fake owner directly).
+#[cfg(test)]
+pub(crate) fn write_over_stream(
+    stream: UnixStream,
+    tool: &str,
+    args: Value,
+) -> Result<Value, String> {
+    let route = Route {
+        mirror_root: PathBuf::from("/nonexistent/figmog-test-route"),
+        local_root: PathBuf::from("/nonexistent/figmog-test-route"),
+    };
+    let client = Client::new(stream).map_err(|e| e.to_string())?;
+    write_over(&route, client, tool, args)
+}
+
+fn write_once(client: Client, tool: &str, frame: &str) -> Result<Value, Failure> {
+    let Client {
+        mut reader,
+        mut writer,
+    } = client;
+    writer
         .set_write_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|e| e.to_string())?;
-    stream
+    writer
         .set_read_timeout(Some(WRITE_TIMEOUT))
         .map_err(|e| e.to_string())?;
-    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
     // A request serve never fully received cannot have been applied.
     writeln!(writer, "{frame}").map_err(|e| format!("writing to serve socket: {e}"))?;
     writer
         .flush()
         .map_err(|e| format!("writing to serve socket: {e}"))?;
 
-    let mut reader = BufReader::new(stream);
     let id = json!(1);
     let mut operation: Option<String> = None;
     loop {
@@ -176,12 +308,12 @@ pub(crate) fn write_over(stream: UnixStream, tool: &str, args: Value) -> Result<
         let line = match read_frame(&mut reader) {
             Ok(line) => line,
             Err(e) if e.starts_with("figmog serve did not respond") => {
-                return Err(unknown(
+                return Err(Failure::Error(unknown(
                     format!("no answer within {}s", WRITE_TIMEOUT.as_secs()),
                     &operation,
-                ));
+                )));
             }
-            Err(e) => return Err(unknown(e, &operation)),
+            Err(e) => return Err(Failure::Error(unknown(e, &operation))),
         };
         let resp: Value = serde_json::from_str(&line)
             .map_err(|e| unknown(format!("invalid JSON: {e}"), &operation))?;
@@ -192,14 +324,22 @@ pub(crate) fn write_over(stream: UnixStream, tool: &str, args: Value) -> Result<
             continue;
         }
         if is_response_to(&resp, &id) {
-            return interpret_call_response(tool, resp);
+            if operation.is_none() && not_accepted(&resp) {
+                return Err(Failure::NotAccepted);
+            }
+            return Ok(interpret_call_response(tool, resp)?);
         }
     }
 }
 
-fn call_over(stream: UnixStream, tool: &str, args: Value) -> Result<Value, String> {
+/// The owner answered "not accepted": it started nothing for this request.
+fn not_accepted(resp: &Value) -> bool {
+    resp["error"]["code"].as_i64() == Some(owner::NOT_ACCEPTED)
+}
+
+fn call_over(client: Client, tool: &str, args: Value) -> Result<Value, Failure> {
     let resp = send_and_recv(
-        stream,
+        client,
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -207,16 +347,16 @@ fn call_over(stream: UnixStream, tool: &str, args: Value) -> Result<Value, Strin
             "params": {"name": tool, "arguments": args},
         }),
     )?;
-    interpret_call_response(tool, resp)
+    Ok(interpret_call_response(tool, resp)?)
 }
 
-fn tools_list_over(stream: UnixStream) -> Result<Vec<Value>, String> {
+fn tools_list_over(client: Client) -> Result<Vec<Value>, Failure> {
     let resp = send_and_recv(
-        stream,
+        client,
         &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
     )?;
     if let Some(err) = resp.get("error") {
-        return Err(protocol_error_message(err));
+        return Err(Failure::Error(protocol_error_message(err)));
     }
     Ok(resp["result"]["tools"]
         .as_array()
@@ -234,27 +374,33 @@ fn tools_list_over(stream: UnixStream) -> Result<Vec<Value>, String> {
 /// notifications (only connections that sent `initialize` get them), but
 /// the reader still tolerates them: frames carrying a `method` (a
 /// notification or a server request) and responses for another id are
-/// skipped until the response to `frame`'s own id arrives (NWS-2959).
-fn send_and_recv(stream: UnixStream, frame: &Value) -> Result<Value, String> {
-    stream
+/// skipped until the response to `frame`'s own id arrives (NWS-2959). A
+/// "not accepted" answer from a closing owner is [`Failure::NotAccepted`].
+fn send_and_recv(client: Client, frame: &Value) -> Result<Value, Failure> {
+    let Client {
+        mut reader,
+        mut writer,
+    } = client;
+    writer
         .set_read_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|e| e.to_string())?;
-    stream
+    writer
         .set_write_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|e| e.to_string())?;
-    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
     writeln!(writer, "{frame}").map_err(|e| format!("writing to serve socket: {e}"))?;
     writer
         .flush()
         .map_err(|e| format!("writing to serve socket: {e}"))?;
 
-    let mut reader = BufReader::new(stream);
     let id = frame.get("id").cloned().unwrap_or(Value::Null);
     loop {
         let line = read_frame(&mut reader)?;
         let resp: Value = serde_json::from_str(&line)
             .map_err(|e| format!("serve socket sent invalid JSON: {e}"))?;
         if is_response_to(&resp, &id) {
+            if not_accepted(&resp) {
+                return Err(Failure::NotAccepted);
+            }
             return Ok(resp);
         }
     }
@@ -427,12 +573,41 @@ mod tests {
             }
         });
         let resp = send_and_recv(
-            client,
+            Client::new(client).unwrap(),
             &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
         )
-        .unwrap();
+        .unwrap_or_else(|_| panic!("send_and_recv failed"));
         assert_eq!(resp["result"], json!({"mine": true}));
         serve.join().unwrap();
+    }
+
+    /// A write the owner did not accept (it is shutting down) is never
+    /// reported as applied or unknown: with no serve left to retry on, the
+    /// CLI says nothing was applied (NWS-2953).
+    #[test]
+    fn a_write_the_owner_did_not_accept_is_retried_or_reported_unapplied() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let owner = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            let mut out = server;
+            writeln!(
+                out,
+                "{}",
+                json!({"jsonrpc": "2.0", "id": request["id"],
+                       "error": {"code": owner::NOT_ACCEPTED, "message": "not accepted"}})
+            )
+            .unwrap();
+        });
+        let error =
+            write_over_stream(client, "figmog_internal_pull", json!({"file": "k"})).unwrap_err();
+        assert!(
+            error.contains("before accepting this write; nothing was applied"),
+            "{error}"
+        );
+        owner.join().unwrap();
     }
 
     #[test]

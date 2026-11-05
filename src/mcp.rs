@@ -242,7 +242,11 @@ pub(crate) fn dispatch_message(
 }
 
 /// Frame a `tools/call` outcome per the transport's error mode.
-fn call_response(id: Value, mode: ToolErrorMode, result: Result<Value, String>) -> Value {
+pub(crate) fn call_response(
+    id: Value,
+    mode: ToolErrorMode,
+    result: Result<Value, String>,
+) -> Value {
     match result {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(message) => match mode {

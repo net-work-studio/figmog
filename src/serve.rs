@@ -61,9 +61,12 @@ use crate::mcp::{self, PendingCall, Reply, ToolErrorMode, ToolOutput};
 use crate::proxy;
 use crate::sessions::{self, SessionManager, StoreRoot};
 
+mod background;
 mod desktop;
 mod output;
 mod reads;
+mod relay;
+pub(crate) use relay::run_relay;
 pub(crate) mod writes;
 
 use crate::upstream::{HttpUpstream, UpstreamMcp};
@@ -495,30 +498,7 @@ pub(crate) fn run_serve(
         interval_dur,
     )?;
 
-    // Upstream probe: once here, so the first `tools/list` already has the
-    // desktop's tools when it is running; the desktop worker re-checks it
-    // from then on (NWS-2959). Global, not per-session (see this module's
-    // doc comment). `--no-upstream` starts no worker and never probes.
-    let desktop: Option<DesktopWorker> = if no_upstream {
-        None
-    } else {
-        let mut client = HttpUpstream::new(upstream_url);
-        let connected = match client.initialize() {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!(
-                    "figmog: upstream unreachable, serving local tools only (re-checking every {}s): {e}",
-                    ProbeCadence::default().missing.as_secs()
-                );
-                false
-            }
-        };
-        Some(DesktopWorker::spawn_with(
-            client,
-            connected,
-            ProbeCadence::default(),
-        ))
-    };
+    let desktop = start_desktop((!no_upstream).then_some(upstream_url));
     let upstream_status = desktop.as_ref().map_or("disabled", DesktopWorker::status);
 
     eprintln!(
@@ -532,12 +512,122 @@ pub(crate) fn run_serve(
     serve_loop(
         manager,
         desktop,
+        None,
         no_watch,
         track_current,
         interval_dur,
         rx,
         registry,
     )
+}
+
+/// Upstream probe: once at startup, so the first `tools/list` already has
+/// the desktop's tools when it is running; the desktop worker re-checks it
+/// from then on (NWS-2959). Global, not per-session (see this module's doc
+/// comment). `None` (`--no-upstream`) starts no worker and never probes.
+fn start_desktop(upstream_url: Option<String>) -> Option<DesktopWorker> {
+    let mut client = HttpUpstream::new(upstream_url?);
+    let connected = match client.initialize() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "figmog: upstream unreachable, serving local tools only (re-checking every {}s): {e}",
+                ProbeCadence::default().missing.as_secs()
+            );
+            false
+        }
+    };
+    Some(DesktopWorker::spawn_with(
+        client,
+        connected,
+        ProbeCadence::default(),
+    ))
+}
+
+/// Run as the repository's background owner (`figmog serve --background`,
+/// NWS-2953), started detached by the first relay. Takes the project's
+/// owner lock (or exits at once, successfully, when another process holds
+/// it: that one is the owner), binds the per-user socket, opens no files
+/// until relays and CLI commands name them, publishes discovery once it can
+/// answer, and serves until it has idled out. Stores are closed and
+/// compacted, then the socket and discovery record removed, before the
+/// lock is released, so a successor never finds either still in use.
+pub(crate) fn run_owner(
+    layout: crate::project::Layout,
+    settings: crate::owner::Settings,
+) -> Result<(), String> {
+    use crate::owner::{self, OwnerLock, OwnerPaths};
+    let paths = OwnerPaths::ensure(&layout.mirror_root)?;
+    let Some(lock) = OwnerLock::try_acquire(&paths)? else {
+        eprintln!(
+            "figmog: another background figmog owns {}; this one exits",
+            paths.identity()
+        );
+        return Ok(());
+    };
+    let lock = Arc::new(lock);
+    let socket = paths.socket();
+    let listener = owner::bind_socket(&socket)?;
+    let guard = SocketGuard::new(socket.clone())?;
+    crate::cli::record_store_owner(Some(&socket));
+    let token = crate::auth::token()?;
+    let interval_dur = clamp_interval(settings.interval);
+
+    let (tx, rx) = mpsc::channel::<Incoming>();
+    let registry: ConnRegistry = Arc::default();
+    spawn_socket_acceptor(listener, tx, registry.clone());
+    let manager = SessionManager {
+        sessions: Vec::new(),
+        root: StoreRoot::Fixed(paths.project.clone()),
+        token,
+        default_key: None,
+        #[cfg(test)]
+        api: None,
+    };
+    let desktop = start_desktop(settings.upstream.clone());
+    let generation = writes::new_generation();
+    let state = background::OwnerState::new(
+        paths.clone(),
+        lock.clone(),
+        &guard,
+        generation.clone(),
+        settings.clone(),
+        owner::idle_timeout(),
+    );
+    owner::write_discovery(
+        &paths,
+        &owner::Discovery {
+            socket: socket.clone(),
+            pid: std::process::id(),
+            generation: generation.clone(),
+            version: owner::version().to_string(),
+            protocol: owner::PROTOCOL,
+        },
+    )?;
+    eprintln!(
+        "figmog: background owner {} ready for {} (socket {}, watch {}, interval {}s, upstream {})",
+        std::process::id(),
+        paths.identity(),
+        socket.display(),
+        if settings.watch { "on" } else { "off" },
+        settings.interval,
+        desktop.as_ref().map_or("disabled", DesktopWorker::status),
+    );
+    let result = serve_loop(
+        manager,
+        desktop,
+        Some(state),
+        !settings.watch,
+        false,
+        interval_dur,
+        rx,
+        registry,
+    );
+    drop(guard);
+    owner::remove_discovery(&paths, &generation);
+    eprintln!("figmog: background owner {} exited", std::process::id());
+    drop(lock);
+    result
 }
 
 /// Dispatch requests using real stdio output. The loop accepts an output
@@ -547,6 +637,7 @@ pub(crate) fn run_serve(
 fn serve_loop(
     manager: SessionManager,
     desktop: Option<DesktopWorker>,
+    owner: Option<background::OwnerState>,
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
@@ -554,9 +645,15 @@ fn serve_loop(
     registry: ConnRegistry,
 ) -> Result<(), String> {
     let first_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
-    serve_loop_with_output(
+    let mut offload = Offload::new(desktop);
+    if let Some(owner) = owner {
+        // The owner's operation ids carry its generation (NWS-2953).
+        offload.ops = writes::Operations::with_generation(owner.generation.clone());
+        offload.owner = Some(owner);
+    }
+    serve_loop_with_offload(
         manager,
-        desktop,
+        offload,
         no_watch,
         track_current,
         interval_dur,
@@ -716,6 +813,9 @@ struct Offload {
     /// The operation id of a write the handler just accepted, announced to
     /// its requester before the write's response.
     op_notice: Option<String>,
+    /// Set when this process is the repository's background owner
+    /// (NWS-2953): handshakes, idle shutdown, "not accepted" answers.
+    owner: Option<background::OwnerState>,
 }
 
 /// Completion polling interval while worker reads are outstanding, so a
@@ -736,6 +836,7 @@ impl Offload {
             exit_drain: EXIT_DRAIN,
             ops: writes::Operations::default(),
             op_notice: None,
+            owner: None,
         }
     }
 
@@ -890,6 +991,7 @@ enum LoopExit {
     StdoutGone,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn serve_loop_with_output(
     manager: SessionManager,
@@ -1002,6 +1104,16 @@ fn request_loop(
         if stdio.gone() {
             return LoopExit::StdoutGone;
         }
+        // A background owner idles out with no connections and no work,
+        // and finishes accepted work before it exits (NWS-2953).
+        if let Some(owner) = &mut offload.owner {
+            let writing = manager.sessions.iter().any(|s| s.has_writes());
+            let busy = registry.open_count() > 0 || !pending.is_empty() || writing;
+            owner.tick(Instant::now(), busy);
+            if owner.closing && pending.is_empty() && !writing {
+                return LoopExit::Drain;
+            }
+        }
         // Completions and due watch work run even under continuous traffic.
         // Polling this in-memory channel never waits on a pull or HTTP.
         let mut published = Vec::new();
@@ -1083,6 +1195,34 @@ fn request_loop(
             ),
         };
 
+        // A background owner answers handshakes itself, refuses every new
+        // request once closing, and frames a relay's answers for its agent
+        // (MCP `isError` content, no internal tools) like stdio (NWS-2953).
+        let mut relay_conn = false;
+        if let (Some(owner), ReplyTo::Socket(conn_id)) = (&offload.owner, to) {
+            match background::request_parts(&line) {
+                Some((id, method, _)) if owner.closing && !method.starts_with("notifications/") => {
+                    deliver(to, frame(&background::not_accepted(id)), registry, stdio);
+                    continue;
+                }
+                Some((id, method, params)) if method == crate::owner::HELLO => {
+                    let (response, relay) = owner.hello(id, &params, manager, interval_dur);
+                    if relay {
+                        registry.set_relay(conn_id);
+                    }
+                    deliver(to, frame(&response), registry, stdio);
+                    continue;
+                }
+                _ if owner.closing => continue,
+                _ => relay_conn = registry.is_relay(conn_id),
+            }
+        }
+        let mode = if relay_conn {
+            ToolErrorMode::McpContent
+        } else {
+            mode
+        };
+
         let over_limit = pending.count(to) >= MAX_PENDING_PER_REQUESTER;
         offload.staged = None;
         offload.op_notice = None;
@@ -1091,7 +1231,7 @@ fn request_loop(
             .as_ref()
             .map_or("disabled", DesktopWorker::status);
         let mut handler = LoopHandler::new(
-            matches!(to, ReplyTo::Socket(_)),
+            matches!(to, ReplyTo::Socket(_)) && !relay_conn,
             |name: &str, args: &Value| -> Result<ToolOutput, String> {
                 if over_limit {
                     return Err(format!(
@@ -1778,6 +1918,7 @@ mod tests {
             registry.register(1, socket).unwrap();
             serve_loop(
                 manager,
+                None,
                 None,
                 false,
                 false,

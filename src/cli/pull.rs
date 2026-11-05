@@ -73,7 +73,8 @@ pub(super) fn cmd_pull(
 pub(super) fn cmd_pull_routed(
     db: &Db,
     key: &str,
-    stream: std::os::unix::net::UnixStream,
+    route: &super::socket::Route,
+    client: super::socket::Client,
     from_file: Option<PathBuf>,
     fresh: bool,
     geometry: bool,
@@ -82,7 +83,7 @@ pub(super) fn cmd_pull_routed(
     if let Some(path) = from_file {
         args["from_file"] = read_saved_response(&path)?;
     }
-    let done = super::socket::write_over(stream, crate::serve::writes::PULL, args)?;
+    let done = super::socket::write_over(route, client, crate::serve::writes::PULL, args)?;
     if let Some(layout) = &db.layout {
         write_current(&layout.local_root, key)?;
     }

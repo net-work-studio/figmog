@@ -56,7 +56,7 @@ impl Live {
         args: Value,
     ) -> std::thread::JoinHandle<Result<Value, String>> {
         let stream = UnixStream::connect(&self.socket).unwrap();
-        std::thread::spawn(move || crate::cli::write_over(stream, tool, args))
+        std::thread::spawn(move || crate::cli::write_over_stream(stream, tool, args))
     }
 
     /// One plain `tools/call` on a fresh connection; the response frame.
@@ -272,7 +272,7 @@ fn a_vanished_owner_leaves_the_outcome_unknown_and_is_not_retried() {
         reader.read_line(&mut rest).unwrap();
         (request, rest)
     });
-    let error = crate::cli::write_over(client, PULL, json!({"file": KEY})).unwrap_err();
+    let error = crate::cli::write_over_stream(client, PULL, json!({"file": KEY})).unwrap_err();
     assert!(
         error.starts_with("outcome unknown") && error.contains("operation feed-7"),
         "{error}"

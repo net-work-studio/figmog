@@ -986,7 +986,8 @@ pub(crate) fn open_session(
     api_token: Option<&str>,
 ) -> Result<FileSession, String> {
     let (path, legacy) = root.store_target(key)?;
-    let api = api_token.map(|token| Arc::new(UreqApi::new(token.to_string())) as SessionApi);
+    let api =
+        api_token.map(|token| Arc::new(UreqApi::for_sessions(token.to_string())) as SessionApi);
     open_session_inner(
         path,
         legacy,
@@ -1004,7 +1005,8 @@ pub(crate) fn open_session_at(
     network_key: Option<&str>,
     api_token: Option<&str>,
 ) -> Result<FileSession, String> {
-    let api = api_token.map(|token| Arc::new(UreqApi::new(token.to_string())) as SessionApi);
+    let api =
+        api_token.map(|token| Arc::new(UreqApi::for_sessions(token.to_string())) as SessionApi);
     open_session_with_api(path, key, network_key, api)
 }
 
@@ -1423,7 +1425,7 @@ pub(crate) struct SessionManager {
     pub(crate) api: Option<SessionApi>,
 }
 
-const NO_DEFAULT_FILE_MSG: &str = "no file specified and no default mirrored file — pass a `file` argument, mirror one with figmog_open, or see figmog_files for the current list";
+pub(crate) const NO_DEFAULT_FILE_MSG: &str = "no file specified and no default mirrored file — pass a `file` argument, mirror one with figmog_open, or see figmog_files for the current list";
 
 impl SessionManager {
     pub(crate) fn open(&mut self, file_ref: &str) -> Result<&mut FileSession, String> {

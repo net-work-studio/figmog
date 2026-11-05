@@ -73,6 +73,9 @@ struct Conn {
     /// The client sent `initialize`, so it gets notifications such as
     /// `notifications/tools/list_changed` (NWS-2959). The CLI never does.
     notify: AtomicBool,
+    /// The connection is a `figmog serve` relay (NWS-2953): it is answered
+    /// with MCP framing, like stdio, on behalf of its agent.
+    relay: AtomicBool,
     stream: UnixStream,
 }
 
@@ -180,6 +183,7 @@ impl Connections {
             wake: Condvar::new(),
             cancelled: Arc::default(),
             notify: AtomicBool::new(false),
+            relay: AtomicBool::new(false),
             stream,
         });
         {
@@ -250,6 +254,28 @@ impl Connections {
         for conn in subscribed {
             conn.enqueue(frame.to_string());
         }
+    }
+
+    /// `conn_id` handshook as a relay (NWS-2953).
+    pub(crate) fn set_relay(&self, conn_id: u64) {
+        if let Some(conn) = self.state.lock().unwrap().conns.get(&conn_id) {
+            conn.relay.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether `conn_id` is a relay's connection.
+    pub(crate) fn is_relay(&self, conn_id: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .conns
+            .get(&conn_id)
+            .is_some_and(|conn| conn.relay.load(Ordering::Relaxed))
+    }
+
+    /// Open connections: a background owner idles out only at zero.
+    pub(crate) fn open_count(&self) -> usize {
+        self.state.lock().unwrap().conns.len()
     }
 
     /// `conn_id`'s cancel flag: already set for a connection that is gone.

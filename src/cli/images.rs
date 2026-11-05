@@ -25,7 +25,7 @@
 //! manifest-shaped error JSON, exit 1" — this command never falls through
 //! to the generic `{"error": ...}` shape other commands use).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
@@ -36,7 +36,7 @@ use super::{Db, socket, write_json};
 
 pub(super) fn cmd_images(
     db: &Db,
-    socket_root: Option<&Path>,
+    socket_root: Option<&socket::Route>,
     ids: Vec<String>,
     format: String,
     scale: Option<f64>,
