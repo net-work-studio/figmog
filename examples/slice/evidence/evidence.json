@@ -2,7 +2,7 @@
   "builds": {
     "after": {
       "card": "examples/slice/app/src/Card.jsx",
-      "commit": "fcaf0787b3f412fbdfcbfefa2de9e46df900955c",
+      "commit": "c9709996fcf5d73a98a3ba4ec79800ce9cd10453",
       "dirty": false,
       "tree": {
         "files": 8,
@@ -11,7 +11,7 @@
     },
     "before": {
       "card": "examples/slice/app/baseline/Card.jsx",
-      "commit": "fcaf0787b3f412fbdfcbfefa2de9e46df900955c",
+      "commit": "c9709996fcf5d73a98a3ba4ec79800ce9cd10453",
       "dirty": false,
       "tree": {
         "files": 8,
@@ -20,7 +20,7 @@
     },
     "broken": {
       "card": "examples/slice/app/variants/Card.wrong-padding.jsx",
-      "commit": "fcaf0787b3f412fbdfcbfefa2de9e46df900955c",
+      "commit": "c9709996fcf5d73a98a3ba4ec79800ce9cd10453",
       "dirty": false,
       "tree": {
         "files": 8,
@@ -211,7 +211,7 @@
   "scoreNote": "advisory: 100 * (1 - mismatched / (W*H)) against the Figma render; never a pass/fail gate",
   "spec": {
     "path": "examples/slice/spec/card.spec.json",
-    "sha256": "11cc71c173e857257d00a6e4f41748f4b2f7a375fdf3dcedfabdfcaa89868e92"
+    "sha256": "3e66ca495c4814790903d5dc1990e252f9fd2febcbd8d14476d3102de78e0445"
   },
   "tokens": {
     "css": {
