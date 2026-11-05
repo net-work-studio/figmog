@@ -42,6 +42,7 @@
 //! live-network test).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use fold::pipeline::terminal::{MultimapReader, TableReader};
 use fold::pipeline::{Keyed, Push};
@@ -73,16 +74,25 @@ pub const RENDER_PIN_GENERATION: u32 = 1;
 /// fingerprint and stored on every [`RenderIndexRec`]. Bump it whenever
 /// what [`render_fingerprint`] hashes changes: every row stored under an
 /// older scheme then reads as an orphan and is evicted, never served.
-pub const RENDER_FINGERPRINT_SCHEME: u32 = 1;
+pub const RENDER_FINGERPRINT_SCHEME: u32 = 2;
+
+/// Key of the render cache's cleanup marker (NWS-2958): a `render_index`
+/// row that is not a render. Its `scheme` and `file_version` record the
+/// fingerprint scheme and mirror version of the last orphan cleanup, so
+/// a request whose renders all hit skips the orphan pass until the
+/// mirror (or the scheme) changes. Never a valid SHA-256 hex, so it can't
+/// collide with a fingerprint; never served, counted or evicted.
+pub const RENDER_CLEANUP_KEY: &str = "cleanup";
 
 /// Default hard byte quota for fingerprint-indexed render bytes
 /// (`render_blobs`, NWS-2958): 256 MiB. Counts each distinct blob once.
 pub const RENDER_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How one image request treats cached renders (NWS-2958). The default
-/// is exactly the pre-NWS-2958 behavior: renders are cached per file
-/// version only, and nothing is written to or read from the
-/// fingerprint-indexed render cache.
+/// serves and writes renders per file version only, exactly as before
+/// NWS-2958; the one thing it does to the fingerprint-indexed render cache
+/// is retire a node's fingerprinted render when it fetches a newer
+/// per-version one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderPolicy {
     /// Opt in to cross-version render reuse: a render stays a hit for as
@@ -94,8 +104,8 @@ pub struct RenderPolicy {
     /// refetch. Fills are content-addressed and unaffected.
     pub refresh: bool,
     /// Hard byte quota for fingerprint-indexed render bytes, enforced
-    /// after every opted-in request that wrote or found something to
-    /// evict.
+    /// after every request that wrote or retired a fingerprinted render
+    /// or ran the orphan pass ([`plan_render_eviction`]).
     pub max_bytes: u64,
 }
 
@@ -165,14 +175,20 @@ macro_rules! with_scan_readers {
 /// Hashed, together with [`RENDER_FINGERPRINT_SCHEME`], `format` and
 /// `scale_milli`:
 ///
-/// - **the subtree**: every node's stored canonical raw JSON
-///   ([`NodeRec::raw`]), in preorder and child order, as nested
-///   `[raw, [children...]]` arrays. Instance children arrive expanded in
-///   the REST response, variable and style values are baked into the raw
-///   properties, image fills are referenced by content hash and fonts are
-///   named in text styles, so this is nearly everything that affects the
-///   picture. Node ids are part of the raw JSON, so a fingerprint belongs
-///   to exactly one node;
+/// - **the subtree**, as a Merkle hash over every node's stored raw JSON
+///   ([`NodeRec::raw`]) in child order. Instance children arrive expanded
+///   in the REST response, variable and style values are baked into the
+///   raw properties, image fills are referenced by content hash and fonts
+///   are named in text styles, so this is nearly everything that affects
+///   the picture. Two things are normalized out first: prototype-only
+///   keys ([`PROTOTYPE_ONLY_KEYS`]), and page-absolute position — each
+///   node's `absoluteBoundingBox`/`absoluteRenderBounds`/
+///   `absoluteTransform`/`relativeTransform` translation is replaced by
+///   its offset from its parent (rounded to 1/1000 px), and the rendered
+///   node's own offset is dropped. Moving the node, or reflowing it
+///   inside an auto-layout parent, keeps its fingerprint; resizing or
+///   moving anything inside it changes it. Node ids stay part of the raw
+///   JSON, so a fingerprint belongs to exactly one node;
 /// - **local main components** (conservative): for every INSTANCE in the
 ///   subtree whose main component is mirrored, that component's own
 ///   subtree hash, transitively — so editing a main component invalidates
@@ -181,8 +197,9 @@ macro_rules! with_scan_readers {
 ///   `explicitVariableModes`, root first.
 ///
 /// `None` (the conservative fallback) when the node, an ancestor or a
-/// subtree node is missing from the mirror, when an earlier sibling is a
-/// mask (`isMask`) that might clip it, or when the tree is inconsistent.
+/// subtree node is missing from the mirror, when a sibling drawn before
+/// the node or before any of its ancestors is a mask (`isMask`) that
+/// might clip it, or when the tree is inconsistent.
 pub fn render_fingerprint<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
@@ -193,13 +210,137 @@ pub fn render_fingerprint<R: Readable>(
     Fingerprinter::new(nodes, children).fingerprint(node_id, format, scale_milli)
 }
 
-/// [`render_fingerprint`] with the per-node part (everything but format
-/// and scale) memoized, so one scan computes each subtree at most once.
+/// Raw node keys that only drive prototyping, never the static picture,
+/// left out of [`render_fingerprint`] (scheme 2).
+pub const PROTOTYPE_ONLY_KEYS: &[&str] = &[
+    "flowStartingPoints",
+    "interactions",
+    "prototypeBackgrounds",
+    "prototypeDevice",
+    "prototypeStartNodeID",
+    "reactions",
+    "transitionDuration",
+    "transitionEasing",
+    "transitionNodeID",
+];
+
+// Test-only count of node hashes computed, so tests can prove a request
+// doesn't walk subtrees it has no reason to.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static NODE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One node's subtree hash and the main components its instances use.
+struct NodeHash {
+    hash: String,
+    components: BTreeSet<String>,
+}
+
+/// Where a node sits on the page: what [`node_core`] strips from its raw
+/// JSON, kept to express its children's offsets from it.
+#[derive(Clone, Copy, Default)]
+struct Placement {
+    /// `absoluteBoundingBox` x, y.
+    origin: Option<(f64, f64)>,
+    /// `absoluteTransform` translation.
+    absolute: Option<(f64, f64)>,
+    /// `relativeTransform` translation.
+    relative: Option<(f64, f64)>,
+}
+
+/// Round a coordinate offset to 1/1000 px, so float noise from
+/// subtracting page positions can't change a fingerprint (and `-0` reads
+/// as `0`).
+fn round_offset(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0 + 0.0
+}
+
+fn xy(v: Option<&Value>) -> Option<(f64, f64)> {
+    let v = v?;
+    Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?))
+}
+
+/// Zero a 2×3 affine transform's translation, returning it.
+fn take_translation(t: Option<&mut Value>) -> Option<(f64, f64)> {
+    let rows = t?.as_array_mut()?;
+    if rows.len() != 2 {
+        return None;
+    }
+    let tx = rows[0].get(2)?.as_f64()?;
+    let ty = rows[1].get(2)?.as_f64()?;
+    rows[0][2] = json!(0.0);
+    rows[1][2] = json!(0.0);
+    Some((tx, ty))
+}
+
+/// A node's raw JSON without prototype-only keys or its page position,
+/// as canonical JSON, plus that position. A node without an
+/// `absoluteBoundingBox` keeps its absolute render bounds (conservative).
+fn node_core(raw: &str) -> Option<(String, Placement)> {
+    #[cfg(test)]
+    NODE_HASHES.with(|n| n.set(n.get() + 1));
+    let mut value: Value = serde_json::from_str(raw).ok()?;
+    let obj = value.as_object_mut()?;
+    for key in PROTOTYPE_ONLY_KEYS {
+        obj.remove(*key);
+    }
+    let origin = xy(obj.get("absoluteBoundingBox"));
+    if let Some((ox, oy)) = origin {
+        if let Some(bbox) = obj
+            .get_mut("absoluteBoundingBox")
+            .and_then(Value::as_object_mut)
+        {
+            bbox.remove("x");
+            bbox.remove("y");
+        }
+        if let Some((rx, ry)) = xy(obj.get("absoluteRenderBounds"))
+            && let Some(bounds) = obj
+                .get_mut("absoluteRenderBounds")
+                .and_then(Value::as_object_mut)
+        {
+            bounds.insert("x".into(), json!(round_offset(rx - ox)));
+            bounds.insert("y".into(), json!(round_offset(ry - oy)));
+        }
+    }
+    let placement = Placement {
+        origin,
+        absolute: take_translation(obj.get_mut("absoluteTransform")),
+        relative: take_translation(obj.get_mut("relativeTransform")),
+    };
+    Some((serde_json::to_string(&value).ok()?, placement))
+}
+
+/// `child`'s offset from `parent`, as canonical JSON: bounding-box and
+/// absolute-transform deltas (absolute when the parent has none), and the
+/// relative-transform translation only when no absolute transform says
+/// it already.
+fn offset(child: &Placement, parent: &Placement) -> Value {
+    let delta = |c: Option<(f64, f64)>, p: Option<(f64, f64)>| match (c, p) {
+        (Some(c), Some(p)) => json!([round_offset(c.0 - p.0), round_offset(c.1 - p.1)]),
+        (Some(c), None) => json!(["absolute", c.0, c.1]),
+        (None, _) => Value::Null,
+    };
+    let relative = match (child.absolute, child.relative) {
+        (None, Some((x, y))) => json!([round_offset(x), round_offset(y)]),
+        _ => Value::Null,
+    };
+    json!([
+        delta(child.origin, parent.origin),
+        delta(child.absolute, parent.absolute),
+        relative
+    ])
+}
+
+/// [`render_fingerprint`] with every node's subtree hash, raw-flag and
+/// per-subject result memoized, so one request hashes each node at most
+/// once however many renders share it.
 struct Fingerprinter<'r, 'a, R: Readable> {
     nodes: &'r TableReader<'a, R, String, NodeRec>,
     children: &'r MultimapReader<'a, R, String, (u32, String)>,
     base: BTreeMap<String, Option<String>>,
-    components: BTreeMap<String, Option<(String, BTreeSet<String>)>>,
+    hashes: BTreeMap<String, Option<(Rc<NodeHash>, Placement)>>,
+    masks: BTreeMap<String, Option<bool>>,
 }
 
 impl<'r, 'a, R: Readable> Fingerprinter<'r, 'a, R> {
@@ -211,7 +352,8 @@ impl<'r, 'a, R: Readable> Fingerprinter<'r, 'a, R> {
             nodes,
             children,
             base: BTreeMap::new(),
-            components: BTreeMap::new(),
+            hashes: BTreeMap::new(),
+            masks: BTreeMap::new(),
         }
     }
 
@@ -229,125 +371,144 @@ impl<'r, 'a, R: Readable> Fingerprinter<'r, 'a, R> {
 
     fn compute_base(&mut self, node_id: &str) -> Option<String> {
         let node = self.nodes.get(&node_id.to_string())?;
-        if self.masked_by_sibling(&node)? {
-            return None;
-        }
-        let context = self.inherited_modes(&node)?;
-        let (subtree, mut pending) = subtree_canonical(self.nodes, self.children, node_id)?;
+        let context = self.ancestor_context(&node)?;
+        let root = self.subtree_hash(node_id)?;
 
         // Transitive local main components, each hashed once.
         let mut deps: BTreeMap<String, String> = BTreeMap::new();
+        let mut pending: BTreeSet<String> = root.components.clone();
         while let Some(component_id) = pending.pop_first() {
             if deps.contains_key(&component_id) {
                 continue;
             }
-            if !self.components.contains_key(&component_id) {
-                let computed = if self.nodes.contains(&component_id) {
-                    subtree_canonical(self.nodes, self.children, &component_id)
-                        .map(|(canon, more)| (sha256_hex(canon.as_bytes()), more))
-                } else {
-                    // A remote (library) main component: only the REST
-                    // expansion inside the instance can speak for it.
-                    Some(("remote".to_string(), BTreeSet::new()))
-                };
-                self.components.insert(component_id.clone(), computed);
+            if self.nodes.contains(&component_id) {
+                let component = self.subtree_hash(&component_id)?;
+                deps.insert(component_id, component.hash.clone());
+                pending.extend(
+                    component
+                        .components
+                        .iter()
+                        .filter(|c| !deps.contains_key(*c))
+                        .cloned(),
+                );
+            } else {
+                // A remote (library) main component: only the REST
+                // expansion inside the instance can speak for it.
+                deps.insert(component_id, "remote".to_string());
             }
-            let (hash, more) = self.components.get(&component_id)?.as_ref()?;
-            deps.insert(component_id.clone(), hash.clone());
-            pending.extend(more.iter().filter(|c| !deps.contains_key(*c)).cloned());
         }
         let deps = serde_json::to_string(&deps).ok()?;
-        Some(format!("{context}\0{deps}\0{subtree}"))
+        Some(format!("{context}\0{deps}\0{}", root.hash))
+    }
+
+    /// `root`'s Merkle subtree hash, computed bottom-up without recursion
+    /// and memoized per node. `None` if a node is missing or unreadable,
+    /// or the children edges loop.
+    fn subtree_hash(&mut self, root: &str) -> Option<Rc<NodeHash>> {
+        enum Step {
+            Enter(String),
+            Exit(String, Vec<String>),
+        }
+        let mut path = BTreeSet::new();
+        let mut stack = vec![Step::Enter(root.to_string())];
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::Enter(id) => {
+                    if self.hashes.contains_key(&id) {
+                        continue;
+                    }
+                    if !path.insert(id.clone()) {
+                        return None;
+                    }
+                    let mut edges = self.children.get(&id);
+                    edges.sort();
+                    let kids: Vec<String> = edges.into_iter().map(|(_, kid)| kid).collect();
+                    stack.extend(kids.iter().rev().map(|kid| Step::Enter(kid.clone())));
+                    // Below its children: popped after all of them.
+                    let at = stack.len() - kids.len();
+                    stack.insert(at, Step::Exit(id, kids));
+                }
+                Step::Exit(id, kids) => {
+                    path.remove(&id);
+                    let hashed = self.hash_node(&id, &kids);
+                    self.hashes.insert(id, hashed);
+                }
+            }
+        }
+        self.hashes
+            .get(root)?
+            .as_ref()
+            .map(|(hash, _)| hash.clone())
+    }
+
+    fn hash_node(&self, id: &str, kids: &[String]) -> Option<(Rc<NodeHash>, Placement)> {
+        let node = self.nodes.get(&id.to_string())?;
+        let (core, placement) = node_core(&node.raw)?;
+        let mut components: BTreeSet<String> = node.component_id.into_iter().collect();
+        let mut canonical = format!("[{core},[");
+        for (n, kid) in kids.iter().enumerate() {
+            let (hash, kid_placement) = self.hashes.get(kid)?.as_ref()?;
+            if n > 0 {
+                canonical.push(',');
+            }
+            canonical.push_str(&json!([offset(kid_placement, &placement), hash.hash]).to_string());
+            components.extend(hash.components.iter().cloned());
+        }
+        canonical.push_str("]]");
+        let hash = NodeHash {
+            hash: sha256_hex(canonical.as_bytes()),
+            components,
+        };
+        Some((Rc::new(hash), placement))
     }
 
     /// Every ancestor's `explicitVariableModes`, root first, as canonical
-    /// JSON; `None` if an ancestor is missing or unreadable.
-    fn inherited_modes(&self, node: &NodeRec) -> Option<String> {
+    /// JSON. `None` if an ancestor is missing or unreadable, or if a
+    /// sibling drawn before the node or before any of its ancestors is a
+    /// mask: such a mask clips it in the canvas, and figmog doesn't know
+    /// whether a single-node export applies it.
+    fn ancestor_context(&mut self, node: &NodeRec) -> Option<String> {
         let mut chain = Vec::new();
         let mut seen = BTreeSet::new();
-        let mut parent = node.parent_id.clone();
-        while let Some(parent_id) = parent {
+        let mut current = node.clone();
+        while let Some(parent_id) = current.parent_id.clone() {
             if !seen.insert(parent_id.clone()) {
                 return None;
             }
-            let ancestor = self.nodes.get(&parent_id)?;
-            let raw: Value = serde_json::from_str(&ancestor.raw).ok()?;
-            if let Some(modes) = raw.get("explicitVariableModes") {
-                chain.push(json!([parent_id, modes]));
+            for (index, sibling) in self.children.get(&parent_id) {
+                if index < current.child_index && sibling != current.id && self.is_mask(&sibling)? {
+                    return None;
+                }
             }
-            parent = ancestor.parent_id;
+            let parent = self.nodes.get(&parent_id)?;
+            if parent.raw.contains("\"explicitVariableModes\"") {
+                let raw: Value = serde_json::from_str(&parent.raw).ok()?;
+                if let Some(modes) = raw.get("explicitVariableModes") {
+                    chain.push(json!([parent_id, modes]));
+                }
+            }
+            current = parent;
         }
         chain.reverse();
         serde_json::to_string(&chain).ok()
     }
 
-    /// Whether a sibling drawn before `node` is a mask. Such a mask clips
-    /// `node` in the canvas, and figmog doesn't know whether a
-    /// single-node export applies it, so the render isn't fingerprinted.
-    fn masked_by_sibling(&self, node: &NodeRec) -> Option<bool> {
-        let Some(parent_id) = &node.parent_id else {
-            return Some(false);
-        };
-        for (index, sibling_id) in self.children.get(parent_id) {
-            if index >= node.child_index || sibling_id == node.id {
-                continue;
-            }
-            let sibling = self.nodes.get(&sibling_id)?;
-            let raw: Value = serde_json::from_str(&sibling.raw).ok()?;
-            if raw.get("isMask").and_then(Value::as_bool) == Some(true) {
-                return Some(true);
-            }
+    /// Whether `id`'s raw JSON says `isMask: true` (memoized; parsed only
+    /// when the canonical text could hold it).
+    fn is_mask(&mut self, id: &str) -> Option<bool> {
+        if let Some(known) = self.masks.get(id) {
+            return *known;
         }
-        Some(false)
-    }
-}
-
-/// `root`'s subtree as nested `[raw, [children...]]` JSON arrays, built
-/// iteratively (no recursion depth limit) in child order, plus the main
-/// component ids of every INSTANCE in it. `None` if a node is missing or
-/// the children edges revisit a node.
-fn subtree_canonical<R: Readable>(
-    nodes: &TableReader<'_, R, String, NodeRec>,
-    children: &MultimapReader<'_, R, String, (u32, String)>,
-    root: &str,
-) -> Option<(String, BTreeSet<String>)> {
-    enum Step {
-        Open(String),
-        Close,
-    }
-    let mut out = String::new();
-    let mut components = BTreeSet::new();
-    let mut seen = BTreeSet::new();
-    let mut stack = vec![Step::Open(root.to_string())];
-    while let Some(step) = stack.pop() {
-        match step {
-            Step::Close => out.push_str("]]"),
-            Step::Open(id) => {
-                if !seen.insert(id.clone()) {
-                    return None;
-                }
-                let node = nodes.get(&id)?;
-                // A node right after its parent's `[` opens the list;
-                // every later sibling follows a `]]`.
-                if !(out.is_empty() || out.ends_with('[')) {
-                    out.push(',');
-                }
-                out.push('[');
-                out.push_str(&node.raw);
-                out.push_str(",[");
-                if let Some(component_id) = node.component_id {
-                    components.insert(component_id);
-                }
-                let mut edges = children.get(&id);
-                edges.sort();
-                stack.push(Step::Close);
-                for (_, child) in edges.into_iter().rev() {
-                    stack.push(Step::Open(child));
-                }
+        let mask = self.nodes.get(&id.to_string()).and_then(|node| {
+            if !node.raw.contains("\"isMask\":true") {
+                return Some(false);
             }
-        }
+            let raw: Value = serde_json::from_str(&node.raw).ok()?;
+            Some(raw.get("isMask").and_then(Value::as_bool) == Some(true))
+        });
+        self.masks.insert(id.to_string(), mask);
+        mask
     }
-    Some((out, components))
 }
 
 /// The digest a fingerprinted render's bytes are stored and validated
@@ -381,13 +542,17 @@ pub struct RenderEviction {
 ///    fingerprint no node has any more;
 /// 2. **hard byte quota**: while the distinct blobs the remaining rows
 ///    reference exceed `max_bytes`, the oldest remaining row, valid or
-///    not.
+///    not — except the `protected` rows, the renders the current request
+///    served or wrote, which no request evicts while answering with them
+///    (so the cache can exceed `max_bytes` by at most one request's own
+///    renders, until the next request that evicts).
 ///
 /// A blob is removed once no remaining row references it — including
 /// `displaced` blobs, those an overwritten row used to reference.
 pub fn plan_render_eviction(
     index: &BTreeMap<String, RenderIndexRec>,
     orphans: &BTreeSet<String>,
+    protected: &BTreeSet<String>,
     displaced: &BTreeSet<String>,
     max_bytes: u64,
 ) -> RenderEviction {
@@ -416,7 +581,9 @@ pub fn plan_render_eviction(
             .1 += 1;
     }
     let mut total: u64 = refs.values().map(|(len, _)| *len).sum();
-    let mut live = live.into_iter();
+    let mut live = live
+        .into_iter()
+        .filter(|row| !protected.contains(&row.fingerprint));
     while total > max_bytes {
         let Some(row) = live.next() else { break };
         evicted.push(row);
@@ -576,10 +743,22 @@ pub struct Scanned {
     /// Requested render id -> fingerprint (opted-in requests only; ids
     /// without one fall back to per-version caching).
     render_fps: BTreeMap<String, String>,
-    /// Every stored render index row, by fingerprint (opted in only).
+    /// Every stored render index row but the cleanup marker, by
+    /// fingerprint. Read whatever the policy (metadata only, and empty
+    /// unless a request ever opted in), so a per-version write can retire
+    /// the same node's fingerprinted render.
     render_index: BTreeMap<String, RenderIndexRec>,
-    /// Fingerprints in `render_index` no node has any more.
+    /// Fingerprints in `render_index` no node has any more (found only
+    /// when the orphan pass ran).
     orphans: BTreeSet<String>,
+    /// Fingerprints this request serves from the render index.
+    hit_fps: BTreeSet<String>,
+    /// Requested render id -> fingerprints of its stored renders at this
+    /// request's format and scale.
+    same_node: BTreeMap<String, Vec<String>>,
+    /// Whether the orphan pass ran, and the cleanup marker didn't already
+    /// record this version and scheme (so `resolve` must record them).
+    mark_cleanup: bool,
 }
 
 /// Whether a row fetched by its key hash actually belongs to the
@@ -657,12 +836,24 @@ pub fn scan_split<R: Readable>(
     let version = meta.get(&0).map(|m| m.version.clone()).unwrap_or_default();
 
     let mut fingerprinter = Fingerprinter::new(nodes, children);
-    let index: BTreeMap<String, RenderIndexRec> = if policy.reuse {
-        render_index.iter().collect()
-    } else {
-        BTreeMap::new()
-    };
+    let index: BTreeMap<String, RenderIndexRec> = render_index
+        .iter()
+        .filter(|(key, _)| key != RENDER_CLEANUP_KEY)
+        .collect();
+    let mut same_node: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in index.values() {
+        if row.format == format
+            && row.scale_milli == scale_milli
+            && render_ids.contains(&row.subject)
+        {
+            same_node
+                .entry(row.subject.clone())
+                .or_default()
+                .push(row.fingerprint.clone());
+        }
+    }
     let mut render_fps: BTreeMap<String, String> = BTreeMap::new();
+    let mut hit_fps: BTreeSet<String> = BTreeSet::new();
     let mut render_hits: BTreeMap<String, ImageItem> = BTreeMap::new();
     for id in render_ids {
         let fingerprint = if policy.reuse {
@@ -677,7 +868,8 @@ pub fn scan_split<R: Readable>(
             continue;
         }
         let fingerprinted = fingerprint
-            .and_then(|fp| index.get(&fp))
+            .as_ref()
+            .and_then(|fp| index.get(fp))
             .filter(|row| {
                 row.scheme == RENDER_FINGERPRINT_SCHEME
                     && row.subject == *id
@@ -690,7 +882,10 @@ pub fn scan_split<R: Readable>(
                     .filter(|blob| blob_is_valid(blob, row))
             });
         let bytes = match fingerprinted {
-            Some(blob) => Some(blob.bytes),
+            Some(blob) => {
+                hit_fps.extend(fingerprint);
+                Some(blob.bytes)
+            }
             None => {
                 let key = image_key(RENDER, id, format, scale_milli);
                 images
@@ -721,19 +916,32 @@ pub fn scan_split<R: Readable>(
         }
     }
 
-    // Orphans: index rows whose subject's current fingerprint (at the
-    // row's own format and scale) is no longer the row's key.
-    let orphans: BTreeSet<String> = index
-        .iter()
-        .filter(|(fp, row)| {
-            row.scheme != RENDER_FINGERPRINT_SCHEME
-                || fingerprinter
-                    .fingerprint(&row.subject, &row.format, row.scale_milli)
-                    .as_ref()
-                    != Some(*fp)
-        })
-        .map(|(fp, _)| fp.clone())
-        .collect();
+    // Orphan pass (opted in only): index rows whose subject's current
+    // fingerprint (at the row's own format and scale) is no longer the
+    // row's key. Orphans appear only when the mirror (or the scheme)
+    // changes, so a request whose renders all hit skips it while the
+    // cleanup marker still records this version and scheme.
+    let marker_current = render_index
+        .get(&RENDER_CLEANUP_KEY.to_string())
+        .is_some_and(|m| m.scheme == RENDER_FINGERPRINT_SCHEME && m.file_version == version);
+    let has_misses = render_ids.iter().any(|id| !render_hits.contains_key(id));
+    let run_orphan_pass = policy.reuse && (has_misses || !marker_current);
+    let orphans: BTreeSet<String> = if run_orphan_pass {
+        index
+            .iter()
+            .filter(|(fp, row)| {
+                row.scheme != RENDER_FINGERPRINT_SCHEME
+                    || fingerprinter
+                        .fingerprint(&row.subject, &row.format, row.scale_milli)
+                        .as_ref()
+                        != Some(*fp)
+            })
+            .map(|(fp, _)| fp.clone())
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mark_cleanup = run_orphan_pass && !marker_current && !version.is_empty();
 
     let mut fill_refs: BTreeSet<String> = BTreeSet::new();
     for id in fill_ids {
@@ -774,6 +982,9 @@ pub fn scan_split<R: Readable>(
         render_fps,
         render_index: index,
         orphans,
+        hit_fps,
+        same_node,
+        mark_cleanup,
     }
 }
 
@@ -811,12 +1022,17 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
         policy,
         render_fps,
         mut render_index,
-        orphans,
+        mut orphans,
+        hit_fps,
+        same_node,
+        mark_cleanup,
     } = scanned;
     // Fingerprinted renders written by this call (NWS-2958) get insertion
     // sequence numbers after every stored row's.
     let mut next_seq = render_index.values().map(|row| row.seq).max().unwrap_or(0) + 1;
     let mut displaced: BTreeSet<String> = BTreeSet::new();
+    // Renders this request serves or writes: never evicted by its quota.
+    let mut protected: BTreeSet<String> = hit_fps;
     let mut wrote_fingerprinted = false;
     let scale_m = scale_milli(scale);
     let unavailable_reason = if file_key.is_none() {
@@ -882,11 +1098,16 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
                                                 byte_len: bytes.len() as u64,
                                             };
                                             next_seq += 1;
+                                            // Also drops the node's
+                                            // per-version row, so no policy
+                                            // can serve bytes older than
+                                            // these (a refresh stays one).
                                             store_render(st, &row, &bytes);
                                             if let Some(old) = render_index.insert(fp.clone(), row)
                                             {
                                                 displaced.insert(old.sha256);
                                             }
+                                            protected.insert(fp.clone());
                                             wrote_fingerprinted = true;
                                         } else {
                                             let key = image_key(RENDER, id, format, scale_m);
@@ -902,6 +1123,20 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
                                                 pinned_version.is_some(),
                                             );
                                         }
+                                        // Either way, this node's other
+                                        // fingerprinted renders at this
+                                        // format and scale are now older
+                                        // than its newest bytes: retire
+                                        // them.
+                                        let current = render_fps.get(id);
+                                        orphans.extend(
+                                            same_node
+                                                .get(id)
+                                                .into_iter()
+                                                .flatten()
+                                                .filter(|fp| Some(*fp) != current)
+                                                .cloned(),
+                                        );
                                         ImageItem {
                                             subject: id.clone(),
                                             kind: RENDER,
@@ -933,20 +1168,41 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
         }
     }
 
-    // Render cache upkeep (NWS-2958), only for opted-in requests that
-    // wrote a fingerprinted render or found orphans to drop.
-    if policy.reuse && (wrote_fingerprinted || !orphans.is_empty()) {
-        let plan = plan_render_eviction(&render_index, &orphans, &displaced, policy.max_bytes);
-        if !plan.index.is_empty() || !plan.blobs.is_empty() {
-            st.wtx(|tx| {
-                for fp in &plan.index {
-                    tx.remove(&Id::RenderIndex(fp.clone()));
-                }
-                for sha in &plan.blobs {
-                    tx.remove(&Id::RenderBlob(sha.clone()));
-                }
-            });
-        }
+    // Render cache upkeep (NWS-2958): after a request that wrote a
+    // fingerprinted render, retired or orphaned one, or ran the orphan
+    // pass for a new mirror version.
+    if wrote_fingerprinted || !orphans.is_empty() || mark_cleanup {
+        let plan = plan_render_eviction(
+            &render_index,
+            &orphans,
+            &protected,
+            &displaced,
+            policy.max_bytes,
+        );
+        st.wtx(|tx| {
+            for fp in &plan.index {
+                tx.remove(&Id::RenderIndex(fp.clone()));
+            }
+            for sha in &plan.blobs {
+                tx.remove(&Id::RenderBlob(sha.clone()));
+            }
+            if mark_cleanup {
+                tx.upsert(
+                    &Id::RenderIndex(RENDER_CLEANUP_KEY.to_string()),
+                    &Rec::RenderIndex(RenderIndexRec {
+                        fingerprint: RENDER_CLEANUP_KEY.to_string(),
+                        scheme: RENDER_FINGERPRINT_SCHEME,
+                        subject: String::new(),
+                        format: String::new(),
+                        scale_milli: 0,
+                        file_version: version.clone(),
+                        seq: 0,
+                        sha256: String::new(),
+                        byte_len: 0,
+                    }),
+                );
+            }
+        });
     }
 
     let fill_misses: Vec<String> = fill_refs
@@ -1085,13 +1341,17 @@ fn store_image<P: Push<Keyed<Id, Rec>>>(
 }
 
 /// Write one fingerprinted render (NWS-2958): its immutable,
-/// content-addressed blob and its index row, in one transaction.
+/// content-addressed blob and its index row, in one transaction that also
+/// drops the node's per-version row at the same format and scale.
 fn store_render<P: Push<Keyed<Id, Rec>>>(
     st: &mut KeyedStream<Id, Rec, P>,
     row: &RenderIndexRec,
     bytes: &[u8],
 ) {
+    let per_version = image_key(RENDER, &row.subject, &row.format, row.scale_milli);
     st.wtx(|tx| {
+        tx.remove(&Id::ImageBlob(per_version.clone()));
+        tx.remove(&Id::ImagePin(per_version));
         tx.upsert(
             &Id::RenderBlob(row.sha256.clone()),
             &Rec::RenderBlob(RenderBlobRec {
@@ -2147,6 +2407,12 @@ mod tests {
         mode: &'static str,
         /// Frame B's name.
         b_name: &'static str,
+        /// Frame A's page x position (its children move with it).
+        a_x: f64,
+        /// Frame A's text width.
+        title_width: f64,
+        /// Frame A's prototype link target (prototype-only).
+        link: &'static str,
     }
 
     impl Default for Design {
@@ -2160,6 +2426,9 @@ mod tests {
                 image_ref: "img1",
                 mode: "light",
                 b_name: "B",
+                a_x: 0.1,
+                title_width: 120.0,
+                link: "2:1",
             }
         }
     }
@@ -2174,9 +2443,21 @@ mod tests {
             "lastModified": "2026-11-01T00:00:00Z",
             "document": {"id": "0:0", "type": "DOCUMENT", "name": "Document", "children": [
                 {"id": "0:1", "type": "CANVAS", "name": "Page", "children": [
-                    {"id": "1:1", "type": "FRAME", "name": "A", "children": [
+                    {"id": "1:1", "type": "FRAME", "name": "A",
+                     "absoluteBoundingBox": {"x": d.a_x, "y": 40.0, "width": 200.0, "height": 100.0},
+                     "absoluteRenderBounds": {"x": d.a_x - 2.0, "y": 38.0, "width": 204.0, "height": 104.0},
+                     "absoluteTransform": [[1.0, 0.0, d.a_x], [0.0, 1.0, 40.0]],
+                     "relativeTransform": [[1.0, 0.0, d.a_x], [0.0, 1.0, 40.0]],
+                     "interactions": [{"trigger": {"type": "ON_CLICK"},
+                                       "actions": [{"type": "NODE", "destinationId": d.link}]}],
+                     "transitionNodeID": d.link,
+                     "children": [
                         {"id": "1:2", "type": "TEXT", "name": "Title", "characters": d.title,
-                         "style": {"fontFamily": d.font, "fontSize": 16.0}}
+                         "style": {"fontFamily": d.font, "fontSize": 16.0},
+                         "absoluteBoundingBox": {"x": d.a_x + 10.3, "y": 50.7, "width": d.title_width, "height": 20.0},
+                         "absoluteRenderBounds": {"x": d.a_x + 10.3, "y": 50.7, "width": d.title_width, "height": 20.0},
+                         "absoluteTransform": [[1.0, 0.0, d.a_x + 10.3], [0.0, 1.0, 50.7]],
+                         "relativeTransform": [[1.0, 0.0, 10.3], [0.0, 1.0, 10.7]]}
                     ]},
                     {"id": "2:1", "type": "FRAME", "name": d.b_name, "children": [
                         {"id": "2:2", "type": "RECTANGLE", "name": "R",
@@ -2205,7 +2486,9 @@ mod tests {
                     ]},
                     {"id": "7:1", "type": "GROUP", "name": "Masked", "children": [
                         {"id": "7:2", "type": "RECTANGLE", "name": "Mask", "isMask": true},
-                        {"id": "7:3", "type": "RECTANGLE", "name": "Clipped"}
+                        {"id": "7:3", "type": "FRAME", "name": "Clipped", "children": [
+                            {"id": "7:4", "type": "RECTANGLE", "name": "Inside"}
+                        ]}
                     ]}
                 ]}
             ]},
@@ -2253,6 +2536,7 @@ mod tests {
             $st.rtx(|(.., index, _)| {
                 index
                     .iter()
+                    .filter(|(key, _)| key != RENDER_CLEANUP_KEY)
                     .map(|(_, row)| row)
                     .collect::<Vec<RenderIndexRec>>()
             })
@@ -2336,7 +2620,7 @@ mod tests {
         assert_ne!(fp!(st, "1:1", "png", 2000), base[0]);
 
         // Each edit, and the fingerprints it must change.
-        let edits: [(Design, &[&str]); 7] = [
+        let edits: [(Design, &[&str]); 10] = [
             (
                 Design {
                     title: "Hi",
@@ -2388,8 +2672,32 @@ mod tests {
                 },
                 &["6:2"],
             ), // inherited mode
+            // Moving frame A (its children move with it) keeps it...
+            (
+                Design {
+                    a_x: 1234.7,
+                    ..v1.clone()
+                },
+                &[],
+            ),
+            // ...as does a prototype-only edit...
+            (
+                Design {
+                    link: "4:1",
+                    ..v1.clone()
+                },
+                &[],
+            ),
+            // ...but resizing its child doesn't.
+            (
+                Design {
+                    title_width: 121.5,
+                    ..v1.clone()
+                },
+                &["1:1"],
+            ),
         ];
-        const VERSIONS: [&str; 7] = ["e0", "e1", "e2", "e3", "e4", "e5", "e6"];
+        const VERSIONS: [&str; 10] = ["e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9"];
         for (n, (design, changed)) in edits.into_iter().enumerate() {
             let version = VERSIONS[n];
             mirror!(st, &Design { version, ..design });
@@ -2421,6 +2729,11 @@ mod tests {
         mirror!(st, &Design::default());
         assert!(fp!(st, "7:2").is_some(), "the mask itself is fine");
         assert_eq!(fp!(st, "7:3"), None, "drawn after a sibling mask");
+        assert_eq!(
+            fp!(st, "7:4"),
+            None,
+            "inside a node drawn after a sibling mask"
+        );
         assert_eq!(fp!(st, "99:9"), None, "not in the mirror");
     }
 
@@ -2619,16 +2932,31 @@ mod tests {
         assert_eq!(subjects, ids(&["2:1", "4:1"]), "1:1 was oldest");
         assert_eq!(blob_keys!(st).len(), 2);
 
-        // The evicted render is fetched again; the others still hit.
+        // The evicted render is fetched again while 2:1 — now the oldest
+        // — is served by the same request: the quota never evicts a
+        // render the request is answering with, so 4:1 goes instead.
         answer(&script, &ids(&["1:1"]), "a");
-        let all = ids(&["1:1", "2:1", "4:1"]);
-        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &all, "png", None, policy);
+        let request = ids(&["2:1", "1:1"]);
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &request, "png", None, policy);
         assert_eq!(script.render_calls.borrow()[3], ids(&["1:1"]));
         let cached: Vec<bool> = items.iter().map(|i| i.cached).collect();
-        assert_eq!(cached, [false, true, true]);
+        assert_eq!(cached, [true, false]);
         let mut subjects: Vec<String> = index_rows!(st).into_iter().map(|r| r.subject).collect();
         subjects.sort();
-        assert_eq!(subjects, ids(&["1:1", "4:1"]), "now 2:1 was oldest");
+        assert_eq!(
+            subjects,
+            ids(&["1:1", "2:1"]),
+            "4:1 goes, not the served 2:1"
+        );
+        assert_eq!(blob_keys!(st).len(), 2);
+
+        // One request's own renders may exceed the cap until a later
+        // request evicts: three 4-byte renders served together all stay.
+        answer(&script, &ids(&["4:1"]), "a");
+        let all = ids(&["1:1", "2:1", "4:1"]);
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &all, "png", None, policy);
+        assert!(items.iter().all(|i| i.error.is_none()));
+        assert_eq!(index_rows!(st).len(), 3);
     }
 
     // -- eviction planning --
@@ -2665,17 +2993,17 @@ mod tests {
 
         let none = BTreeSet::new();
         // Plenty of room: only orphans go.
-        let plan = plan_render_eviction(&index, &orphans, &none, 1_000);
+        let plan = plan_render_eviction(&index, &orphans, &none, &none, 1_000);
         assert_eq!(plan.index, ["f-old-orphan", "f-new-orphan"]);
         assert_eq!(plan.blobs, ["s1", "s2"]);
 
         // Room for two: then the oldest valid render goes too.
-        let plan = plan_render_eviction(&index, &orphans, &none, 20);
+        let plan = plan_render_eviction(&index, &orphans, &none, &none, 20);
         assert_eq!(plan.index, ["f-old-orphan", "f-new-orphan", "f-valid-old"]);
         assert_eq!(plan.blobs, ["s1", "s2", "s3"]);
 
         // A zero quota empties the cache, deterministically ordered.
-        let plan = plan_render_eviction(&index, &BTreeSet::new(), &none, 0);
+        let plan = plan_render_eviction(&index, &BTreeSet::new(), &none, &none, 0);
         assert_eq!(
             plan.index,
             [
@@ -2699,20 +3027,154 @@ mod tests {
         .collect();
         let none = BTreeSet::new();
         // 20 distinct bytes fit exactly: nothing to do.
-        let plan = plan_render_eviction(&index, &none, &none, 20);
+        let plan = plan_render_eviction(&index, &none, &none, &none, 20);
         assert_eq!(plan, RenderEviction::default());
 
         // Over by one: "a" (tie at seq 1, smaller fingerprint) goes first,
         // but its blob stays while "b" still references it, so "b" goes
         // too before the total drops.
-        let plan = plan_render_eviction(&index, &none, &none, 19);
+        let plan = plan_render_eviction(&index, &none, &none, &none, 19);
         assert_eq!(plan.index, ["a", "b"]);
         assert_eq!(plan.blobs, ["shared"]);
 
         // A displaced blob is dropped only once nothing references it.
         let displaced: BTreeSet<String> = ["gone", "own"].map(String::from).into();
-        let plan = plan_render_eviction(&index, &none, &displaced, 100);
+        let plan = plan_render_eviction(&index, &none, &none, &displaced, 100);
         assert!(plan.index.is_empty());
         assert_eq!(plan.blobs, ["gone"]);
+    }
+
+    #[test]
+    fn eviction_never_evicts_a_protected_render_for_the_quota() {
+        let index: BTreeMap<String, RenderIndexRec> = [
+            row("old", 1, "s1", 10),
+            row("mid", 2, "s2", 10),
+            row("new", 3, "s3", 10),
+        ]
+        .into_iter()
+        .collect();
+        let protected: BTreeSet<String> = ["old".to_string()].into();
+        let none = BTreeSet::new();
+        let plan = plan_render_eviction(&index, &none, &protected, &none, 20);
+        assert_eq!(plan.index, ["mid"], "the oldest unprotected row goes");
+        assert_eq!(plan.blobs, ["s2"]);
+        // Orphans go even when nothing else may.
+        let orphans: BTreeSet<String> = ["new".to_string()].into();
+        let all: BTreeSet<String> = ["old", "mid"].map(String::from).into();
+        let plan = plan_render_eviction(&index, &orphans, &all, &none, 0);
+        assert_eq!(plan.index, ["new"]);
+    }
+
+    // -- switching policies can't undo a refresh --
+
+    /// Reuse fetches a render, then a plain `--refresh` replaces it: a
+    /// later `--reuse-renders` request must serve the refreshed bytes, not
+    /// the fingerprinted pre-refresh ones.
+    #[test]
+    fn a_plain_refresh_retires_the_fingerprinted_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        mirror!(st, &Design::default());
+        let script = Script::new();
+        let frame = ids(&["2:1"]);
+        answer(&script, &frame, "a");
+        scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, reuse());
+        assert_eq!(index_rows!(st).len(), 1);
+
+        answer(&script, &frame, "b");
+        let refresh = RenderPolicy {
+            refresh: true,
+            ..RenderPolicy::default()
+        };
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, refresh);
+        assert_eq!(items[0].bytes[0], b'b');
+        assert!(index_rows!(st).is_empty(), "the old render is retired");
+        assert!(blob_keys!(st).is_empty());
+
+        let items = scan_and_resolve!(st, None, &url_bytes, &frame, "png", None, reuse());
+        assert!(items[0].cached);
+        assert_eq!(items[0].bytes[0], b'b', "never the pre-refresh bytes");
+    }
+
+    /// The reverse switch: a per-version render, then `--reuse-renders
+    /// --refresh`; a later plain request must not serve the older
+    /// per-version bytes.
+    #[test]
+    fn a_reuse_refresh_drops_the_per_version_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        mirror!(st, &Design::default());
+        let script = Script::new();
+        let frame = ids(&["2:1"]);
+        answer(&script, &frame, "a");
+        scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None);
+
+        answer(&script, &frame, "b");
+        let refresh = RenderPolicy {
+            refresh: true,
+            ..reuse()
+        };
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, refresh);
+        assert_eq!(items[0].bytes[0], b'b');
+
+        // Plain request: the per-version row is gone, so this is a miss
+        // (never the pre-refresh "a")...
+        let items = scan_and_resolve!(st, None, &url_bytes, &frame, "png", None);
+        assert!(items[0].error.is_some(), "no stale per-version hit");
+        // ...while the refreshed render still serves reuse requests.
+        let items = scan_and_resolve!(st, None, &url_bytes, &frame, "png", None, reuse());
+        assert!(items[0].cached);
+        assert_eq!(items[0].bytes[0], b'b');
+    }
+
+    // -- the orphan pass's cost --
+
+    fn hashed_nodes() -> usize {
+        NODE_HASHES.with(|n| n.replace(0))
+    }
+
+    /// A request whose renders all hit, at the version the last cleanup
+    /// saw, hashes only its own subtrees — not every cached render's.
+    #[test]
+    fn a_pure_hit_request_hashes_only_its_own_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        let v1 = Design::default();
+        mirror!(st, &v1);
+        let script = Script::new();
+        let frames = ids(&["1:1", "2:1", "5:1"]);
+        answer(&script, &frames, "a");
+        scan_and_resolve!(st, Some(&script), &url_bytes, &frames, "png", None, reuse());
+
+        // 1:1 is two nodes (the frame and its text).
+        let a = ids(&["1:1"]);
+        hashed_nodes();
+        let items = scan_and_resolve!(st, None, &url_bytes, &a, "png", None, reuse());
+        assert!(items[0].cached);
+        assert_eq!(hashed_nodes(), 2, "no orphan pass on a pure hit");
+
+        // A new mirror version: one orphan pass, over every cached render
+        // (each node hashed once: 1:1's two, 2:1's two, 5:1's two)...
+        mirror!(
+            st,
+            &Design {
+                version: "v2",
+                b_name: "B2",
+                ..v1.clone()
+            }
+        );
+        let items = scan_and_resolve!(st, None, &url_bytes, &a, "png", None, reuse());
+        assert!(items[0].cached);
+        assert_eq!(hashed_nodes(), 6);
+        let subjects: BTreeSet<String> = index_rows!(st).into_iter().map(|r| r.subject).collect();
+        assert_eq!(
+            subjects,
+            ["1:1", "5:1"].map(String::from).into(),
+            "B's render is an orphan"
+        );
+
+        // ...and none again until the mirror changes.
+        scan_and_resolve!(st, None, &url_bytes, &a, "png", None, reuse());
+        assert_eq!(hashed_nodes(), 2);
     }
 }

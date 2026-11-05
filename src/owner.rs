@@ -40,7 +40,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 /// Bumped whenever the relay/owner wire contract changes incompatibly.
-pub(crate) const PROTOCOL: u64 = 1;
+/// 2 (NWS-2958): `figmog_images` takes `reuse`/`refresh`, which an owner
+/// speaking 1 would silently ignore.
+pub(crate) const PROTOCOL: u64 = 2;
 /// The handshake method, the first frame of every owner connection.
 pub(crate) const HELLO: &str = "figmog/hello";
 /// The JSON-RPC id clients use for their handshake.

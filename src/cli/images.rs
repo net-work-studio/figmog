@@ -45,6 +45,17 @@ pub(super) fn cmd_images(
 ) -> Result<(), String> {
     let out_dir = out.unwrap_or_else(|| PathBuf::from("figmog-images"));
 
+    // A server from before NWS-2958 would silently ignore `reuse` and
+    // `refresh`. A background owner from such a build is already refused
+    // by the handshake (protocol 2); a plain `figmog serve` socket has no
+    // handshake, so its tool schema is checked instead.
+    if let Some(root) = socket_root
+        && (policy.reuse || policy.refresh)
+        && let Some(tools) = socket::try_tools_list(root)
+    {
+        check_policy_support(&tools?, policy)?;
+    }
+
     let fetched = if let Some(root) = socket_root
         && let Some(result) = socket::try_images_call(
             root,
@@ -108,6 +119,31 @@ pub(super) fn cmd_images(
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Refuse a render policy the running server's `figmog_images` schema
+/// doesn't list (a build from before NWS-2958), instead of letting the
+/// server drop the flag silently.
+fn check_policy_support(tools: &[Value], policy: images::RenderPolicy) -> Result<(), String> {
+    let properties = tools
+        .iter()
+        .find(|t| t["name"] == "figmog_images")
+        .map(|t| &t["inputSchema"]["properties"]);
+    let missing: Vec<&str> = [
+        ("reuse", policy.reuse, "--reuse-renders"),
+        ("refresh", policy.refresh, "--refresh"),
+    ]
+    .into_iter()
+    .filter(|(arg, wanted, _)| *wanted && properties.is_none_or(|p| p.get(*arg).is_none()))
+    .map(|(_, _, flag)| flag)
+    .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the running figmog serve is an older build that doesn't support {}; restart it with this figmog, or pass --no-socket to fetch directly",
+        missing.join(" and ")
+    ))
 }
 
 /// One fetched-or-not item, ready to write: `entry` is always the
@@ -249,6 +285,37 @@ fn filename(entry: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NWS-2958: a server whose `figmog_images` lacks `reuse`/`refresh`
+    /// is refused for those flags; this build's own schema passes.
+    #[test]
+    fn check_policy_support_refuses_a_server_without_the_new_arguments() {
+        let reuse = images::RenderPolicy {
+            reuse: true,
+            ..Default::default()
+        };
+        let both = images::RenderPolicy {
+            refresh: true,
+            ..reuse
+        };
+        let old = vec![
+            json!({"name": "figmog_images", "inputSchema": {"properties": {
+                "ids": {}, "format": {}, "scale": {}, "renders": {}
+            }}}),
+        ];
+        let err = check_policy_support(&old, both).unwrap_err();
+        assert!(
+            err.contains("--reuse-renders and --refresh") && err.contains("--no-socket"),
+            "{err}"
+        );
+        assert!(check_policy_support(&old, images::RenderPolicy::default()).is_ok());
+
+        let current: Vec<Value> = crate::dispatch::tool_registry()
+            .into_iter()
+            .map(|def| json!({"name": def.name, "inputSchema": def.input_schema}))
+            .collect();
+        assert!(check_policy_support(&current, both).is_ok());
+    }
 
     #[test]
     fn filename_sanitizes_node_id_colons() {
