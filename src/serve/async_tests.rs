@@ -1235,6 +1235,7 @@ mod desktop;
 mod isolation;
 mod offload;
 mod watch_and_cache;
+mod writes;
 
 #[test]
 fn successful_explicit_sync_preserves_metadata_retry_and_normal_round() {

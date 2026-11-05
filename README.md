@@ -175,9 +175,14 @@ free.
 `.figmog/serve.sock` in the project root. Read commands, `figmog tools` and `figmog call` connect
 there first and answer from the running server's live view; with no server
 listening they open the store directly. `--no-socket` forces direct mode on
-both sides. `pull` is a writer and always opens the store itself, so while a
-server runs its error points at `figmog call figmog_sync`, which reaches the
-process that owns the store. Open/sync on the server acknowledge a background
+both sides. The writers go through the server too: `figmog pull` (with
+`--fresh`, `--from-file` or `--geometry`) and `figmog import-variables` become
+operations of the running server, and return only once the change is
+committed and visible, with the same output as without a server. Files are
+read in your checkout and sent as content; an invalid file is rejected before
+anything changes. If the server dies mid-operation the command says "outcome
+unknown" with the operation id and does not retry. For agents, open/sync on
+the server acknowledge a background
 job immediately; check `figmog call figmog_status` (or `figmog_files`) for
 `ready`, job state, last successful version/churn, and errors. Reads continue
 using the last completed mirror while a pull runs. Direct sync without a
@@ -383,9 +388,10 @@ job succeeds. No custom repository secrets are required.
 - macOS and Linux only. The control plane is a unix domain socket and the
   code uses unix filesystem APIs directly, so there is no Windows build.
 - One process may open a store at a time (fjall is single-writer).
-  `figmog serve` holds that handle for its life. Other commands reach it over
-  the socket instead, but `--no-socket`, or a `--db` naming the store `serve`
-  owns, still gets the plain `store is locked` error.
+  `figmog serve` holds that handle for its life. Other commands, writers
+  included, reach it over the socket instead; `--no-socket`, or a `--db`
+  naming the store `serve` owns, gets a `store is locked by figmog serve (pid
+  …, socket …)` error naming the owner.
 
 ## License
 

@@ -30,6 +30,8 @@ mod store_lock;
 use store_lock::{OwnedStore, StoreOwner};
 
 pub(crate) use pull::{PullError, now_ms, pull_failure_wait, write_current};
+#[cfg(test)]
+pub(crate) use {pull::apply_pull_at, socket::write_over};
 
 #[derive(Parser)]
 #[command(
@@ -466,6 +468,26 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         _ => None,
     };
     let db = resolve_db(&cli, layout)?;
+    // Writers through a running serve (NWS-2963): when its socket answers,
+    // serve owns (or will open) this store, so `pull` and
+    // `import-variables` become its operations — same output, no lock
+    // error. Unreachable ⇒ the direct path below. `--db` and `--no-socket`
+    // never route (no `socket_root`).
+    if let (Some(root), Some(key)) = (&socket_root, &db.key)
+        && matches!(cli.cmd, Cmd::Pull { .. } | Cmd::ImportVariables { .. })
+        && let Some(stream) = socket::connect(root)
+    {
+        return match cli.cmd {
+            Cmd::Pull {
+                from_file,
+                fresh,
+                geometry,
+                ..
+            } => pull::cmd_pull_routed(&db, key, stream, from_file, fresh, geometry),
+            Cmd::ImportVariables { path } => call::cmd_import_variables_routed(stream, key, path),
+            _ => unreachable!("matched above"),
+        };
+    }
     match cli.cmd {
         Cmd::Pull {
             file,
@@ -602,9 +624,10 @@ fn strip_routed_status_fields(mut result: Value) -> Value {
 /// the one representation the direct path executes and the socket path
 /// serializes ([`ReadCommand::to_tool_call`]), so a socket-routed read
 /// produces byte-identical results to the direct-open path (spec §6a).
-/// `None` for every command socket routing doesn't apply to: `pull` is a
-/// writer (spec §1: "pull stays direct-open"); `serve`/`tools`/`call`/
-/// `import-variables`/`images` are each handled at their own call sites.
+/// `None` for every other command: the writers `pull` and
+/// `import-variables` route as serve operations (NWS-2963, in `dispatch`);
+/// `serve`/`tools`/`call`/`images` are each handled at their own call
+/// sites.
 fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
     Some(match cmd {
         Cmd::Status => ReadCommand::Status,
@@ -810,6 +833,36 @@ fn check_key(key: &str) -> Result<(), String> {
 /// panic (exit 101).
 const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Query the server instead (figmog call/tools), or stop it first.";
 
+/// This process's owner record, written into every store lock it takes
+/// (NWS-2963). Set once by `figmog serve`; other commands leave it unset
+/// and record nothing.
+static OWNER_RECORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Make this process (a `figmog serve`) name itself in the store locks it
+/// takes, so a command that finds one held — `--db`, `--no-socket`, a
+/// serve in another checkout — can say who owns it instead of a bare
+/// lock error. `socket` is where it listens, if anywhere.
+pub(crate) fn record_store_owner(socket: Option<&Path>) {
+    let socket = socket.map_or_else(
+        || "no socket".to_string(),
+        |path| {
+            let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            format!("socket {}", path.display())
+        },
+    );
+    let _ = OWNER_RECORD.set(format!(
+        "figmog serve (pid {}, {socket})",
+        std::process::id()
+    ));
+}
+
+/// The locked-store error naming its owner (a running serve).
+fn store_owned_msg(owner: &str) -> String {
+    format!(
+        "store is locked by {owner} — run the command without --db/--no-socket from that serve's project to route it through the serve, or stop it first"
+    )
+}
+
 /// Establish a private directory at `path` before invoking `open`, including
 /// on existing mirrors. Failure to protect it is a clean error and never
 /// reaches fold, which may write journal data while opening the store.
@@ -865,6 +918,19 @@ pub(crate) fn open_store_checked<T>(
     open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
 ) -> Result<OwnedStore<T>, String> {
     open_store_owned(StoreOwner::acquire(path)?, open)
+}
+
+/// Open the store at `path` emptied (`pull --fresh` through a running
+/// serve, NWS-2963): like [`OwnedStore::reset`] — the first open checks
+/// fjall's own lock too — but returns the cleared store opened by `open`
+/// under the same ownership, with no window for another opener.
+pub(crate) fn open_store_cleared<T>(
+    path: &Path,
+    open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
+) -> Result<OwnedStore<T>, String> {
+    let owner = open_store_checked(path, |path| crate::open_store!(path))?.into_owner();
+    owner.clear_contents()?;
+    open_store_owned(owner, open)
 }
 
 fn open_store_owned<T>(

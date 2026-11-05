@@ -43,13 +43,12 @@ pub(super) fn cmd_pull(
 ) -> Result<(), String> {
     let (churn, _name, _version) = do_pull(db, file, from_file, fresh, geometry).map_err(|e| {
         let message = e.to_string();
-        // `pull` is a writer (spec §1: it stays direct-open, never routed
-        // over the socket), so a running `figmog serve` holding the same
-        // store's single-writer lock is the single most common way this
-        // fails while serve is up — point at the one escape hatch that
-        // still works in that situation (`figmog call figmog_sync` reaches
-        // the *owning* process over the socket) rather than leaving the
-        // generic "is figmog serve running?" message to speak for itself.
+        // A reachable serve already took this pull (NWS-2963,
+        // `cmd_pull_routed`); this direct path meets a held store only via
+        // `--db`/`--no-socket` or an owner without a socket. A serve owner
+        // is named by the lock error itself; for an unnamed one, point at
+        // the escape hatch that reaches a serve (`figmog call
+        // figmog_sync`) rather than leaving the generic message alone.
         // Scoped to exactly this message (not every `do_pull` failure) so
         // an unrelated error (bad JSON, a real network failure, ...) isn't
         // given a hint that doesn't apply to it.
@@ -59,6 +58,40 @@ pub(super) fn cmd_pull(
             message
         }
     })?;
+    finish_pull(
+        db,
+        &serde_json::to_value(&churn).map_err(|e| e.to_string())?,
+    )
+}
+
+/// `figmog pull` through the running serve that owns the store (NWS-2963):
+/// a saved response is read and parsed here, in the invoking worktree, with
+/// the direct path's errors, and sent as content; serve validates it before
+/// touching the store, applies it on the file's worker (`--fresh` behind
+/// the per-store reset barrier) and answers once the pull committed and was
+/// published. The output is the direct path's.
+pub(super) fn cmd_pull_routed(
+    db: &Db,
+    key: &str,
+    stream: std::os::unix::net::UnixStream,
+    from_file: Option<PathBuf>,
+    fresh: bool,
+    geometry: bool,
+) -> Result<(), String> {
+    let mut args = serde_json::json!({"file": key, "fresh": fresh, "geometry": geometry});
+    if let Some(path) = from_file {
+        args["from_file"] = read_saved_response(&path)?;
+    }
+    let done = super::socket::write_over(stream, crate::serve::writes::PULL, args)?;
+    if let Some(layout) = &db.layout {
+        write_current(&layout.local_root, key)?;
+    }
+    finish_pull(db, &done["result"])
+}
+
+/// After a successful pull (either path): keep `.figmog/` ignored, then
+/// print the churn.
+fn finish_pull(db: &Db, churn: &Value) -> Result<(), String> {
     if db.key.is_some()
         && let Some(layout) = &db.layout
     {
@@ -78,7 +111,14 @@ pub(super) fn cmd_pull(
             );
         }
     }
-    print_churn(&churn)
+    write_json(churn)
+}
+
+/// Read and parse a saved `GET /v1/files/:key` response (`--from-file`).
+fn read_saved_response(path: &std::path::Path) -> Result<Value, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    serde_json::from_str(&content).map_err(|e| format!("parsing {}: {e}", path.display()))
 }
 
 /// The pull mechanics without any printing. `.figmog/current` is written
@@ -104,13 +144,7 @@ pub(super) fn do_pull(
     // ingests a saved `GET /v1/files/:key` response and never touches the
     // network at all, so it never calls `variables_local` either.
     let (resp, vars_resp): (Value, Option<Value>) = match from_file {
-        Some(path) => {
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| format!("reading {}: {e}", path.display()))?;
-            let resp = serde_json::from_str(&content)
-                .map_err(|e| format!("parsing {}: {e}", path.display()))?;
-            (resp, None)
-        }
+        Some(path) => (read_saved_response(&path)?, None),
         None => {
             let key = db
                 .key
@@ -152,6 +186,25 @@ pub(super) fn do_pull(
     };
 
     apply_pull(db, &resp, vars_resp.as_ref(), fresh, geometry)
+}
+
+/// [`apply_pull`] for in-crate tests comparing serve's writes with the
+/// direct path (NWS-2963).
+#[cfg(test)]
+pub(crate) fn apply_pull_at(
+    path: &std::path::Path,
+    resp: &Value,
+    fresh: bool,
+    geometry: bool,
+) -> Result<Churn, String> {
+    let db = Db {
+        path: path.to_path_buf(),
+        key: None,
+        layout: None,
+    };
+    apply_pull(&db, resp, None, fresh, geometry)
+        .map(|(churn, ..)| churn)
+        .map_err(|e| e.to_string())
 }
 
 /// Validate both responses before opening or changing a mirror. Fresh
@@ -235,10 +288,6 @@ fn apply_pull(
         flattened.file.name.clone(),
         flattened.file.version.clone(),
     ))
-}
-
-fn print_churn(churn: &Churn) -> Result<(), String> {
-    write_json(&serde_json::to_value(churn).map_err(|e| e.to_string())?)
 }
 
 /// How long a failed pull's caller (`figmog serve`'s sessions, via

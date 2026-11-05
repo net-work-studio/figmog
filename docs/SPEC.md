@@ -451,10 +451,61 @@ client and never runs a whole-mirror scan.
   applies steps 2–3 (bounded by the exit drain) before closing stores; a
   worker read still running at the exit deadline is detached with its own
   lease rather than awaited, so shutdown stays within the deadline and no
-  store is reset or reopened under it. No
-  tool resets a store yet; `SessionManager::begin_reset` /
-  `service_resets` are the mechanism NWS-2963 builds on (its only
-  operation today is a close-and-reopen, which starts fresh job history).
+  store is reset or reopened under it. The operations behind it are a
+  close-and-reopen (`StoreReset::Reopen`, tests only) and a routed `pull
+  --fresh` (`StoreReset::Fresh`, below): step 1 is the worker's fetch,
+  parse and flatten, and step 4 clears the store's contents (its ownership
+  anchor stays) under the same ownership before reopening it empty.
+  Either starts fresh job history; CLI writes still queued for the store
+  carry over to the reopened session.
+
+**CLI writers through serve (NWS-2963):** when its socket answers, `figmog
+pull` (plain, `--geometry`, `--from-file`, `--fresh`) and `figmog
+import-variables` run as *operations* of serve instead of opening the
+store (§10). They are internal socket-only tools — `figmog_internal_pull
+{file, fresh?, geometry?, from_file?}`, `figmog_internal_import_variables
+{file, content, name}` and the receipt read `figmog_internal_operation
+{id}` — never listed by `tools/list` and refused on stdio as unknown, so
+the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
+
+- *Operation ids.* Each accepted write gets id `<generation>-<seq>`: the
+  generation is this process's pid and start time (hex), the sequence
+  counts from 1. The requester's connection first receives
+  `{"method": "notifications/figmog/operation", "params": {"id": ...}}`;
+  the `tools/call` is a deferred response (NWS-2955) sent only once the
+  write committed **and** its view was published — `{"operation": id,
+  "result": <churn | {"imported","removed"}>}` — or a `-32000` error if it
+  failed, in which case nothing changed. The wait is the requester's own
+  connection; the loop never blocks on it.
+- *Receipts.* A finished operation's outcome is kept for 10 minutes;
+  `figmog_internal_operation {id}` (any connection) returns `{"id",
+  "state": "succeeded", "result"}`, `{"id", "state": "failed", "error"}`,
+  `{"id", "state": "running"}`, or an unknown-operation error (another
+  process's id, or expired). Receipts and ids are in memory only.
+- *Ordering and coalescing.* Writes run on the file's worker (still its
+  only writer) in arrival order, ahead of queued watch/sync jobs, and,
+  like a direct pull, without waiting out a failed pull's backoff. Two
+  writes are never merged, except identical plain pulls (network, not
+  fresh, same `geometry`) that have not started yet: they share one fetch
+  and apply, each keeping its own operation id. A network write uses
+  serve's credentials. While a write is pending on a not-yet-mirrored
+  store, reads queue no implicit first pull. A successful routed pull
+  updates `last_success` (`"job_id": null`, plus `"operation"`); it is not
+  a lifecycle job.
+- *Validation first.* `from_file` (a parsed `GET /v1/files/:key`
+  response) and `content` (an export's exact text; the snapshot digest is
+  over it) are checked — parse, flatten, variable entries — before any
+  store change, exactly like the direct path. A fresh pull's fetch and
+  flatten run on the worker before its reset barrier closes.
+- *Owner loss.* A write whose worker stops before reporting is answered
+  `outcome unknown: ...`; if the connection ends first, the CLI reports
+  `outcome unknown` with the announced operation id (exit 1) and never
+  retries or falls back to a direct open.
+- *Store owner records.* A serve writes `figmog serve (pid N, socket
+  <path>)` (or `no socket`) into each store lock (`.figmog-lock`) it
+  takes; every other opener clears it. A command finding a store held
+  (`--db`, `--no-socket`) names that owner in its `store is locked by ...`
+  error.
 
 **Off-loop images and desktop calls (NWS-2955):** `figmog_images` and
 proxied desktop calls are answered later instead of on the loop, so a slow
@@ -623,7 +674,11 @@ This preserves default socket startup in deep checkouts. `--no-socket`
 skips binding.
 
 Frames on the socket are the same newline-delimited JSON-RPC the stdio
-loop reads. `initialize` is optional for socket clients: `tools/call` is
+loop reads. An incoming frame may be at most 256 MiB (raised from 8 MiB
+for NWS-2963: a routed `pull --from-file` sends the saved file response
+in its request); a longer line without a newline drops the connection,
+and the CLI refuses up front to send a larger write, pointing at stopping
+serve and applying it directly. Output is bounded separately (below). `initialize` is optional for socket clients: `tools/call` is
 accepted directly, since dispatch treats every frame independently.
 Sending `initialize` is also how a connection opts in to notifications
 (`notifications/tools/list_changed`, §8); stdio gets them once its client
@@ -1013,20 +1068,33 @@ Both paths forward uncached and preserve desktop arguments exactly,
 including an absent `file` or explicit null, string, number, or object.
 Socket routing never injects `.figmog/current` into desktop arguments.
 
-`pull` is a writer and always opens the store directly. While `serve`
-holds that store, `pull`'s lock error additionally says "or ask the
-running serve: figmog call figmog_sync", which reaches the process that
-owns it and returns an immediate job acknowledgement. Inspect
-`figmog call figmog_status` or `figmog call figmog_files` for completion and
-errors. With no running server, direct `figmog call figmog_sync` remains
-synchronous and returns churn.
+**Writers (NWS-2963).** `pull` (including `--fresh`, `--from-file`,
+`--geometry`) and `import-variables` resolve their mirror exactly as
+direct mode does, then try the same socket. Reachable ⇒ they run as serve
+operations (§6 "CLI writers through serve"): a `--from-file` response is
+read and parsed in the invoking worktree (the direct path's `reading`/
+`parsing` errors) and sent as content; an import is read and fully
+validated locally (same errors, nothing sent for an invalid file) and its
+exact text sent. The command returns only after the write committed and
+was published, printing the same JSON as the direct path, byte for byte
+(churn, or `{"imported","removed"}`); a successful routed pull also
+writes `.figmog/current` and the `.gitignore` entry as a direct pull
+does. Serve-side failures are the direct path's messages. If serve goes
+away first: `outcome unknown` with the operation id, exit 1, no retry and
+no direct fallback. Unreachable ⇒ direct. `--db` and `--no-socket` never
+route. While `serve` holds a store, a direct open's lock error names it
+(`store is locked by figmog serve (pid …, socket …) — …`); an unnamed
+holder keeps the generic message, which for `pull` adds "or ask the
+running serve: figmog call figmog_sync". With no running server, direct
+`figmog call figmog_sync` remains synchronous and returns churn.
 
 **Single-writer constraint:** fjall allows only one open handle per
 store. `figmog serve` holds its `--db`'s lock for its whole life; a CLI
-command that opens the same store directly (`--no-socket`, an explicit
-`--db`, or `pull`) while `serve` runs gets a clean `store is locked — is
-figmog serve running? ...` error (exit 1), never fold's raw lock panic
-(exit 101) — see `open_store_checked`.
+command that opens the same store directly (`--no-socket` or an explicit
+`--db`) while `serve` runs gets a clean `store is locked by figmog serve
+(pid …, socket …) — ...` error (exit 1; the generic `store is locked — is
+figmog serve running? ...` when the holder left no owner record), never
+fold's raw lock panic (exit 101) — see `open_store_checked`.
 
 ## 11. Determinism and schema-stability contracts
 

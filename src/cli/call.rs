@@ -21,17 +21,7 @@ use super::{Db, open_store_checked, write_json};
 /// (`store::replace_variable_snapshot`), removing variables and
 /// collections absent from the new export.
 pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String> {
-    let invalid = |e: String| format!("invalid variables file {}: {e}", path.display());
-    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let v: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
-    crate::vars::check_import_entries(&v).map_err(|e| invalid(e.to_string()))?;
-    let parsed = crate::vars::parse_variables_snapshot(
-        &v,
-        crate::vars::SOURCE_FILE,
-        crate::vars::snapshot_digest(&bytes),
-    )
-    .map_err(|e| invalid(e.to_string()))?;
-
+    let (_, parsed) = load_import(&path)?;
     let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
     let prior = st.rtx(|(_, _, _, _, variables, collections, ..)| {
         crate::store::collect_variable_ids(&variables, &collections)
@@ -45,6 +35,41 @@ pub(super) fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String>
         .filter(|(id, _)| matches!(id, Id::Variable(_)))
         .count();
     write_json(&json!({"imported": imported, "removed": churn.removed}))
+}
+
+/// `import-variables` through the running serve that owns the store
+/// (NWS-2963): the file is read and fully validated here first (the direct
+/// path's errors, nothing sent for an invalid file), then its exact text is
+/// sent as content — the snapshot digest is over those bytes. Serve
+/// validates again, replaces the snapshot on the file's worker and answers
+/// once it committed and was published; the output is the direct path's.
+pub(super) fn cmd_import_variables_routed(
+    stream: std::os::unix::net::UnixStream,
+    key: &str,
+    path: PathBuf,
+) -> Result<(), String> {
+    let (bytes, _) = load_import(&path)?;
+    let content = String::from_utf8(bytes)
+        .map_err(|e| format!("invalid variables file {}: {e}", path.display()))?;
+    let args = json!({"file": key, "content": content, "name": path.display().to_string()});
+    let done = super::socket::write_over(stream, crate::serve::writes::IMPORT_VARIABLES, args)?;
+    write_json(&done["result"])
+}
+
+/// Read, parse and validate a variables export before any store is opened,
+/// so an unreadable or invalid file leaves the previous snapshot untouched.
+fn load_import(path: &std::path::Path) -> Result<(Vec<u8>, crate::vars::ParsedSnapshot), String> {
+    let invalid = |e: String| format!("invalid variables file {}: {e}", path.display());
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    crate::vars::check_import_entries(&v).map_err(|e| invalid(e.to_string()))?;
+    let parsed = crate::vars::parse_variables_snapshot(
+        &v,
+        crate::vars::SOURCE_FILE,
+        crate::vars::snapshot_digest(&bytes),
+    )
+    .map_err(|e| invalid(e.to_string()))?;
+    Ok((bytes, parsed))
 }
 
 /// Probe `upstream_url` unless `no_upstream`, matching `figmog serve`'s own

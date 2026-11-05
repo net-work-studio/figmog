@@ -2861,3 +2861,254 @@ fn every_local_read_matches_across_direct_socket_and_mcp() {
     drop(stdin);
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
+
+// ---- NWS-2963: writers through a running serve ----
+
+/// One writer invocation's observable outcome: exit code, stdout, stderr.
+fn run_cli(cwd: &std::path::Path, args: &[&str]) -> (Option<i32>, Vec<u8>, Vec<u8>) {
+    let output = common::command()
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    (output.status.code(), output.stdout, output.stderr)
+}
+
+/// With serve owning the store, every writer goes through its socket and
+/// prints exactly what the direct path prints on an identical store (run
+/// in a second, serve-less project): `pull --from-file` (plain, with
+/// `--geometry`, `--fresh`), a network pull (failing identically without
+/// credentials), and `import-variables`. Invalid inputs fail identically
+/// and leave both mirrors as they were.
+#[test]
+fn routed_writers_match_the_direct_path_byte_for_byte() {
+    const KEY: &str = "figmogwriterkey12345";
+    let served = default_root_fixture(KEY, common::fixture_v1());
+    let direct = default_root_fixture(KEY, common::fixture_v1());
+    let inputs = tempfile::tempdir().unwrap();
+    let input = |name: &str, content: &[u8]| {
+        let path = inputs.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let v1 = input("v1.json", common::fixture_v1().to_string().as_bytes());
+    let v2 = input("v2.json", common::fixture_v2().to_string().as_bytes());
+    let other = input("other.json", common::fixture_other().to_string().as_bytes());
+    let shapeless = input(
+        "shapeless.json",
+        json!({"name": "Synthetic", "version": "9", "document": {}})
+            .to_string()
+            .as_bytes(),
+    );
+    let not_json = input("not.json", b"{ not json");
+    let vars = input(
+        "vars.json",
+        include_bytes!("fixtures/variables-export.json").as_slice(),
+    );
+    let bad_vars = input(
+        "bad-vars.json",
+        json!({"meta": {"variables": {"VariableID:1": 7}, "variableCollections": {}}})
+            .to_string()
+            .as_bytes(),
+    );
+
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(served.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    let steps: Vec<(Vec<&str>, bool)> = vec![
+        (vec!["pull", "--from-file", &v2], true),
+        (vec!["pull", "--from-file", &other, "--geometry"], true),
+        (vec!["pull", "--from-file", &other], true),
+        (vec!["import-variables", &vars], true),
+        (vec!["import-variables", &bad_vars], false),
+        (vec!["import-variables", &not_json], false),
+        (vec!["pull", "--from-file", &shapeless], false),
+        (vec!["pull", "--fresh", "--from-file", &shapeless], false),
+        (vec!["pull", "--fresh", "--from-file", &not_json], false),
+        (vec!["pull"], false),
+        (vec!["pull", "--fresh"], false),
+        (vec!["pull", "--fresh", "--from-file", &v1], true),
+        (vec!["import-variables", &vars], true),
+        (vec!["pull", "--from-file", &v1, "--geometry"], true),
+    ];
+    let reads: [&[&str]; 4] = [&["tree"], &["vars", "--snapshot"], &["stats"], &["pages"]];
+    for (args, ok) in &steps {
+        let routed = run_cli(served.path(), args);
+        let direct_out = run_cli(direct.path(), args);
+        assert_eq!(
+            routed,
+            direct_out,
+            "{args:?}: routed {} / {}",
+            String::from_utf8_lossy(&routed.1),
+            String::from_utf8_lossy(&routed.2)
+        );
+        assert_eq!(routed.0 == Some(0), *ok, "{args:?}: {routed:?}");
+        if !ok {
+            let error: Value = serde_json::from_slice(&routed.2).unwrap();
+            assert!(error["error"].is_string(), "{error}");
+        }
+        // The mirrors agree after every step (a failed one changed neither).
+        for read in reads {
+            assert_eq!(
+                run_cli(served.path(), read),
+                run_cli(direct.path(), read),
+                "{read:?} after {args:?}"
+            );
+        }
+    }
+
+    // Every write above went through serve: it still owns the store and
+    // reports the last routed pull as a success with its operation id.
+    let status = result_json(&call(&mut stdin, &rx, 50, "figmog_status", json!({})));
+    assert_eq!(status["name"], "Fixture");
+    let operation = status["pull"]["last_success"]["operation"]
+        .as_str()
+        .unwrap();
+    assert!(operation.contains('-'), "{status}");
+    // Its receipt is readable from another connection, but the write
+    // operations are not agent tools.
+    let tools = call(
+        &mut stdin,
+        &rx,
+        51,
+        "figmog_internal_pull",
+        json!({"file": KEY}),
+    );
+    assert_eq!(tools["result"]["isError"], true, "{tools}");
+    let receipt = run_cli(
+        served.path(),
+        &[
+            "call",
+            "figmog_internal_operation",
+            "--args",
+            &json!({"id": operation}).to_string(),
+        ],
+    );
+    assert_eq!(receipt.0, Some(0), "{receipt:?}");
+    let receipt: Value = serde_json::from_slice(&receipt.1).unwrap();
+    assert_eq!(receipt["state"], "succeeded");
+    assert_eq!(receipt["id"], operation);
+
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+/// `--db` at a store a running serve owns fails with a message naming that
+/// serve (pid and socket) instead of a bare lock error, and changes nothing.
+#[test]
+fn db_flag_at_a_serve_owned_store_names_the_owner() {
+    const KEY: &str = "figmogownerkey123456";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+    let db = dir.path().join(".figmog").join(KEY).join("db");
+    let response = dir.path().join("other.json");
+    std::fs::write(&response, common::fixture_other().to_string()).unwrap();
+    let pid = guard.0.id().to_string();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(
+        &vars,
+        include_bytes!("fixtures/variables-export.json").as_slice(),
+    )
+    .unwrap();
+
+    for args in [
+        vec!["status", "--db", db.to_str().unwrap()],
+        vec![
+            "pull",
+            "--fresh",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ],
+        vec!["import-variables", vars.to_str().unwrap(), "--no-socket"],
+    ] {
+        let (code, _, stderr) = run_cli(dir.path(), &args);
+        assert_eq!(code, Some(1), "{args:?}");
+        let error: Value = serde_json::from_slice(&stderr).unwrap();
+        let error = error["error"].as_str().unwrap();
+        assert!(
+            error.contains("store is locked by figmog serve")
+                && error.contains(&format!("pid {pid}"))
+                && error.contains("serve.sock"),
+            "{args:?}: {error}"
+        );
+    }
+    let (code, stdout, _) = run_cli(dir.path(), &["status"]);
+    assert_eq!(code, Some(0));
+    let status: Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(status["name"], "Fixture");
+
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+/// If the owner disappears after accepting a write, `figmog pull` reports
+/// "outcome unknown" with the announced operation id and exits nonzero —
+/// it neither retries through the socket nor falls back to opening the
+/// store directly. (A stand-in owner on the project's socket plays a serve
+/// killed mid-operation.)
+#[test]
+fn owner_vanishing_mid_write_reports_outcome_unknown_without_retry() {
+    use std::os::unix::net::UnixListener;
+
+    const KEY: &str = "figmogvanishkey12345";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let response = dir.path().join("v2.json");
+    std::fs::write(&response, common::fixture_v2().to_string()).unwrap();
+    let db = dir.path().join(".figmog").join(KEY).join("db");
+    let before = common::store_snapshot(&db);
+    let listener = UnixListener::bind(dir.path().join(".figmog/serve.sock")).unwrap();
+
+    let cli = {
+        let cwd = dir.path().to_path_buf();
+        let response = response.clone();
+        std::thread::spawn(move || {
+            common::command()
+                .args(["pull", "--from-file"])
+                .arg(&response)
+                .current_dir(cwd)
+                .output()
+                .unwrap()
+        })
+    };
+    let (stream, _) = listener.accept().unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut request = String::new();
+    reader.read_line(&mut request).unwrap();
+    let request: Value = serde_json::from_str(&request).unwrap();
+    assert_eq!(request["params"]["name"], "figmog_internal_pull");
+    assert_eq!(request["params"]["arguments"]["file"], KEY);
+    assert_eq!(
+        request["params"]["arguments"]["from_file"],
+        common::fixture_v2()
+    );
+    let mut out = stream;
+    writeln!(
+        out,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "notifications/figmog/operation",
+            "params": {"id": "c0ffee-1"}})
+    )
+    .unwrap();
+    drop(out);
+    drop(reader);
+
+    let output = cli.join().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    let error = error["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("outcome unknown") && error.contains("operation c0ffee-1"),
+        "{error}"
+    );
+    assert!(output.stdout.is_empty());
+    listener.set_nonblocking(true).unwrap();
+    assert!(listener.accept().is_err(), "the CLI connected again");
+    assert_eq!(
+        common::store_snapshot(&db),
+        before,
+        "the CLI wrote directly"
+    );
+}

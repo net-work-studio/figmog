@@ -47,13 +47,21 @@ struct ImageJob {
 }
 
 enum Command {
-    Pull { geometry: bool },
-    Poll { expedited: bool },
+    Pull {
+        geometry: bool,
+    },
+    Poll {
+        expedited: bool,
+    },
     Images(ImageJob),
+    /// A CLI writer operation (NWS-2963), or one step of it.
+    Write(WriteWork),
 }
 
 enum Completion {
     Pull(Result<(PullOutcome, Arc<SessionView>), PullError>),
+    /// A [`Command::Write`] finished (its waiters are answered on the loop).
+    Write(Result<WriteResult, String>),
     Phase(PullPhase),
     Poll {
         tick: Tick,
@@ -68,6 +76,141 @@ struct PullOutcome {
     churn: Churn,
     name: String,
     version: String,
+}
+
+/// Delivers one CLI write's result (NWS-2963) from the loop back to whoever
+/// asked: `Ok` only once the write committed *and* its view was published.
+/// Dropping it uncalled is the deliverer's to report (as "outcome unknown").
+pub(crate) type WriteReply = Box<dyn FnOnce(Result<Value, String>) + Send>;
+
+/// Where a CLI pull's file response comes from.
+pub(crate) enum PullSource {
+    /// `GET /v1/files/:key` (and `variables/local`) with serve's credentials.
+    Network,
+    /// A saved `GET /v1/files/:key` response (`pull --from-file`), sent by
+    /// the CLI as content.
+    File(Value),
+}
+
+/// A writer operation the CLI routes through a running serve (NWS-2963).
+/// Each one is applied by the file's worker, the store's only writer;
+/// distinct operations are never merged, except identical plain pulls
+/// still waiting to start.
+pub(crate) enum WriteOp {
+    /// `figmog pull [--fresh] [--from-file] [--geometry]`.
+    Pull {
+        source: PullSource,
+        fresh: bool,
+        geometry: bool,
+    },
+    /// `figmog import-variables`: the export's raw bytes (their digest is
+    /// the snapshot's) and the name to report validation errors under.
+    Import { content: Vec<u8>, label: String },
+}
+
+impl WriteOp {
+    fn is_plain_pull(&self, with_geometry: bool) -> bool {
+        matches!(self, WriteOp::Pull { source: PullSource::Network, fresh: false, geometry }
+            if *geometry == with_geometry)
+    }
+
+    fn into_work(self) -> WriteWork {
+        match self {
+            WriteOp::Pull {
+                source,
+                fresh,
+                geometry,
+            } => WriteWork::Pull {
+                source,
+                fresh,
+                geometry,
+            },
+            WriteOp::Import { content, label } => WriteWork::Import { content, label },
+        }
+    }
+}
+
+/// What the worker runs for a [`WriteOp`]. A fresh pull is two steps:
+/// `Pull { fresh: true }` only validates (fetch/parse/flatten, touching no
+/// store) and returns the [`Prepared`] data; the loop then resets the store
+/// behind the per-store reset barrier and the reopened session's worker
+/// runs `Apply`.
+enum WriteWork {
+    Pull {
+        source: PullSource,
+        fresh: bool,
+        geometry: bool,
+    },
+    Apply(Prepared),
+    Import {
+        content: Vec<u8>,
+        label: String,
+    },
+}
+
+/// A validated pull, not yet applied to any store.
+pub(crate) struct Prepared {
+    flattened: crate::flatten::Flattened,
+    has_vars: bool,
+    /// The geometry flag to persist (OR'd with the store's at apply time).
+    geometry: bool,
+    /// Fetched from Figma: a successful apply acknowledges a pending watch
+    /// observation, like any network pull.
+    network: bool,
+}
+
+enum WriteResult {
+    Applied(Applied),
+    Prepared(Prepared),
+}
+
+struct Applied {
+    /// The CLI's result: pull churn, or the import summary.
+    value: Value,
+    view: Arc<SessionView>,
+    mirrored: bool,
+    geometry: bool,
+    outcome: Option<PullOutcome>,
+}
+
+/// Everyone waiting on one write (identical plain pulls share one).
+struct Waiters {
+    /// The first waiter's operation id, recorded in `last_success`.
+    operation: String,
+    replies: Vec<WriteReply>,
+}
+
+impl Waiters {
+    fn answer(self, result: &Result<Value, String>) {
+        for reply in self.replies {
+            reply(result.clone());
+        }
+    }
+}
+
+/// An accepted write waiting for the worker.
+struct PendingWrite {
+    op: WriteOp,
+    waiters: Waiters,
+}
+
+/// Writes a store reset carries from the closed session to its reopened
+/// one: the prepared fresh pull it was reset for, and writes still queued.
+pub(crate) struct Carry {
+    fresh: Option<(Prepared, Waiters)>,
+    writes: VecDeque<PendingWrite>,
+}
+
+impl Carry {
+    fn fail(self, error: &str) {
+        let error = Err(error.to_string());
+        if let Some((_, waiters)) = self.fresh {
+            waiters.answer(&error);
+        }
+        for write in self.writes {
+            write.waiters.answer(&error);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize)]
@@ -152,21 +295,31 @@ pub(crate) struct FileSession {
     /// set, no new read is admitted and no worker command starts.
     reset: Option<StoreReset>,
     /// Reopens this store at the same path with the same key, credentials
-    /// and hooks — the reset barrier's step 4.
+    /// and hooks — the reset barrier's step 4. `true` clears the store's
+    /// contents first (a fresh pull).
     reopen: Reopen,
+    /// CLI writes accepted and not yet started, in arrival order (NWS-2963).
+    writes: VecDeque<PendingWrite>,
+    /// The waiters of the write the worker is running.
+    writing: Option<Waiters>,
+    /// A validated fresh pull waiting for this store's reset barrier.
+    fresh: Option<(Prepared, Waiters)>,
 }
 
-type Reopen = Arc<dyn Fn() -> Result<FileSession, String> + Send + Sync>;
+type Reopen = Arc<dyn Fn(bool) -> Result<FileSession, String> + Send + Sync>;
 
 /// A store-level operation that must not run underneath live views; it
-/// waits behind the per-store reset barrier ([`ReadGate`]). Append-only:
-/// NWS-2963 adds its own variants (e.g. a fresh re-pull) here.
+/// waits behind the per-store reset barrier ([`ReadGate`]). Append-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // first constructed by NWS-2963's reset tool
 pub(crate) enum StoreReset {
     /// Close the store and reopen it from disk, publishing a new session
     /// (fresh job history, like a reopened mirror).
+    #[cfg_attr(not(test), allow(dead_code))] // only tests reopen without a write
     Reopen,
+    /// A fresh pull (NWS-2963): close the store, clear its contents (the
+    /// ownership anchor stays), reopen it empty and apply the session's
+    /// prepared pull there.
+    Fresh,
 }
 
 /// A status read captured on the loop and finished on a read worker: the
@@ -458,6 +611,32 @@ impl FileSession {
                         }
                     }
                 }
+                Completion::Write(result) => {
+                    let waiters = self.writing.take().expect("write has waiters");
+                    match result {
+                        Ok(WriteResult::Applied(applied)) => {
+                            self.view = applied.view;
+                            self.mirrored = applied.mirrored;
+                            self.geometry |= applied.geometry;
+                            if let Some(outcome) = applied.outcome {
+                                self.last_success = Some(json!({"job_id": null,
+                                    "operation": waiters.operation, "name": outcome.name,
+                                    "version": outcome.version, "churn": outcome.churn}));
+                                published = true;
+                            }
+                            // Committed and published: only now answer.
+                            waiters.answer(&Ok(applied.value));
+                        }
+                        Ok(WriteResult::Prepared(prepared)) => {
+                            // Reset barrier steps 1–2; `service_resets`
+                            // clears and reopens once reads have drained.
+                            self.gate.close();
+                            self.reset = Some(StoreReset::Fresh);
+                            self.fresh = Some((prepared, waiters));
+                        }
+                        Err(error) => waiters.answer(&Err(error)),
+                    }
+                }
                 Completion::Pull(result) => {
                     let job = self.job.as_mut().expect("pull has an accepted job");
                     match result {
@@ -492,6 +671,8 @@ impl FileSession {
                 }
             }
         }
+        // CLI writes go first: their callers are waiting on them.
+        self.start_write();
         self.start_if_ready_at(now);
         if watch && self.expedited_poll {
             self.poll_at(self.interval, now);
@@ -525,6 +706,80 @@ impl FileSession {
             self.start_images(job);
         }
         published
+    }
+
+    /// Accept one CLI write (NWS-2963); `reply` receives its result once it
+    /// committed and was published, or failed (validation failures touch
+    /// no store). Writes run on the worker in arrival order, ahead of
+    /// queued watch/sync pulls, and — like a direct `figmog pull` — do not
+    /// wait out a failed pull's backoff. An identical plain pull that has
+    /// not started yet is shared; nothing else is merged.
+    pub(crate) fn write(&mut self, operation: String, op: WriteOp, reply: WriteReply) {
+        if let WriteOp::Pull {
+            source: PullSource::Network,
+            fresh: false,
+            geometry,
+        } = &op
+            && let Some(queued) = self
+                .writes
+                .iter_mut()
+                .find(|write| write.op.is_plain_pull(*geometry))
+        {
+            queued.waiters.replies.push(reply);
+            return;
+        }
+        self.writes.push_back(PendingWrite {
+            op,
+            waiters: Waiters {
+                operation,
+                replies: vec![reply],
+            },
+        });
+        self.start_write();
+    }
+
+    /// Whether a CLI write is queued, running or waiting for its reset —
+    /// a not-yet-mirrored store then queues no implicit first pull.
+    pub(crate) fn has_writes(&self) -> bool {
+        !self.writes.is_empty() || self.writing.is_some() || self.fresh.is_some()
+    }
+
+    fn start_write(&mut self) {
+        if self.busy || self.reset.is_some() {
+            return;
+        }
+        let Some(PendingWrite { op, waiters }) = self.writes.pop_front() else {
+            return;
+        };
+        self.run_write(op.into_work(), waiters);
+    }
+
+    fn run_write(&mut self, work: WriteWork, waiters: Waiters) {
+        match self.send(Command::Write(work)) {
+            Ok(()) => {
+                self.busy = true;
+                self.writing = Some(waiters);
+            }
+            Err(_) => waiters.answer(&Err(WORKER_GONE.to_string())),
+        }
+    }
+
+    /// The writes a reset carries over to the reopened session.
+    fn take_carry(&mut self) -> Carry {
+        Carry {
+            fresh: self.fresh.take(),
+            writes: std::mem::take(&mut self.writes),
+        }
+    }
+
+    /// Continue carried writes on this (reopened) session: the prepared
+    /// fresh pull first, then the queue.
+    fn adopt(&mut self, carry: Carry) {
+        self.writes = carry.writes;
+        match carry.fresh {
+            Some((prepared, waiters)) => self.run_write(WriteWork::Apply(prepared), waiters),
+            None => self.start_write(),
+        }
     }
 
     /// Desktop context cannot identify a mirror authoritatively. Its
@@ -759,27 +1014,46 @@ pub(crate) fn open_session_with_hooks(
     api: Option<SessionApi>,
     hooks: WorkerHooks,
 ) -> Result<FileSession, String> {
+    open_session_inner(path, key, network_key, api, hooks, false)
+}
+
+/// Open (with `fresh`: clear, then open) one session's store and start its
+/// worker.
+fn open_session_inner(
+    path: PathBuf,
+    key: String,
+    network_key: Option<&str>,
+    api: Option<SessionApi>,
+    hooks: WorkerHooks,
+    fresh: bool,
+) -> Result<FileSession, String> {
     let reopen: Reopen = {
         let (path, key, network_key) = (path.clone(), key.clone(), network_key.map(str::to_string));
         let (api, hooks) = (api.clone(), hooks.clone());
-        Arc::new(move || {
-            open_session_with_hooks(
+        Arc::new(move |fresh| {
+            open_session_inner(
                 path.clone(),
                 key.clone(),
                 network_key.as_deref(),
                 api.clone(),
                 hooks.clone(),
+                fresh,
             )
         })
     };
     let network_key = network_key.map(str::to_string);
     let pipeline = Arc::new(Mutex::new(crate::figmog_pipeline!()));
-    let mut st = open_store_checked(&path, |path| {
+    let open = |path: &std::path::Path| {
         fold::stream::KeyedStream::<Id, crate::model::Rec, _>::new(
             path,
             SharedPipeline(pipeline.clone()),
         )
-    })?;
+    };
+    let mut st = if fresh {
+        crate::cli::open_store_cleared(&path, open)?
+    } else {
+        open_store_checked(&path, open)?
+    };
     let make_view = move |snapshot, node_count| {
         Arc::new(SessionView::new(
             snapshot,
@@ -797,12 +1071,16 @@ pub(crate) fn open_session_with_hooks(
     let worker = std::thread::spawn(move || {
         // Count the opened mirror's nodes here, once, so the first status
         // poll doesn't pay for it (NWS-2942). A read racing this waits for
-        // the same count rather than starting its own.
-        opened.node_count();
+        // the same count rather than starting its own. Kept current so a
+        // view published by a write that leaves `nodes` alone (a variable
+        // import) carries it too.
+        let mut node_count = opened.node_count();
         drop(opened);
         let mut watcher = Watcher::new(None);
         while let Ok(command) = work.recv() {
-            match command {
+            // Agent/watch pulls (`Command::Pull`, a lifecycle job) and CLI
+            // writes (`Command::Write`) share one apply path below.
+            let (work, job) = match command {
                 Command::Poll { expedited } => {
                     let tick = match (&api, &network_key) {
                         (Some(api), Some(key)) => watcher.tick(&**api, key),
@@ -813,91 +1091,7 @@ pub(crate) fn open_session_with_hooks(
                     if done.send(Completion::Poll { tick, expedited }).is_err() {
                         break;
                     }
-                }
-                Command::Pull { geometry } => {
-                    let phase = |name| {
-                        let _ = done.send(Completion::Phase(name));
-                        hooks.phase(name.as_str());
-                    };
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let key = network_key.as_deref().ok_or_else(|| {
-                            PullError::from(
-                                "no file key: pass a file key or figma.com URL".to_string(),
-                            )
-                        })?;
-                        let api = api.as_ref().ok_or_else(|| {
-                            PullError::from(crate::auth::missing_token("network pulls"))
-                        })?;
-                        let stored =
-                            st.rtx(|(_, (.., config, _, _, _))| store::read_geometry(&config));
-                        let geometry = store::effective_geometry(geometry, stored);
-                        phase(PullPhase::Fetching);
-                        let response = api.file(key, geometry)?;
-                        let vars = api.variables_local(key)?;
-                        phase(PullPhase::Flattening);
-                        let mut flattened =
-                            flatten_file(&response).map_err(|e| PullError::from(e.to_string()))?;
-                        let mut prior: BTreeSet<Id> =
-                            st.rtx(|(_, ((nodes, ..), components, sets, styles, ..))| {
-                                collect_sweepable(&nodes, &components, &sets, &styles)
-                            });
-                        if let Some(vars) = vars {
-                            flattened.recs.extend(
-                                crate::vars::enterprise_snapshot_recs(&vars)
-                                    .map_err(|e| PullError::from(e.to_string()))?,
-                            );
-                            prior.extend(st.rtx(|(_, (_, _, _, _, vars, collections, ..))| {
-                                collect_variable_ids(&vars, &collections)
-                            }));
-                        }
-                        phase(PullPhase::Applying);
-                        let prior_version =
-                            st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _, _))| {
-                                meta.get(&0).map(|meta| meta.version.clone())
-                            });
-                        let churn = store::sync(&mut st, &prior, &flattened, now_ms());
-                        // After a sync the `nodes` table holds exactly the
-                        // flattened nodes, so the new view's count is known
-                        // without a scan (NWS-2942).
-                        let node_count = store::flattened_node_count(&flattened);
-                        let version = flattened.file.version.clone();
-                        // Match direct pulls: unchanged versions avoid decoding
-                        // potentially large image blobs merely to evict none.
-                        if prior_version.as_deref() != Some(version.as_str()) {
-                            let mut stale =
-                                st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, _, _))| {
-                                    let mut ids = store::stale_cache_ids(&cache, &version);
-                                    ids.extend(store::stale_image_ids(&images, &version));
-                                    ids
-                                });
-                            if !stale.is_empty() {
-                                stale.sort();
-                                store::evict_stale_cache(&mut st, &stale);
-                            }
-                        }
-                        store::upsert_mirror_config(&mut st, geometry);
-                        phase(PullPhase::Publishing);
-                        let view =
-                            make_view(st.rtx(|(snapshot, _)| snapshot.clone()), Some(node_count));
-                        watcher.note_pull_success();
-                        Ok((
-                            PullOutcome {
-                                churn,
-                                name: flattened.file.name,
-                                version,
-                            },
-                            view,
-                        ))
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err(PullError::from(
-                            "pull worker panicked; retry the pull and inspect server stderr"
-                                .to_string(),
-                        ))
-                    });
-                    if done.send(Completion::Pull(result)).is_err() {
-                        break;
-                    }
+                    continue;
                 }
                 Command::Images(ImageJob {
                     ids,
@@ -942,7 +1136,211 @@ pub(crate) fn open_session_with_hooks(
                     if stop {
                         break;
                     }
+                    continue;
                 }
+                Command::Pull { geometry } => (
+                    WriteWork::Pull {
+                        source: PullSource::Network,
+                        fresh: false,
+                        geometry,
+                    },
+                    true,
+                ),
+                Command::Write(work) => (work, false),
+            };
+            // Lifecycle phases belong to jobs only.
+            let phase = |name: PullPhase| {
+                if job {
+                    let _ = done.send(Completion::Phase(name));
+                    hooks.phase(name.as_str());
+                }
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<WriteResult, PullError> {
+                    let prepared = match work {
+                        WriteWork::Import { content, label } => {
+                            // Validated in full before any write, exactly
+                            // like the direct `import-variables`.
+                            let invalid = |e: String| {
+                                PullError::from(format!("invalid variables file {label}: {e}"))
+                            };
+                            let v: Value = serde_json::from_slice(&content)
+                                .map_err(|e| invalid(e.to_string()))?;
+                            crate::vars::check_import_entries(&v)
+                                .map_err(|e| invalid(e.to_string()))?;
+                            let parsed = crate::vars::parse_variables_snapshot(
+                                &v,
+                                crate::vars::SOURCE_FILE,
+                                crate::vars::snapshot_digest(&content),
+                            )
+                            .map_err(|e| invalid(e.to_string()))?;
+                            let prior = st.rtx(|(_, (_, _, _, _, vars, collections, ..))| {
+                                collect_variable_ids(&vars, &collections)
+                            });
+                            let churn = store::replace_variable_snapshot(
+                                &mut st,
+                                &prior,
+                                &parsed.recs,
+                                parsed.snapshot,
+                            );
+                            let imported = parsed
+                                .recs
+                                .iter()
+                                .filter(|(id, _)| matches!(id, Id::Variable(_)))
+                                .count();
+                            let (mirrored, geometry) =
+                                st.rtx(|(_, (_, _, _, _, _, _, meta, _, config, _, _, _))| {
+                                    (meta.get(&0).is_some(), store::read_geometry(&config))
+                                });
+                            let view = make_view(
+                                st.rtx(|(snapshot, _)| snapshot.clone()),
+                                Some(node_count),
+                            );
+                            return Ok(WriteResult::Applied(Applied {
+                                value: json!({"imported": imported, "removed": churn.removed}),
+                                view,
+                                mirrored,
+                                geometry,
+                                outcome: None,
+                            }));
+                        }
+                        WriteWork::Apply(prepared) => prepared,
+                        WriteWork::Pull {
+                            source,
+                            fresh,
+                            geometry,
+                        } => {
+                            // A fresh pull ignores the stored config (the
+                            // documented way to turn geometry back off).
+                            let stored = !fresh
+                                && st.rtx(|(_, (.., config, _, _, _))| {
+                                    store::read_geometry(&config)
+                                });
+                            let geometry = store::effective_geometry(geometry, stored);
+                            let (response, vars, network) = match source {
+                                PullSource::Network => {
+                                    let key = network_key.as_deref().ok_or_else(|| {
+                                        PullError::from(
+                                            "no file key: pass a file key or figma.com URL"
+                                                .to_string(),
+                                        )
+                                    })?;
+                                    let api = api.as_ref().ok_or_else(|| {
+                                        PullError::from(crate::auth::missing_token("network pulls"))
+                                    })?;
+                                    phase(PullPhase::Fetching);
+                                    let response = api.file(key, geometry)?;
+                                    let vars = api.variables_local(key)?;
+                                    (response, vars, true)
+                                }
+                                PullSource::File(response) => (response, None, false),
+                            };
+                            phase(PullPhase::Flattening);
+                            let mut flattened = flatten_file(&response)
+                                .map_err(|e| PullError::from(e.to_string()))?;
+                            if let Some(vars) = &vars {
+                                flattened.recs.extend(
+                                    crate::vars::enterprise_snapshot_recs(vars)
+                                        .map_err(|e| PullError::from(e.to_string()))?,
+                                );
+                            }
+                            let prepared = Prepared {
+                                flattened,
+                                has_vars: vars.is_some(),
+                                geometry,
+                                network,
+                            };
+                            if fresh {
+                                // Nothing touched yet: the loop resets the
+                                // store behind its barrier, then applies.
+                                return Ok(WriteResult::Prepared(prepared));
+                            }
+                            prepared
+                        }
+                    };
+                    let Prepared {
+                        flattened,
+                        has_vars,
+                        geometry,
+                        network,
+                    } = prepared;
+                    phase(PullPhase::Applying);
+                    let mut prior: BTreeSet<Id> =
+                        st.rtx(|(_, ((nodes, ..), components, sets, styles, ..))| {
+                            collect_sweepable(&nodes, &components, &sets, &styles)
+                        });
+                    if has_vars {
+                        prior.extend(st.rtx(|(_, (_, _, _, _, vars, collections, ..))| {
+                            collect_variable_ids(&vars, &collections)
+                        }));
+                    }
+                    let prior_version = st.rtx(|(_, (_, _, _, _, _, _, meta, _, _, _, _, _))| {
+                        meta.get(&0).map(|meta| meta.version.clone())
+                    });
+                    let churn = store::sync(&mut st, &prior, &flattened, now_ms());
+                    // After a sync the `nodes` table holds exactly the
+                    // flattened nodes, so the new view's count is known
+                    // without a scan (NWS-2942).
+                    node_count = store::flattened_node_count(&flattened);
+                    let version = flattened.file.version.clone();
+                    // Match direct pulls: unchanged versions avoid decoding
+                    // potentially large image blobs merely to evict none.
+                    if prior_version.as_deref() != Some(version.as_str()) {
+                        let mut stale =
+                            st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, _, _))| {
+                                let mut ids = store::stale_cache_ids(&cache, &version);
+                                ids.extend(store::stale_image_ids(&images, &version));
+                                ids
+                            });
+                        if !stale.is_empty() {
+                            stale.sort();
+                            store::evict_stale_cache(&mut st, &stale);
+                        }
+                    }
+                    // Sticky geometry (spec §4): this pull's flag OR what
+                    // the store already holds (nothing, after a fresh reset).
+                    let stored_now =
+                        st.rtx(|(_, (.., config, _, _, _))| store::read_geometry(&config));
+                    let geometry = store::effective_geometry(geometry, stored_now);
+                    store::upsert_mirror_config(&mut st, geometry);
+                    phase(PullPhase::Publishing);
+                    let view =
+                        make_view(st.rtx(|(snapshot, _)| snapshot.clone()), Some(node_count));
+                    if network {
+                        watcher.note_pull_success();
+                    }
+                    Ok(WriteResult::Applied(Applied {
+                        value: serde_json::to_value(&churn).expect("churn serializes"),
+                        view,
+                        mirrored: true,
+                        geometry,
+                        outcome: Some(PullOutcome {
+                            churn,
+                            name: flattened.file.name,
+                            version,
+                        }),
+                    }))
+                },
+            ))
+            .unwrap_or_else(|_| {
+                Err(PullError::from(
+                    "pull worker panicked; retry the pull and inspect server stderr".to_string(),
+                ))
+            });
+            let completion = if job {
+                Completion::Pull(result.map(|result| match result {
+                    WriteResult::Applied(Applied {
+                        view,
+                        outcome: Some(outcome),
+                        ..
+                    }) => (outcome, view),
+                    _ => unreachable!("a lifecycle pull applies a network pull"),
+                }))
+            } else {
+                Completion::Write(result.map_err(|e| e.to_string()))
+            };
+            if done.send(completion).is_err() {
+                break;
             }
         }
     });
@@ -974,6 +1372,9 @@ pub(crate) fn open_session_with_hooks(
         gate: Arc::default(),
         reset: None,
         reopen,
+        writes: VecDeque::new(),
+        writing: None,
+        fresh: None,
     })
 }
 
@@ -1039,7 +1440,7 @@ impl SessionManager {
                 .find(|s| s.key == key)
                 .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?
         };
-        if !session.mirrored && session.job.is_none() {
+        if !session.mirrored && session.job.is_none() && !session.has_writes() {
             session.request_pull(false, interval);
         }
         Ok(session)
@@ -1079,7 +1480,9 @@ impl SessionManager {
     /// reads for `key`'s store only. Steps 3–5 run in
     /// [`service_resets`](Self::service_resets) once its worker reads have
     /// released their views and its worker is idle.
-    #[cfg_attr(not(test), allow(dead_code))] // first caller: NWS-2963's reset tool
+    /// (A fresh pull closes its gate the same way from `maintain_at`, once
+    /// its worker has validated it.)
+    #[cfg_attr(not(test), allow(dead_code))] // no tool resets without a write
     pub(crate) fn begin_reset(&mut self, file_ref: &str, reset: StoreReset) -> Result<(), String> {
         let key = parse_file_ref(file_ref)
             .ok_or_else(|| format!("not a Figma file key or URL: {file_ref}"))?;
@@ -1114,16 +1517,23 @@ impl SessionManager {
             }
             let key = session.key.clone();
             let reopen = session.reopen.clone();
+            let fresh = session.reset == Some(StoreReset::Fresh);
             // Closing the old session joins its idle worker and releases
-            // the store before it is reopened.
-            drop(self.sessions.remove(index));
-            match reopen() {
-                Ok(session) => {
+            // the store before it is reopened. Its CLI writes carry over.
+            let mut closed = self.sessions.remove(index);
+            let carry = closed.take_carry();
+            drop(closed);
+            match reopen(fresh) {
+                Ok(mut session) => {
+                    session.adopt(carry);
                     self.sessions.insert(index, session);
                     index += 1;
                     finished.push((key, Ok(())));
                 }
-                Err(error) => finished.push((key, Err(error))),
+                Err(error) => {
+                    carry.fail(&error);
+                    finished.push((key, Err(error)));
+                }
             }
         }
         finished

@@ -65,6 +65,14 @@ pub trait ToolHandler {
     fn unknown_tool(&mut self, name: &str) {
         let _ = name;
     }
+
+    /// Whether `name`, which is not in the registry (so never in
+    /// `tools/list`), is still callable here: serve's internal write
+    /// operations on the socket control plane (NWS-2963).
+    fn accepts_hidden(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
 }
 
 /// The notification `figmog serve` sends to clients that sent `initialize`
@@ -299,7 +307,7 @@ fn tools_call_result(
         None => return Err("missing required field: name".to_string()),
     };
 
-    if !tools.iter().any(|t| t.name == name) {
+    if !tools.iter().any(|t| t.name == name) && !handler.accepts_hidden(name) {
         handler.unknown_tool(name);
         return Err(format!("unknown tool: {name}"));
     }

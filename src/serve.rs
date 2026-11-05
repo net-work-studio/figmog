@@ -64,6 +64,7 @@ use crate::sessions::{self, SessionManager, StoreRoot};
 mod desktop;
 mod output;
 mod reads;
+pub(crate) mod writes;
 
 use crate::upstream::{HttpUpstream, UpstreamMcp};
 use desktop::{DesktopJob, DesktopWorker, ProbeCadence};
@@ -284,7 +285,11 @@ impl Drop for SocketGuard {
 /// rather than let grow this connection's read buffer without bound. Any
 /// real figmog request/response — including a large `figmog_subtree` dump
 /// — is orders of magnitude smaller than this.
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+///
+/// Raised from 8 MiB for NWS-2963: `figmog pull --from-file` through a
+/// running serve sends the saved file response as content, in one request
+/// frame. Responses are bounded separately (`output.rs`).
+pub(crate) const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 /// Read one newline-delimited frame from `reader`, capped at
 /// [`MAX_FRAME_BYTES`] (review m4). `Ok(None)` on a clean EOF with no
@@ -293,6 +298,11 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// connection", exactly like every other read failure in
 /// [`spawn_socket_acceptor`].
 fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
+    read_line_within(reader, MAX_FRAME_BYTES)
+}
+
+/// [`read_bounded_line`] with an explicit cap (tests use a small one).
+fn read_line_within<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
     // Driven directly off `fill_buf`/`consume` rather than `Take` wrapping
     // `read_until`: a chunk can (and, with a client that pipelines several
@@ -313,9 +323,9 @@ fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Strin
         buf.extend_from_slice(available);
         let consumed = available.len();
         reader.consume(consumed);
-        if buf.len() > MAX_FRAME_BYTES {
+        if buf.len() > cap {
             return Err(std::io::Error::other(format!(
-                "frame exceeds {MAX_FRAME_BYTES} bytes with no newline"
+                "frame exceeds {cap} bytes with no newline"
             )));
         }
     }
@@ -445,9 +455,11 @@ pub(crate) fn run_serve(
     let (tx, rx) = mpsc::channel::<Incoming>();
     let registry: ConnRegistry = Arc::default();
     let _socket_guard: Option<SocketGuard> = if no_socket {
+        crate::cli::record_store_owner(None);
         None
     } else {
         let (listener, path) = bind_socket(&socket_root)?;
+        crate::cli::record_store_owner(Some(&path));
         let guard = SocketGuard::new(path)?;
         spawn_socket_acceptor(listener, tx.clone(), registry.clone());
         Some(guard)
@@ -601,6 +613,8 @@ struct Done {
 pub(crate) struct DeferredReply {
     token: u64,
     done: Option<mpsc::Sender<Done>>,
+    /// The error sent if this is dropped unsent.
+    abandoned: &'static str,
 }
 
 impl DeferredReply {
@@ -625,14 +639,12 @@ impl DeferredReply {
 
 impl Drop for DeferredReply {
     fn drop(&mut self) {
-        self.answer(
-            Answer::Output(Err(
-                "request abandoned: its worker stopped before answering".into(),
-            )),
-            false,
-        );
+        self.answer(Answer::Output(Err(self.abandoned.into())), false);
     }
 }
+
+/// A write dropped unanswered may or may not have committed.
+const WRITE_ABANDONED: &str = "outcome unknown: figmog serve stopped this write's worker before it reported; inspect the mirror before retrying";
 
 /// Where a deferred call's response is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -699,6 +711,11 @@ struct Offload {
     reads_in_flight: std::collections::BTreeSet<u64>,
     /// How long shutdown may take: [`EXIT_DRAIN`] (tests shorten it).
     exit_drain: Duration,
+    /// CLI write operations: ids and receipts (NWS-2963).
+    ops: writes::Operations,
+    /// The operation id of a write the handler just accepted, announced to
+    /// its requester before the write's response.
+    op_notice: Option<String>,
 }
 
 /// Completion polling interval while worker reads are outstanding, so a
@@ -717,6 +734,8 @@ impl Offload {
             staged: None,
             reads_in_flight: std::collections::BTreeSet::new(),
             exit_drain: EXIT_DRAIN,
+            ops: writes::Operations::default(),
+            op_notice: None,
         }
     }
 
@@ -730,6 +749,7 @@ impl Offload {
             DeferredReply {
                 token,
                 done: Some(self.done_tx.clone()),
+                abandoned: "request abandoned: its worker stopped before answering",
             },
         )
     }
@@ -764,6 +784,19 @@ impl Offload {
             self.reads_in_flight.insert(staged.token);
             self.reads.submit(staged, call.clone());
         }
+    }
+}
+
+/// Keep a finished write's receipt, whether or not its requester is still
+/// there to receive the answer.
+fn record_receipt(ops: &mut writes::Operations, done: &Done) {
+    if !ops.is_running(done.token) {
+        return;
+    }
+    match &done.answer {
+        Answer::Output(Ok(ToolOutput::Json(value))) => ops.finish(done.token, Ok(value)),
+        Answer::Output(Err(error)) => ops.finish(done.token, Err(error)),
+        _ => ops.finish(done.token, Err("unexpected write answer")),
     }
 }
 
@@ -985,6 +1018,7 @@ fn request_loop(
         // deferring), so its result has no requester.
         while let Ok(done) = offload.done_rx.try_recv() {
             offload.reads_in_flight.remove(&done.token);
+            record_receipt(&mut offload.ops, &done);
             let Some((to, call)) = pending.remove(done.token) else {
                 continue;
             };
@@ -1045,11 +1079,13 @@ fn request_loop(
 
         let over_limit = pending.count(to) >= MAX_PENDING_PER_REQUESTER;
         offload.staged = None;
+        offload.op_notice = None;
         let upstream_status = offload
             .desktop
             .as_ref()
             .map_or("disabled", DesktopWorker::status);
         let mut handler = LoopHandler::new(
+            matches!(to, ReplyTo::Socket(_)),
             |name: &str, args: &Value| -> Result<ToolOutput, String> {
                 if over_limit {
                     return Err(format!(
@@ -1094,6 +1130,11 @@ fn request_loop(
             None => {}
             Some(Reply::Later(call)) => {
                 offload.park(&call);
+                // A write's operation id reaches its requester first, so
+                // a client that loses the owner can still name it.
+                if let Some(id) = offload.op_notice.take() {
+                    deliver(to, frame(&writes::notification(&id)), registry, stdio);
+                }
                 pending.insert(to, call);
             }
             Some(Reply::Now(response)) if !deliver(to, frame(&response), registry, stdio) => {
@@ -1122,6 +1163,9 @@ fn merged_registry(desktop: Option<&DesktopWorker>) -> Vec<mcp::ToolDef> {
 /// protocol events the loop acts on after dispatch (NWS-2959).
 struct LoopHandler<F> {
     call: F,
+    /// The request came from the socket control plane, the only place
+    /// serve's hidden write operations are callable (NWS-2963).
+    socket: bool,
     /// The client sent `initialize`.
     initialized: bool,
     /// A `tools/call` was refused as an unknown tool.
@@ -1129,9 +1173,10 @@ struct LoopHandler<F> {
 }
 
 impl<F> LoopHandler<F> {
-    fn new(call: F) -> Self {
+    fn new(socket: bool, call: F) -> Self {
         Self {
             call,
+            socket,
             initialized: false,
             unknown_tool: None,
         }
@@ -1149,6 +1194,10 @@ impl<F: FnMut(&str, &Value) -> Result<ToolOutput, String>> mcp::ToolHandler for 
 
     fn unknown_tool(&mut self, name: &str) {
         self.unknown_tool = Some(name.to_string());
+    }
+
+    fn accepts_hidden(&self, name: &str) -> bool {
+        self.socket && writes::is_internal(name)
     }
 }
 
@@ -1421,6 +1470,30 @@ fn handle_tool_call(
         return offload.defer_read(cancel, ReadTask::Files(read));
     }
 
+    if name == writes::OPERATION {
+        return offload.ops.query(args).map(ToolOutput::Json);
+    }
+    if name == writes::PULL || name == writes::IMPORT_VARIABLES {
+        let (file, op) = writes::parse(name, args)?;
+        let session = manager.open(&file)?;
+        let (token, mut reply) = offload.reply();
+        reply.abandoned = WRITE_ABANDONED;
+        let id = offload.ops.begin(token);
+        offload.op_notice = Some(id.clone());
+        let operation = id.clone();
+        session.write(
+            id,
+            op,
+            Box::new(move |result| {
+                let output = result.map(|value| {
+                    ToolOutput::Json(serde_json::json!({"operation": operation, "result": value}))
+                });
+                reply.send(output, false);
+            }),
+        );
+        return Ok(ToolOutput::Deferred(token));
+    }
+
     if name == "figmog_open" {
         let file = dispatch::require_str(args, "file")?;
         // spec §4: `geometry` turns sticky vector-geometry requests on for
@@ -1471,7 +1544,7 @@ fn handle_tool_call(
             );
         }
 
-        if !session.mirrored {
+        if !session.mirrored && !session.has_writes() {
             session.request_pull(false, interval);
         }
         if name == "figmog_images" {
@@ -2149,7 +2222,8 @@ mod tests {
         let mut client = UnixStream::connect(&path).unwrap();
         let (server_side, _) = listener.accept().unwrap();
 
-        let oversized = vec![b'a'; MAX_FRAME_BYTES + 1];
+        const CAP: usize = 64 * 1024;
+        let oversized = vec![b'a'; CAP + 1];
         let writer = std::thread::spawn(move || {
             // Never completes the frame with a newline — the reader must
             // give up once the cap is exceeded, not once EOF arrives.
@@ -2157,7 +2231,7 @@ mod tests {
         });
 
         let mut reader = BufReader::new(server_side);
-        let result = read_bounded_line(&mut reader);
+        let result = read_line_within(&mut reader, CAP);
         assert!(
             result.is_err(),
             "an oversized frame should error, not block forever collecting it"

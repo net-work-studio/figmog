@@ -3,7 +3,10 @@
 //! at `<figmog-root>/serve.sock`, instead of opening the store directly —
 //! always-fresh answers, no single-writer lock contention, and (for `call
 //! figmog_sync`) a pull that reaches the *owning* process rather than
-//! failing against a store `serve` already holds locked.
+//! failing against a store `serve` already holds locked. The writers
+//! `pull` and `import-variables` run as serve operations through
+//! [`write_over`] (NWS-2963): one request, an operation-id notification,
+//! then the answer once the write committed and was published.
 //!
 //! Socket routing only applies when the root is knowable at all: `--db`
 //! bypasses the whole multi-file root concept (an arbitrary store path has
@@ -109,6 +112,89 @@ pub(super) fn try_images_call(root: &Path, args: Value) -> Option<Result<Value, 
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }))
+}
+
+/// Connect to the running serve at `root`, if one is reachable — for the
+/// writers (NWS-2963), which prepare their request only once routing is
+/// known.
+pub(super) fn connect(root: &Path) -> Option<UnixStream> {
+    UnixStream::connect(socket_path(root)).ok()
+}
+
+/// How long a routed write may take to report: it may queue behind other
+/// writes and pulls of its file, and a pull's fetch alone has a two-minute
+/// HTTP budget. Past it, the outcome is unknown.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Run one write operation (`crate::serve::writes`) on the serve at the
+/// other end of `stream`, waiting on this connection for its answer —
+/// `{"operation": id, "result": ...}`, sent once the write committed and
+/// was published. A serve-side failure is that failure's error (nothing was
+/// applied). If the connection ends first (serve killed or stopped), the
+/// write is reported as **outcome unknown**, naming the operation id serve
+/// announced when it accepted the write; it is never retried.
+pub(crate) fn write_over(stream: UnixStream, tool: &str, args: Value) -> Result<Value, String> {
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": args},
+    })
+    .to_string();
+    if frame.len() >= crate::serve::MAX_FRAME_BYTES {
+        return Err(format!(
+            "this write is too large to send to the running figmog serve ({} bytes; limit {} MiB) — stop it and run the command again to apply it directly",
+            frame.len(),
+            crate::serve::MAX_FRAME_BYTES / (1024 * 1024)
+        ));
+    }
+    stream
+        .set_write_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(WRITE_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    // A request serve never fully received cannot have been applied.
+    writeln!(writer, "{frame}").map_err(|e| format!("writing to serve socket: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("writing to serve socket: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let id = json!(1);
+    let mut operation: Option<String> = None;
+    loop {
+        let unknown = |cause: String, operation: &Option<String>| match operation {
+            Some(op) => format!(
+                "outcome unknown: figmog serve did not report operation {op} ({cause}); it may or may not have been applied — inspect the mirror (figmog status) before retrying"
+            ),
+            None => format!(
+                "outcome unknown: figmog serve did not acknowledge or answer this write ({cause}); it may or may not have been applied — inspect the mirror (figmog status) before retrying"
+            ),
+        };
+        let line = match read_frame(&mut reader) {
+            Ok(line) => line,
+            Err(e) if e.starts_with("figmog serve did not respond") => {
+                return Err(unknown(
+                    format!("no answer within {}s", WRITE_TIMEOUT.as_secs()),
+                    &operation,
+                ));
+            }
+            Err(e) => return Err(unknown(e, &operation)),
+        };
+        let resp: Value = serde_json::from_str(&line)
+            .map_err(|e| unknown(format!("invalid JSON: {e}"), &operation))?;
+        if resp.get("method").and_then(Value::as_str)
+            == Some(crate::serve::writes::OPERATION_NOTIFICATION)
+        {
+            operation = resp["params"]["id"].as_str().map(str::to_string);
+            continue;
+        }
+        if is_response_to(&resp, &id) {
+            return interpret_call_response(tool, resp);
+        }
+    }
 }
 
 fn call_over(stream: UnixStream, tool: &str, args: Value) -> Result<Value, String> {

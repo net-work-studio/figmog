@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::ops::{Deref, DerefMut};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub(super) const LOCK_NAME: &str = ".figmog-lock";
@@ -17,12 +17,18 @@ pub(super) struct StoreOwner {
 
 impl StoreOwner {
     pub(super) fn acquire(path: &Path) -> Result<Self, String> {
+        enum Failure {
+            /// Held by another opener, with its owner record if it left one.
+            Locked(Option<String>),
+            Failed(String),
+        }
+        use Failure::{Failed, Locked};
         let path = crate::private_dir::ensure(path)?;
         if path.parent().is_none() {
             return Err("the filesystem root cannot be a mirror directory".into());
         }
         let lock_path = path.join(LOCK_NAME);
-        let acquire = || -> Result<File, String> {
+        let acquire = || -> Result<File, Failure> {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -31,32 +37,39 @@ impl StoreOwner {
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&lock_path)
-                .map_err(|e| e.to_string())?;
-            let metadata = file.metadata().map_err(|e| e.to_string())?;
+                .map_err(|e| Failed(e.to_string()))?;
+            let metadata = file.metadata().map_err(|e| Failed(e.to_string()))?;
             // SAFETY: geteuid has no preconditions or side effects.
             let uid = unsafe { libc::geteuid() };
             if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != uid {
-                return Err(
+                return Err(Failed(
                     "lock must be a regular, unshared file owned by the current user".into(),
-                );
+                ));
             }
-            file.try_lock().map_err(|e| match e {
-                TryLockError::WouldBlock => super::STORE_LOCKED_MSG.to_string(),
-                TryLockError::Error(e) => e.to_string(),
-            })?;
+            if let Err(e) = file.try_lock() {
+                return Err(match e {
+                    TryLockError::WouldBlock => Locked(owner_record(&file)),
+                    TryLockError::Error(e) => Failed(e.to_string()),
+                });
+            }
+            // Name this process as the owner (NWS-2963): a serve records
+            // itself so another command can say who holds the store; any
+            // other opener clears a record a previous owner left behind.
+            let record = super::OWNER_RECORD.get().map_or("", String::as_str);
+            file.set_len(0)
+                .and_then(|()| file.write_all_at(record.as_bytes(), 0))
+                .map_err(|e| Failed(e.to_string()))?;
             Ok(file)
         };
-        let lock = acquire().map_err(|e| {
-            if e == super::STORE_LOCKED_MSG {
-                e
-            } else {
-                format!("locking {}: {e}", lock_path.display())
-            }
+        let lock = acquire().map_err(|e| match e {
+            Locked(Some(owner)) => super::store_owned_msg(&owner),
+            Locked(None) => super::STORE_LOCKED_MSG.to_string(),
+            Failed(e) => format!("locking {}: {e}", lock_path.display()),
         })?;
         Ok(Self { path, lock })
     }
 
-    fn clear_contents(&self) -> Result<(), String> {
+    pub(super) fn clear_contents(&self) -> Result<(), String> {
         let clear = || -> std::io::Result<()> {
             let held = self.lock.metadata()?;
             let linked = std::fs::symlink_metadata(self.path.join(LOCK_NAME))?;
@@ -83,6 +96,17 @@ impl StoreOwner {
         };
         clear().map_err(|e| format!("resetting {}: {e}", self.path.display()))
     }
+}
+
+/// The owner record a running serve left in a held lock file: one short
+/// line of printable text, or `None` (another kind of opener, or anything
+/// unexpected — the generic locked message applies then).
+fn owner_record(file: &File) -> Option<String> {
+    let mut buf = [0u8; 1024];
+    let n = file.read_at(&mut buf, 0).ok()?;
+    let text = std::str::from_utf8(&buf[..n]).ok()?.trim();
+    (text.starts_with("figmog serve") && !text.chars().any(char::is_control))
+        .then(|| text.to_string())
 }
 
 fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
