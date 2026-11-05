@@ -1957,6 +1957,7 @@ Every key is optional; a missing key is its default:
 | `stack.tokens` | string | `"src/figmog-tokens.css"` | relative path inside the project: no `..`, not absolute, no `\`, last segment a file name (not `.`, `..` or empty) |
 | `inspector.enabled` | boolean | `true` | the dev-server inspector, development builds only |
 | `inspector.shortcut` | string | `"Alt+Shift+F"` | one or more of `Ctrl`/`Alt`/`Shift`/`Meta` (any case, each once), `+`-joined, then one ASCII letter or digit, or `F1`–`F12` |
+| `inspector.attributes` | boolean | `false` | the `@figmog/react` Vite plugin adds `data-figmog`/`data-figmog-node` to mapped components' root elements, development builds only (§20); off by default: explicit locators come first |
 | `verify.loop` | boolean | `true` | the verify loop on or off |
 | `verify.dev_server` | string | `"http://localhost:5173"` | `http`/`https`, no credentials, loopback host only (`localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`): v1 is local only |
 | `verify.threshold` | number | `95` | advisory match score, 0–100 (the screenshot comparison's `score`) |
@@ -1998,7 +1999,7 @@ is skipped (above). `figmog doctor` reports unknown keys as a warning.
 
 `figmog settings` prints `{project_root, config (the figmog.toml path or
 null), files, unknown_keys, stack: {framework, styling, tokens,
-tokens_path}, inspector: {enabled, shortcut}, verify: {loop, dev_server,
+tokens_path}, inspector: {enabled, shortcut, attributes}, verify: {loop, dev_server,
 threshold, viewports, color_scheme, state}, tokens: {format, modes}}`
 (`tokens_path` is absolute).
 It does not take `--db`.
@@ -2848,3 +2849,126 @@ instances never share an id and every reference resolves inside its own
 Deferred: deleting stale files (`--prune`), sprites, an icon `size`
 prop / Tailwind sizing classes, CSS for image fills' scale modes and
 crops in `figmog spec`, raster icons, and a sanitizer for `<style>`.
+
+## 20. `@figmog/react`: dev-server plugin, bridge and targets (NWS-2957)
+
+Source: `packages/react/src/` — `vite.ts` (the plugin), `mark.ts`
+(attributes), `bridge.ts` + `relay.ts` (the bridge), `figmog.ts`
+(settings and map through the CLI), `client.ts` (browser helper),
+`target.ts` (target manifest and runner). The Rust crate gains no
+dependency: the browser features live in this JavaScript package, which
+reads everything through the `figmog` binary (`figmog settings`, `figmog
+map check`/`coverage`, `figmog serve`) and parses no TOML itself.
+Sample app and end-to-end test: `examples/dev-plugin/`.
+
+**The plugin** (`import { figmog } from "@figmog/react/vite"`) applies to
+the dev server only (`apply: "serve"`): a production build never runs it,
+so built output contains no attribute, bridge code, token or the word
+figmog (asserted on the built files). At start it runs `figmog settings`
+in Vite's root; if that fails (no binary, invalid figmog.toml) the plugin
+warns and does nothing else.
+
+**Attributes (optional).** With `[inspector] attributes = true` (or the
+plugin's `attributes: true`), each component named in `figmog.map.json`
+(`code.path` + `code.export`, after `figmog map check` validates the file)
+gets `data-figmog="<component|component_set>:<key>"` — the map entry's
+Figma identity — and, when `figmog map coverage` finds exactly one node for
+it in the mirror, `data-figmog-node="<node id>"`, on its root element. The
+transform runs before JSX compilation (`enforce: "pre"`), parses the module
+with Vite's own parser, and finds the export (function declaration, arrow
+or function expression, `export { Local as Name }`, `export default
+function Name`, `memo(...)`/`forwardRef(...)` wrappers) and every value its
+own body returns. It marks only when **every** return is a DOM element
+(lowercase JSX tag), `null`, or a conditional of those; a fragment, a
+component element (`<Card>` — its props may not reach the DOM), an array or
+anything else skips the whole component with a dev-server warning, and so
+does a root that already has `data-figmog` (explicit markers win) or an
+export two map entries name. Settings, map and node ids are read once,
+when the dev server starts (restart it after editing them). Dev source maps are not adjusted for the
+inserted text (columns after it on that line shift). Attributes are
+optional because one component renders many instances (every Pro and Free
+card carries the same attributes), fragments have no single root and
+portals render elsewhere: verification targets use explicit locators.
+
+**The bridge.** `POST /__figmog/bridge` on the dev server, body
+`{"tool": "<name>", "arguments": {...}}`, answers the tool's MCP
+`CallToolResult` verbatim (200; tool errors as `isError` content) or
+`{"error"}` with 400 (malformed), 401 (token), 403 (refused), 404 (other
+`/__figmog/` path), 405 (not POST), 413 (body over 64 KiB), 415 (not
+JSON), 502/503/504 (figmog unreachable, busy — 16 calls in flight —, or
+silent past 30 s; 150 s for `figmog_images`). Rules, all checked before
+anything is forwarded:
+
+- **Session token.** 32 random bytes (base64url) generated when the dev
+  server starts, injected into the dev page only, as
+  `window.__FIGMOG_BRIDGE__ = {token, url}`; sent back as `x-figmog-token`
+  and compared in constant time.
+- **Local only.** The peer address must be loopback (`127.0.0.1`, `::1`,
+  `::ffff:127.0.0.1`) and the `Host` header exactly `localhost`,
+  `127.0.0.1` or `[::1]` (any port) — so `vite --host` exposes nothing to
+  the network and DNS rebinding fails.
+- **Same origin.** `Origin` must equal `<scheme>://<Host>` — the page's own
+  origin — and `Sec-Fetch-Site`, when sent, `same-origin`. Vite's own CORS
+  middleware runs first and allows every localhost origin by default, so
+  another local dev server's page (another project) can send a request:
+  the bridge refuses it and removes the CORS headers from every answer, so
+  no other origin can read one.
+- **Allowlist.** The 18 local reads (§6 "Read adapters") plus
+  `figmog_images` (renders; `refresh: true` refused). Not `figmog_open`,
+  `figmog_sync`, `figmog_files`, the internal write tools, `tools/list`
+  or any desktop-proxy tool.
+- **This project's files.** An explicit `file`, and a Figma URL naming a
+  file in `id`/`under`/`target`, must be one of figmog.toml's `[files]`
+  keys; without one, the relay's worktree default applies (§6b).
+- **No credentials.** The Figma token stays in figmog's own processes; the
+  bridge forwards tool calls and returns their results only.
+
+Allowed calls go to one `figmog serve` relay (§6b) the plugin starts on the
+first call, in the project root, with the dev server's environment and the
+plugin's `serveArgs` (default none: the same settings an agent's relay
+uses); line-delimited JSON-RPC `tools/call` frames over its stdio, matched
+by id, notifications ignored, no `initialize`. The relay finds or launches
+the repository's background owner, checks the handshake and injects the
+worktree default file and `figmog_spec`'s project settings — the bridge
+re-implements none of it. A relay that exits fails its pending calls (502)
+and is started again on the next call; closing the dev server closes its
+stdin, and the owner idles out on its own.
+
+**Targets.** `figmog.targets.json` at the project root:
+
+```json
+{"version": 1, "targets": [
+  {"name": "pricing-pro", "figma": {"node": "1:2"}, "route": "/",
+   "locator": {"testid": "pricing-pro"}}]}
+```
+
+Strict: unknown keys, a duplicate or non-`[a-z0-9-]` name, a `route` that
+is not a path starting with `/` (no other host), and a `locator` that is not
+exactly one of `testid` (→ `[data-testid="…"]`) or `css` are errors naming
+the JSON path. `captureTarget` (API) / `figmog-shot target --manifest …
+--target … --base-url … --out …` (CLI, `--viewport WxH` repeatable)
+captures the target with the screenshot runner at the v1 contract viewports
+(1440×900 and 390×844, light) — `<target>-<W>x<H>.png` with its capture
+manifest, plus `<target>.target.json` — and fails on zero or several
+matches (`SelectorMatchError`, exit 1).
+
+**Tests.** `packages/react/test/mark.test.ts` (export forms, branches,
+every skip reason, determinism), `test/plugin.test.ts` (a real Vite dev
+server on every interface with a stand-in figmog: attributes from settings
+and options, nothing in a production build, and the bridge's refusals —
+no/wrong token, other origins, non-loopback Host and peer, non-allowlisted
+tools, other projects' files, malformed requests, CORS headers removed —
+plus relay restart), `test/target.test.ts` (manifest validation, PNGs,
+zero/multiple matches, CLI); `examples/dev-plugin/test/e2e.test.mjs`
+against the built figmog binary in a fresh `git init` copy of the sample
+app with the synthetic `tests/fixtures/map/pricing.json` mirrored by
+`pull --from-file`: attributes in the browser and the skipped fragment,
+bridge reads (`figmog_node`, `figmog_spec` with the injected map) through
+a real relay and owner, refusals, a PNG of one card, the attribute locator
+being ambiguous across instances, a clean production build, and the owner
+exiting after the dev server closes.
+
+Deferred: Next.js, the in-page inspector overlay (NWS-2950), wiring targets
+into `figmog verify` (NWS-2951), fixture data and non-default states in
+targets, and the Playwright browser download as an opt-in step of `figmog
+init` / `figmog doctor`.

@@ -1,0 +1,8 @@
+# Synthetic sample project for the @figmog/react Vite plugin (NWS-2957).
+# The "Figma file" is the repository's synthetic fixture
+# tests/fixtures/map/pricing.json, mirrored with `figmog pull --from-file`.
+[files]
+default = "DevPluginFile001"
+
+[inspector]
+attributes = true  # automatic data-figmog attributes (development builds only)

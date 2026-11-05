@@ -2,7 +2,7 @@
   "name": "@figmog/react",
   "version": "0.0.0",
   "private": true,
-  "description": "Screenshot runner and Figma comparison images for figmog's React verification slice.",
+  "description": "figmog's React tooling: the dev-only Vite plugin (attributes and the local bridge to figmog) and the screenshot runner for verification.",
   "license": "AGPL-3.0-only",
   "type": "module",
   "engines": {
@@ -12,7 +12,9 @@
     "figmog-shot": "dist/src/cli.js"
   },
   "exports": {
-    ".": "./dist/src/index.js"
+    ".": "./dist/src/index.js",
+    "./vite": "./dist/src/vite.js",
+    "./client": "./dist/src/client.js"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
@@ -26,10 +28,19 @@
     "playwright": "1.63.0",
     "pngjs": "7.0.0"
   },
+  "peerDependencies": {
+    "vite": "^8.3.5"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/node": "22.20.5",
     "@types/pngjs": "6.0.5",
     "tailwindcss": "4.3.4",
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
   }
 }

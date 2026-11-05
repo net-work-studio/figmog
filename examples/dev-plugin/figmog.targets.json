@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "targets": [
+    {
+      "name": "pricing-pro",
+      "figma": { "node": "1:2" },
+      "route": "/",
+      "locator": { "testid": "pricing-pro" }
+    }
+  ]
+}
