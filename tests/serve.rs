@@ -2693,6 +2693,89 @@ fn wait_for_pull(stdin: &mut ChildStdin, rx: &Receiver<String>, args: Value, sta
     }
 }
 
+/// NWS-2961: a store only ever `import-variables`'d into (no `meta` row)
+/// reports its stored snapshot through a real `figmog serve` — over stdio
+/// MCP and via socket-routed plain `figmog status` — while the file itself
+/// stays not ready. The routed CLI output is byte-identical to direct
+/// `figmog status --db` on the same store.
+#[test]
+fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let export = dir.path().join("vars.json");
+    std::fs::write(
+        &export,
+        include_bytes!("fixtures/variables-export.json").as_slice(),
+    )
+    .unwrap();
+    common::command()
+        .args(["import-variables", export.to_str().unwrap(), "--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let direct = common::command()
+        .args(["status", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let direct_json: Value = serde_json::from_slice(&direct).unwrap();
+    assert_eq!(direct_json["variables"]["state"], "current");
+
+    // `spawn_serve` runs with cwd = `dir`, so serve's socket lands at
+    // `<dir>/.figmog/serve.sock`, which plain CLI reads from `dir` route to.
+    let (mut guard, mut stdin, rx) = spawn_serve(&db);
+    handshake(&mut stdin, &rx);
+
+    let resp = call(&mut stdin, &rx, 2, "figmog_status", json!({}));
+    // One request in flight at a time, so the next line is its answer.
+    assert_eq!(resp["id"], 2, "{resp}");
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let status = result_json(&resp);
+    assert_eq!(status["ready"], false, "{status}");
+    assert_eq!(status["name"], Value::Null);
+    assert_eq!(status["version"], Value::Null);
+    assert_eq!(status["nodes"], 0);
+    assert_eq!(status["variables"], direct_json["variables"], "{status}");
+
+    // Data reads keep the not-ready error: a snapshot is not a mirror.
+    let resp = call(&mut stdin, &rx, 3, "figmog_pages", json!({}));
+    assert_eq!(resp["id"], 3, "{resp}");
+    assert_eq!(resp["result"]["isError"], true, "{resp}");
+
+    // Serve holds the writer lock, so success here proves socket routing.
+    let routed = common::command()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&routed),
+        String::from_utf8_lossy(&direct)
+    );
+    let called: Value = serde_json::from_slice(
+        &common::command()
+            .args(["call", "figmog_status"])
+            .current_dir(dir.path())
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(called["ready"], false, "{called}");
+    assert_eq!(called["variables"], direct_json["variables"]);
+
+    drop(stdin);
+    let exit = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(exit.success(), "figmog serve exited with {exit:?}");
+}
+
 /// NWS-2902 adapter parity over the server transports: every local read
 /// in [`common::read_parity_cases`] runs direct (before serve locks the
 /// store), then socket-routed through the same CLI command, then as a raw

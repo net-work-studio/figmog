@@ -406,7 +406,12 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let tool_args = with_current_file(tool_args)?;
             if let Some(result) = socket::try_call(root, tool, tool_args) {
                 let result = result?;
-                if tool == "figmog_status" && result["ready"] == false {
+                // Not ready is an error, except for an import-only store
+                // (SPEC §9): its stored variable snapshot still answers.
+                if tool == "figmog_status"
+                    && result["ready"] == false
+                    && !has_variable_state(&result)
+                {
                     return Err("mirror is not ready — inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors".to_string());
                 }
                 let result = if tool == "figmog_status" {
@@ -532,6 +537,14 @@ fn with_current_file(mut args: Value) -> Result<Value, String> {
         obj.insert("file".to_string(), json!(key));
     }
     Ok(args)
+}
+
+/// Whether a status result carries a variable snapshot summary with
+/// stored state (anything but `none`) — the import-only status case.
+fn has_variable_state(status: &Value) -> bool {
+    status["variables"]["state"]
+        .as_str()
+        .is_some_and(|state| state != "none")
 }
 
 /// Preserve the direct read command's JSON shape for an existing mirror.

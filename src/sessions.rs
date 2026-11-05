@@ -215,22 +215,34 @@ pub(crate) fn read_tool(
 }
 
 /// A session's status JSON. `view` is required for a mirrored session; a
-/// missing one (its store is resetting) is an error.
+/// missing one (its store is resetting) is an error. A not-mirrored
+/// session still reads its view when it has one: the store may already
+/// hold an imported variable snapshot (SPEC §9 "Import-only stores"), and
+/// the shared status query then answers with null file fields plus the
+/// `variables` summary. Readiness stays false either way — a snapshot is
+/// not a mirrored file. With no variable state the query reports "no
+/// mirror here" (and a resetting store has no view), so the bare shape
+/// stands.
 fn status_value(
     mirrored: bool,
     lifecycle: Value,
     view: Option<&SessionView>,
 ) -> Result<Value, String> {
+    let status_json = |view| match read_tool(view, "figmog_status", &json!({}))? {
+        ToolOutput::Json(value) => Ok::<_, String>(value),
+        ToolOutput::Raw(_) | ToolOutput::Deferred(_) => {
+            unreachable!("local read tools return JSON")
+        }
+    };
     let mut value = match (mirrored, view) {
-        (true, Some(view)) => match read_tool(view, "figmog_status", &json!({}))? {
-            ToolOutput::Json(value) => value,
-            ToolOutput::Raw(_) | ToolOutput::Deferred(_) => {
-                unreachable!("local read tools return JSON")
-            }
-        },
+        (true, Some(view)) => status_json(view)?,
         (true, None) => return Err(RESETTING.to_string()),
-        (false, _) => json!({"name": null, "version": null, "last_modified": null,
-            "synced_at_unix_ms": null, "nodes": 0}),
+        (false, view) => view
+            .and_then(|view| status_json(view).ok())
+            .unwrap_or_else(|| {
+                json!({"name": null, "version": null, "last_modified": null,
+                    "synced_at_unix_ms": null, "nodes": 0})
+            }),
     };
     value["ready"] = json!(mirrored);
     value["pull"] = lifecycle;
@@ -267,13 +279,16 @@ impl FileSession {
         self.status_read().run()
     }
 
-    /// Capture a status read for a read worker. A mirrored session whose
-    /// store is resetting captures no view; its status read then fails.
+    /// Capture a status read for a read worker. The lease goes through the
+    /// reset barrier even when not mirrored (an import-only store still
+    /// reports its variable snapshot). A session whose store is resetting
+    /// captures no view: a mirrored status read then fails, a not-mirrored
+    /// one falls back to the bare shape.
     pub(crate) fn status_read(&self) -> StatusRead {
         StatusRead {
             mirrored: self.mirrored,
             lifecycle: self.lifecycle(),
-            lease: self.mirrored.then(|| self.gate.admit(&self.view)).flatten(),
+            lease: self.gate.admit(&self.view),
         }
     }
 
