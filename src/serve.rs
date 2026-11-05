@@ -935,7 +935,7 @@ fn handle_tool_call<U: UpstreamMcp>(
     }
 
     // spec §2b: an explicit `file` arg always wins, but when it's absent
-    // and the call's node-id-shaped argument (`id`/`under`/`target`) is a
+    // and the call's node-id-shaped argument (`id`/`under`/`target`/`page`) is a
     // full Figma URL naming a file, that URL's file key routes the call
     // (auto-open semantics apply, same as an explicit `file`). When both
     // are present and disagree, the explicit arg still wins — the
@@ -993,7 +993,7 @@ fn handle_tool_call<U: UpstreamMcp>(
             match (&explicit_key, &url_file_key) {
                 (Some(ef), Some(uf)) if ef != uf => {
                     format!(
-                        "{msg} (note: the id/under URL names file {uf}, but the explicit `file` argument {ef} was used instead)"
+                        "{msg} (note: the node URL names file {uf}, but the explicit `file` argument {ef} was used instead)"
                     )
                 }
                 _ => msg,

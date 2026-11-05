@@ -225,12 +225,21 @@ enum Cmd {
         #[arg(long)]
         under: Option<String>,
     },
-    /// Nodes whose absolute bounds contain a point, sorted by area ascending.
+    /// Visible nodes on one page containing a point, sorted by area then id.
     At {
         #[arg(long)]
         x: f64,
         #[arg(long)]
         y: f64,
+        /// Page id or Figma page URL defining the coordinate space.
+        #[arg(long)]
+        page: String,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
+        /// Maximum number of matches after filtering and sorting.
+        #[arg(long, default_value_t = crate::query::DEFAULT_AT_LIMIT)]
+        limit: usize,
     },
     /// Download node renders and/or fill images to --out, caching by file version.
     ///
@@ -584,7 +593,15 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 } => st.rtx(|((nodes, children, ..), ..)| {
                     read::cmd_where(&nodes, &children, pointer, equals, page, under)
                 }),
-                Cmd::At { x, y } => st.rtx(|((nodes, ..), ..)| read::cmd_at(&nodes, x, y)),
+                Cmd::At {
+                    x,
+                    y,
+                    page,
+                    under,
+                    limit,
+                } => st.rtx(|((nodes, children, ..), ..)| {
+                    read::cmd_at(&nodes, &children, x, y, page, under, limit)
+                }),
                 Cmd::Version
                 | Cmd::Auth { .. }
                 | Cmd::Pull { .. }
@@ -777,7 +794,16 @@ fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
             }
             Some(("figmog_where", args))
         }
-        Cmd::At { x, y } => Some(("figmog_at", json!({"x": x, "y": y}))),
+        Cmd::At {
+            x,
+            y,
+            page,
+            under,
+            limit,
+        } => Some((
+            "figmog_at",
+            json!({"x": x, "y": y, "page": page, "under": under, "limit": limit}),
+        )),
         Cmd::Version
         | Cmd::Auth { .. }
         | Cmd::Pull { .. }
@@ -824,7 +850,7 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
     // current is only a fallback. Desktop calls keep the current mirror
     // regardless of their arguments, since they cannot select the
     // desktop's open file. Reuse the read command's tool arguments so
-    // `id`, `under`, and `target` follow the socket/server URL inference.
+    // `id`, `under`, `target`, and `page` follow socket/server URL inference.
     // `figmog_open` and `figmog_files` keep their management semantics.
     let file = match &cli.cmd {
         Cmd::Call { tool, args, .. } if is_per_file_local_tool(tool) => {

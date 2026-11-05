@@ -159,7 +159,9 @@ needs no token up front. `figmog_open` and `figmog_files` manage the set. See
 
 `figmog dump <id>` returns a node and its descendants as nested raw JSON,
 with `--depth N` and `--fields a,b,c` to keep the payload small.
-`--under <id>` scopes `text`, `find`, `search` and `where` to one subtree,
+`figmog at --page 0:1 --x 10 --y 10 --limit 20` looks up a point on one
+page, excluding hidden branches and returning up to 100 matches by default.
+`--under <id>` scopes `text`, `find`, `search`, `where` and `at` to one subtree,
 and composes with `--page`. `--resolve-vars` annotates every
 `boundVariables` binding site with the variable's name and per-mode values
 under a `resolved_variables` key, so a generator can emit

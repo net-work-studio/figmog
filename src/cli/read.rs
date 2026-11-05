@@ -243,8 +243,12 @@ pub(super) fn cmd_where<R: Readable>(
 
 pub(super) fn cmd_at<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     x: f64,
     y: f64,
+    page: String,
+    under: Option<String>,
+    limit: usize,
 ) -> Result<(), String> {
-    print_value(&query::at(nodes, x, y)?)
+    print_value(&query::at(nodes, children, x, y, page, under, limit)?)
 }

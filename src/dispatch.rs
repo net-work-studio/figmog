@@ -93,6 +93,22 @@ pub(crate) fn arg_usize(args: &Value, key: &str) -> Option<usize> {
     args.get(key).and_then(Value::as_u64).map(|n| n as usize)
 }
 
+/// A JSON Schema non-negative integer, including integral decimal/exponent
+/// representations, that fits the platform's index size.
+fn json_usize(value: &Value) -> Option<usize> {
+    if let Some(integer) = value.as_u64() {
+        return usize::try_from(integer).ok();
+    }
+    let number = value.as_f64()?;
+    // Use an exclusive power-of-two bound: usize::MAX can round up as f64.
+    let upper_exclusive = 2.0_f64.powi(usize::BITS as i32);
+    if number.is_finite() && number.fract() == 0.0 && (0.0..upper_exclusive).contains(&number) {
+        Some(number as usize)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
@@ -148,14 +164,13 @@ pub(crate) fn require_f64(args: &Value, key: &str) -> Result<f64, String> {
 
 /// The file key named by a full Figma URL in whichever node-id-shaped
 /// argument this call carries (spec §2b): tries `id`, then `under`, then
-/// `target`, in that order — a given tool call has at most one of these,
-/// so trying all three is safe. `None` when no such argument is present,
+/// `target`, then `page`, in that order. `None` when no such argument is present,
 /// or it's present but isn't a URL naming a file (a bare id, or a URL
 /// with no file segment). Used by `figmog serve`'s multi-file session
 /// routing (`serve.rs::handle_tool_call`) to auto-infer the target mirror
 /// from a pasted node/frame URL when the call omits an explicit `file`.
 pub(crate) fn infer_file_from_node_ref(args: &Value) -> Option<String> {
-    ["id", "under", "target"].iter().find_map(|key| {
+    ["id", "under", "target", "page"].iter().find_map(|key| {
         let raw = arg_str(args, key)?;
         crate::ident::parse_node_ref(&raw)?.0
     })
@@ -306,7 +321,17 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         "figmog_at" => Some((|| {
             let x = require_f64(args, "x")?;
             let y = require_f64(args, "y")?;
-            query::at(nodes, x, y)
+            let page = require_str(args, "page")?;
+            let under = args
+                .get("under")
+                .map(|_| require_str(args, "under"))
+                .transpose()?;
+            let limit = match args.get("limit") {
+                None => query::DEFAULT_AT_LIMIT,
+                Some(value) => json_usize(value)
+                    .ok_or_else(|| "expected non-negative integer for `limit`".to_string())?,
+            };
+            query::at(nodes, children, x, y, page, under, limit)
         })()),
         _ => None,
     }
@@ -522,14 +547,17 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "figmog_at",
-            description: "Nodes whose absolute bounds contain a point, sorted by area ascending (deepest/smallest first) — reads the local mirror (no Figma API cost).",
+            description: "Visible nodes on one page whose absolute bounds contain a point, sorted by area ascending then id. Excludes hidden branches; optionally intersects a subtree. Returns at most limit matches (default 100) — reads the local mirror (no Figma API cost).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "x": {"type": "number"},
-                    "y": {"type": "number"}
+                    "y": {"type": "number"},
+                    "page": {"type": "string", "description": "Page id or Figma page URL defining the coordinate space; must name a CANVAS."},
+                    "under": {"type": "string", "description": "Intersect with the subtree rooted at this node id or Figma URL (inclusive)."},
+                    "limit": {"type": "integer", "minimum": 0, "default": query::DEFAULT_AT_LIMIT, "description": "Maximum matches after filtering and sorting; zero returns an empty array."}
                 },
-                "required": ["x", "y"]
+                "required": ["x", "y", "page"]
             }),
         },
     ];
