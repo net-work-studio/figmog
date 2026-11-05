@@ -18,6 +18,7 @@ mod dispatch;
 pub mod flatten;
 pub(crate) mod ident;
 pub mod images;
+pub(crate) mod map;
 pub(crate) mod mcp;
 pub mod model;
 pub(crate) mod owner;

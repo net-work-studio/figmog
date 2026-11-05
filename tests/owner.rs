@@ -1222,3 +1222,48 @@ fn three_worktrees_share_one_mirror_and_one_edit_pulls_once() {
     relay.finish();
     wait_owner_gone(repo.path());
 }
+
+/// NWS-2949: the relay passes the project's figmog.map.json to
+/// `figmog_spec` (an agent's own `map` wins), re-reading it per call, and
+/// an invalid map file is that call's error, naming the file and path.
+#[test]
+fn a_relay_maps_instances_with_the_projects_map() {
+    let repo = repo();
+    std::fs::write(
+        repo.path().join("figmog.toml"),
+        format!("[files]\ndefault = \"{KEY}\"\n"),
+    )
+    .unwrap();
+    let map = json!({"version": 1, "components": [{
+        "figma": {"component_set": "keyset21"},
+        "code": {"path": "src/Button.tsx", "export": "Button"},
+        "props": {"Size": {"prop": "size", "values": {"Large": "lg", "Small": "sm"}}}
+    }]});
+    std::fs::write(repo.path().join("figmog.map.json"), map.to_string()).unwrap();
+    seed(repo.path(), KEY, &common::fixture_v1());
+    let mut relay = spawn_relay(&mut relay_command(
+        repo.path(),
+        &["--no-watch", "--no-upstream"],
+    ));
+    relay.initialize();
+    let spec = relay.call("figmog_spec", json!({"id": "1:3"})).unwrap();
+    let code = &spec["node"]["instance"]["code_component"];
+    assert_eq!(code["jsx"], "<Button size=\"lg\" />", "{code}");
+    // State, Label, HasIcon and Icon have no prop: partial.
+    assert_eq!(code["coverage"], "partial");
+    // The agent's own map wins.
+    let mut other = map.clone();
+    other["components"][0]["code"]["export"] = json!("Btn");
+    let spec = relay
+        .call("figmog_spec", json!({"id": "1:3", "map": other}))
+        .unwrap();
+    assert_eq!(spec["node"]["instance"]["code_component"]["export"], "Btn");
+    std::fs::write(repo.path().join("figmog.map.json"), "{\"version\": 9}").unwrap();
+    let err = relay.call("figmog_spec", json!({"id": "1:3"})).unwrap_err();
+    assert!(
+        err.contains("figmog.map.json: version: unsupported 9"),
+        "{err}"
+    );
+    relay.finish();
+    wait_owner_gone(repo.path());
+}

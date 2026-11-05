@@ -375,6 +375,34 @@ referenced as assets by node id and `imageRef`. In a project whose
 equivalent — a rotated layer, a gradient, a blur — is listed under
 `unsupported` instead of being guessed. See `docs/SPEC.md` §17.
 
+### Mapping Figma components to code
+
+A committed `figmog.map.json` at the project root links Figma components
+to the code components that implement them, so the spec can say "use
+`<PricingCard tier="pro" />`" instead of describing rectangles:
+
+```json
+{
+  "version": 1,
+  "components": [
+    {
+      "figma": {"component_set": "<key from figmog components>"},
+      "code": {"path": "src/components/PricingCard.tsx", "export": "PricingCard"},
+      "props": {"Tier": {"prop": "tier", "values": {"Free": "free", "Pro": "pro"}}}
+    }
+  ]
+}
+```
+
+Each instance of a mapped component then carries `code_component` in
+`figmog spec`: the import path, export, mapped props and a JSX rendering.
+The mapping is marked `partial`, with the reasons listed, whenever the
+instance has something the map can't express — a property without a
+prop, a hand-made text override, an instance swap, slot content.
+`figmog map check` validates the file; `figmog map coverage` lists Figma
+components with no entry, entries whose component is no longer in the
+mirror, and mapped code files that don't exist. See `docs/SPEC.md` §18.
+
 ### The vertical slice example
 
 `examples/slice/` runs the whole loop offline on a synthetic file: a

@@ -404,7 +404,10 @@ impl Relay {
         // `figmog_spec` names tokens as this project's token file does
         // (NWS-2948): its `[tokens]` settings, unless the agent passed some;
         // and shows the Tailwind class hint when `[stack] styling` is
-        // `tailwind` (NWS-2947), unless the agent said `tailwind`.
+        // `tailwind` (NWS-2947), unless the agent said `tailwind`; and maps
+        // instances to code components with the project's figmog.map.json
+        // (NWS-2949), unless the agent passed a `map` — an invalid map file
+        // is this call's error, naming the file and the JSON path.
         if name == "figmog_spec" {
             let params = &mut frame["params"];
             if !params["arguments"].is_object() {
@@ -420,6 +423,11 @@ impl Relay {
             {
                 params["arguments"]["tailwind"] =
                     json!(settings.stack.styling == crate::project::Styling::Tailwind);
+            }
+            if params["arguments"].get("map").is_none_or(Value::is_null)
+                && let Some(map) = crate::map::CodeMap::load(&self.layout.project_root)?
+            {
+                params["arguments"]["map"] = map.to_json();
             }
         }
         let args = &frame["params"]["arguments"];

@@ -347,6 +347,10 @@ pub(crate) enum ReadCommand {
         /// CLI and the stdio relay fill it from the project's `[stack]
         /// styling`; left `None`, no hint.
         tailwind: Option<bool>,
+        /// The Figma → code component map (NWS-2949): the project's
+        /// `figmog.map.json`, injected by the CLI and the stdio relay;
+        /// `None`, every `code_component` is null.
+        map: Option<crate::map::CodeMap>,
     },
 }
 
@@ -429,6 +433,10 @@ impl ReadCommand {
                     Some(v) => Some(crate::tokens::ExportOptions::from_json(v)?),
                 },
                 tailwind: arg_bool_opt(args, "tailwind")?,
+                map: match args.get("map") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(crate::map::CodeMap::from_json(v, "map")?),
+                },
             },
             _ => return Ok(None),
         }))
@@ -545,10 +553,14 @@ impl ReadCommand {
                 id,
                 tokens,
                 tailwind,
+                map,
             } => {
                 args = json!({"id": id});
                 if let Some(tokens) = tokens {
                     args["tokens"] = tokens.to_json();
+                }
+                if let Some(map) = map {
+                    args["map"] = map.to_json();
                 }
                 put(&mut args, "tailwind", *tailwind);
                 "figmog_spec"
@@ -684,6 +696,7 @@ impl ReadCommand {
                 id,
                 tokens,
                 tailwind,
+                map,
             } => query::spec(
                 nodes,
                 children,
@@ -695,6 +708,7 @@ impl ReadCommand {
                 id,
                 &tokens.unwrap_or_default(),
                 tailwind.unwrap_or(false),
+                map.as_ref(),
             ),
         }
     }
@@ -958,7 +972,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "figmog_spec",
-            description: "Code-ready spec of a subtree. Per node, two layers: `design` (the layout Figma recorded: auto layout, grid, sizing, constraints, min/max, clipping, text auto-resize, verbatim) and figmog's interpretation — `layout`/`values` (gap, padding, alignment, hug/fill/fixed, grid tracks, fill, stroke, radius, effects, opacity, typography), each value shown as its bound variable token (name plus the CSS name `figmog tokens export` emits) with the raw value, or flagged untokenized (a token of equal value is only ever named under `matches`); `css` (the declarations: flex or CSS grid, constraints as absolute offsets, tokens as var()); `content` (text, mixed runs, image/vector assets by node id and imageRef); `instance` (component, variant properties; `code_component` is null until a mapping exists); and, with `tailwind`, a Tailwind class hint. Whatever has no exact CSS is listed under `unsupported`, never approximated — reads the local mirror (no Figma API cost).",
+            description: "Code-ready spec of a subtree. Per node, two layers: `design` (the layout Figma recorded: auto layout, grid, sizing, constraints, min/max, clipping, text auto-resize, verbatim) and figmog's interpretation — `layout`/`values` (gap, padding, alignment, hug/fill/fixed, grid tracks, fill, stroke, radius, effects, opacity, typography), each value shown as its bound variable token (name plus the CSS name `figmog tokens export` emits) with the raw value, or flagged untokenized (a token of equal value is only ever named under `matches`); `css` (the declarations: flex or CSS grid, constraints as absolute offsets, tokens as var()); `content` (text, mixed runs, image/vector assets by node id and imageRef); `instance` (component, variant properties, and `code_component`: the code component the project's figmog.map.json maps it to — path, export, mapped props, a JSX rendering, and `coverage` \"full\" or \"partial\" with every unmapped property, override (text, swap, nested) and slot listed — else null); and, with `tailwind`, a Tailwind class hint. Whatever has no exact CSS is listed under `unsupported`, never approximated — reads the local mirror (no Figma API cost).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -974,6 +988,10 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                     "tailwind": {
                         "type": "boolean",
                         "description": "Add a Tailwind class hint per node (theme utilities for bound tokens, arbitrary values otherwise). The figmog CLI and stdio relay turn it on when the project's [stack] styling is tailwind; omit for none."
+                    },
+                    "map": {
+                        "type": "object",
+                        "description": "The Figma → code component map, as figmog.map.json: {version: 1, components: [{figma: {component|component_set: <key>}, code: {path, export}, props?: {\"<Figma property>\": {prop, values?}}}]}. The figmog CLI and stdio relay pass the project's figmog.map.json; omit for none (every code_component null)."
                     }
                 },
                 "required": ["id"]

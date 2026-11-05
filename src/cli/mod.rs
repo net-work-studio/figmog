@@ -24,6 +24,7 @@ mod doctor;
 mod gitignore;
 mod images;
 mod init;
+mod map;
 mod migrate;
 mod pull;
 mod socket;
@@ -252,6 +253,11 @@ enum Cmd {
         #[command(subcommand)]
         command: tokens::TokensCommand,
     },
+    /// The project's Figma → code component map (figmog.map.json).
+    Map {
+        #[command(subcommand)]
+        command: map::MapCommand,
+    },
     /// Node counts by type and page, table totals, text-node count, max tree depth.
     Stats,
     /// Ancestor chain root→node for one id.
@@ -470,6 +476,19 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         return write_json(&init::cmd_settings(layout));
     }
 
+    // `map` reads the project's figmog.map.json: no project, no map.
+    if let Cmd::Map { command } = &cli.cmd {
+        let Some(layout) = &layout else {
+            return Err(format!(
+                "map reads the project's {} and does not take --db",
+                crate::map::MAP_FILE
+            ));
+        };
+        if let map::MapCommand::Check = command {
+            return map::check(layout);
+        }
+    }
+
     if let Cmd::Migrate { file } = &cli.cmd {
         let Some(layout) = &layout else {
             return Err("migrate works on the project's mirrors and does not take --db".into());
@@ -543,7 +562,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 return write_json(&result?);
             }
         } else if let Some(read) = read_command(&cli.cmd) {
-            let (tool, tool_args) = with_project_settings(read, Some(layout)).to_tool_call();
+            let (tool, tool_args) = with_project_settings(read, Some(layout))?.to_tool_call();
             let tool_args = with_current_file(tool_args, layout)?;
             if let Some(route) = route_for(root, layout, &tool_args, true)
                 && let Some(result) = socket::try_call(&route, tool, tool_args.clone())
@@ -628,7 +647,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let Some(read) = read_command(&other) else {
                 unreachable!("every non-read command is handled above")
             };
-            let read = with_project_settings(read, db.layout.as_ref());
+            let read = with_project_settings(read, db.layout.as_ref())?;
             // `open_store!`'s pipeline type contains fn items and can't be
             // named, so the store must be opened at this concrete call
             // site; the reader tuple itself is nameable (`RootReaders`), so
@@ -646,15 +665,26 @@ fn dispatch(cli: Cli) -> Result<(), String> {
 /// the project's `[tokens]` settings ride along as `figmog_spec`'s
 /// `tokens` argument (NWS-2948), and its `[stack] styling` turns on the
 /// Tailwind class hint (NWS-2947) unless `--tailwind`/`--no-tailwind`
-/// said otherwise. With `--db` (no project): the defaults, no hint.
-fn with_project_settings(read: ReadCommand, layout: Option<&Layout>) -> ReadCommand {
-    match read {
+/// said otherwise; its `figmog.map.json`, when there is one, rides along
+/// as `map` (NWS-2949) — an invalid map fails the command. With `--db`
+/// (no project): the defaults, no hint, no map.
+fn with_project_settings(
+    read: ReadCommand,
+    layout: Option<&Layout>,
+) -> Result<ReadCommand, String> {
+    Ok(match read {
         ReadCommand::Spec {
             id,
             tokens,
             tailwind,
+            map,
         } => {
             let settings = layout.map(Layout::settings);
+            let map = match (map, layout) {
+                (Some(map), _) => Some(map),
+                (None, Some(layout)) => crate::map::CodeMap::load(&layout.project_root)?,
+                (None, None) => None,
+            };
             ReadCommand::Spec {
                 id,
                 tokens: tokens.or_else(|| settings.as_ref().map(|s| s.tokens.export_options())),
@@ -663,18 +693,24 @@ fn with_project_settings(read: ReadCommand, layout: Option<&Layout>) -> ReadComm
                         .as_ref()
                         .map(|s| s.stack.styling == crate::project::Styling::Tailwind)
                 }),
+                map,
             }
         }
         other => other,
-    }
+    })
 }
 
 /// Print a read command's result: JSON for every read, except `tokens`,
 /// which renders its `figmog_vars` read as CSS and compares it with the
-/// project's token file (NWS-2967, NWS-2948).
+/// project's token file (NWS-2967, NWS-2948), and `map coverage`, which
+/// compares its `figmog_components` read with the project's map (NWS-2949).
 fn write_read(cmd: &Cmd, result: &Value, layout: Option<&Layout>) -> Result<(), String> {
     match cmd {
         Cmd::Tokens { command } => tokens::run(command, result, layout),
+        Cmd::Map { .. } => match layout {
+            Some(layout) => map::run_coverage(result, layout),
+            None => unreachable!("`map` without a project fails before any read"),
+        },
         _ => write_json(result),
     }
 }
@@ -916,8 +952,10 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
                 (_, true) => Some(false),
                 _ => None,
             },
+            map: None,
         },
         Cmd::Tokens { .. } => tokens::read(),
+        Cmd::Map { .. } => map::read(),
         Cmd::Version
         | Cmd::Auth { .. }
         | Cmd::Pull { .. }
