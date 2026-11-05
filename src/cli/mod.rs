@@ -1,17 +1,20 @@
 //! Command-line surface. Read commands never touch the network: they open
 //! the local store and read one snapshot.
 //!
-//! Split into `pull` (pull/do_pull/`PullError`/`.figmog/current` helpers),
-//! `read` (the read-only query commands), and `call` (`tools`/`call`/
-//! `import-variables`, the desktop-proxy CLI parity surface). This module
-//! keeps the clap types, top-level dispatch, `run`, and the store-opening/
-//! JSON-writing helpers every submodule shares.
+//! Split into `pull` (pull/do_pull/`PullError`/`.figmog/current` helpers)
+//! and `call` (`tools`/`call`/`import-variables`, the desktop-proxy CLI
+//! parity surface). This module keeps the clap types, top-level dispatch,
+//! `run`, and the store-opening/JSON-writing helpers every submodule
+//! shares. The read-only query commands (`status`, `pages`, ... `at`) are
+//! converted to the shared `ReadCommand` (`read_command`) and either
+//! executed directly or sent over the socket in its tool form.
 
 use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
+use crate::dispatch::{DEFAULT_SEARCH_LIMIT, ReadCommand};
 use crate::ident::{is_file_key, parse_file_ref};
 
 mod auth;
@@ -19,7 +22,6 @@ mod call;
 mod gitignore;
 mod images;
 mod pull;
-mod read;
 mod socket;
 mod store_lock;
 
@@ -172,7 +174,7 @@ enum Cmd {
     /// BM25 search over layer names and text content.
     Search {
         query: String,
-        #[arg(short = 'n', long, default_value = "10")]
+        #[arg(short = 'n', long, default_value_t = DEFAULT_SEARCH_LIMIT)]
         limit: usize,
         /// Scope to the subtree rooted at this node id (inclusive).
         #[arg(long)]
@@ -399,8 +401,9 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 note_ignored_upstream_flags(upstream, *no_upstream);
                 return write_json(&result?);
             }
-        } else if let Some((tool, tool_args)) = cmd_as_tool_call(&cli.cmd) {
-            let tool_args = with_current_file(strip_null_options(tool_args))?;
+        } else if let Some(read) = read_command(&cli.cmd) {
+            let (tool, tool_args) = read.to_tool_call();
+            let tool_args = with_current_file(tool_args)?;
             if let Some(result) = socket::try_call(root, tool, tool_args) {
                 let result = result?;
                 if tool == "figmog_status" && result["ready"] == false {
@@ -440,208 +443,16 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             no_upstream,
         } => call::cmd_call(&db, tool, args, upstream, no_upstream),
         other => {
+            let Some(read) = read_command(&other) else {
+                unreachable!("every non-read command is handled above")
+            };
             // `open_store!`'s pipeline type contains fn items and can't be
-            // named, so the store-reading dispatch below must live at this
-            // concrete (non-generic) call site rather than in a helper `fn`
-            // generic over `P: Push<..>` — `P::Reader<'tx, R>` would be an
-            // opaque associated type there, and a tuple pattern can't
-            // destructure an unconstrained associated type.
+            // named, so the store must be opened at this concrete call
+            // site; the reader tuple itself is nameable (`RootReaders`), so
+            // the query runs through the same `ReadCommand::execute` arm
+            // every tool adapter uses (NWS-2902).
             let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
-            match other {
-                Cmd::Status => st.rtx(
-                    |(
-                        (nodes, _, _, _, _, _, _),
-                        _,
-                        _,
-                        _,
-                        variables,
-                        variable_collections,
-                        meta,
-                        _,
-                        _,
-                        _,
-                        _,
-                        snapshot,
-                    )| {
-                        read::cmd_status(
-                            &nodes,
-                            &meta,
-                            &variables,
-                            &variable_collections,
-                            &snapshot,
-                        )
-                    },
-                ),
-                Cmd::Pages => st
-                    .rtx(|((nodes, _, _, _, _, _, by_type), ..)| read::cmd_pages(&nodes, &by_type)),
-                Cmd::Tree { id, depth } => {
-                    st.rtx(|((nodes, children, _, _, _, _, by_type), ..)| {
-                        read::cmd_tree(&nodes, &children, &by_type, id, depth)
-                    })
-                }
-                Cmd::Get {
-                    id,
-                    children: with_children,
-                    resolve_vars,
-                } => st.rtx(
-                    |((nodes, children, ..), _, _, _, variables, variable_collections, ..)| {
-                        read::cmd_get(
-                            &nodes,
-                            &children,
-                            &variables,
-                            &variable_collections,
-                            id,
-                            with_children,
-                            resolve_vars,
-                        )
-                    },
-                ),
-                Cmd::Dump {
-                    id,
-                    depth,
-                    fields,
-                    resolve_vars,
-                } => st.rtx(
-                    |((nodes, children, ..), _, _, _, variables, variable_collections, ..)| {
-                        read::cmd_dump(
-                            &nodes,
-                            &children,
-                            &variables,
-                            &variable_collections,
-                            id,
-                            depth,
-                            fields,
-                            resolve_vars,
-                        )
-                    },
-                ),
-                Cmd::Find {
-                    node_type,
-                    page,
-                    under,
-                } => st.rtx(|((nodes, children, _, _, _, _, by_type), ..)| {
-                    read::cmd_find(&nodes, &children, &by_type, node_type, page, under)
-                }),
-                Cmd::Search {
-                    query,
-                    limit,
-                    under,
-                } => st.rtx(|((nodes, children, text, ..), ..)| {
-                    read::cmd_search(&nodes, &children, &text, query, limit, under)
-                }),
-                Cmd::Instances { target } => st.rtx(
-                    |((nodes, _, _, instances_of, ..), components, component_sets, ..)| {
-                        read::cmd_instances(
-                            &nodes,
-                            &instances_of,
-                            &components,
-                            &component_sets,
-                            target,
-                        )
-                    },
-                ),
-                Cmd::Components => st.rtx(|((nodes, ..), components, component_sets, ..)| {
-                    read::cmd_components(&component_sets, &components, &nodes)
-                }),
-                Cmd::Styles {
-                    style_type,
-                    values,
-                    resolve_vars,
-                } => st.rtx(
-                    |(
-                        (nodes, _, _, _, styled_by, ..),
-                        _,
-                        _,
-                        styles,
-                        variables,
-                        variable_collections,
-                        ..,
-                    )| {
-                        read::cmd_styles(
-                            &styles,
-                            &styled_by,
-                            &nodes,
-                            &variables,
-                            &variable_collections,
-                            style_type,
-                            values,
-                            resolve_vars,
-                        )
-                    },
-                ),
-                Cmd::Uses { id } => st.rtx(|((nodes, _, _, _, styled_by, bound_to, _), ..)| {
-                    read::cmd_uses(&nodes, &styled_by, &bound_to, id)
-                }),
-                Cmd::Vars { id, snapshot } => st.rtx(
-                    |(
-                        (nodes, ..),
-                        _,
-                        _,
-                        _,
-                        variables,
-                        variable_collections,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                        snap,
-                    )| {
-                        read::cmd_vars(
-                            &nodes,
-                            &variables,
-                            &variable_collections,
-                            &snap,
-                            id,
-                            snapshot,
-                        )
-                    },
-                ),
-                Cmd::Stats => st.rtx(
-                    |(
-                        (nodes, _, _, _, _, _, by_type),
-                        components,
-                        component_sets,
-                        styles,
-                        variables,
-                        ..,
-                    )| {
-                        read::cmd_stats(
-                            &nodes,
-                            &components,
-                            &component_sets,
-                            &styles,
-                            &variables,
-                            &by_type,
-                        )
-                    },
-                ),
-                Cmd::Path { id } => st.rtx(|((nodes, ..), ..)| read::cmd_path(&nodes, id)),
-                Cmd::Text { page, under } => {
-                    st.rtx(|((nodes, children, _, _, _, _, by_type), ..)| {
-                        read::cmd_text(&nodes, &children, &by_type, page, under)
-                    })
-                }
-                Cmd::Where {
-                    pointer,
-                    equals,
-                    page,
-                    under,
-                } => st.rtx(|((nodes, children, ..), ..)| {
-                    read::cmd_where(&nodes, &children, pointer, equals, page, under)
-                }),
-                Cmd::At { x, y } => st.rtx(|((nodes, ..), ..)| read::cmd_at(&nodes, x, y)),
-                Cmd::Version
-                | Cmd::Auth { .. }
-                | Cmd::Pull { .. }
-                | Cmd::ImportVariables { .. }
-                | Cmd::Serve { .. }
-                | Cmd::Tools { .. }
-                | Cmd::Call { .. }
-                | Cmd::Images { .. } => {
-                    unreachable!("handled above")
-                }
-            }
+            write_json(&st.rtx(|r| read.execute(&r))?)
         }
     }
 }
@@ -707,7 +518,7 @@ fn is_per_file_local_tool(tool: &str) -> bool {
 /// would let `figmog call figmog_open`
 /// (no `--args`) succeed over the socket while the exact same invocation
 /// fails direct, breaking the very byte-compatibility this routing exists
-/// to preserve (see `dispatch::cmd_as_tool_call`'s caller).
+/// to preserve (see `read_command`'s socket caller).
 fn with_current_file(mut args: Value) -> Result<Value, String> {
     // Preserve explicit non-null values for the local tool's own argument
     // handling, even when they cannot select a mirror.
@@ -723,16 +534,6 @@ fn with_current_file(mut args: Value) -> Result<Value, String> {
     Ok(args)
 }
 
-/// Omit absent optional flags that `json!` encoded as null in a mapped
-/// read command. `equals` carries an arbitrary JSON value, including
-/// literal null, so `cmd_as_tool_call` omits that key itself when absent.
-fn strip_null_options(mut args: Value) -> Value {
-    if let Some(obj) = args.as_object_mut() {
-        obj.retain(|key, v| key == "equals" || !v.is_null());
-    }
-    args
-}
-
 /// Preserve the direct read command's JSON shape for an existing mirror.
 /// `figmog call figmog_status` keeps the full server lifecycle instead.
 fn strip_routed_status_fields(mut result: Value) -> Value {
@@ -744,88 +545,95 @@ fn strip_routed_status_fields(mut result: Value) -> Value {
     result
 }
 
-/// Maps a read-only [`Cmd`] to the equivalent local `figmog_*` tool name +
-/// arguments `figmog serve` would answer over the socket (spec §1's CLI
-/// routing) — the exact argument shapes [`crate::dispatch::dispatch_read_tool`]
-/// expects, so a socket-routed read produces byte-identical results to the
-/// direct-open path below. `None` for every command socket routing doesn't
-/// apply to: `pull` is a writer (spec §1: "pull stays direct-open");
-/// `serve`/`tools`/`call`/`import-variables` are each handled at their own
-/// call sites (`serve`/`tools` before this is ever reached, `call` by
-/// `dispatch`'s own socket block above `import-variables` is a writer, like
-/// `pull`, and isn't part of spec §1's routed surface at all).
-fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
-    match cmd {
-        Cmd::Status => Some(("figmog_status", json!({}))),
-        Cmd::Pages => Some(("figmog_pages", json!({}))),
-        Cmd::Tree { id, depth } => Some(("figmog_tree", json!({"id": id, "depth": depth}))),
+/// Maps a read-only [`Cmd`] to its typed [`ReadCommand`] (NWS-2902) —
+/// the one representation the direct path executes and the socket path
+/// serializes ([`ReadCommand::to_tool_call`]), so a socket-routed read
+/// produces byte-identical results to the direct-open path (spec §6a).
+/// `None` for every command socket routing doesn't apply to: `pull` is a
+/// writer (spec §1: "pull stays direct-open"); `serve`/`tools`/`call`/
+/// `import-variables`/`images` are each handled at their own call sites.
+fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
+    Some(match cmd {
+        Cmd::Status => ReadCommand::Status,
+        Cmd::Pages => ReadCommand::Pages,
+        Cmd::Tree { id, depth } => ReadCommand::Tree {
+            id: id.clone(),
+            depth: *depth,
+        },
         Cmd::Get {
             id,
             children,
             resolve_vars,
-        } => Some((
-            "figmog_node",
-            json!({"id": id, "children": children, "resolve_vars": resolve_vars}),
-        )),
+        } => ReadCommand::Node {
+            id: id.clone(),
+            children: *children,
+            resolve_vars: *resolve_vars,
+        },
         Cmd::Dump {
             id,
             depth,
             fields,
             resolve_vars,
-        } => Some((
-            "figmog_subtree",
-            json!({"id": id, "depth": depth, "fields": fields, "resolve_vars": resolve_vars}),
-        )),
+        } => ReadCommand::Subtree {
+            id: id.clone(),
+            depth: *depth,
+            fields: fields.clone(),
+            resolve_vars: *resolve_vars,
+        },
         Cmd::Find {
             node_type,
             page,
             under,
-        } => Some((
-            "figmog_find",
-            json!({"type": node_type, "page": page, "under": under}),
-        )),
+        } => ReadCommand::Find {
+            node_type: node_type.clone(),
+            page: page.clone(),
+            under: under.clone(),
+        },
         Cmd::Search {
             query,
             limit,
             under,
-        } => Some((
-            "figmog_search",
-            json!({"query": query, "limit": limit, "under": under}),
-        )),
-        Cmd::Instances { target } => Some(("figmog_instances", json!({"target": target}))),
-        Cmd::Components => Some(("figmog_components", json!({}))),
+        } => ReadCommand::Search {
+            query: query.clone(),
+            limit: *limit,
+            under: under.clone(),
+        },
+        Cmd::Instances { target } => ReadCommand::Instances {
+            target: target.clone(),
+        },
+        Cmd::Components => ReadCommand::Components,
         Cmd::Styles {
             style_type,
             values,
             resolve_vars,
-        } => Some((
-            "figmog_styles",
-            json!({"type": style_type, "values": values, "resolve_vars": resolve_vars}),
-        )),
-        Cmd::Uses { id } => Some(("figmog_uses", json!({"id": id}))),
-        Cmd::Vars { id, snapshot } => {
-            Some(("figmog_vars", json!({"id": id, "snapshot": snapshot})))
-        }
-        Cmd::Stats => Some(("figmog_stats", json!({}))),
-        Cmd::Path { id } => Some(("figmog_path", json!({"id": id}))),
-        Cmd::Text { page, under } => Some(("figmog_text", json!({"page": page, "under": under}))),
+        } => ReadCommand::Styles {
+            style_type: style_type.clone(),
+            values: *values,
+            resolve_vars: *resolve_vars,
+        },
+        Cmd::Uses { id } => ReadCommand::Uses { id: id.clone() },
+        Cmd::Vars { id, snapshot } => ReadCommand::Vars {
+            id: id.clone(),
+            snapshot: *snapshot,
+        },
+        Cmd::Stats => ReadCommand::Stats,
+        Cmd::Path { id } => ReadCommand::Path { id: id.clone() },
+        Cmd::Text { page, under } => ReadCommand::Text {
+            page: page.clone(),
+            under: under.clone(),
+        },
         Cmd::Where {
             pointer,
             equals,
             page,
             under,
-        } => {
-            let mut args = json!({
-                "pointer": pointer,
-                "page": page,
-                "under": under,
-            });
-            if let Some(equals) = equals {
-                args["equals"] = read::parse_equals(equals);
-            }
-            Some(("figmog_where", args))
-        }
-        Cmd::At { x, y } => Some(("figmog_at", json!({"x": x, "y": y}))),
+        } => ReadCommand::Where {
+            pointer: pointer.clone(),
+            equals: equals.as_deref().map(parse_equals),
+            page: page.clone(),
+            under: under.clone(),
+        },
+        Cmd::At { x, y } => ReadCommand::At { x: *x, y: *y },
         Cmd::Version
         | Cmd::Auth { .. }
         | Cmd::Pull { .. }
@@ -833,8 +641,15 @@ fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
         | Cmd::Tools { .. }
         | Cmd::Call { .. }
         | Cmd::ImportVariables { .. }
-        | Cmd::Images { .. } => None,
-    }
+        | Cmd::Images { .. } => return None,
+    })
+}
+
+/// `--equals <json>`: parse as JSON, falling back to treating the bare word
+/// as a JSON string (so `--equals VERTICAL` works without quoting). A
+/// literal `--equals null` is equality to null (NWS-2897).
+fn parse_equals(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 // ---- config / db resolution ----
@@ -878,8 +693,8 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
         Cmd::Call { tool, args, .. } if is_per_file_local_tool(tool) => {
             requested_file(&call::parse_args(args.as_deref())?)?
         }
-        cmd => match cmd_as_tool_call(cmd) {
-            Some((_, args)) => requested_file(&args)?,
+        cmd => match read_command(cmd) {
+            Some(read) => requested_file(&read.to_tool_call().1)?,
             None => None,
         },
     };
@@ -1145,27 +960,6 @@ mod tests {
     // ---- socket-routing helpers (review C1/C2/m1 fix round) ----
 
     #[test]
-    fn strip_null_options_preserves_literal_null_equality() {
-        let args = strip_null_options(json!({
-            "pointer": "/layoutMode",
-            "equals": null,
-            "page": null,
-            "under": "1:1",
-            "limit": 0,
-        }));
-        assert_eq!(
-            args,
-            json!({"pointer": "/layoutMode", "equals": null, "under": "1:1", "limit": 0})
-        );
-    }
-
-    #[test]
-    fn strip_null_options_is_a_no_op_on_an_object_with_no_nulls() {
-        let args = json!({"id": "1:1", "children": true});
-        assert_eq!(strip_null_options(args.clone()), args);
-    }
-
-    #[test]
     fn strip_routed_status_fields_removes_only_that_key() {
         let result = strip_routed_status_fields(json!({
             "name": "Fixture",
@@ -1194,6 +988,95 @@ mod tests {
         ] {
             let args = json!({"id": "1:1", "file": file});
             assert_eq!(with_current_file(args.clone()).unwrap(), args);
+        }
+    }
+
+    /// NWS-2902: every clap read command's socket form parses back to the
+    /// same typed command the direct path executes, and the socket JSON
+    /// keeps its pre-refactor shape (absent optionals omitted, flags and
+    /// `limit` always sent, `equals` present exactly when given).
+    #[test]
+    fn read_commands_round_trip_through_their_tool_form() {
+        let cases: &[(&[&str], &str, Value)] = &[
+            (&["status"], "figmog_status", json!({})),
+            (&["tree"], "figmog_tree", json!({})),
+            (
+                &["tree", "1:1", "--depth", "2"],
+                "figmog_tree",
+                json!({"id": "1:1", "depth": 2}),
+            ),
+            (
+                &["get", "1:1"],
+                "figmog_node",
+                json!({"id": "1:1", "children": false, "resolve_vars": false}),
+            ),
+            (
+                &["dump", "1:1", "--fields", "id,fills", "--depth", "0"],
+                "figmog_subtree",
+                json!({"id": "1:1", "depth": 0, "fields": ["id", "fills"], "resolve_vars": false}),
+            ),
+            (
+                &["find", "--type", "TEXT", "--under", "1:1"],
+                "figmog_find",
+                json!({"type": "TEXT", "under": "1:1"}),
+            ),
+            (
+                &["search", "x"],
+                "figmog_search",
+                json!({"query": "x", "limit": 10}),
+            ),
+            (
+                &["styles", "--type", "FILL"],
+                "figmog_styles",
+                json!({"type": "FILL", "values": false, "resolve_vars": false}),
+            ),
+            (&["vars"], "figmog_vars", json!({"snapshot": false})),
+            (
+                &["text", "--page", "0:1"],
+                "figmog_text",
+                json!({"page": "0:1"}),
+            ),
+            (
+                &["where", "--pointer", "/a"],
+                "figmog_where",
+                json!({"pointer": "/a"}),
+            ),
+            (
+                &["where", "--pointer", "/a", "--equals", "null"],
+                "figmog_where",
+                json!({"pointer": "/a", "equals": null}),
+            ),
+            (
+                &["where", "--pointer", "/a", "--equals", "VERTICAL"],
+                "figmog_where",
+                json!({"pointer": "/a", "equals": "VERTICAL"}),
+            ),
+            (
+                &["at", "--x", "1.5", "--y", "2"],
+                "figmog_at",
+                json!({"x": 1.5, "y": 2.0}),
+            ),
+        ];
+        for (argv, tool, want) in cases {
+            let cli =
+                Cli::try_parse_from(std::iter::once("figmog").chain(argv.iter().copied())).unwrap();
+            let read = read_command(&cli.cmd).unwrap();
+            let (name, args) = read.to_tool_call();
+            assert_eq!((name, &args), (*tool, want), "{argv:?}");
+            assert_eq!(
+                ReadCommand::from_tool_args(name, &args),
+                Ok(Some(read)),
+                "{argv:?}"
+            );
+        }
+        for argv in [
+            &["pull"][..],
+            &["call", "figmog_status"],
+            &["images", "1:1"],
+        ] {
+            let cli =
+                Cli::try_parse_from(std::iter::once("figmog").chain(argv.iter().copied())).unwrap();
+            assert_eq!(read_command(&cli.cmd), None, "{argv:?}");
         }
     }
 }

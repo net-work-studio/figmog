@@ -2692,3 +2692,60 @@ fn wait_for_pull(stdin: &mut ChildStdin, rx: &Receiver<String>, args: Value, sta
         std::thread::yield_now();
     }
 }
+
+/// NWS-2902 adapter parity over the server transports: every local read
+/// in [`common::read_parity_cases`] runs direct (before serve locks the
+/// store), then socket-routed through the same CLI command, then as a raw
+/// MCP `tools/call`. Socket CLI output is byte-identical to direct; the MCP
+/// result is the same JSON. `figmog_status` keeps its documented transport
+/// metadata: the socket CLI strips `ready`/`pull`/`upstream` back to the
+/// direct shape, while MCP reports them.
+#[test]
+fn every_local_read_matches_across_direct_socket_and_mcp() {
+    const KEY: &str = "figmogreadparitykey01";
+    let dir = default_root_fixture(KEY, common::parity_fixture());
+    let cases = common::read_parity_cases();
+    let run = |args: &[&str]| -> Vec<u8> {
+        common::command()
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    let direct: Vec<Vec<u8>> = cases.iter().map(|(args, _, _)| run(args)).collect();
+
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    for ((cli_args, tool, tool_args), direct) in cases.iter().zip(&direct) {
+        let socket = run(cli_args);
+        assert_eq!(
+            String::from_utf8_lossy(&socket),
+            String::from_utf8_lossy(direct),
+            "socket vs direct for {cli_args:?}"
+        );
+        let resp = call(&mut stdin, &rx, 2, tool, tool_args.clone());
+        assert_eq!(
+            resp["result"]["isError"], false,
+            "{tool} {tool_args}: {resp}"
+        );
+        let mut mcp = result_json(&resp);
+        let direct: Value = serde_json::from_slice(direct).unwrap();
+        if *tool == "figmog_status" {
+            assert_eq!(mcp["ready"], true);
+            assert_eq!(mcp["upstream"], "disabled");
+            assert!(mcp["pull"].is_object(), "{mcp}");
+            let obj = mcp.as_object_mut().unwrap();
+            for key in ["ready", "pull", "upstream"] {
+                obj.remove(key);
+            }
+        }
+        assert_eq!(mcp, direct, "MCP vs direct for {tool} {tool_args}");
+    }
+
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}

@@ -53,8 +53,8 @@ Two commands spend Figma's API budget deliberately and explicitly: `pull`
                     ┌────────────┘         └────────────┐
                     ▼                                    ▼
          ┌─────────────────────┐              ┌─────────────────────────┐
-         │  cli/ (read.rs)      │              │  dispatch.rs              │
-         │  pretty-JSON stdout, │              │  dispatch_read_tool +      │
+         │  cli/ (ReadCommand)  │              │  dispatch.rs              │
+         │  pretty-JSON stdout, │              │  ReadCommand (17 reads) +  │
          │  or a socket client  │              │  tool_registry (21 tools)  │
          │  of serve (§6a)      │              └────────────┬────────────┘
          └─────────────────────┘                           │
@@ -493,6 +493,20 @@ there still means equality to null). These are ordinary tool errors —
 `isError` on stdio, the socket's `-32000` error (§6a), and `figmog
 call`'s stderr error. Desktop tools' arguments are forwarded unchecked.
 
+**Read adapters (NWS-2902):** the 17 local reads (every `figmog_*` tool
+except `figmog_sync`, `figmog_images`, `figmog_open` and `figmog_files`)
+share one typed representation, `dispatch::ReadCommand`. Tool JSON (MCP,
+the socket, `figmog call`) is parsed into it with the argument typing
+above; the clap read commands convert into it directly; the CLI's socket
+client serializes it back to tool JSON. Each read has exactly one query
+arm (`ReadCommand::execute`). Defaults live in the typed payload: an
+omitted or `null` optional is absent/false, search's `limit` defaults to
+10 on both the CLI (`-n`) and the tool, and `where`'s `equals` is absent
+only when omitted. Routing (`file`, node-URL inference) and status
+transport metadata (`upstream`, serve's `ready`/`pull`) stay with each
+adapter. Synthetic parity tests run every read through direct CLI,
+`figmog call`, socket CLI and MCP and require identical JSON.
+
 **Protocol (`mcp.rs`):** pure JSON-RPC 2.0 over stdio frames, no store,
 no I/O. `initialize` echoes the client's `protocolVersion` (or
 `2025-06-18` if omitted) and returns steering `instructions` telling an
@@ -702,9 +716,10 @@ The standard clap flags `--version` / `-V` print `figmog <version>` as plain
 text and exit before dispatch, like `--help`.
 
 The CLI is split by concern: `src/cli/mod.rs` (clap types, top-level
-dispatch, `run`, the shared store-opening/JSON-writing helpers),
+dispatch, `run`, the shared store-opening/JSON-writing helpers, and the
+mapping of the 17 read-only query commands onto `dispatch::ReadCommand`),
 `src/cli/pull.rs` (`pull`, the typed `PullError`, `.figmog/current`),
-`src/cli/read.rs` (the 17 read-only query commands), `src/cli/call.rs`
+`src/cli/call.rs`
 (`tools`, `call`, `import-variables` — the desktop-proxy CLI parity
 surface, so every tool `figmog serve` would expose is reachable without
 an MCP client), `src/cli/images.rs` (`images`, §15), and
@@ -800,8 +815,9 @@ mirror data between worktrees.
 **Socket-first routing (§6a).** When neither `--no-socket` nor `--db` is
 given, every read command, plus `tools`, `call` and `images`, first tries
 `<.figmog>/serve.sock`. Reachable ⇒ the command becomes a client of the
-running `serve`: `cli::cmd_as_tool_call` maps the subcommand to the tool
-name and argument object `dispatch::dispatch_read_tool` expects, so the
+running `serve`: `cli::read_command` maps the subcommand to its typed
+`dispatch::ReadCommand`, whose `to_tool_call` produces the tool name and
+argument object serve parses back into the same command, so the
 JSON on stdout is byte-identical to the direct-open answer, and a
 serve-side failure surfaces as the standard `{"error": ...}` exit 1.
 Unreachable ⇒ the store is opened directly. `--db` bypasses the socket
