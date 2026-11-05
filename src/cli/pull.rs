@@ -225,7 +225,9 @@ pub(super) fn do_pull(
             } else {
                 db.open(|path| crate::open_store!(path))
                     .map(|st| {
-                        st.rtx(|(.., mirror_config, _, _, _)| store::read_geometry(&mirror_config))
+                        st.rtx(|(.., mirror_config, _, _, _, _, _)| {
+                            store::read_geometry(&mirror_config)
+                        })
                     })
                     .unwrap_or(false)
             };
@@ -288,14 +290,15 @@ fn apply_pull(
         });
     if vars_resp.is_some() {
         let stored_var_ids = st.rtx(
-            |(_, _, _, _, variables, variable_collections, _, _, _, _, _, _)| {
+            |(_, _, _, _, variables, variable_collections, _, _, _, _, _, _, _, _)| {
                 collect_variable_ids(&variables, &variable_collections)
             },
         );
         prior.extend(stored_var_ids);
     }
-    let prior_version =
-        st.rtx(|(_, _, _, _, _, _, meta, _, _, _, _, _)| meta.get(&0).map(|m| m.version.clone()));
+    let prior_version = st.rtx(|(_, _, _, _, _, _, meta, _, _, _, _, _, _, _)| {
+        meta.get(&0).map(|m| m.version.clone())
+    });
     let churn = sync(&mut st, &prior, &flattened, now_ms());
 
     // Every caller of `do_pull` (`pull` and `figmog call figmog_sync`) goes
@@ -308,7 +311,7 @@ fn apply_pull(
     // here would hit the same single-open-per-process wall `figmog call
     // figmog_sync` used to.
     if prior_version.as_deref() != Some(flattened.file.version.as_str()) {
-        let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images, _, _)| {
+        let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images, _, _, _, _)| {
             let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
             stale.extend(crate::store::stale_image_ids(
                 &images,
@@ -331,7 +334,8 @@ fn apply_pull(
     // function's doc comment). `--fresh` already wiped any prior row, so
     // this store's own current read is `false` there, giving exactly
     // `geometry` as the persisted value, same as the fetch decision above.
-    let stored_now = st.rtx(|(.., mirror_config, _, _, _)| store::read_geometry(&mirror_config));
+    let stored_now =
+        st.rtx(|(.., mirror_config, _, _, _, _, _)| store::read_geometry(&mirror_config));
     store::upsert_mirror_config(&mut st, store::effective_geometry(geometry, stored_now));
 
     if let (Some(key), Some(layout)) = (&db.key, &db.layout) {
@@ -434,7 +438,7 @@ mod tests {
 
     fn snapshot_source(db: &Db) -> Option<String> {
         let st = db.open(|path| crate::open_store!(path)).unwrap();
-        st.rtx(|(.., snapshot)| snapshot.get(&0).map(|s| s.source))
+        st.rtx(|(.., snapshot, _, _)| snapshot.get(&0).map(|s| s.source))
     }
 
     /// NWS-2961: the provenance row rides in the pull's transaction but not

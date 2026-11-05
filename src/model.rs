@@ -35,9 +35,17 @@ pub enum Id {
     ImagePin(String),
     /// The single variable-snapshot provenance row (NWS-2961), one per
     /// store, like [`Id::Meta`]. APPEND ONLY — see [`Id::ProxyCache`]'s
-    /// note; this must stay the last variant until the next one is
-    /// appended after it.
+    /// note.
     VariableSnapshot,
+    /// Fingerprint-indexed render cache entry (NWS-2958), keyed by the
+    /// render fingerprint ([`crate::images::render_fingerprint`]). APPEND
+    /// ONLY — see [`Id::ProxyCache`]'s note.
+    RenderIndex(String),
+    /// Immutable, content-addressed render bytes (NWS-2958), keyed by the
+    /// SHA-256 hex of the bytes themselves. APPEND ONLY — see
+    /// [`Id::ProxyCache`]'s note; this must stay the last variant until
+    /// the next one is appended after it.
+    RenderBlob(String),
 }
 
 /// One mirrored record; variant always matches its [`Id`] variant.
@@ -60,6 +68,10 @@ pub enum Rec {
     ImagePin(ImagePinRec),
     /// See [`Id::VariableSnapshot`]. APPEND ONLY — see [`Id::ProxyCache`]'s note.
     VariableSnapshot(VariableSnapshotRec),
+    /// See [`Id::RenderIndex`]. APPEND ONLY — see [`Id::ProxyCache`]'s note.
+    RenderIndex(RenderIndexRec),
+    /// See [`Id::RenderBlob`]. APPEND ONLY — see [`Id::ProxyCache`]'s note.
+    RenderBlob(RenderBlobRec),
 }
 
 /// One node of the document tree (children stripped from `raw`).
@@ -289,6 +301,58 @@ pub struct VariableCodeRec {
     pub remote: bool,
 }
 
+/// One fingerprint-indexed render (key [`Id::RenderIndex`], NWS-2958):
+/// the render of `subject` at `format`/`scale_milli` whose subtree
+/// fingerprint is the key. Unlike an [`ImageBlobRec`] render row it is not
+/// tied to a file version — it stays a hit for as long as the node's
+/// recomputed fingerprint still equals the key, across any number of
+/// file versions. Only written and read when a caller opts in to render
+/// reuse (`images::RenderPolicy::reuse`); never evicted by the
+/// version-change pass (`store::stale_image_ids`), only by
+/// `images`'s orphan cleanup and byte quota.
+///
+/// The bytes live in a separate, content-addressed [`RenderBlobRec`] row
+/// so the orphan and quota scans read only these small metadata rows.
+/// A new record kind rather than new [`ImageBlobRec`] fields, for the
+/// same reason as [`MirrorConfigRec`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderIndexRec {
+    /// The render fingerprint; identical to the [`Id::RenderIndex`] key.
+    pub fingerprint: String,
+    /// Fingerprint scheme the key was computed under
+    /// (`images::RENDER_FINGERPRINT_SCHEME`); a row from another scheme is
+    /// an orphan.
+    pub scheme: u32,
+    /// The rendered node id.
+    pub subject: String,
+    /// Requested render format.
+    pub format: String,
+    /// Requested scale × 1000.
+    pub scale_milli: u32,
+    /// File version the render request was pinned to (NWS-2960) —
+    /// provenance only, never compared on a hit.
+    pub file_version: String,
+    /// Store-local insertion sequence: eviction removes the lowest first,
+    /// ties broken by fingerprint.
+    pub seq: u64,
+    /// SHA-256 hex of the render bytes; the [`Id::RenderBlob`] key.
+    pub sha256: String,
+    /// Byte length of the render bytes (what the byte quota counts).
+    pub byte_len: u64,
+}
+
+/// Immutable render bytes (key [`Id::RenderBlob`], NWS-2958), addressed by
+/// their own SHA-256 hex. Written only with bytes whose digest equals the
+/// key, never modified afterwards, and re-validated against the key on
+/// every read: a row whose bytes no longer hash to its key reads as a miss.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderBlobRec {
+    /// SHA-256 hex of `bytes`; identical to the [`Id::RenderBlob`] key.
+    pub sha256: String,
+    /// The raw image bytes.
+    pub bytes: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,7 +421,8 @@ mod tests {
     /// index (it would corrupt every existing cache row's discriminant on
     /// decode), and each new variant must land at the next free index (8
     /// for `MirrorConfig`, 9 for the later-appended `ImageBlob`, 10 for
-    /// `ImagePin`, 11 for `VariableSnapshot`). A
+    /// `ImagePin`, 11 for `VariableSnapshot`, 12 and 13 for `RenderIndex` and
+    /// `RenderBlob`). A
     /// pre-change build isn't available to literally round-trip against,
     /// so this pins the concrete bytes instead — the same guarantee the
     /// append-only doc comments on `Id`/`Rec` assert, made checkable.
@@ -418,7 +483,38 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&Id::VariableSnapshot).unwrap()[0],
             11,
-            "Id::VariableSnapshot is the newly appended Id variant"
+            "Id::VariableSnapshot's variant index must not move"
+        );
+
+        // NWS-2958: the render cache's two record kinds land at 12 and 13.
+        let index = Rec::RenderIndex(RenderIndexRec {
+            fingerprint: "f".into(),
+            scheme: 1,
+            subject: "1:2".into(),
+            format: "png".into(),
+            scale_milli: 1000,
+            file_version: "100".into(),
+            seq: 1,
+            sha256: "s".into(),
+            byte_len: 3,
+        });
+        let bytes = postcard::to_allocvec(&index).unwrap();
+        assert_eq!(bytes[0], 12, "RenderIndex is a newly appended variant");
+        assert_eq!(postcard::from_bytes::<Rec>(&bytes).unwrap(), index);
+        let blob = Rec::RenderBlob(RenderBlobRec {
+            sha256: "s".into(),
+            bytes: vec![1, 2, 3],
+        });
+        let bytes = postcard::to_allocvec(&blob).unwrap();
+        assert_eq!(bytes[0], 13, "RenderBlob is the newly appended variant");
+        assert_eq!(postcard::from_bytes::<Rec>(&bytes).unwrap(), blob);
+        assert_eq!(
+            postcard::to_allocvec(&Id::RenderIndex("f".into())).unwrap()[0],
+            12
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Id::RenderBlob("s".into())).unwrap()[0],
+            13
         );
     }
 

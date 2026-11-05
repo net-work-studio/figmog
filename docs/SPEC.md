@@ -43,7 +43,7 @@ Two commands spend Figma's API budget deliberately and explicitly: `pull`
                          │  store.rs                │  figmog_pipeline! (fold)
                          │  sync() — upsert + sweep │  KeyedStream<Id, Rec, _>
                          └────────────┬─────────────┘
-                                      │ 18 materialized sinks (frozen names)
+                                      │ 20 materialized sinks (frozen names)
                                       ▼
                          ┌─────────────────────────┐
                          │  query.rs                 │  one source of truth for
@@ -111,13 +111,16 @@ matching [`Rec`](../src/model.rs) variant:
 | `ImageBlob(String)` | `ImageBlobRec` | cached render and fill bytes (§15) |
 | `ImagePin(String)` | `ImagePinRec` | version-pin marker for one cached render row (§15) |
 | `VariableSnapshot` | `VariableSnapshotRec` | one row: provenance and code names of the stored variable snapshot (§9) |
+| `RenderIndex(String)` | `RenderIndexRec` | fingerprint-indexed render cache entry (§15, opt-in) |
+| `RenderBlob(String)` | `RenderBlobRec` | immutable render bytes, keyed by their SHA-256 (§15, opt-in) |
 
 `Id`/`Rec` are **append-only enums** — postcard encodes variant indices
 positionally, so inserting a new variant anywhere but the end would
-silently corrupt every existing on-disk store. `VariableSnapshot` is the
-most recent addition and sits last in both enums (`ImagePin` immediately
-before it); the next new record kind goes after `VariableSnapshot`, never
-between existing variants. The same rule is why a new setting arrives as
+silently corrupt every existing on-disk store. `RenderIndex` and
+`RenderBlob` (NWS-2958) are the most recent additions and sit last in both
+enums, in that order (`VariableSnapshot` immediately before them); the
+next new record kind goes after `RenderBlob`, never between existing
+variants. The same rule is why a new setting arrives as
 a new record kind rather than a new field on an existing `Rec` struct:
 struct fields are positional too, so widening `FileMeta` would break
 every store already on disk, while appending `MirrorConfig` does not.
@@ -159,6 +162,18 @@ whose `file_version` equals the row's. It is a separate record kind
 rather than a new `ImageBlobRec` field for the same reason as
 `MirrorConfig`. Fill rows carry no marker.
 
+`RenderIndexRec` (§15, NWS-2958): `fingerprint` (= the `Id::RenderIndex`
+key), `scheme` (`images::RENDER_FINGERPRINT_SCHEME`), `subject` (node
+id), `format`, `scale_milli`, `file_version` (the version the render
+request was pinned to — provenance only, never compared on a hit), `seq`
+(store-local insertion order, for oldest-first eviction), `sha256` (the
+`Id::RenderBlob` key of its bytes) and `byte_len`. `RenderBlobRec`:
+`sha256` (= the key) and `bytes`. The bytes sit in their own record so
+the orphan and quota scans decode only the small index rows. Both are new
+record kinds rather than `ImageBlobRec` fields, for the same reason as
+`MirrorConfig`, and neither is ever written unless a caller opts in to
+render reuse.
+
 `VariableSnapshotRec` (§9): `source` (`"file"` for `import-variables`,
 `"enterprise_rest"` for a pull's `variables/local` fetch), `format`
 (detected export shape: `"rest"` for `{meta: …}`, `"bare"` for the
@@ -183,7 +198,7 @@ detector. No `HashMap` iteration ever reaches an output boundary.
 
 ## 4. Pipeline and sinks
 
-`store::figmog_pipeline!()` wires the flattened records into 18
+`store::figmog_pipeline!()` wires the flattened records into 20
 `fold` terminal sinks, keyed off `store.rs`'s pure branch functions
 (`node_only`, `child_edge`, `text_doc`, `instance_edge`, `style_edges`,
 `variable_edges`, `type_edge`, plus one `rec_branch!`-generated filter per
@@ -210,13 +225,17 @@ is a breaking store-format change:
 | `images` | Table | image cache key hash | render/fill byte caching (§15) |
 | `image_pins` | Table | image cache key hash | render version-pin markers (§15) |
 | `variable_snapshot` | Table | `0u8` (one row, like `meta`) | variable snapshot state and provenance (§9) |
+| `render_index` | Table | render fingerprint | opt-in cross-version render reuse (§15) |
+| `render_blobs` | Table | SHA-256 hex of the bytes | immutable render bytes for `render_index` (§15) |
 
-`mirror_config`, `images`, `image_pins` and `variable_snapshot` are
-appended at the pipeline root's tail, so the reader tuple grows at the
-end and older stores keep decoding (a store created before `image_pins`
-or `variable_snapshot` existed opens with that sink empty). All four sit
-outside `collect_sweepable` (§5): a file sync never removes a config or
-snapshot row, and image rows are evicted by version instead.
+`mirror_config`, `images`, `image_pins`, `variable_snapshot`,
+`render_index` and `render_blobs` are appended at the pipeline root's
+tail, so the reader tuple grows at the end and older stores keep decoding
+(a store created before one of them existed opens with that sink empty).
+All six sit outside `collect_sweepable` (§5): a file sync never removes a
+config or snapshot row, image rows are evicted by version instead, and
+render-reuse rows only by the render cache's own orphan cleanup and byte
+quota (§15).
 
 `bound_to`'s edges are deliberately not deduped before feeding the
 inverted index: `InvertedIndex` is set-semantic, so duplicate `(node,
@@ -342,7 +361,9 @@ after a sync whose file *version* actually moved, every `proxy_cache` row
 (`store::stale_cache_ids`) and every `images` row
 (`store::stale_image_ids`, which also yields each row's `image_pins`
 marker) tagged with the old version is removed through
-the one `store::evict_stale_cache` function. This runs after every
+the one `store::evict_stale_cache` function. Fingerprint-indexed renders
+(`render_index`/`render_blobs`, §15) are not version-tagged and never
+touched by this pass. This runs after every
 `pull`/`figmog_sync`/watch-tick pull that changes the version, and is
 bundled into `pull --fresh`'s whole-store wipe too.
 
@@ -1717,9 +1738,9 @@ outside `sync`'s, and is never swept.
 
 ## 15. Images
 
-`figmog images <node-id>... [--format png|svg] [--scale N] [--out <dir>]`
-and the `figmog_images { ids, format?, scale?, renders?, file? }` tool fetch image
-bytes. `renders: false` (default true; NWS-2952) skips the renders and
+`figmog images <node-id>... [--format png|svg] [--scale N] [--out <dir>]
+[--reuse-renders] [--refresh]` and the `figmog_images { ids, format?,
+scale?, renders?, reuse?, refresh?, file? }` tool fetch image bytes. `renders: false` (default true; NWS-2952) skips the renders and
 fetches only the fills the nodes' own `fills` reference — what `figmog
 assets export` (§19) uses for image fills. Nothing in figmog calls them on its own: the images endpoints are
 Figma's most rate-limited, so a fetch happens only when a person or an
@@ -1750,6 +1771,70 @@ marker: fills are addressed by content hash, and the fills endpoint
 takes no version. Rows tagged with an older version, and their markers,
 are evicted by the same version-change pass that evicts `proxy_cache`
 (§5).
+
+**Render reuse across versions (NWS-2958, opt-in).** Per-version caching
+throws every render away on any edit anywhere in the file. With
+`--reuse-renders` (tool: `reuse: true`) a render is instead tied to a
+fingerprint of what it shows, and stays a hit across file versions for as
+long as that fingerprint is unchanged — editing one frame leaves the
+cached renders of unrelated frames valid. Reuse is **off by default**:
+until the rendering contract is confirmed against Figma's images endpoint
+(below), a request without the opt-in behaves exactly as described
+above and never reads or writes the fingerprint tables.
+
+- **Fingerprint** (`images::render_fingerprint`, computed lazily at
+  render time from the mirror, never during a pull): SHA-256 over the
+  fingerprint-scheme version (`images::RENDER_FINGERPRINT_SCHEME`, 1),
+  format, scale and three parts: (1) the node's subtree — every node's
+  stored canonical raw JSON in preorder and child order, as nested
+  `[raw, [children…]]` arrays; instance children arrive expanded in the
+  REST response, variable and style values are baked into raw properties,
+  image fills are referenced by content hash and fonts are named in text
+  styles, so this covers nearly everything a single-node export shows.
+  Node ids are part of the raw JSON, so a fingerprint belongs to exactly
+  one node. (2) Conservatively, for every INSTANCE in the subtree whose
+  main component is mirrored, that component's own subtree hash,
+  transitively, so editing a main component invalidates its instances
+  even where the expansion doesn't show the edit. (3) Conservatively,
+  every ancestor's `explicitVariableModes`, root first.
+- **Conservative fallback.** A node gets no fingerprint — and so only
+  the per-version cache — when it, an ancestor or a subtree node is
+  missing from the mirror, when an earlier sibling is a mask
+  (`isMask`) that may clip it, or when the tree is inconsistent; also
+  when the mirror has no version to pin the request to. With reuse on, a
+  fingerprint miss still falls back to the per-version lookup.
+- **Storage.** A fetched fingerprinted render is written as a
+  `render_index` row (§3) plus an immutable, content-addressed
+  `render_blobs` row keyed by the bytes' SHA-256 (the in-house
+  implementation `figmog assets` uses — no new dependency), in one
+  transaction, instead of an `images` row. The request is still pinned to
+  the mirrored version (NWS-2960), which is the version the fingerprint
+  was computed at. A hit requires the row's scheme, subject, format and
+  scale to match, and the blob's bytes to still hash to the digest the
+  row names (validated on every read; anything else is a miss and is
+  refetched, repairing the blob).
+- **Force refresh.** `--refresh` (tool: `refresh: true`) ignores every
+  cached render, per-version and fingerprinted, and fetches again; a
+  refetched fingerprinted render replaces its index row, and the blob it
+  displaced is dropped once nothing references it. Fills are unaffected.
+- **Eviction**, after every opted-in request that wrote a fingerprinted
+  render or found orphans, in two separate passes over the index ordered
+  oldest first (`seq`, then fingerprint as a deterministic tie-break;
+  `images::plan_render_eviction`): **orphan cleanup** removes every row
+  whose fingerprint no node has any more (its subject's current
+  fingerprint differs, the subject is gone, or the row's scheme is
+  stale); then a **hard byte quota** (`images::RENDER_CACHE_MAX_BYTES`,
+  256 MiB of distinct blobs) removes the oldest remaining rows, still
+  valid or not, until the cache fits. A blob goes when no remaining row
+  references it. The version-change pass (§5) never touches these
+  tables; `pull --fresh` wipes them with the rest of the store.
+- **Unconfirmed contract.** The claim that a single-node export shows
+  nothing outside the node's subtree (no ancestor effects) has not been
+  checked against the live REST images endpoint — figmog's suite has no
+  network access — which is why reuse stays opt-in. The fixtures in
+  `images::tests` (text, fonts, instances and main components, image
+  fills, inherited variable modes, sibling masks) pin what the
+  fingerprint covers, not what Figma renders.
 
 **Explicit stores.** `figmog --db <store> images <node-id>...` exports
 matching cached renders and fills without a token or file key. The store

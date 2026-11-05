@@ -342,14 +342,14 @@ fn a_pull_taking_the_worker_answers_queued_images_busy() {
     let session = &mut h.manager.sessions[0];
     let ids = vec!["0:0".to_string()];
     session
-        .images(&ids, "png", None, true, reply("first"))
+        .images(&ids, "png", None, true, Default::default(), reply("first"))
         .unwrap();
     assert_eq!(
         h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
         "render"
     );
     session
-        .images(&ids, "png", None, true, reply("queued"))
+        .images(&ids, "png", None, true, Default::default(), reply("queued"))
         .unwrap();
     // A pull requested meanwhile waits for the worker, then takes it.
     let accepted = session.request_pull(false, Duration::from_secs(3600));
@@ -492,7 +492,7 @@ fn a_poll_due_during_images_gets_the_worker_before_queued_images() {
     let ids = vec!["0:0".to_string()];
     let session = &mut h.manager.sessions[0];
     session
-        .images(&ids, "png", None, true, reply("first"))
+        .images(&ids, "png", None, true, Default::default(), reply("first"))
         .unwrap();
     assert_eq!(
         h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -501,7 +501,7 @@ fn a_poll_due_during_images_gets_the_worker_before_queued_images() {
     // The scheduler's visit finds the worker busy with images...
     assert!(!session.poll_at(hour, Instant::now()));
     session
-        .images(&ids, "png", None, true, reply("second"))
+        .images(&ids, "png", None, true, Default::default(), reply("second"))
         .unwrap();
     h.release.send(()).unwrap();
     assert_eq!(
@@ -554,14 +554,14 @@ fn no_watch_images_do_not_dispatch_a_due_watch_retry() {
     let ids = vec!["0:0".to_string()];
     let session = &mut h.manager.sessions[0];
     session
-        .images(&ids, "png", None, true, reply("first"))
+        .images(&ids, "png", None, true, Default::default(), reply("first"))
         .unwrap();
     assert_eq!(
         h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
         "render"
     );
     session
-        .images(&ids, "png", None, true, reply("second"))
+        .images(&ids, "png", None, true, Default::default(), reply("second"))
         .unwrap();
     h.release.send(()).unwrap();
     assert_eq!(

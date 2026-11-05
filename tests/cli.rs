@@ -144,8 +144,8 @@ fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
         .success();
     {
         let st = figmog::open_store!(&db_path);
-        let stored =
-            st.rtx(|(.., mirror_config, _, _, _)| figmog::store::read_geometry(&mirror_config));
+        let stored = st
+            .rtx(|(.., mirror_config, _, _, _, _, _)| figmog::store::read_geometry(&mirror_config));
         assert!(stored, "the --geometry pull must persist the flag");
     }
 
@@ -161,8 +161,8 @@ fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
         .success();
     {
         let st = figmog::open_store!(&db_path);
-        let still_stored =
-            st.rtx(|(.., mirror_config, _, _, _)| figmog::store::read_geometry(&mirror_config));
+        let still_stored = st
+            .rtx(|(.., mirror_config, _, _, _, _, _)| figmog::store::read_geometry(&mirror_config));
         assert!(still_stored, "a plain re-pull must not turn geometry off");
     }
 }
@@ -207,7 +207,7 @@ fn pull_fresh_turns_geometry_back_off() {
 
     let st = figmog::open_store!(&db_path);
     let stored =
-        st.rtx(|(.., mirror_config, _, _, _)| figmog::store::read_geometry(&mirror_config));
+        st.rtx(|(.., mirror_config, _, _, _, _, _)| figmog::store::read_geometry(&mirror_config));
     assert!(!stored, "--fresh must reset the sticky geometry flag");
 }
 
@@ -284,11 +284,13 @@ fn pull_fresh_invalid_response_preserves_every_existing_store_file() {
         for id in ids {
             assert!(st.get(&id).is_some(), "lost {id:?}");
         }
-        st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, config, _, _, _)| {
-            assert_eq!(nodes.iter().count(), 12);
-            assert_eq!(meta.get(&0).unwrap().version, "100");
-            assert!(figmog::store::read_geometry(&config));
-        });
+        st.rtx(
+            |((nodes, ..), _, _, _, _, _, meta, _, config, _, _, _, _, _)| {
+                assert_eq!(nodes.iter().count(), 12);
+                assert_eq!(meta.get(&0).unwrap().version, "100");
+                assert!(figmog::store::read_geometry(&config));
+            },
+        );
     }
 }
 
@@ -421,7 +423,7 @@ fn pull_fresh_resets_file_imports_config_and_same_version_caches() {
         assert!(st.get(&id).is_none(), "fresh retained {id:?}");
     }
     st.rtx(
-        |((nodes, _, text, ..), components, sets, styles, _, _, meta, _, config, _, _, _)| {
+        |((nodes, _, text, ..), components, sets, styles, _, _, meta, _, config, _, _, _, _, _)| {
             assert_eq!(nodes.iter().count(), 3);
             assert!(nodes.get(&"1:2".into()).is_none());
             assert!(text.search("garden", 5).is_empty());
@@ -1247,7 +1249,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
             &serde_json::json!({"cached": true}),
         )
         .unwrap();
-        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _, _, _)| {
+        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _, _, _, _, _)| {
             cache::lookup(&cache_reader, "get_code", "{}", "100")
         });
         assert!(
@@ -1276,7 +1278,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
         .success();
 
     let st = figmog::open_store!(&db);
-    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _, _, _)| {
+    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _, _, _, _, _)| {
         cache::lookup(&cache_reader, "get_code", "{}", "100")
     });
     assert_eq!(
@@ -2014,6 +2016,79 @@ fn images_help_explains_explicit_store_cache_extraction() {
             "missing {explanation:?}: {help}"
         );
     }
+}
+
+/// NWS-2958: a fingerprint-indexed render is served only with
+/// `--reuse-renders`, whatever version it was fetched at, and never with
+/// `--refresh`; without the opt-in the request behaves as before (a miss).
+#[test]
+fn images_reuse_renders_serves_a_fingerprinted_render_only_when_opted_in() {
+    use figmog::model::{Id, Rec, RenderBlobRec, RenderIndexRec};
+
+    let (dir, db) = fixture_db();
+    let png = b"\x89PNG-synthetic".to_vec();
+    {
+        let mut st = figmog::open_store!(&db);
+        let fp = st
+            .rtx(|((nodes, children, ..), ..)| {
+                figmog::images::render_fingerprint(&nodes, &children, "1:1", "png", 1000)
+            })
+            .expect("the hero frame is fingerprintable");
+        let sha = figmog::images::render_blob_digest(&png);
+        st.wtx(|tx| {
+            tx.upsert(
+                &Id::RenderBlob(sha.clone()),
+                &Rec::RenderBlob(RenderBlobRec {
+                    sha256: sha.clone(),
+                    bytes: png.clone(),
+                }),
+            );
+            tx.upsert(
+                &Id::RenderIndex(fp.clone()),
+                &Rec::RenderIndex(RenderIndexRec {
+                    fingerprint: fp.clone(),
+                    scheme: figmog::images::RENDER_FINGERPRINT_SCHEME,
+                    subject: "1:1".into(),
+                    format: "png".into(),
+                    scale_milli: 1000,
+                    // An older version than the mirror's "100".
+                    file_version: "90".into(),
+                    seq: 1,
+                    sha256: sha.clone(),
+                    byte_len: png.len() as u64,
+                }),
+            );
+        });
+    }
+    let images = |extra: &[&str]| {
+        let out_dir = dir.path().join("exported");
+        let out = common::command()
+            .current_dir(dir.path())
+            .args(["--db", &db, "images", "1:1", "--out"])
+            .arg(&out_dir)
+            .args(extra)
+            .output()
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code(), manifest[0].clone())
+    };
+
+    let (code, row) = images(&["--reuse-renders"]);
+    assert_eq!(code, Some(0), "{row}");
+    assert_eq!(row["cached"], true);
+    assert_eq!(row["bytes"], png.len());
+    assert_eq!(
+        std::fs::read(dir.path().join("exported/render-1-1.png")).unwrap(),
+        png
+    );
+
+    let (code, row) = images(&[]);
+    assert_eq!(code, Some(1), "no opt-in: a plain per-version miss");
+    assert_eq!(row["cached"], false);
+
+    let (code, row) = images(&["--reuse-renders", "--refresh"]);
+    assert_eq!(code, Some(1), "--refresh never serves a cached render");
+    assert_eq!(row["cached"], false);
 }
 
 #[test]
