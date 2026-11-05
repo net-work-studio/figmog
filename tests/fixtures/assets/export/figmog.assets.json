@@ -6,6 +6,7 @@
       "component": "IconArrowRight",
       "current_color": true,
       "figma_name": "Icon / Name=Arrow Right",
+      "file": "figmogassetsfixture12",
       "key": "c0ffee0000000000000000000000000000000102",
       "node_id": "1:2",
       "path": "src/icons/IconArrowRight.jsx",
@@ -16,6 +17,7 @@
       "component": "IconLogo",
       "current_color": false,
       "figma_name": "Icon / Name=Logo",
+      "file": "figmogassetsfixture12",
       "key": "c0ffee0000000000000000000000000000000104",
       "node_id": "1:4",
       "path": "src/icons/IconLogo.jsx",
@@ -26,6 +28,7 @@
       "component": "IconStar",
       "current_color": true,
       "figma_name": "Icon / Name=Star",
+      "file": "figmogassetsfixture12",
       "key": "c0ffee0000000000000000000000000000000103",
       "node_id": "1:3",
       "path": "src/icons/IconStar.jsx",
@@ -36,6 +39,7 @@
       "component": "IconUnsafe",
       "current_color": true,
       "figma_name": "Icon / Name=Unsafe",
+      "file": "figmogassetsfixture12",
       "key": "c0ffee0000000000000000000000000000000105",
       "node_id": "1:5",
       "path": "src/icons/IconUnsafe.jsx",
@@ -45,6 +49,7 @@
   "images": [
     {
       "bytes": 100,
+      "file": "figmogassetsfixture12",
       "format": "png",
       "image_ref": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
       "nodes": [
@@ -56,6 +61,7 @@
     }
   ],
   "sources": {
+    "file": "figmogassetsfixture12",
     "icons": [
       "1:1"
     ],

@@ -586,7 +586,14 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 return write_json(&result?);
             }
         } else if let Some(read) = read_command(&cli.cmd) {
-            let (tool, tool_args) = with_project_settings(read, Some(layout))?.to_tool_call();
+            // The file this read targets: what the socket call carries.
+            let target = with_current_file(read.to_tool_call().1, layout)?
+                .get("file")
+                .and_then(Value::as_str)
+                .and_then(parse_file_ref)
+                .or_else(|| crate::dispatch::infer_file_from_node_ref(&read.to_tool_call().1));
+            let (tool, tool_args) =
+                with_project_settings(read, Some(layout), target.as_deref())?.to_tool_call();
             let tool_args = with_current_file(tool_args, layout)?;
             if let Some(route) = route_for(root, layout, &tool_args, true)
                 && let Some(result) = socket::try_call(&route, tool, tool_args.clone())
@@ -686,7 +693,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let Some(read) = read_command(&other) else {
                 unreachable!("every non-read command is handled above")
             };
-            let read = with_project_settings(read, db.layout.as_ref())?;
+            let read = with_project_settings(read, db.layout.as_ref(), db.key.as_deref())?;
             // `open_store!`'s pipeline type contains fn items and can't be
             // named, so the store must be opened at this concrete call
             // site; the reader tuple itself is nameable (`RootReaders`), so
@@ -707,11 +714,13 @@ fn dispatch(cli: Cli) -> Result<(), String> {
 /// said otherwise; its `figmog.map.json`, when there is one, rides along
 /// as `map` (NWS-2949) — an invalid map fails the command — and its asset
 /// manifest (`[assets] manifest`), when there is one, as `assets`
-/// (NWS-2952), likewise. With `--db` (no project): the defaults, no hint,
-/// no map, no manifest.
+/// (NWS-2952), likewise, for the file `target` (its icons match by node id
+/// only when they were exported from that file). With `--db` (no
+/// project): the defaults, no hint, no map, no manifest.
 fn with_project_settings(
     read: ReadCommand,
     layout: Option<&Layout>,
+    target: Option<&str>,
 ) -> Result<ReadCommand, String> {
     Ok(match read {
         ReadCommand::Spec {
@@ -732,7 +741,8 @@ fn with_project_settings(
                 (None, Some(layout), Some(settings)) => crate::assets::AssetIndex::load(
                     &layout.project_root,
                     &settings.assets.manifest,
-                )?,
+                )?
+                .map(|index| index.for_file(target)),
                 _ => None,
             };
             ReadCommand::Spec {

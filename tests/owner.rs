@@ -1369,6 +1369,13 @@ fn assets_export_routes_through_the_owner_and_the_relay_passes_the_manifest() {
         "{button}"
     );
     assert_eq!(spec["node"]["content"]["assets"][0]["path"], path);
+    // The exported variant itself matches by node id: the relay resolved
+    // this call's file to the manifest's.
+    let spec = relay.call("figmog_spec", json!({"id": "2:2"})).unwrap();
+    assert_eq!(
+        spec["node"]["content"]["assets"][0]["kind"], "icon",
+        "{spec}"
+    );
     relay.finish();
     wait_owner_gone(repo.path());
 }
