@@ -716,7 +716,7 @@ process's life.
 `figmog_components`, `figmog_styles`, `figmog_uses`, `figmog_vars`,
 `figmog_sync`) + 5 whole-file structural queries (`figmog_stats`,
 `figmog_path`, `figmog_text`, `figmog_where`, `figmog_at`) +
-`figmog_spec` (the binding-aware spec, §17) + `figmog_images` (§15) + 2 multi-file management tools that aren't
+`figmog_spec` (the code-ready spec, §17) + `figmog_images` (§15) + 2 multi-file management tools that aren't
 per-file (`figmog_open`, `figmog_files`). Every tool but
 `figmog_sync`/`figmog_open`/`figmog_images` reads the local mirror at
 zero Figma API cost; `figmog_sync` and `figmog_open` schedule pulls, and `figmog_images` fetches renders and fills, so
@@ -2085,34 +2085,40 @@ builds honor `FIGMOG_API_BASE`, for tests). The token is never printed.
 Exit 0 unless a check failed; then the report is still printed and
 `{"error": "doctor: failed checks: <names>"}` goes to stderr, exit 1.
 
-## 17. Binding-aware spec (NWS-2968)
+## 17. Code-ready spec (NWS-2968, NWS-2947)
 
-`figmog spec <node>` and the `figmog_spec {id, tokens?}` tool describe one
-auto-layout subtree — typically a card — the way a developer rebuilds it:
-layout plus values, every value either the variable token it is bound to
-or explicitly untokenized. Source: `src/spec.rs` (pure), composed in
-`query::spec`.
+`figmog spec <node> [--tailwind | --no-tailwind]` and the
+`figmog_spec {id, tokens?, tailwind?}` tool describe one subtree — a
+card, a page section — the way a developer builds it. Source:
+`src/spec.rs` (pure) and `src/spec/css.rs` (the CSS declarations and the
+Tailwind hint), composed in `query::spec`. NWS-2968 was the slice (one
+auto-layout card); NWS-2947 grew it to the full description below.
 
 **How it reads.** A local read like any other (`ReadCommand::Spec`, §6
 "Read adapters"): direct CLI, socket/owner-routed CLI, `figmog call` and
 MCP all return the same JSON, and the NWS-2902 parity tests cover it. It
 runs on a read worker. The inputs are exactly the `figmog_subtree {id}`
-answer (raw JSON, children nested) and the `figmog_vars {snapshot: true}`
-answer, so the output is a function of the mirror alone. `id` takes a
+answer (raw JSON, children nested), the `figmog_vars {snapshot: true}`
+answer, and the `components`/`component_sets` records of the subtree's
+instances, so the output is a function of the mirror alone. `id` takes a
 bare id, a `12-34` id or a Figma URL (§12); an unknown id is the standard
 `no node … in the mirror` error.
 
-**Token settings (NWS-2948).** Token CSS names and root modes come from
-the token export (§9) run with the project's `[tokens]` settings, so they
-match the committed token file. `figmog_spec` takes them as an optional
-`tokens: {format?, modes?}` argument (validated like figmog.toml's
-`[tokens]`/`[tokens.modes]`); `figmog spec` in a project and the stdio
-relay (`figmog serve`'s default shape) pass the project's settings when
-the caller gave none. With `--db`, `figmog call`, or an MCP client of an
-in-process serve, an omitted `tokens` is the default mapping.
+**Project settings.** Token CSS names and root modes come from the token
+export (§9) run with the project's `[tokens]` settings (NWS-2948), so
+they match the committed token file; `figmog_spec` takes them as an
+optional `tokens: {format?, modes?}` argument (validated like
+figmog.toml's `[tokens]`/`[tokens.modes]`). The Tailwind class hint
+(`tailwind: true`) is on when the project's `[stack] styling` is
+`tailwind` (§16; v1's only styling, so on in every project), and
+`--tailwind`/`--no-tailwind` (or an explicit `tailwind` argument)
+override it. `figmog spec` in a project and the stdio relay (`figmog
+serve`'s default shape) fill in whichever of the two the caller left out;
+with `--db`, `figmog call`, or an MCP client of an in-process serve, an
+omitted `tokens` is the default mapping and an omitted `tailwind` is off.
 
 **Output.** One JSON object, every key sorted (`serde_json` without
-`preserve_order`):
+`preserve_order`); byte-identical across runs for the same mirror:
 
 ```
 {
@@ -2123,18 +2129,59 @@ in-process serve, an omitted `tokens` is the default mapping.
 }
 ```
 
-A spec node is `{id, name, type, layout?, values, children}` with
-`children` in child-index order. `tokens_snapshot` is the §9 snapshot
-summary the names refer to, plus the theme the token export picks
-(`{collection, light_mode, dark_mode}` or null) and `css_unavailable`:
-null, or the token export's error (no `current` snapshot, a name
-collision, an ambiguous theme), in which case every `css` is null.
+`tokens_snapshot` is the §9 snapshot summary the names refer to, plus the
+theme the token export picks (`{collection, light_mode, dark_mode}` or
+null) and `css_unavailable`: null, or the token export's error (no
+`current` snapshot, a name collision, an ambiguous theme), in which case
+every `css` name is null and bound values are written raw in the CSS.
 
-**Layout** (only on auto-layout frames and on children of one):
+### Two layers
 
-- `direction`: `horizontal` | `vertical` (`layoutMode`);
+A spec node is
+
+```
+{id, name, type,
+ design?,                      // what Figma recorded
+ layout?, values, content?, instance?, css?, tailwind?,   // figmog's reading
+ children}
+```
+
+with `children` in child-index order. A hidden layer (`visible: false`)
+keeps only `{id, name, type, design?}`.
+
+- **`design`** is the recorded layout, copied verbatim (never
+  normalized): `layoutMode`, `layoutWrap`, `layoutPositioning`,
+  `layoutAlign`, `layoutGrow`, `layoutSizingHorizontal`/`Vertical`,
+  `primaryAxisSizingMode`, `counterAxisSizingMode`,
+  `primaryAxisAlignItems`, `counterAxisAlignItems`,
+  `counterAxisAlignContent`, `itemSpacing`, `counterAxisSpacing`,
+  `itemReverseZIndex`, `strokesIncludedInLayout`, `padding*`,
+  `min/maxWidth`, `min/maxHeight`, `constraints`, `clipsContent`,
+  `rotation`, `absoluteBoundingBox`, `textAutoResize`, the twelve `grid*`
+  fields, and for TEXT `style: {textAutoResize, textTruncation, maxLines,
+  textAlignHorizontal, textAlignVertical}` — whichever the node has.
+- **figmog's interpretation** is everything else: `layout` and `values`
+  (value entries, below), `content`, `instance`, and `css` — a
+  `{property: value}` map of the declarations figmog derives, a bound
+  value as its token's `var(--name)`. `tailwind` is a class string derived
+  from exactly those declarations.
+
+What figmog can't translate exactly is listed under `unsupported` and
+left out of `css` — never approximated. The design layer still records
+it, and the node's other values and children are still specified.
+
+### Layout
+
+`layout` (on auto-layout and grid frames, their children, absolutely
+positioned nodes, and the root when it carries `layoutSizing*`):
+
+- `direction`: `horizontal` | `vertical`; `wrap: true` and `wrap_gap`
+  (the `counterAxisSpacing` entry; Figma's default, the item spacing, when
+  absent) for `layoutWrap: WRAP`;
 - `gap`: a value entry for `itemSpacing`, or `"auto"` under
   `SPACE_BETWEEN`;
+- `grid` (`layoutMode: GRID`): `{columns, rows, column_gap, row_gap}` —
+  the counts and the `gridColumnGap`/`gridRowGap` entries;
 - `padding`: `{top, right, bottom, left}` value entries (an absent padding
   is Figma's 0);
 - `align`: `{primary, counter}` from `primaryAxisAlignItems` /
@@ -2146,76 +2193,193 @@ collision, an ambiguous theme), in which case every `css` is null.
   across it ⇒ fill; the node's own `primaryAxisSizingMode` /
   `counterAxisSizingMode` (absent ⇒ `AUTO`) ⇒ hug or fixed; a TEXT node's
   `textAutoResize` (`WIDTH_AND_HEIGHT` both axes, `HEIGHT` vertical) ⇒
-  hug; else fixed. Emitted on children of an auto-layout parent, on
-  auto-layout frames, and on the spec root when it carries
-  `layoutSizing*`;
+  hug; else fixed;
+- `width`/`height`: value entries for a fixed dimension the CSS declares
+  (bindings: `boundVariables.size.x`/`.y`, else `width`/`height`);
+- `min_width`, `max_width`, `min_height`, `max_height`: value entries;
+- `position: "absolute"` for an absolutely positioned node;
 - `size`: `{width, height}` from `absoluteBoundingBox`, whenever `layout`
   is present.
 
-**Values:** `fill` and `stroke` (arrays, one entry per visible `SOLID`
-paint; the raw value is `#rrggbb`, or `#rrggbbaa` below full alpha, the
-paint's `opacity` folded into alpha — the token export's color form),
-`stroke_weight` (with visible strokes), `radius` (`{top_left, top_right,
-bottom_right, bottom_left}` from `rectangleCornerRadii`, else
-`cornerRadius`; absent when the node has neither and no corner binding),
-and on TEXT nodes `typography`: `font_family`, `font_size`,
-`font_weight`, `line_height` (`lineHeightPx`; `"auto"` for
-`INTRINSIC_%`), `letter_spacing`, each present when the type style has it.
+### Values
+
+`fill` and `stroke` (arrays, one entry per visible `SOLID` paint; the raw
+value is `#rrggbb`, or `#rrggbbaa` below full alpha, the paint's `opacity`
+folded into alpha — the token export's color form), `stroke_weight` (with
+visible strokes), `radius` (`{top_left, top_right, bottom_right,
+bottom_left}` from `rectangleCornerRadii`, else `cornerRadius`; absent
+when the node has neither and no corner binding), `opacity` (a layer
+opacity below 1, or bound; matched against tokens as 0–100, Figma's
+opacity-variable scale), `effects` (one object per visible effect: `type`
+plus `offset_x`, `offset_y`, `radius`, `spread`, `color` entries for
+shadows, `radius` for blurs), and on TEXT nodes `typography`:
+`font_family`, `font_size`, `font_weight`, `line_height` (`lineHeightPx`;
+`"auto"` for `INTRINSIC_%`), `letter_spacing`, each present when the type
+style has it.
 
 **Value entries.** Bound:
 `{"token": <variable name | null>, "variable_id", "css": <name | null>,
 "raw": <Figma's baked value>}`. Bindings are read from the paint's
 `boundVariables.color`, else the node's `boundVariables.fills[i]` /
-`strokes[i]`; `itemSpacing`, `paddingTop`…, `strokeWeight`,
-`topLeftRadius`…; text properties from the node's `boundVariables`, else
-its type style's (`fontFamily`, `fontSize`, `fontWeight`, `lineHeight`,
-`letterSpacing`), an alias or an array of aliases naming one variable.
-`token` is the variable's name in the snapshot (null for a variable bound
-in the file but absent from the snapshot); `css` is the custom property
-name `figmog tokens export` emits for it (§9 "Token export, diff and check", taken from
-that export run on the same snapshot, so they cannot drift) — null for a
-variable the export skips (STRING, BOOLEAN…). An alias variable is shown
-as itself (`surface`, not the primitive it aliases).
+`strokes[i]`; `itemSpacing`, `counterAxisSpacing`, `gridColumnGap`,
+`gridRowGap`, `paddingTop`…, `strokeWeight`, `topLeftRadius`… (else
+`rectangleCornerRadii.RECTANGLE_*`), `size.x`/`size.y` (else `width`/
+`height`), `minWidth`…, `opacity`; an effect's own `boundVariables`
+(`offsetX`, `offsetY`, `radius`, `spread`, `color`); text properties from
+the node's `boundVariables`, else its type style's (`fontFamily`,
+`fontSize`, `fontWeight`, `lineHeight`, `letterSpacing`; a mixed-run
+node and each run read the style's first), an alias or an array of
+aliases naming one variable. `token` is the variable's name in the
+snapshot (null for a variable bound in the file but absent from the
+snapshot); `css` is the custom property name `figmog tokens export` emits
+for it (§9, taken from that export run on the same snapshot, so they
+cannot drift) — null for a variable the export skips (STRING, BOOLEAN…).
+An alias variable is shown as itself (`surface`, not the primitive it
+aliases).
 
-Unbound: `{"untokenized": true, "raw", "matches"?}` — never token usage.
-`matches` lists (sorted by token name, then id) every snapshot variable
-`{token, variable_id, css}` whose value in its root mode — the mode the
-token export writes to `:root` under the default mode mapping (§9), else
-its collection's default mode, aliases followed — equals the raw value (colors as `#rrggbb[aa]`, numbers within
+**Token claims only from bindings.** Unbound: `{"untokenized": true,
+"raw", "matches"?}` — never token usage, and the CSS uses the raw value
+(`8px`, never `var(--spacing-2)`). `matches` lists (sorted by token name,
+then id) every snapshot variable `{token, variable_id, css}` whose value
+in its root mode — the mode the token export writes to `:root` under the
+project's mapping (§9), else its collection's default mode, aliases
+followed — equals the raw value (colors as `#rrggbb[aa]`, numbers within
 1e-6, strings exactly), of the property's type, and scoped for it:
 `ALL_SCOPES`, or `ALL_FILLS` plus `TEXT_FILL` / `FRAME_FILL` /
 `SHAPE_FILL` by node type for fills, `STROKE_COLOR`, `STROKE_FLOAT`,
-`CORNER_RADIUS`, `GAP` (gap and padding), `FONT_FAMILY`, `FONT_SIZE`,
-`FONT_WEIGHT`, `LINE_HEIGHT`, `LETTER_SPACING`. Omitted when nothing
-matches.
+`CORNER_RADIUS`, `GAP` (gaps and padding), `WIDTH_HEIGHT` (sizes and
+min/max), `OPACITY`, `EFFECT_COLOR`, `EFFECT_FLOAT`, `FONT_FAMILY`,
+`FONT_SIZE`, `FONT_WEIGHT`, `LINE_HEIGHT`, `LETTER_SPACING`. Omitted when
+nothing matches.
 
-**Unsupported, never approximated.** Each case is listed under
-`unsupported` with the node id and reason, and the affected part is left
-out of the spec:
+A node-level `boundVariables` key the spec doesn't read (`visible`,
+`textRangeFills`, …) is listed under `unsupported`, so no binding
+disappears silently.
+
+### Content and instances
+
+- `content.text`: a TEXT node's `characters` (`content.text_token`, a
+  bound entry, when `characters` is bound).
+- `content.runs` (mixed text runs: `characterStyleOverrides` naming a
+  style other than 0): every run in order, `{start, end, text, style}`
+  (offsets in UTF-16 code units, as Figma's; `style` the override id, 0
+  the base style), plus for an override its `typography` and `fill`
+  entries (only the properties the override sets), `css` and `tailwind`.
+- `content.assets`: `{kind: "image", node_id, paint, image_ref,
+  scale_mode}` per visible `IMAGE` fill; `{kind: "vector", node_id,
+  format: "svg"}` for a node CSS can't draw (`VECTOR`,
+  `BOOLEAN_OPERATION`, `STAR`, `LINE`, `REGULAR_POLYGON` — one asset, its
+  children are part of it and not specified; its fills/strokes are still
+  value entries but get no CSS); `{kind: "export", node_id, formats}` for
+  a node with `exportSettings` (`PNG@2x`…). Assets are referenced by node
+  id and `imageRef` only: local file paths come with the asset manifest
+  (NWS-2952); `figmog images` (§15) fetches them meanwhile.
+- `instance` (INSTANCE nodes): `{component_id, component: {name, key,
+  remote} | null, component_set: {id, name, key} | null, variant: {name:
+  value} (VARIANT properties), properties: {name: {type, value, token?}}
+  (the other component properties, `token` a bound entry), code_component:
+  null}`. `code_component` is the hook for the Figma → code component map
+  (NWS-2949): null until that map exists. A component missing from the
+  mirror is listed under `unsupported`.
+
+### The CSS layer
+
+Per node, from the parent's layout and its own:
+
+| design | `css` |
+|---|---|
+| auto layout | `display: flex`, `flex-direction`, `gap` (`column-gap` + `row-gap` when wrapping), `justify-content` (non-start), `align-items` (always: CSS's default is stretch), `flex-wrap` + `align-content` |
+| negative `itemSpacing` (no wrap) | no gap; `margin-left`/`margin-top` = the spacing on every in-flow child after the first (exact: the children overlap the same way) |
+| `layoutMode: GRID` | `display: grid`, `grid-template-columns`/`-rows` = `gridColumnsSizing`/`gridRowsSizing` (Figma's own CSS track lists), `column-gap`, `row-gap`; a child gets `grid-column`/`grid-row: <anchor + 1> / span <span>` and `justify-self`/`align-self` from `gridChild*Align` |
+| padding | `padding` when all four sides are equal, else the longhands; an unbound 0 is left out |
+| sizing in a flex parent | main axis: fill → `flex: 1 1 0%`, fixed → `width`/`height` + `flex-shrink: 0`, hug → `flex-shrink: 0`; cross axis: fill → `align-self: stretch`, fixed → the dimension |
+| sizing in a grid parent | fill → `justify-self`/`align-self: stretch`, fixed → the dimension, hug → `fit-content` |
+| sizing of the root | fixed → the dimension, horizontal hug → `width: fit-content`, fill → `100%` |
+| `min/max*` | `min-width`… |
+| absolute child (`layoutPositioning: ABSOLUTE`, or any child of a frame without auto layout) | `position: absolute` (the parent gets `position: relative`); per axis from `constraints` (default LEFT/TOP) and the boxes: LEFT/TOP → `left`/`top`, RIGHT/BOTTOM → `right`/`bottom`, LEFT_RIGHT/TOP_BOTTOM → both, CENTER → `calc(50% ± offset)` + `translate(-50%)`, SCALE → percentages for offset and size; a fixed dimension otherwise |
+| `clipsContent` (with children) | `overflow: hidden` |
+| fill | one visible solid paint → `background-color` (`color` on TEXT) |
+| stroke | one visible solid paint with `strokeAlign`: `outline-*` (Figma strokes take no layout space), `outline-offset` −weight (INSIDE) or −weight/2 (CENTER); a `border-*` for INSIDE with `strokesIncludedInLayout` |
+| radius | `border-radius`, or the corner longhands |
+| drop/inner shadow | `box-shadow` (`inset`), listed top-most first (Figma lists effects bottom-most first); a TEXT drop shadow → `text-shadow` |
+| opacity | `opacity` |
+| typography | `font-family` (quoted), `font-size`, `font-weight`, `line-height` (`normal` for auto), `letter-spacing`, `font-style: italic`, `text-align`, `text-transform` / `font-variant-caps`, `text-decoration-line` |
+| `textAutoResize` | `WIDTH_AND_HEIGHT` → `white-space: nowrap`; `HEIGHT` and `NONE` follow from the sizing |
+| `textTruncation: ENDING` | one line: `overflow: hidden; text-overflow: ellipsis; white-space: nowrap`; `maxLines` > 1: `-webkit-line-clamp` |
+| padding or border | `box-sizing: border-box` (Figma sizes include both) |
+
+Lengths are `px` with at most three decimals; a bound value with a CSS
+name is its `var()`.
+
+**Tailwind hint** (`tailwind`). One class per declaration, ordered by
+property group (position, layout, size, paint, text): keyword utilities
+(`flex`, `flex-col`, `items-center`, `self-stretch`, `shrink-0`,
+`flex-1`, `absolute`, `overflow-hidden`, `line-clamp-2`, …); a value bound
+to a token with a Tailwind theme name in the right namespace becomes that
+theme utility (`--color-surface` → `bg-surface`, `--spacing-4` →
+`gap-4`, `p-4`, `--radius-md` → `rounded-md`); any other bound value the
+arbitrary property `[font-size:var(--font-size-title)]`; an unbound value
+an arbitrary value (`gap-[8px]`, `bg-[#1a1a1f]`) — never a theme utility.
+`pt-X pb-X` / `pl-X pr-X` collapse to `py-X` / `px-X`. `box-sizing:
+border-box` has no class (Tailwind's preflight sets it).
+
+### Unsupported, never approximated
+
+Each case is listed under `unsupported` with the node id and reason, and
+the affected part is left out of `css` (and, where noted, of the spec):
 
 | case | left out |
 |---|---|
 | `visible: false` | the node's layout, values and children |
-| `layoutMode` other than `HORIZONTAL`/`VERTICAL`/`NONE` (e.g. `GRID`) | its own layout; children get no sizing |
-| `layoutWrap: WRAP` | its own layout; children get no sizing |
-| `layoutMode: NONE` with children (constraints-based frame, group) | children's positions (no sizing) |
-| `layoutPositioning: ABSOLUTE` | the node's position and sizing |
-| TEXT with nonzero `characterStyleOverrides` (mixed runs) | its fill and typography |
-| a visible non-`SOLID` paint (gradients, `IMAGE`, …) | that paint |
+| `layoutMode` other than `HORIZONTAL`/`VERTICAL`/`GRID`/`NONE` | its own layout; children unplaced |
+| a GROUP (or other non-frame) with children | its children's positions (they follow the enclosing frame's constraints) |
+| `layoutWrap: WRAP` on a vertical frame | the wrapping |
+| negative `itemSpacing` in a wrapping frame; negative `counterAxisSpacing` or grid gap | that gap |
+| `gridColumnsSizing`/`gridRowsSizing` missing or not a plain track list | that template |
+| `itemReverseZIndex` | the stacking order |
+| an absolute child before in-flow siblings | the stacking order (CSS paints it above them) |
+| `rotation` on an absolutely positioned node | its position and size |
+| `rotation` on any other node | the rotation (its CSS size is the rotated bounds) |
+| `layoutPositioning: ABSOLUTE` on the spec root | its position in its parent |
+| a visible `IMAGE` fill | the CSS background (it is under `content.assets`) |
+| any other non-`SOLID` paint (gradients, video…) | that paint |
+| several visible fills or strokes | that CSS property |
+| a non-normal `blendMode` (layer or paint) | the blend |
 | a property bound to several variables (mixed alias array) | that property |
-| visible `effects` | the effects |
-| layer `opacity` below 1 | the opacity |
-| `individualStrokeWeights` | the stroke weight |
+| a bound property the spec doesn't read | that binding |
+| `LAYER_BLUR`/`BACKGROUND_BLUR` (no exact CSS `blur()`), `showShadowBehindNode`, a non-normal shadow blend, an inner or spread shadow on text | that effect |
+| `individualStrokeWeights`, `strokeDashes`, a text stroke, a missing `strokeAlign` | the CSS stroke |
+| `cornerSmoothing` | the smoothing |
+| `textAlignVertical` other than TOP in a fixed-height text box, `paragraphSpacing`, `paragraphIndent`, list text (`lineTypes`) | that text rule |
+| mixed runs splitting a UTF-16 surrogate pair, a run style missing from `styleOverrideTable` | the runs / that run's style |
+| a component not in the mirror | the instance's component name |
 
-The node's other values and its children are still specified.
+### Fixtures and tests
 
-**Fixtures.** `tests/fixtures/spec/card.json` (a synthetic file: a
-vertical auto-layout card with a horizontal row using the older sizing
-fields, a GRID child, an absolutely positioned ribbon with a gradient,
-and a mixed-run caption) and `tests/fixtures/spec/variables.json` (a
-synthetic export with a Light/Dark theme collection) produce the golden
-`tests/fixtures/spec/card.spec.json` (`tests/spec.rs`; `FIGMOG_BLESS=1`
-regenerates it). The tests also check that every binding in the
-specified nodes appears as its token, that each `css` name appears in
-the `tokens export` output for the same snapshot, the flagged unbound
-padding, the `matches` gap, and the unsupported grid child.
+`tests/fixtures/spec/card.json` (a vertical auto-layout card: a
+horizontal row using the older sizing fields, a CSS-grid gallery with an
+image fill, an absolute ribbon with a gradient, a mixed-run caption) and
+`tests/fixtures/spec/edge.json` (negative spacing, wrap, a 2×2 grid with
+a span and an aligned cell, min/max sizes, a frame without auto layout
+with every constraint, a rotated child and clipping, text auto-resize,
+truncation, line clamp and mixed runs, an instance with variant
+properties and a vector icon, an image fill with a shadow and opacity, an
+absolute ribbon), with `tests/fixtures/spec/variables.json`, produce the
+golden `card.spec.json` (no hint) and `edge.spec.json` (with the Tailwind
+hint), and `tokens.css` (the token export of the same variables)
+(`tests/spec.rs`; `FIGMOG_BLESS=1` regenerates them). The tests check
+byte-identical output across runs and against `figmog call figmog_spec`,
+the issue's done-when line on both fixtures — every binding in the
+subtree appears as its token reference, every value entry without one is
+flagged untokenized, each `css` name appears in the `tokens export`
+output — and the project defaults for `tokens` and `tailwind`.
+
+**The two contract viewports.** The spec is viewport-independent JSON;
+what can differ by viewport is its translation. `packages/react`'s
+`test/spec.test.ts` renders `edge.spec.json` in Chromium twice — each
+node's `css` inline, and its Tailwind hint compiled by Tailwind v4 against
+`tokens.css` — at 1440 px and 390 px, and asserts that every node's box
+(relative to the root) equals its recorded `absoluteBoundingBox` within
+half a pixel, except nodes under a position-related `unsupported` entry
+and the width of a hugging text node (font-dependent); and that bound
+tokens, clipping, truncation and run styles resolve.

@@ -356,14 +356,23 @@ through a symlink. See `docs/SPEC.md` §9 "Token export, diff and check".
 
 ### A spec of one component
 
-`figmog spec <node>` (tool `figmog_spec`) describes an auto-layout card the
-way you rebuild it: direction, gap, padding, alignment and hug/fill/fixed
-sizing for every frame, and fill, stroke, radius and typography for every
-layer. Each value is shown as the variable token it is bound to, with the
-CSS name `figmog tokens export` gives it and the raw value beside it. An
-unbound value is flagged as untokenized, and named "matches X" when it
-equals a token's light/default value. Grid layout, absolutely positioned
-children, mixed text runs, gradients and the like are listed under
+`figmog spec <node>` (tool `figmog_spec`) describes a subtree the way you
+build it. For every node it gives two layers: `design`, the layout Figma
+recorded (auto layout, grid, sizing, constraints, min/max sizes, clipping,
+text auto-resize), and figmog's interpretation of it: layout and values
+(gap, padding, alignment, hug/fill/fixed sizing, grid tracks, fill,
+stroke, radius, effects, opacity, typography) and the CSS declarations
+they become (flex or CSS grid, constraints as absolute offsets). Each value
+is shown as the variable token it is bound to, with the CSS name
+`figmog tokens export` gives it and the raw value beside it. An unbound
+value is flagged as untokenized, and named "matches X" when it equals a
+token's light/default value — it never counts as using that token.
+Text nodes carry their text and mixed-style runs, instances their
+component and variant properties, and image fills and vector icons are
+referenced as assets by node id and `imageRef`. In a project whose
+`[stack] styling` is `tailwind`, each node also gets a Tailwind class hint
+(`--tailwind` / `--no-tailwind` override it). Whatever has no exact CSS
+equivalent — a rotated layer, a gradient, a blur — is listed under
 `unsupported` instead of being guessed. See `docs/SPEC.md` §17.
 
 ### The vertical slice example
