@@ -298,6 +298,16 @@ equals a token's light/default value. Grid layout, absolutely positioned
 children, mixed text runs, gradients and the like are listed under
 `unsupported` instead of being guessed. See `docs/SPEC.md` §17.
 
+### The vertical slice example
+
+`examples/slice/` runs the whole loop offline on a synthetic file: a
+variables snapshot is imported and exported as tokens, `figmog spec`
+describes one card, a sample React + Tailwind v4 app builds that card from
+the exported tokens only, and `figmog-shot` captures before/after evidence
+at 1440 px and 390 px against a committed **stand-in** for the Figma render
+(no Figma access is involved). `examples/slice/run.sh` reproduces it from a
+clean checkout; see `examples/slice/README.md`.
+
 ### The tools
 
 `figmog serve` exposes 22 `figmog_*` tools: 18 reads of the local mirror,

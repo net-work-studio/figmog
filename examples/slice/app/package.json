@@ -1,0 +1,26 @@
+{
+  "name": "@figmog/slice-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Sample React + Tailwind v4 app for figmog's vertical slice (NWS-2965): one card built only from exported tokens.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "vite build",
+    "evidence": "node scripts/evidence.mjs",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.mjs\""
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.4",
+    "playwright": "1.63.0",
+    "tailwindcss": "4.3.4",
+    "vite": "8.3.5"
+  }
+}

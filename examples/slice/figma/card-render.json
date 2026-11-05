@@ -1,0 +1,21 @@
+{
+  "caveat": "STAND-IN, not a Figma export: figma/standin/index.html re-draws node 1:1 of figma/card-file.json from its raw values in plain CSS and is captured with figmog-shot in the same Chromium as the app. No Figma access was used.",
+  "file": {
+    "name": "Synthetic card (vertical slice)",
+    "path": "examples/slice/figma/card-file.json",
+    "version": "4243"
+  },
+  "images": {
+    "390": {
+      "path": "examples/slice/figma/card-render-390.png",
+      "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+    },
+    "1440": {
+      "path": "examples/slice/figma/card-render-1440.png",
+      "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+    }
+  },
+  "kind": "figma-render-stand-in",
+  "node": "1:1",
+  "source": "examples/slice/figma/standin/index.html"
+}

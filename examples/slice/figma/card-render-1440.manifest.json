@@ -1,0 +1,38 @@
+{
+  "image": {
+    "file": "card-render-1440.png",
+    "height": 100,
+    "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf",
+    "width": 320
+  },
+  "kind": "figmog-shot/capture",
+  "selector": "[data-testid=\"slice-card\"]",
+  "settings": {
+    "animations": "disabled",
+    "browser": {
+      "args": [
+        "--disable-lcd-text",
+        "--font-render-hinting=none",
+        "--force-color-profile=srgb"
+      ],
+      "name": "chromium",
+      "version": "153.0.8010.12"
+    },
+    "caret": "hidden",
+    "colorScheme": "light",
+    "deviceScaleFactor": 1,
+    "disableMotionCss": "*, *::before, *::after {\n  animation-delay: 0s !important;\n  animation-duration: 0s !important;\n  animation-iteration-count: 1 !important;\n  animation-play-state: paused !important;\n  caret-color: transparent !important;\n  scroll-behavior: auto !important;\n  transition-delay: 0s !important;\n  transition-duration: 0s !important;\n}",
+    "fontsReady": true,
+    "headless": true,
+    "locale": "en-US",
+    "playwright": "1.63.0",
+    "reducedMotion": "reduce",
+    "timezoneId": "UTC"
+  },
+  "url": "http://127.0.0.1:<port>/",
+  "version": 1,
+  "viewport": {
+    "height": 900,
+    "width": 1440
+  }
+}
