@@ -21,7 +21,9 @@
 //! quote, `<`, `>`, `&`, a backtick, a brace, a backslash or a control
 //! character is dropped. URL-bearing values are reduced to local
 //! references: `href`/`xlink:href` must be `#<id>` (or, on `<image>`, a
-//! base64 `data:image/{png,jpeg,gif,webp}` URI); `fill`, `stroke`,
+//! base64 `data:image/{png,jpeg,gif,webp}` URI), and a `<use>` may only
+//! reference an `<image>` or a basic shape (so references can't fan out);
+//! `fill`, `stroke`,
 //! `clip-path`, `mask`, `filter` may hold `url(#<id>)` and nothing else
 //! URL-like; a `url(#id)` to an id the document doesn't define is dropped.
 //! The `style` attribute keeps only `mask-type`, `mix-blend-mode` and
@@ -38,9 +40,11 @@
 //! fixed prefix, [`Sanitized::to_jsx`] a JS expression (a React `useId`).
 //!
 //! **Colors.** [`Sanitized::single_color`] is the one paint color an icon
-//! uses — fills, strokes, stops and floods outside `<clipPath>`/`<mask>`
-//! (whose colors are geometry, not paint) — or `None` when it uses several,
-//! none, or any gradient, pattern, filter or image.
+//! uses — fills (a shape no `fill` applies to is black), strokes, stops
+//! and floods outside `<clipPath>`/`<mask>` (whose colors are geometry,
+//! not paint), `currentColor` counting as a color of its own — or `None`
+//! when it uses several, none, or any gradient, pattern, filter, image or
+//! `color` attribute.
 //! [`Sanitized::use_current_color`] replaces that color with
 //! `currentColor`.
 //!
@@ -105,6 +109,17 @@ const ELEMENTS: [&str; 39] = [
     "feMergeNode",
     "feMorphology",
     "feOffset",
+];
+
+/// What a `<use>` may reference: an image or a basic shape, never a
+/// container or another `<use>` (so references can't fan out).
+const USE_TARGETS: [&str; 8] = [
+    "image", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon",
+];
+
+/// Elements that paint a fill (black when no `fill` applies).
+const FILLED: [&str; 8] = [
+    "path", "rect", "circle", "ellipse", "polygon", "polyline", "text", "tspan",
 ];
 
 /// Elements whose text content is kept.
@@ -564,6 +579,11 @@ fn is_raster_data_uri(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
 }
 
+/// The allowlisted `&'static` name of an element name already checked.
+fn element_name(name: &str) -> &'static str {
+    canonical(&ELEMENTS, name).expect("only allowlisted elements get here")
+}
+
 fn canonical<'a>(list: &[&'a str], name: &str) -> Option<&'a str> {
     list.iter().copied().find(|n| *n == name)
 }
@@ -590,8 +610,9 @@ enum PreNode {
 
 struct Sanitizer {
     removed: BTreeSet<String>,
-    /// Every id defined, in document order (first definition wins).
-    defined: Vec<String>,
+    /// Every id defined, in document order (first definition wins), with
+    /// the element defining it.
+    defined: Vec<(String, &'static str)>,
 }
 
 impl Sanitizer {
@@ -660,8 +681,8 @@ impl Sanitizer {
                 if !is_id(id) {
                     return None;
                 }
-                if !self.defined.iter().any(|d| d == id) {
-                    self.defined.push(id.to_string());
+                if !self.defined.iter().any(|(d, _)| d == id) {
+                    self.defined.push((id.to_string(), element_name(element)));
                 }
                 Some(PreVal::Id(id.to_string()))
             }
@@ -729,6 +750,37 @@ impl Sanitizer {
 /// reference, dropping those to undefined ids.
 struct Numbering {
     index: BTreeMap<String, usize>,
+}
+
+/// Drop every `<use>` whose `href` doesn't name an image or a basic shape
+/// ([`USE_TARGETS`]) defined in the document.
+fn prune_uses(
+    el: &mut PreEl,
+    targets: &BTreeMap<&str, &'static str>,
+    removed: &mut BTreeSet<String>,
+) {
+    el.children.retain_mut(|c| {
+        let PreNode::El(e) = c else {
+            return true;
+        };
+        if e.name == "use" {
+            let target = e.attrs.iter().find_map(|(n, v)| match v {
+                PreVal::Hash(id) if *n == "href" => Some(targets.get(id.as_str()).copied()),
+                _ => None,
+            });
+            match target {
+                Some(Some(t)) if USE_TARGETS.contains(&t) => {}
+                Some(Some(t)) => {
+                    removed.insert(format!("dropped <use> of a <{t}>"));
+                    return false;
+                }
+                // No local href, or an undefined id: dropped later.
+                _ => {}
+            }
+        }
+        prune_uses(e, targets, removed);
+        true
+    });
 }
 
 fn collect_refs(el: &PreEl, out: &mut BTreeSet<String>) {
@@ -829,13 +881,19 @@ pub(crate) fn sanitize(input: &str) -> Result<Sanitized, String> {
         removed: BTreeSet::new(),
         defined: Vec::new(),
     };
-    let pre = s
+    let mut pre = s
         .element(raw, false)
         .expect("the root is <svg>, which is allowed");
+    let targets: BTreeMap<&str, &'static str> = s
+        .defined
+        .iter()
+        .map(|(id, el)| (id.as_str(), *el))
+        .collect();
+    prune_uses(&mut pre, &targets, &mut s.removed);
     let mut refs = BTreeSet::new();
     collect_refs(&pre, &mut refs);
     let mut index = BTreeMap::new();
-    for id in &s.defined {
+    for (id, _) in &s.defined {
         if refs.contains(id) {
             let n = index.len();
             index.insert(id.clone(), n);
@@ -855,12 +913,16 @@ pub(crate) fn sanitize(input: &str) -> Result<Sanitized, String> {
 
 // ---- colors ----
 
-/// A paint value's color, normalized (`#rrggbb`, lowercase), or `None`
-/// for `none`, `transparent` and `currentColor`.
+/// The implicit fill of a shape no `fill` applies to.
+const DEFAULT_FILL: &str = "#000000";
+
+/// A paint value's color, normalized (`#rrggbb`, lowercase;
+/// `currentcolor` is a color of its own), or `None` for `none`,
+/// `transparent` and `inherit`.
 fn color_of(value: &str) -> Option<String> {
     let v = value.trim().to_ascii_lowercase();
     match v.as_str() {
-        "none" | "transparent" | "currentcolor" | "inherit" => return None,
+        "none" | "transparent" | "inherit" => return None,
         "black" => return Some("#000000".into()),
         "white" => return Some("#ffffff".into()),
         _ => {}
@@ -879,31 +941,40 @@ fn color_of(value: &str) -> Option<String> {
 impl Sanitized {
     /// The icon's one paint color (see the module doc), normalized.
     pub(crate) fn single_color(&self) -> Option<String> {
-        fn walk(el: &El, colors: &mut BTreeSet<String>, flat: &mut bool) {
+        /// `default_fill`: no ancestor sets `fill`, so a shape without one
+        /// is filled black.
+        fn walk(el: &El, default_fill: bool, colors: &mut BTreeSet<String>, flat: &mut bool) {
             if matches!(el.name, "clipPath" | "mask") {
                 return;
             }
             if NON_FLAT.contains(&el.name) {
                 *flat = false;
             }
+            let has_fill = el.attrs.iter().any(|(n, _)| *n == "fill");
+            if FILLED.contains(&el.name) && !has_fill && default_fill {
+                colors.insert(DEFAULT_FILL.into());
+            }
             for (name, v) in &el.attrs {
                 match v {
                     Val::Url(_) if PAINT_ATTRS.contains(name) => *flat = false,
-                    Val::Lit(s) if PAINT_ATTRS.contains(name) || *name == "color" => {
+                    Val::Lit(s) if PAINT_ATTRS.contains(name) => {
                         colors.extend(color_of(s));
                     }
+                    // `color` redefines currentColor below it: the icon
+                    // would not follow the text color.
+                    Val::Lit(_) if *name == "color" => *flat = false,
                     _ => {}
                 }
             }
             for c in &el.children {
                 if let Node::El(e) = c {
-                    walk(e, colors, flat);
+                    walk(e, default_fill && !has_fill, colors, flat);
                 }
             }
         }
         let mut colors = BTreeSet::new();
         let mut flat = true;
-        walk(&self.root, &mut colors, &mut flat);
+        walk(&self.root, true, &mut colors, &mut flat);
         (flat && colors.len() == 1)
             .then(|| colors.into_iter().next())
             .flatten()
@@ -912,25 +983,30 @@ impl Sanitized {
     /// Replace `color` (as [`Sanitized::single_color`] returned it) with
     /// `currentColor` wherever it paints, outside `<clipPath>`/`<mask>`.
     pub(crate) fn use_current_color(&mut self, color: &str) {
-        fn walk(el: &mut El, color: &str) {
+        fn walk(el: &mut El, default_fill: bool, color: &str) {
             if matches!(el.name, "clipPath" | "mask") {
                 return;
             }
+            let has_fill = el.attrs.iter().any(|(n, _)| *n == "fill");
             for (name, v) in &mut el.attrs {
                 if let Val::Lit(s) = v
-                    && (PAINT_ATTRS.contains(name) || *name == "color")
+                    && PAINT_ATTRS.contains(name)
                     && color_of(s).as_deref() == Some(color)
                 {
                     *s = "currentColor".into();
                 }
             }
+            // The implicit black fill, made explicit.
+            if FILLED.contains(&el.name) && !has_fill && default_fill && color == DEFAULT_FILL {
+                el.attrs.push(("fill", Val::Lit("currentColor".into())));
+            }
             for c in &mut el.children {
                 if let Node::El(e) = c {
-                    walk(e, color);
+                    walk(e, default_fill && !has_fill, color);
                 }
             }
         }
-        walk(&mut self.root, color);
+        walk(&mut self.root, true, color);
     }
 
     /// Whether the output defines any id (and so needs a per-instance
@@ -1241,6 +1317,69 @@ mod tests {
             jsx,
             "    <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" {...props}>\n      <g clipPath={`url(#${uid}-0)`}>\n        <path d=\"M5 12H19M19 12L12 5\" stroke=\"#0F172A\" strokeWidth=\"2\" strokeLinecap=\"round\" />\n        <circle cx=\"12\" cy=\"12\" r=\"2\" fill=\"#0f172a\" />\n      </g>\n      <defs>\n        <clipPath id={`${uid}-0`}>\n          <rect width=\"24\" height=\"24\" fill=\"white\" />\n        </clipPath>\n      </defs>\n    </svg>\n"
         );
+    }
+
+    #[test]
+    fn use_may_only_reference_images_and_basic_shapes() {
+        // 3 levels of 3 `<use>` of a group: would fan out 27x.
+        let bomb = r##"<svg viewBox="0 0 1 1"><defs><path id="p" d="M0 0h1"/><g id="a"><use href="#p"/><use href="#p"/><use href="#p"/></g><g id="b"><use href="#a"/><use href="#a"/><use href="#a"/></g><g id="c"><use href="#b"/><use href="#b"/></g><use id="u" href="#p"/></defs><use href="#c"/><use href="#u"/><use href="#p" fill="#123456"/><svg id="s"/><use href="#s"/></svg>"##;
+        let s = sanitize(bomb).unwrap();
+        let out = s.to_svg("x");
+        // The three inside `a`, `u` itself and the last one: each draws
+        // one path.
+        assert_eq!(out.matches("<use").count(), 5, "{out}");
+        assert!(
+            !out.contains("href=\"#x-1\""),
+            "a <use> of a <g> survived: {out}"
+        );
+        for r in [
+            "dropped <use> of a <g>",
+            "dropped <use> of a <use>",
+            "dropped <use> of a <svg>",
+        ] {
+            assert!(s.removed.contains(&r.to_string()), "{r}: {:?}", s.removed);
+        }
+        // Only the path id is still referenced.
+        assert_eq!(s.ids, 1, "{out}");
+    }
+
+    #[test]
+    fn implicit_black_fill_and_current_color_count_as_colors() {
+        // No fill anywhere: black. Converted explicitly.
+        let mut s = sanitize(r#"<svg viewBox="0 0 1 1"><path d="M0 0h1v1z"/></svg>"#).unwrap();
+        assert_eq!(s.single_color().as_deref(), Some("#000000"));
+        s.use_current_color("#000000");
+        assert!(
+            s.to_svg("x")
+                .contains("<path d=\"M0 0h1v1z\" fill=\"currentColor\"/>")
+        );
+        // An implicit black shape next to a red one: two colors.
+        let two = r##"<svg viewBox="0 0 1 1"><path d="M0 0h1"/><rect width="1" height="1" fill="#f00"/></svg>"##;
+        assert_eq!(sanitize(two).unwrap().single_color(), None);
+        // `fill="none"` on the root: unfilled shapes paint nothing.
+        let none = r##"<svg viewBox="0 0 1 1" fill="none"><path d="M0 0h1" stroke="#f00"/></svg>"##;
+        assert_eq!(
+            sanitize(none).unwrap().single_color().as_deref(),
+            Some("#ff0000")
+        );
+        // A group's fill applies below it.
+        let group = r##"<svg viewBox="0 0 1 1"><g fill="#0f0"><path d="M0 0h1"/></g></svg>"##;
+        assert_eq!(
+            sanitize(group).unwrap().single_color().as_deref(),
+            Some("#00ff00")
+        );
+        // currentColor is a color of its own.
+        let mixed = r##"<svg viewBox="0 0 1 1" fill="none"><path d="M0 0" fill="currentColor"/><path d="M1 1" fill="#f00"/></svg>"##;
+        assert_eq!(sanitize(mixed).unwrap().single_color(), None);
+        let only =
+            r##"<svg viewBox="0 0 1 1" fill="none"><path d="M0 0" stroke="currentColor"/></svg>"##;
+        assert_eq!(
+            sanitize(only).unwrap().single_color().as_deref(),
+            Some("currentcolor")
+        );
+        // A `color` attribute pins currentColor: not convertible.
+        let pinned = r##"<svg viewBox="0 0 1 1" fill="none" color="#f00"><path d="M0 0" stroke="currentColor"/></svg>"##;
+        assert_eq!(sanitize(pinned).unwrap().single_color(), None);
     }
 
     #[test]

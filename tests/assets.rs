@@ -535,3 +535,101 @@ fn assets_needs_a_project_and_roots() {
         "{stderr}"
     );
 }
+
+/// Review: node ids repeat across files, so a manifest exported from file
+/// A never labels file B's nodes by node id (only by component key), and a
+/// bare re-export never replays A's roots against B.
+#[test]
+fn the_manifest_is_tied_to_the_file_it_was_exported_from() {
+    let dir = project(GOLDEN_ASSETS, &ICONS);
+    let root = dir.path();
+    figmog(
+        root,
+        &["assets", "export", "--icons", "1:1", "--images", "2:1"],
+    )
+    .success();
+    let manifest = json_of(&fs::read(root.join("figmog.assets.json")).unwrap());
+    assert_eq!(manifest["sources"]["file"], KEY);
+    assert_eq!(manifest["icons"][0]["file"], KEY);
+
+    // File B: its 1:2 is an unrelated frame; its 1:3 an instance of the
+    // library arrow (same component key, another local id).
+    const OTHER: &str = "figmogassetsotherb34";
+    let b = json!({
+        "name": "Other", "version": "3", "lastModified": "2026-11-05T09:00:00Z",
+        "document": {"id": "0:0", "name": "Document", "type": "DOCUMENT", "children": [
+            {"id": "0:1", "name": "Page", "type": "CANVAS", "children": [
+                {"id": "1:1", "name": "Screen", "type": "FRAME",
+                 "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 100},
+                 "children": [
+                    {"id": "1:2", "name": "Unrelated", "type": "FRAME",
+                     "absoluteBoundingBox": {"x": 0, "y": 0, "width": 10, "height": 10},
+                     "children": []},
+                    {"id": "1:3", "name": "Arrow", "type": "INSTANCE", "componentId": "9:9",
+                     "absoluteBoundingBox": {"x": 0, "y": 20, "width": 24, "height": 24},
+                     "children": []}
+                 ]}
+            ]}
+        ]},
+        "components": {"9:9": {"key": "c0ffee0000000000000000000000000000000102",
+                               "name": "Name=Arrow Right", "description": "", "remote": true}},
+        "componentSets": {}, "styles": {}
+    });
+    let response = root.join("b.json");
+    fs::write(&response, b.to_string()).unwrap();
+    figmog(
+        root,
+        &["pull", OTHER, "--from-file", response.to_str().unwrap()],
+    )
+    .success();
+    fs::write(
+        root.join("figmog.toml"),
+        format!("[files]\ndefault = \"{OTHER}\"\n\n[assets]\n{GOLDEN_ASSETS}"),
+    )
+    .unwrap();
+    let spec = json_of(
+        &figmog(root, &["spec", "1:1", "--no-tailwind"])
+            .success()
+            .get_output()
+            .stdout,
+    );
+    let child = |id: &str| {
+        spec["node"]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert!(child("1:2").get("content").is_none(), "{}", child("1:2"));
+    assert_eq!(
+        child("1:3")["content"]["assets"][0]["component"],
+        "IconArrowRight"
+    );
+    // In file A, the same node id is the icon itself.
+    let spec_a = json_of(
+        &figmog(
+            root,
+            &[
+                "spec",
+                &format!("https://www.figma.com/design/{KEY}/x?node-id=1-2"),
+                "--no-tailwind",
+            ],
+        )
+        .success()
+        .get_output()
+        .stdout,
+    );
+    assert_eq!(
+        spec_a["node"]["content"]["assets"][0]["kind"], "icon",
+        "{spec_a}"
+    );
+
+    let out = figmog(root, &["assets", "export"]).failure().code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains(&format!("figmog.assets.json was exported from Figma file {KEY}, but this project's file is {OTHER}")),
+        "{stderr}"
+    );
+}
