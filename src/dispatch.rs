@@ -93,6 +93,22 @@ pub(crate) fn arg_usize(args: &Value, key: &str) -> Option<usize> {
     args.get(key).and_then(Value::as_u64).map(|n| n as usize)
 }
 
+/// A JSON Schema non-negative integer, including integral decimal/exponent
+/// representations, that fits the platform's index size.
+fn json_usize(value: &Value) -> Option<usize> {
+    if let Some(integer) = value.as_u64() {
+        return usize::try_from(integer).ok();
+    }
+    let number = value.as_f64()?;
+    // Use an exclusive power-of-two bound: usize::MAX can round up as f64.
+    let upper_exclusive = 2.0_f64.powi(usize::BITS as i32);
+    if number.is_finite() && number.fract() == 0.0 && (0.0..upper_exclusive).contains(&number) {
+        Some(number as usize)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
@@ -312,9 +328,7 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
                 .transpose()?;
             let limit = match args.get("limit") {
                 None => query::DEFAULT_AT_LIMIT,
-                Some(value) => value
-                    .as_u64()
-                    .and_then(|n| usize::try_from(n).ok())
+                Some(value) => json_usize(value)
                     .ok_or_else(|| "expected non-negative integer for `limit`".to_string())?,
             };
             query::at(nodes, children, x, y, page, under, limit)

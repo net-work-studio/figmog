@@ -2714,6 +2714,65 @@ fn at_is_scoped_and_bounded_across_direct_socket_and_mcp_requests() {
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
 
+#[test]
+fn at_accepts_integral_json_limit_representations_within_usize() {
+    const KEY: &str = "figmogpointnumbers01";
+    let dir = default_root_fixture(KEY, common::fixture_at());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+    let max = usize::MAX.to_string();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+    let float_overflow = format!("{overflow}.0");
+    for (limit, expected_len) in [
+        ("0", Some(0)),
+        ("1", Some(1)),
+        ("0.0", Some(0)),
+        ("1.0", Some(1)),
+        ("1e2", Some(100)),
+        ("-0.0", Some(0)),
+        (max.as_str(), Some(108)),
+        ("1.5", None),
+        ("-1.0", None),
+        ("1e100", None),
+        (overflow.as_str(), None),
+        (float_overflow.as_str(), None),
+    ] {
+        // Send the original numeric spelling over the wire, including exponents.
+        let args = format!(r#"{{"page":"0:1","x":0,"y":0,"limit":{limit}}}"#);
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"figmog_at","arguments":{args}}}}}"#
+        );
+        writeln!(stdin, "{request}").unwrap();
+        stdin.flush().unwrap();
+        let response = recv(&rx);
+        if let Some(expected_len) = expected_len {
+            assert_eq!(
+                response["result"]["isError"], false,
+                "limit {limit}: {response}"
+            );
+            assert_eq!(
+                result_json(&response).as_array().unwrap().len(),
+                expected_len,
+                "limit {limit}"
+            );
+        } else {
+            assert_eq!(
+                response["result"]["isError"], true,
+                "limit {limit}: {response}"
+            );
+            assert!(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("expected non-negative integer for `limit`"),
+                "limit {limit}: {response}"
+            );
+        }
+    }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
 /// m6: a handful of read commands (deliberately including `where
 /// --pointer` with no `--equals` — C2's exact regression shape — and
 /// `status` — m1's) run once direct (before serve ever starts, so the
