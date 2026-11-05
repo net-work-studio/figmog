@@ -1,8 +1,18 @@
-# @figmog/react (screenshot runner)
+# @figmog/react
 
-The start of the future `@figmog/react` package. For now it holds one small
-tool, `figmog-shot`, which produces the visual evidence for a verification
-run:
+figmog's JavaScript side, so the Rust crate gains no dependencies
+(spec: `docs/SPEC.md` §20):
+
+- **A Vite plugin** (`@figmog/react/vite`), development server only:
+  optional `data-figmog` / `data-figmog-node` attributes on mapped
+  components, and a **local bridge** from the dev page to the project's
+  figmog. See [The Vite plugin](#the-vite-plugin) and
+  [The bridge](#the-bridge).
+- **Verification targets**: `figmog-shot target` / `captureTarget` capture
+  one element through the explicit locator of a target manifest. See
+  [Targets](#targets).
+- **The screenshot runner**, `figmog-shot`, which produces the visual
+  evidence for a verification run:
 
 - **capture** one element of a page (URL + CSS selector + viewport) as a PNG
   in headless Chromium, under a pinned, stable rendering environment;
@@ -12,7 +22,99 @@ run:
   of every image.
 
 It is private and not published. It does not touch the Rust crate at the
-repository root.
+repository root; it reads project settings and the component map through the
+`figmog` binary (`figmog settings`, `figmog map check`/`coverage`), never by
+parsing figmog.toml itself.
+
+## The Vite plugin
+
+```js
+// vite.config.js
+import tailwindcss from "@tailwindcss/vite";
+import { figmog } from "@figmog/react/vite";
+
+export default {
+  plugins: [figmog(), tailwindcss()], // before any plugin that compiles JSX
+};
+```
+
+Options: `figmog` (binary; default `FIGMOG_BIN`, else `figmog` on `PATH`),
+`attributes` (default: figmog.toml `[inspector] attributes`, off),
+`bridge` (default `true`), `serveArgs` (extra `figmog serve` flags for the
+bridge's relay, e.g. `["--no-watch"]`).
+
+The plugin applies to `vite` / `vite dev` only. `vite build` never runs it:
+the built app contains no attribute, bridge code or token (tested on the
+built files).
+
+**Attributes are optional; explicit locators come first.** When enabled,
+the root element of each component in `figmog.map.json` gets
+`data-figmog="component_set:<key>"` (or `component:<key>`) and, when the
+mirror knows exactly one node for it, `data-figmog-node="<id>"`. A component
+whose root is not one DOM element on every path — a fragment, another
+component, an array — is skipped with a warning on the dev server's console,
+never half-marked; so is one that already has `data-figmog`. One component
+renders many instances (every card gets the same attributes), so
+verification captures through a `data-testid` in figmog.targets.json, not
+through these.
+
+## The bridge
+
+The dev page can call figmog's read tools and renders:
+
+```js
+import { callFigmog, resultJson } from "@figmog/react/client";
+
+const node = resultJson(await callFigmog("figmog_node", { id: "10:1" }));
+```
+
+or directly: `POST /__figmog/bridge` with `{"tool", "arguments"}`, header
+`x-figmog-token: window.__FIGMOG_BRIDGE__.token`. The answer is the tool's
+MCP result. The bridge forwards to the project's background figmog through
+one `figmog serve` relay it starts on first use (the same relay an agent
+uses, so default files, the project's map and token settings, and the
+owner's handshake all come from figmog itself).
+
+Security (Vite's `--host` makes the dev server reachable from the network,
+so it is not a boundary on its own):
+
+- a per-session token, generated when the dev server starts and injected
+  into the dev page only;
+- requests from this machine only (loopback peer), with a `Host` of
+  `localhost`, `127.0.0.1` or `[::1]`;
+- `Origin` must be the dev page's own origin — another local dev server's
+  page is refused, and the CORS headers Vite adds for localhost origins are
+  removed from every answer;
+- read tools and `figmog_images` only — no `figmog_sync`/`figmog_open`,
+  `figmog_files`, internal write tools or desktop-proxy tools;
+- only this project's Figma files (figmog.toml `[files]`);
+- the Figma token never leaves figmog.
+
+## Targets
+
+`figmog.targets.json` at the project root names each verification target:
+
+```json
+{
+  "version": 1,
+  "targets": [
+    { "name": "pricing-pro", "figma": { "node": "1:2" }, "route": "/", "locator": { "testid": "pricing-pro" } }
+  ]
+}
+```
+
+`locator` is exactly one of `testid` (a `data-testid` value) or `css`.
+
+```sh
+node dist/src/cli.js target --manifest figmog.targets.json --target pricing-pro \
+  --base-url http://localhost:5173 --out shots
+```
+
+writes `shots/pricing-pro-1440x900.png` and `-390x844.png` (the v1 contract
+viewports; `--viewport WxH` to override) with their capture manifests, plus
+`shots/pricing-pro.target.json`, and prints that path. Like `capture`, it
+fails (exit 1) unless the locator matches exactly one element. The API is
+`captureTarget({ manifest, target, baseUrl, outDir })`.
 
 ## Setup
 
@@ -42,6 +144,15 @@ specific binary instead, set `FIGMOG_SHOT_CHROMIUM` to its path (or pass
 The tests start a tiny `node:http` server over `test/fixtures/` (a synthetic
 card page plus a "wrong padding" variant) and drive real Chromium captures at
 1440 px and 390 px.
+
+`test/plugin.test.ts` runs the plugin on a real Vite dev server listening on
+every interface (like `vite --host`), with `test/fixtures/fake-figmog.mjs`
+standing in for the figmog binary (no Rust build needed): attributes from
+settings and options, a clean production build, and every bridge refusal
+(token, origin, host, non-loopback peer, tools, other projects' files,
+malformed requests). `test/mark.test.ts` covers the attribute transform and
+`test/target.test.ts` the target manifest and runner. The end-to-end run
+against the real figmog binary is `examples/dev-plugin`'s test.
 
 `test/tokens.test.ts` checks `figmog tokens export` (NWS-2967, NWS-2948) in a real
 browser: it compiles the Rust golden file `tests/fixtures/tokens/export.css`
@@ -157,11 +268,13 @@ relative to the output directory, never absolute paths.
 
 Everything under `test/fixtures/` is synthetic. The tests produce the Figma
 render by capturing the correct card page. That capture stands in for a real
-Figma export until the bridge exists.
+Figma export (no Figma access in the tests).
 
 ## Dependencies and why
 
-Every dependency is pinned exactly; `package-lock.json` is committed.
+Every dependency is pinned exactly (the optional `vite` peer is a range, so
+the plugin uses the app's own Vite 8; its development copy is pinned);
+`package-lock.json` is committed.
 
 Runtime:
 
@@ -179,8 +292,18 @@ Runtime:
   its only dependency is `pngjs`, which this package already uses. Writing a
   perceptual diff with anti-aliasing detection here would duplicate it badly.
 
+Peer (optional):
+
+- **`vite` `^8.3.5`**: the plugin is a Vite plugin, so it uses the app's
+  own Vite: its plugin API, and `parseAst` (Vite's bundled Oxc parser) to
+  find a component's root JSX element without adding Babel or a parser of
+  our own. Optional, because the screenshot runner does not need it.
+
 Development:
 
+- **`vite` 8.3.5**: the peer dependency above, pinned for the type-checker
+  and the plugin tests (a real dev server and production build). Same
+  version as `examples/slice/app`.
 - **`typescript` 7.0.2**: compiler and type-checker (`tsc`). It also builds
   the tests, so no `tsx` or `ts-node` is needed.
 - **`@types/node` 22.20.5**: Node 22 API types for `tsc`.

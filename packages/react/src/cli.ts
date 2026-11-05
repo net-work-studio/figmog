@@ -2,13 +2,15 @@
 import { parseArgs } from "node:util";
 import { captureToDir, parseViewport } from "./capture.js";
 import { compareToDir } from "./compare.js";
+import { captureTarget } from "./target.js";
 
 const USAGE = `usage:
   figmog-shot capture --url URL --selector CSS --viewport WIDTHxHEIGHT --out DIR [--name NAME]
   figmog-shot compare --figma FIGMA.png --before BEFORE.png --after AFTER.png --out DIR
+  figmog-shot target --manifest figmog.targets.json --target NAME --base-url URL --out DIR [--viewport WIDTHxHEIGHT]...
 `;
 
-function required(values: Record<string, string | boolean | undefined>, name: string): string {
+function required(values: Record<string, string | string[] | boolean | undefined>, name: string): string {
   const value = values[name];
   if (typeof value !== "string" || value === "") {
     throw new UsageError(`missing --${name}`);
@@ -58,6 +60,26 @@ async function main(argv: string[]): Promise<void> {
       outDir: required(values, "out"),
     });
     process.stdout.write(`${manifestPath}\n`);
+  } else if (command === "target") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        "base-url": { type: "string" },
+        manifest: { type: "string" },
+        out: { type: "string" },
+        target: { type: "string" },
+        viewport: { type: "string", multiple: true },
+      },
+      strict: true,
+    });
+    const { summaryPath } = await captureTarget({
+      baseUrl: required(values, "base-url"),
+      manifest: required(values, "manifest"),
+      outDir: required(values, "out"),
+      target: required(values, "target"),
+      ...(values.viewport === undefined ? {} : { viewports: values.viewport.map(parseViewport) }),
+    });
+    process.stdout.write(`${summaryPath}\n`);
   } else if (command === "--help" || command === "-h" || command === "help") {
     process.stdout.write(USAGE);
   } else {

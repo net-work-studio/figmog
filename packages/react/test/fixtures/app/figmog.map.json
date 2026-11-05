@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "components": [
+    { "figma": { "component_set": "5e7000000000000000000000000000000000a001" }, "code": { "path": "src/Card.jsx", "export": "Card" } },
+    { "figma": { "component": "5e7000000000000000000000000000000000b001" }, "code": { "path": "src/Badge.jsx", "export": "Badge" } },
+    { "figma": { "component": "5e7000000000000000000000000000000000c001" }, "code": { "path": "src/Card.jsx", "export": "Star" } }
+  ]
+}

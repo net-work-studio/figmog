@@ -267,7 +267,7 @@ fn init_takes_a_new_react_tailwind_repo_to_a_mirror_and_mcp_server() {
     assert_eq!(settings["stack"]["framework"], "react");
     assert_eq!(
         settings["inspector"],
-        json!({"enabled": true, "shortcut": "Alt+Shift+F"})
+        json!({"enabled": true, "shortcut": "Alt+Shift+F", "attributes": false})
     );
     assert_eq!(
         settings["verify"],
