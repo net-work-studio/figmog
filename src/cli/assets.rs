@@ -101,10 +101,22 @@ pub(super) fn run(
 
     let previous = previous_manifest(layout, &settings.manifest, *force)?;
     let sources = if icons.is_empty() && images.is_empty() {
-        previous
+        let recorded = previous
             .as_ref()
             .map(|p| p.sources.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The recorded roots are node ids of the recorded file: never
+        // replay them against another one.
+        if let Some(file) = &recorded.file
+            && db.key.as_deref() != Some(file.as_str())
+        {
+            return Err(format!(
+                "{} was exported from Figma file {file}, but this project's file is {} — pass --icons/--images to export from it (replacing the manifest)",
+                settings.manifest,
+                db.key.as_deref().unwrap_or("unknown")
+            ));
+        }
+        recorded
     } else {
         // Sorted, so the manifest doesn't depend on the flags' order.
         let canonical = |ids: &[String]| -> Vec<String> {
@@ -115,6 +127,7 @@ pub(super) fn run(
                 .collect()
         };
         Sources {
+            file: db.key.clone(),
             icons: canonical(icons),
             images: canonical(images),
         }
@@ -198,18 +211,15 @@ pub(super) fn run(
     } else {
         BTreeMap::new()
     };
-    let stale: Vec<&str> = previous
-        .iter()
-        .flat_map(|p| {
+    let stale = stale(
+        previous.iter().flat_map(|p| {
             p.icons
                 .iter()
                 .flat_map(|i| [i.path.as_str(), i.svg.as_str()])
                 .chain(p.images.iter().map(|i| i.path.as_str()))
-        })
-        .filter(|p| !plan.files.contains_key(*p))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+        }),
+        &plan.files,
+    );
     let written = statuses.values().filter(|s| **s == "written").count();
     let files: Vec<Value> = statuses
         .iter()
@@ -439,73 +449,217 @@ fn fetch_routed(
 
 // ---- writing ----
 
+/// Files a previous export listed that this one doesn't write — except a
+/// path that differs from a new one only in case (a renamed icon on a
+/// case-insensitive filesystem is the same, live file).
+fn stale<'a>(
+    previous: impl Iterator<Item = &'a str>,
+    files: &BTreeMap<String, (Kind, Vec<u8>)>,
+) -> Vec<&'a str> {
+    let live: BTreeSet<String> = files.keys().map(|p| p.to_lowercase()).collect();
+    previous
+        .filter(|p| !live.contains(&p.to_lowercase()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// How one path component exists in its directory.
+#[derive(Debug, PartialEq, Eq)]
+enum Entry {
+    Missing,
+    /// An entry with exactly this name.
+    Exact,
+    /// Found only under another spelling (a case-insensitive filesystem):
+    /// the name actually on disk.
+    Alias(String),
+}
+
+/// Classify `name`, given whether looking it up found something and the
+/// directory's actual entry names. Pure, so case-insensitive behavior is
+/// testable on any filesystem.
+fn classify(found: bool, entries: &[String], name: &str) -> Entry {
+    if !found {
+        return Entry::Missing;
+    }
+    if entries.iter().any(|e| e == name) {
+        return Entry::Exact;
+    }
+    let lower = name.to_lowercase();
+    match entries.iter().find(|e| e.to_lowercase() == lower) {
+        Some(actual) => Entry::Alias(actual.clone()),
+        // Found, but listed under no recognizable spelling (Unicode
+        // normalization): report it as is, never guess.
+        None => Entry::Alias(name.to_string()),
+    }
+}
+
+fn entry_names(dir: &Path) -> Result<Vec<String>, String> {
+    std::fs::read_dir(dir)
+        .map_err(|e| format!("listing {}: {e}", dir.display()))?
+        .map(|e| {
+            e.map(|e| e.file_name().to_string_lossy().into_owned())
+                .map_err(|e| format!("listing {}: {e}", dir.display()))
+        })
+        .collect()
+}
+
+/// What is on disk at a write target.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Existing {
+    bytes: Option<Vec<u8>>,
+    /// The file's name on disk when it differs from the target's only in
+    /// case (it is renamed on write).
+    alias: Option<String>,
+}
+
 /// Check `rel` (a project-relative path) for writing: no symlink and
 /// nothing but directories on its way from `root`, not a symlink or a
-/// non-file itself. Returns the existing bytes, if any.
-fn check_target(root: &Path, rel: &str) -> Result<Option<Vec<u8>>, String> {
+/// non-file itself, and no directory spelled differently on disk.
+fn check_target(root: &Path, rel: &str) -> Result<Existing, String> {
     check_project_path(rel).map_err(|e| format!("{rel}: {e}"))?;
     let parts: Vec<&str> = rel
         .split('/')
         .filter(|p| !p.is_empty() && *p != ".")
         .collect();
     let mut path = root.to_path_buf();
+    let mut alias = None;
     for (i, part) in parts.iter().enumerate() {
+        let parent = path.clone();
         path.push(part);
         let shown = parts[..=i].join("/");
         let last = i + 1 == parts.len();
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Existing::default());
+            }
+            Err(e) => return Err(format!("checking {shown}: {e}")),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "{shown} is a symlink — figmog writes assets only through real directories inside the project; remove the link or change [assets] in figmog.toml"
+            ));
+        }
+        if !last && !meta.is_dir() {
+            return Err(format!("{shown} is not a directory"));
+        }
+        if last && !meta.is_file() {
+            return Err(format!("{shown} is not a regular file"));
+        }
+        match classify(true, &entry_names(&parent)?, part) {
+            Entry::Exact | Entry::Missing => {}
+            Entry::Alias(actual) if last => alias = Some(actual),
+            Entry::Alias(actual) => {
                 return Err(format!(
-                    "{shown} is a symlink — figmog writes assets only through real directories inside the project; remove the link or change [assets] in figmog.toml"
+                    "{shown} exists on disk as {actual} (a case-insensitive filesystem) — rename the directory or change [assets] in figmog.toml"
                 ));
             }
-            Ok(meta) if !last && !meta.is_dir() => {
-                return Err(format!("{shown} is not a directory"));
-            }
-            Ok(meta) if last && !meta.is_file() => {
-                return Err(format!("{shown} is not a regular file"));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("checking {shown}: {e}")),
         }
     }
-    std::fs::read(&path)
-        .map(Some)
-        .map_err(|e| format!("reading {rel}: {e}"))
+    let bytes = std::fs::read(&path).map_err(|e| format!("reading {rel}: {e}"))?;
+    Ok(Existing {
+        bytes: Some(bytes),
+        alias,
+    })
 }
 
-/// Write `bytes` to `path` as a regular file, never through a symlink
-/// swapped in after the check.
-fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+/// Open a new file for writing: it must not exist, and is never reached
+/// through a symlink.
+fn create_new(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.flush()
+    options.open(path)
 }
 
-/// Check every planned file, then write the ones whose bytes differ.
-/// Returns each path's status (`written` / `unchanged`).
+/// A name in `dir` nothing uses yet, for a temporary file.
+fn temp_name(dir: &Path, name: &str, n: u32) -> std::path::PathBuf {
+    dir.join(format!(".{name}.figmog-{}-{n}.tmp", std::process::id()))
+}
+
+/// Write `bytes` as `dir/name` atomically: a new temporary file in the
+/// same directory, then renamed over the target (a rename replaces a
+/// link, it never writes through one).
+fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    for n in 0..100 {
+        let tmp = temp_name(dir, name, n);
+        let mut file = match create_new(&tmp) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = file
+            .write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| std::fs::rename(&tmp, dir.join(name)));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return written;
+    }
+    Err(std::io::Error::other("no free temporary file name"))
+}
+
+/// Create `rel`'s directories under `root` one at a time, refusing any
+/// symlink or non-directory on the way (never `create_dir_all`).
+fn ensure_dirs(root: &Path, rel_dir: &[&str]) -> Result<(), String> {
+    let mut path = root.to_path_buf();
+    for (i, part) in rel_dir.iter().enumerate() {
+        path.push(part);
+        let shown = rel_dir[..=i].join("/");
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "{shown} is a symlink — refusing to write through it"
+                ));
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(format!("{shown} is not a directory")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&path) {
+                    Ok(()) => {}
+                    // Created meanwhile: checked again on the next pass.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let meta = std::fs::symlink_metadata(&path)
+                            .map_err(|e| format!("checking {shown}: {e}"))?;
+                        if meta.file_type().is_symlink() || !meta.is_dir() {
+                            return Err(format!("{shown} is not a real directory"));
+                        }
+                    }
+                    Err(e) => return Err(format!("creating {shown}: {e}")),
+                }
+            }
+            Err(e) => return Err(format!("checking {shown}: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Check every planned file, then write the ones whose bytes (or
+/// on-disk spelling) differ. Returns each path's status (`written` /
+/// `unchanged`).
 fn write_files(
     root: &Path,
     plan: &Plan,
     force: bool,
 ) -> Result<BTreeMap<String, &'static str>, String> {
     let mut statuses = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
     for (rel, (kind, bytes)) in &plan.files {
-        let status = match check_target(root, rel)? {
+        let existing = check_target(root, rel)?;
+        let status = match existing.bytes {
             None => "written",
-            Some(existing) if existing == *bytes => "unchanged",
+            Some(old) if old == *bytes && existing.alias.is_none() => "unchanged",
             Some(_) if force => "written",
-            Some(existing) => match kind {
-                Kind::Generated if assets::is_generated(&existing) => "written",
+            Some(old) if old == *bytes => "written",
+            Some(old) => match kind {
+                Kind::Generated if assets::is_generated(&old) => "written",
                 Kind::Generated => {
                     return Err(format!(
                         "{rel} exists and was not generated by figmog (it does not start with figmog's generated header) — refusing to overwrite it; move it, change [assets] in figmog.toml, or pass --force"
@@ -518,20 +672,43 @@ fn write_files(
                 }
             },
         };
+        if let Some(alias) = existing.alias {
+            aliases.insert(rel.clone(), alias);
+        }
         statuses.insert(rel.clone(), status);
     }
     for (rel, status) in &statuses {
         if *status != "written" {
             continue;
         }
-        let path = root.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
-        }
-        // Directories created above are real; re-check before writing.
+        let parts: Vec<&str> = rel
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != ".")
+            .collect();
+        let (name, dirs) = parts.split_last().expect("checked: a file path");
+        ensure_dirs(root, dirs)?;
+        let dir = dirs.iter().fold(root.to_path_buf(), |p, d| p.join(d));
+        // Re-check now that the directories exist.
         check_target(root, rel)?;
-        write_file(&path, &plan.files[rel].1).map_err(|e| format!("writing {rel}: {e}"))?;
+        // A case-only rename: move the old spelling aside first, so the
+        // new file gets the new name on a case-insensitive filesystem.
+        let aside = match aliases.get(rel) {
+            Some(alias) => {
+                let aside = (0..100)
+                    .map(|n| temp_name(&dir, name, 1000 + n))
+                    .find(|p| std::fs::symlink_metadata(p).is_err())
+                    .ok_or_else(|| format!("renaming {rel}: no free temporary name"))?;
+                std::fs::rename(dir.join(alias), &aside)
+                    .map_err(|e| format!("renaming {alias} for {rel}: {e}"))?;
+                Some(aside)
+            }
+            None => None,
+        };
+        write_atomic(&dir, name, &plan.files[rel].1).map_err(|e| format!("writing {rel}: {e}"))?;
+        if let Some(aside) = aside {
+            std::fs::remove_file(&aside)
+                .map_err(|e| format!("removing the old spelling of {rel}: {e}"))?;
+        }
     }
     Ok(statuses)
 }
@@ -563,7 +740,87 @@ mod tests {
                 .unwrap_err()
                 .contains("not a directory")
         );
-        assert_eq!(check_target(root, "src/new/file").unwrap(), None);
-        assert_eq!(check_target(root, "plain").unwrap(), Some(b"p".to_vec()));
+        assert_eq!(
+            check_target(root, "src/new/file").unwrap(),
+            Existing::default()
+        );
+        assert_eq!(
+            check_target(root, "plain").unwrap(),
+            Existing {
+                bytes: Some(b"p".to_vec()),
+                alias: None
+            }
+        );
+        // ensure_dirs never creates through a symlink.
+        let e = ensure_dirs(root, &["src", "icons", "svg"]).unwrap_err();
+        assert!(e.starts_with("src/icons is a symlink"), "{e}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+    }
+
+    /// Case-insensitive filesystems, simulated: a lookup of `IconStar.tsx`
+    /// that finds `Iconstar.tsx` is an alias, never an exact match.
+    #[test]
+    fn classify_spots_case_aliases() {
+        let entries = vec!["Iconstar.tsx".to_string(), "index.ts".to_string()];
+        assert_eq!(classify(false, &entries, "IconStar.tsx"), Entry::Missing);
+        assert_eq!(classify(true, &entries, "index.ts"), Entry::Exact);
+        assert_eq!(
+            classify(true, &entries, "IconStar.tsx"),
+            Entry::Alias("Iconstar.tsx".into())
+        );
+        assert_eq!(
+            classify(true, &entries, "Odd.tsx"),
+            Entry::Alias("Odd.tsx".into())
+        );
+    }
+
+    #[test]
+    fn a_case_alias_of_a_live_file_is_not_stale() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "src/icons/IconStar.tsx".to_string(),
+            (Kind::Generated, vec![]),
+        );
+        let previous = ["src/icons/Iconstar.tsx", "src/icons/IconGone.tsx"];
+        assert_eq!(
+            stale(previous.into_iter(), &files),
+            ["src/icons/IconGone.tsx"]
+        );
+    }
+
+    /// A case-only rename on a real directory: the old spelling is moved
+    /// aside and replaced, whatever the filesystem's case sensitivity.
+    #[test]
+    fn write_files_renames_a_case_alias_and_writes_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("icons")).unwrap();
+        let old = format!("{}old", assets::js_header());
+        std::fs::write(root.join("icons/Iconstar.tsx"), &old).unwrap();
+        let new = format!("{}new", assets::js_header()).into_bytes();
+        let mut files = BTreeMap::new();
+        files.insert(
+            "icons/IconStar.tsx".to_string(),
+            (Kind::Generated, new.clone()),
+        );
+        let plan = Plan {
+            files,
+            icons: vec![],
+            images: vec![],
+            skipped: vec![],
+        };
+        let statuses = write_files(root, &plan, false).unwrap();
+        assert_eq!(statuses["icons/IconStar.tsx"], "written");
+        let names = entry_names(&root.join("icons")).unwrap();
+        // Case-sensitive: both spellings are separate files (the old one
+        // is left for `stale`); case-insensitive: only the new spelling.
+        assert!(names.contains(&"IconStar.tsx".to_string()), "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+        assert_eq!(std::fs::read(root.join("icons/IconStar.tsx")).unwrap(), new);
+        // Unchanged bytes: nothing written.
+        assert_eq!(
+            write_files(root, &plan, false).unwrap()["icons/IconStar.tsx"],
+            "unchanged"
+        );
     }
 }

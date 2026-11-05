@@ -78,70 +78,14 @@ pub(crate) fn is_generated(bytes: &[u8]) -> bool {
 
 // ---- hashing and sniffing ----
 
-/// SHA-256 (FIPS 180-4) of `data`, as lowercase hex.
+/// SHA-256 of `data`, as lowercase hex (`ring`, already compiled in
+/// through rustls).
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let mut msg = data.to_vec();
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ (!e & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *x = x.wrapping_add(y);
-        }
-    }
-    h.iter().map(|x| format!("{x:08x}")).collect()
+    ring::digest::digest(&ring::digest::SHA256, data)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The raster format `bytes` are, from their magic number — never from a
@@ -197,6 +141,16 @@ fn pascal(raw: &str) -> String {
         .collect()
 }
 
+/// Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+/// `LPT1`–`LPT9`, any case): not usable as a file stem there.
+fn is_reserved_stem(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+}
+
 /// The component name for an icon named `raw` (already reduced to the
 /// words that name it): PascalCase, starting with `prefix` (not doubled
 /// when the name already starts with it as a word).
@@ -219,6 +173,11 @@ pub(crate) fn component_name(prefix: &str, raw: &str) -> Result<String, String> 
     } else {
         format!("{prefix}{base}")
     };
+    if is_reserved_stem(&name) {
+        return Err(format!(
+            "component name {name} is a reserved file name on Windows — rename the icon in Figma or change [assets] prefix"
+        ));
+    }
     if name.len() > MAX_COMPONENT {
         return Err(format!(
             "component name {}… is longer than {MAX_COMPONENT} characters",
@@ -483,10 +442,13 @@ pub(crate) struct Plan {
     pub(crate) skipped: Vec<Value>,
 }
 
-/// The node ids an export starts from, kept in the manifest so a plain
-/// `figmog assets export` repeats it.
+/// What an export starts from — the Figma file and the root node ids —
+/// kept in the manifest so a plain `figmog assets export` repeats it (and
+/// node ids are only ever read against the file they belong to).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Sources {
+    /// The file key (none for a store with no known key).
+    pub(crate) file: Option<String>,
     pub(crate) icons: Vec<String>,
     pub(crate) images: Vec<String>,
 }
@@ -627,7 +589,8 @@ pub(crate) fn plan(
         let key = inventory.keys.get(&r.source.node_id);
         manifest_icons.push(json!({
             "component": r.name,
-            "figma_name": r.source.figma_name,
+            "figma_name": shorten(&r.source.figma_name),
+            "file": sources.file,
             "key": key,
             "node_id": r.source.node_id,
             "path": component_path,
@@ -710,6 +673,7 @@ pub(crate) fn plan(
             continue;
         }
         let row = json!({
+            "file": sources.file,
             "image_ref": r,
             "path": path,
             "url": url,
@@ -726,7 +690,7 @@ pub(crate) fn plan(
     let manifest = json!({
         MANIFEST_MARKER: GENERATED,
         "version": MANIFEST_VERSION,
-        "sources": {"icons": sources.icons, "images": sources.images},
+        "sources": {"file": sources.file, "icons": sources.icons, "images": sources.images},
         "icons": manifest_icons,
         "images": manifest_images,
     });
@@ -746,11 +710,26 @@ pub(crate) fn plan(
     }
 }
 
+/// A Figma name as the manifest keeps it: at most [`MAX_FIGMA_NAME`]
+/// bytes (cut at a character boundary, `…` appended).
+fn shorten(name: &str) -> String {
+    if name.len() <= MAX_FIGMA_NAME {
+        return name.to_string();
+    }
+    let mut end = MAX_FIGMA_NAME;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &name[..end])
+}
+
 // ---- reading a manifest back ----
 
 /// The icon entries of a manifest, as `figmog spec` uses them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IconRef {
+    /// The file `node_id` belongs to (none: unknown).
+    pub(crate) file: Option<String>,
     pub(crate) node_id: String,
     pub(crate) key: Option<String>,
     pub(crate) component: String,
@@ -773,6 +752,19 @@ pub(crate) struct AssetIndex {
     pub(crate) icons: Vec<IconRef>,
     pub(crate) images: Vec<ImageRef>,
     pub(crate) sources: Sources,
+    /// The file the spec using this index describes, as the CLI and the
+    /// relay resolved it ([`AssetIndex::for_file`]): an icon is matched
+    /// by node id only when it was exported from this file.
+    pub(crate) for_file: Option<String>,
+}
+
+/// An optional Figma file key field.
+fn file_field(o: &Map<String, Value>, key: &str, at: &str) -> Result<Option<String>, String> {
+    match o.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(k)) if crate::ident::is_file_key(k) => Ok(Some(k.clone())),
+        Some(_) => Err(format!("{at}{key}: expected a Figma file key or null")),
+    }
 }
 
 fn field<'a>(o: &'a Map<String, Value>, key: &str, at: &str) -> Result<&'a str, String> {
@@ -858,6 +850,7 @@ impl AssetIndex {
                 Some(_) => return Err(format!("{at}.key: expected a component key or null")),
             };
             index.icons.push(IconRef {
+                file: file_field(o, "file", &format!("{at}."))?,
                 node_id: node_id.into(),
                 key,
                 component: component.into(),
@@ -892,11 +885,20 @@ impl AssetIndex {
         if let Some(s) = root.get("sources") {
             let s = s.as_object().ok_or("sources: expected an object")?;
             index.sources = Sources {
+                file: file_field(s, "file", "sources.")?,
                 icons: ids(s.get("icons"), "sources.icons")?,
                 images: ids(s.get("images"), "sources.images")?,
             };
         }
+        index.for_file = file_field(root, "for_file", "")?;
         Ok(index)
+    }
+
+    /// This index for a spec of file `target` (none: unknown — no icon is
+    /// then matched by node id).
+    pub(crate) fn for_file(mut self, target: Option<&str>) -> AssetIndex {
+        self.for_file = target.map(str::to_string);
+        self
     }
 
     /// The normalized index, as `figmog_spec`'s `assets` argument;
@@ -905,7 +907,9 @@ impl AssetIndex {
     pub(crate) fn to_json(&self) -> Value {
         json!({
             "version": MANIFEST_VERSION,
+            "for_file": self.for_file,
             "icons": self.icons.iter().map(|i| json!({
+                "file": i.file,
                 "node_id": i.node_id,
                 "key": i.key,
                 "component": i.component,
@@ -921,11 +925,18 @@ impl AssetIndex {
     }
 
     /// The icon exported from the component with `key`, else from node
-    /// `node_id` (keys first: they are the same in every file that uses a
-    /// library component; node ids are file-local).
+    /// `node_id` — the latter only for an icon exported from the file this
+    /// index is [for](AssetIndex::for_file) (keys are the same in every
+    /// file that uses a library component; node ids are file-local and
+    /// repeat across files).
     pub(crate) fn icon(&self, key: Option<&str>, node_id: &str) -> Option<&IconRef> {
         key.and_then(|k| self.icons.iter().find(|i| i.key.as_deref() == Some(k)))
-            .or_else(|| self.icons.iter().find(|i| i.node_id == node_id))
+            .or_else(|| {
+                let file = self.for_file.as_deref()?;
+                self.icons
+                    .iter()
+                    .find(|i| i.node_id == node_id && i.file.as_deref() == Some(file))
+            })
     }
 
     /// The exported image of `image_ref`.
@@ -988,6 +999,21 @@ mod tests {
             component_name("Glyph", "icon star").unwrap(),
             "GlyphIconStar"
         );
+        for (prefix, raw) in [
+            ("Co", "n"),
+            ("Nul", "nul"),
+            ("Com", "1"),
+            ("Lpt", "9"),
+            ("Aux", "aux"),
+        ] {
+            let e = component_name(prefix, raw).unwrap_err();
+            assert!(e.contains("reserved file name"), "{prefix}{raw}: {e}");
+        }
+        assert_eq!(component_name("Com", "10").unwrap(), "Com10");
+        assert_eq!(component_name("Con", "sole").unwrap(), "ConSole");
+        // Long Figma names are cut in the manifest.
+        assert_eq!(shorten(&"é".repeat(300)).chars().count(), 257);
+        assert_eq!(shorten("short"), "short");
     }
 
     #[test]
@@ -1135,13 +1161,27 @@ mod tests {
                 bytes: Ok(b"GIF89a".to_vec()),
             }],
             &Sources {
+                file: Some("figmogassetsfilea1".into()),
                 icons: vec!["1:1".into()],
                 images: vec!["2:1".into()],
             },
             &inv,
         );
         let manifest: Value = serde_json::from_slice(&p.files["figmog.assets.json"].1).unwrap();
+        // Node ids match only for the file they came from; keys always.
         let index = AssetIndex::from_json(&manifest, "m").unwrap();
+        assert_eq!(index.sources.file.as_deref(), Some("figmogassetsfilea1"));
+        assert!(
+            index.icon(None, "1:2").is_none(),
+            "no target file: no node-id match"
+        );
+        let other = index.clone().for_file(Some("figmogassetsfileb2"));
+        assert!(other.icon(None, "1:2").is_none(), "another file's 1:2");
+        assert_eq!(
+            other.icon(Some("abc"), "1:2").unwrap().component,
+            "IconStar"
+        );
+        let index = index.for_file(Some("figmogassetsfilea1"));
         assert_eq!(index.icons[0].component, "IconStar");
         assert_eq!(index.icon(Some("abc"), "9:9").unwrap().node_id, "1:2");
         assert_eq!(index.icon(None, "1:2").unwrap().component, "IconStar");

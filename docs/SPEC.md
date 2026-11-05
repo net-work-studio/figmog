@@ -2309,8 +2309,12 @@ style and the runs' overrides name every variable in them.
   an exported image fill's entry also carries the file's `path` and
   `url` (null outside `public/`), and its `unsupported` reason says it
   was exported (its scaling and cropping still have no CSS); a node that
-  is an exported icon — by its own node id, or for an instance by its
-  main component's key, else id — gets `{kind: "icon", node_id,
+  is an exported icon — for an instance by its main component's key
+  (keys are the same in every file using a library component), else by
+  node id, but only when the manifest's icon was exported from the file
+  this spec describes (node ids are file-local and repeat across files;
+  the CLI and the relay tell the manifest which file the call targets,
+  as its `for_file`) — gets `{kind: "icon", node_id,
   component, path, svg, jsx: "<IconX />"}` (instead of the `vector`
   entry, for a vector node). Without a manifest the output is unchanged.
 - `instance` (INSTANCE nodes): `{component_id, component: {name, key,
@@ -2651,15 +2655,20 @@ sanitizer), `src/cli/assets.rs` (reads, fetches and writes).
   is skipped). The name depends only on the content, so an unchanged
   image never produces a diff.
 - **Manifest** (`[assets] manifest`): `{"$generated", version: 1,
-  sources: {icons, images}, icons: [{component, figma_name, key, node_id,
-  path, svg, colors: "single"|"multi", current_color}], images:
-  [{image_ref, path, url, format, bytes, sha256, nodes}]}` — sorted keys,
+  sources: {file, icons, images}, icons: [{component, figma_name, file,
+  key, node_id, path, svg, colors: "single"|"multi", current_color}],
+  images: [{file, image_ref, path, url, format, bytes, sha256, nodes}]}`
+  (`file`: the Figma file key the export read; `figma_name` cut to 512
+  bytes) — sorted keys,
   icons by component name, images by imageRef, no timestamps or file
   version (a re-export after unrelated edits is byte-identical). `url` is
   the root-relative URL when the images folder is `public` or under
   `public/` (the Vite / Next.js static folder), else null. `sources`
-  records the roots, so a plain `figmog assets export` repeats the last
-  export. `figmog spec` reads it (§17).
+  records the file and the roots, so a plain `figmog assets export`
+  repeats the last export — and refuses when the project's file is no
+  longer the recorded one (the roots are that file's node ids; pass
+  `--icons`/`--images` to export from the new file, which replaces the
+  manifest). `figmog spec` reads it (§17).
 
 **Naming.** An icon's name is built from ASCII letters and digits only
 (every other character separates words), PascalCased: a variant from its
@@ -2667,8 +2676,10 @@ set's name (last `/` segment) and its property values (`Icon` / `Name=Arrow
 Right` → `IconArrowRight`), anything else from the last `/` segment of its
 own name. The `[assets] prefix` (default `Icon`) is prepended unless the
 name already starts with it as a word. Names longer than 64 characters,
-names with no ASCII letter or digit, and names that collide
-case-insensitively (case-insensitive filesystems) are skipped — every
+names with no ASCII letter or digit, Windows device names (`CON`, `PRN`,
+`AUX`, `NUL`, `COM1`–`9`, `LPT1`–`9`, any case, after prefixing), and
+names that collide case-insensitively (case-insensitive filesystems) are
+skipped — every
 icon in a collision, with the node ids involved; nothing is picked
 arbitrarily.
 
@@ -2676,11 +2687,19 @@ arbitrarily.
 file. Figma names never reach generated code (only the manifest, as JSON
 data); node ids reach a comment only after a strict character check
 (`[A-Za-z0-9:;-]`, ≤ 128); imageRefs must be ASCII alphanumeric; file
-names are the validated component name or the content hash. Every write
-target is checked before anything is written: inside the project, no
-symlink anywhere on its path below the project root (the file or any
-directory; `--force` doesn't change this), a regular file; files are
-opened `O_NOFOLLOW`. An existing file is replaced only when figmog wrote
+names are the validated component name or the content hash (SHA-256 via
+`ring`, already compiled in through rustls). Every write target is
+checked before anything is written: inside the project, no symlink
+anywhere on its path below the project root (the file or any directory;
+`--force` doesn't change this), a regular file, and no directory on the
+way spelled differently on disk (a case-insensitive filesystem: refused,
+naming the spelling on disk). Missing directories are created one at a
+time, each checked (never `create_dir_all` through a link). Each file is
+written atomically: a new temporary file in the same directory (created
+exclusively, `O_NOFOLLOW`), then renamed over the target. A target that
+exists only under another case (a renamed icon on a case-insensitive
+filesystem) is moved aside and replaced, so the new spelling lands on
+disk, and is never reported as `stale`. An existing file is replaced only when figmog wrote
 it — a text file starting with figmog's generated header (`// Generated
 by \`figmog assets export\`…`, `<!-- … -->` for SVG, a leading
 `"$generated"` key for the manifest), an image whose bytes are what its
@@ -2700,7 +2719,11 @@ animations, `feImage`, prefixed names — is dropped with its content);
 only allowlisted presentation/geometry attributes survive (no `on*`,
 `class`, `xml:base`); values containing quotes, `<>&`, backticks,
 braces, backslashes or control characters are dropped; `href` must be a
-local `#id` (or, on `<image>`, a base64 raster `data:` URI); `fill`,
+local `#id` (or, on `<image>`, a base64 raster `data:` URI) — and a
+`<use>` may reference only an `<image>` or a basic shape (`path`, `rect`,
+`circle`, `ellipse`, `line`, `polyline`, `polygon`), never a `<g>`,
+`<svg>`, `<symbol>` or another `<use>`, so references can't fan out
+(dropped and reported otherwise); `fill`,
 `stroke`, `clip-path`, `mask`, `filter` may reference only a local
 `url(#id)`, and a reference to an undefined id is dropped; `style` keeps
 only `mask-type`, `mix-blend-mode` and `isolation` keywords. Every
@@ -2712,10 +2735,14 @@ styles), no `<symbol>`/`<marker>`/`<switch>`; meant for Figma's own SVG
 export shape.
 
 **Fidelity.** An icon is single-color when exactly one flat paint color
-(fill, stroke, stop, flood — normalized, `none` ignored) appears outside
+(fill, stroke, stop, flood — normalized, `none` ignored; a shape that no
+`fill` applies to counts as its default black; an existing
+`currentColor` is a color of its own) appears outside
 `<clipPath>`/`<mask>` (their colors are geometry, not paint) and it uses
-no gradient, pattern, filter or image. With `current_color = true` that
-color becomes `currentColor`, so Tailwind text colors apply; multicolor
+no gradient, pattern, filter, image or `color` attribute (which would
+pin `currentColor`). With `current_color = true` that color becomes
+`currentColor` (an implicit black fill is written out as
+`fill="currentColor"`), so Tailwind text colors apply; multicolor
 icons and logos always keep their colors (`colors` in the manifest). Ids
 are renumbered in document order: the `.svg` file prefixes them with the
 component name; the component with React's `useId()` (reduced to
@@ -2746,7 +2773,10 @@ colors, current_color, removed}], images: [...], files: [{path, status:
 "written"|"unchanged"}], written, unchanged, skipped, stale}`.
 
 **Tests.** `src/svg.rs` (Figma shapes, hostile markup, entities, limits,
-colors, JSX), `src/assets.rs` (SHA-256 vectors, sniffing, naming,
+`<use>` targets, colors incl. implicit black and `currentColor`, JSX),
+`src/cli/assets.rs` (symlinks, simulated case-insensitive lookups, case
+renames, atomic writes), `serve::async_tests` (`renders: false` makes no
+render request), the multi-file manifest test in `tests/assets.rs`, `src/assets.rs` (SHA-256 vectors, sniffing, naming,
 discovery, plan determinism, collisions, opt-in `currentColor`, manifest
 validation); `tests/assets.rs` on the synthetic
 `tests/fixtures/assets/icons.json` with seeded renders (the done-when: the

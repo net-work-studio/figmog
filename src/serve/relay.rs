@@ -431,13 +431,26 @@ impl Relay {
             }
             // ... and names exported assets from the project's asset
             // manifest (NWS-2952), unless the agent passed `assets`.
+            // For the file this call targets, resolved as below: its icons
+            // match by node id only when exported from that file.
             if params["arguments"].get("assets").is_none_or(Value::is_null)
                 && let Some(assets) = crate::assets::AssetIndex::load(
                     &self.layout.project_root,
                     &settings.assets.manifest,
                 )?
             {
-                params["arguments"]["assets"] = assets.to_json();
+                let args = &params["arguments"];
+                let target = match args.get("file") {
+                    Some(Value::String(file)) => parse_file_ref(file),
+                    _ => crate::dispatch::infer_file_from_node_ref(args).or_else(|| {
+                        self.default_key.clone().or_else(|| {
+                            (self.referenced.len() == 1)
+                                .then(|| self.referenced.iter().next().cloned())
+                                .flatten()
+                        })
+                    }),
+                };
+                params["arguments"]["assets"] = assets.for_file(target.as_deref()).to_json();
             }
         }
         let args = &frame["params"]["arguments"];

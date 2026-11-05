@@ -2268,10 +2268,9 @@ impl Cx<'_> {
         }
     }
 
-    /// An INSTANCE: its component, variant and other properties, and the
-    /// code component the project's map names (NWS-2949), else `null`.
     /// The exported icon (NWS-2952) this node is — by its own node id, or
-    /// for an instance by its main component's key, else id — as a
+    /// for an instance by its main component's key, else id (node ids
+    /// only for icons exported from this spec's file) — as a
     /// `content.assets` entry; `None` without a manifest.
     fn icon(&self, n: &Value, id: &str, node_type: &str) -> Option<Value> {
         let assets = self.assets?;
@@ -2293,6 +2292,8 @@ impl Cx<'_> {
         }))
     }
 
+    /// An INSTANCE: its component, variant and other properties, and the
+    /// code component the project's map names (NWS-2949), else `null`.
     fn instance(&mut self, n: &Value, id: &str) -> Value {
         let component_id = n["componentId"].as_str().unwrap_or_default();
         let component = &self.components[component_id];
