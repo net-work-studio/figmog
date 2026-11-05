@@ -669,11 +669,11 @@ fn note_ignored_upstream_flags(upstream: &str, no_upstream: bool) {
 /// Prefer an explicit `file` over a pasted node URL, matching serve's
 /// session routing. Validation of an explicit file ref happens when the
 /// chosen mirror is resolved; an invalid explicit ref never falls back.
-fn requested_file(args: &Value) -> Option<String> {
-    args.get("file")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| crate::dispatch::infer_file_from_node_ref(args))
+/// A present-but-non-string `file` is a type error (NWS-2944), never a
+/// silent fall-through to `.figmog/current`; `null` counts as omitted.
+fn requested_file(args: &Value) -> Result<Option<String>, String> {
+    Ok(crate::dispatch::arg_str(args, "file")?
+        .or_else(|| crate::dispatch::infer_file_from_node_ref(args)))
 }
 
 /// Management tools don't target an existing mirror, and desktop tools
@@ -876,9 +876,12 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
     // `figmog_open` and `figmog_files` keep their management semantics.
     let file = match &cli.cmd {
         Cmd::Call { tool, args, .. } if is_per_file_local_tool(tool) => {
-            requested_file(&call::parse_args(args.as_deref())?)
+            requested_file(&call::parse_args(args.as_deref())?)?
         }
-        cmd => cmd_as_tool_call(cmd).and_then(|(_, args)| requested_file(&args)),
+        cmd => match cmd_as_tool_call(cmd) {
+            Some((_, args)) => requested_file(&args)?,
+            None => None,
+        },
     };
     let key = match file {
         Some(file) => {

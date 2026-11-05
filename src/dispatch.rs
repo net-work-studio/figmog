@@ -59,8 +59,27 @@ pub(crate) type RootReaders<'a, R> = (
 
 // ---- arg extraction ----
 
-pub(crate) fn arg_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(Value::as_str).map(str::to_string)
+/// The value of an optional argument, treating an omitted key and an
+/// explicit JSON `null` alike as "absent" (NWS-2944) — `figmog images`
+/// itself sends `"scale": null` for an unset `--scale`, and a client that
+/// spells "no value" as `null` means the default, not an error.
+fn optional_arg<'a>(args: &'a Value, key: &str) -> Option<&'a Value> {
+    args.get(key).filter(|v| !v.is_null())
+}
+
+/// Optional string field. Absent/`null` ⇒ `Ok(None)`; present but some
+/// other JSON type ⇒ the same `"expected string for `key`, got …"` error
+/// [`require_str`] reports, rather than silently treating it as absent
+/// (NWS-2944).
+pub(crate) fn arg_str(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match optional_arg(args, key) {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!(
+            "expected string for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
 }
 
 /// JSON type name for an error message — `Value`'s own variant names
@@ -92,18 +111,85 @@ pub(crate) fn require_str(args: &Value, key: &str) -> Result<String, String> {
     }
 }
 
-pub(crate) fn arg_usize(args: &Value, key: &str) -> Option<usize> {
-    args.get(key).and_then(Value::as_u64).map(|n| n as usize)
+/// Optional non-negative integer field (`depth`, `limit`). Absent/`null`
+/// ⇒ `Ok(None)`. A non-number ⇒ `"expected integer for `key`, got
+/// string"`; a fractional number ⇒ `"… got number"`; a negative integer ⇒
+/// `"expected non-negative integer for `key`, got -1"` (NWS-2944 — a
+/// string `depth` used to read as "unlimited").
+pub(crate) fn arg_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    let Some(v) = optional_arg(args, key) else {
+        return Ok(None);
+    };
+    if let Some(n) = v.as_u64() {
+        return Ok(Some(usize::try_from(n).unwrap_or(usize::MAX)));
+    }
+    match v.as_i64() {
+        Some(n) => Err(format!(
+            "expected non-negative integer for `{key}`, got {n}"
+        )),
+        None => Err(format!(
+            "expected integer for `{key}`, got {}",
+            json_type_name(v)
+        )),
+    }
 }
 
-pub(crate) fn arg_bool(args: &Value, key: &str) -> bool {
-    args.get(key).and_then(Value::as_bool).unwrap_or(false)
+/// Optional boolean flag. Absent/`null` ⇒ `Ok(false)`; present but not a
+/// JSON boolean (e.g. the string `"true"`) ⇒ `"expected boolean for `key`,
+/// got string"` (NWS-2944).
+pub(crate) fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
+    match optional_arg(args, key) {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!(
+            "expected boolean for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
 }
 
 /// Optional numeric field — [`require_f64`]'s absent-is-`None` sibling,
-/// used by `figmog_images`'s optional `scale` (v0.0.2 spec §5).
-pub(crate) fn arg_f64(args: &Value, key: &str) -> Option<f64> {
-    args.get(key).and_then(Value::as_f64)
+/// used by `figmog_images`'s optional `scale` (v0.0.2 spec §5). Absent or
+/// `null` ⇒ `Ok(None)`; any other non-number is an error (NWS-2944).
+pub(crate) fn arg_f64(args: &Value, key: &str) -> Result<Option<f64>, String> {
+    match optional_arg(args, key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| format!("expected number for `{key}`, got {}", json_type_name(v))),
+    }
+}
+
+/// Optional array-of-strings field — `figmog_subtree`'s `fields`.
+/// Absent/`null` ⇒ `Ok(None)`; an empty array is allowed (project to the
+/// always-kept keys only). A non-array, or a non-string element, is named
+/// precisely, mirroring [`require_str_array`] (NWS-2944 — a bare string
+/// used to be silently ignored, returning every field).
+pub(crate) fn arg_str_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match optional_arg(args, key) {
+        None => Ok(None),
+        Some(Value::Array(items)) => str_items(key, items).map(Some),
+        Some(other) => Err(format!(
+            "expected array for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
+}
+
+fn str_items(key: &str, items: &[Value]) -> Result<Vec<String>, String> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_str().map(str::to_string).ok_or_else(|| {
+                format!(
+                    "expected string for `{key}[{i}]`, got {}",
+                    json_type_name(v)
+                )
+            })
+        })
+        .collect()
 }
 
 /// A required array-of-strings field — `figmog_images`'s `ids` (v0.0.2
@@ -118,18 +204,7 @@ pub(crate) fn require_str_array(args: &Value, key: &str) -> Result<Vec<String>, 
             if items.is_empty() {
                 return Err(format!("`{key}` must not be empty"));
             }
-            items
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    v.as_str().map(str::to_string).ok_or_else(|| {
-                        format!(
-                            "expected string for `{key}[{i}]`, got {}",
-                            json_type_name(v)
-                        )
-                    })
-                })
-                .collect()
+            str_items(key, items)
         }
         Some(other) => Err(format!(
             "expected array for `{key}`, got {}",
@@ -159,8 +234,10 @@ pub(crate) fn require_f64(args: &Value, key: &str) -> Result<f64, String> {
 /// from a pasted node/frame URL when the call omits an explicit `file`.
 pub(crate) fn infer_file_from_node_ref(args: &Value) -> Option<String> {
     ["id", "under", "target"].iter().find_map(|key| {
-        let raw = arg_str(args, key)?;
-        crate::ident::parse_node_ref(&raw)?.0
+        // Best-effort routing hint only: a wrong-typed value can't name a
+        // file, and the dispatched tool itself reports the type error.
+        let raw = args.get(key)?.as_str()?;
+        crate::ident::parse_node_ref(raw)?.0
     })
 }
 
@@ -211,15 +288,15 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
             }),
         ),
         "figmog_pages" => Some(query::pages(nodes, by_type)),
-        "figmog_tree" => {
-            let id = arg_str(args, "id");
-            let depth = arg_usize(args, "depth");
-            Some(query::tree(nodes, children, by_type, id, depth))
-        }
+        "figmog_tree" => Some((|| {
+            let id = arg_str(args, "id")?;
+            let depth = arg_usize(args, "depth")?;
+            query::tree(nodes, children, by_type, id, depth)
+        })()),
         "figmog_node" => Some((|| {
             let id = require_str(args, "id")?;
-            let with_children = arg_bool(args, "children");
-            let resolve_vars = arg_bool(args, "resolve_vars");
+            let with_children = arg_bool(args, "children")?;
+            let resolve_vars = arg_bool(args, "resolve_vars")?;
             query::node(
                 nodes,
                 children,
@@ -232,14 +309,9 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         })()),
         "figmog_subtree" => Some((|| {
             let id = require_str(args, "id")?;
-            let depth = arg_usize(args, "depth");
-            let fields = args.get("fields").and_then(Value::as_array).map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            });
-            let resolve_vars = arg_bool(args, "resolve_vars");
+            let depth = arg_usize(args, "depth")?;
+            let fields = arg_str_array(args, "fields")?;
+            let resolve_vars = arg_bool(args, "resolve_vars")?;
             query::subtree(
                 nodes,
                 children,
@@ -253,14 +325,14 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         })()),
         "figmog_find" => Some((|| {
             let node_type = require_str(args, "type")?;
-            let page = arg_str(args, "page");
-            let under = arg_str(args, "under");
+            let page = arg_str(args, "page")?;
+            let under = arg_str(args, "under")?;
             query::find(nodes, children, by_type, node_type, page, under)
         })()),
         "figmog_search" => Some((|| {
             let q = require_str(args, "query")?;
-            let limit = arg_usize(args, "limit").unwrap_or(10);
-            let under = arg_str(args, "under");
+            let limit = arg_usize(args, "limit")?.unwrap_or(10);
+            let under = arg_str(args, "under")?;
             query::search(text, nodes, children, &q, limit, under)
         })()),
         "figmog_instances" => Some((|| {
@@ -268,11 +340,11 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
             query::instances(nodes, components, component_sets, instances_of, &target)
         })()),
         "figmog_components" => Some(query::components(nodes, components, component_sets)),
-        "figmog_styles" => {
-            let style_type = arg_str(args, "type");
-            let values = arg_bool(args, "values");
-            let resolve_vars = arg_bool(args, "resolve_vars");
-            Some(query::styles(
+        "figmog_styles" => Some((|| {
+            let style_type = arg_str(args, "type")?;
+            let values = arg_bool(args, "values")?;
+            let resolve_vars = arg_bool(args, "resolve_vars")?;
+            query::styles(
                 nodes,
                 styles,
                 styled_by,
@@ -281,24 +353,24 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
                 style_type,
                 values,
                 resolve_vars,
-            ))
-        }
+            )
+        })()),
         "figmog_uses" => Some((|| {
             let id = require_str(args, "id")?;
             query::uses(nodes, styled_by, bound_to, &id)
         })()),
-        "figmog_vars" => {
-            let id = arg_str(args, "id");
-            let with_snapshot = arg_bool(args, "snapshot");
-            Some(query::vars(
+        "figmog_vars" => Some((|| {
+            let id = arg_str(args, "id")?;
+            let with_snapshot = arg_bool(args, "snapshot")?;
+            query::vars(
                 nodes,
                 variables,
                 variable_collections,
                 variable_snapshot,
                 id,
                 with_snapshot,
-            ))
-        }
+            )
+        })()),
         "figmog_stats" => Some(query::stats(
             nodes,
             components,
@@ -311,18 +383,18 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
             let id = require_str(args, "id")?;
             query::path(nodes, id)
         })()),
-        "figmog_text" => {
-            let page = arg_str(args, "page");
-            let under = arg_str(args, "under");
-            Some(query::text(nodes, children, by_type, page, under))
-        }
+        "figmog_text" => Some((|| {
+            let page = arg_str(args, "page")?;
+            let under = arg_str(args, "under")?;
+            query::text(nodes, children, by_type, page, under)
+        })()),
         "figmog_where" => Some((|| {
             let pointer = require_str(args, "pointer")?;
             // Presence means equality to this JSON value, including null;
             // only an omitted key means "pointer exists".
             let equals = args.get("equals").cloned();
-            let page = arg_str(args, "page");
-            let under = arg_str(args, "under");
+            let page = arg_str(args, "page")?;
+            let under = arg_str(args, "under")?;
             query::where_(nodes, children, &pointer, equals, page, under)
         })()),
         "figmog_at" => Some((|| {
@@ -637,5 +709,81 @@ mod tests {
     fn require_f64_reports_missing_when_key_absent() {
         let err = require_f64(&json!({}), "x").unwrap_err();
         assert_eq!(err, "missing required field: x");
+    }
+
+    #[test]
+    fn optional_args_absent_or_null_keep_defaults() {
+        for args in [json!({}), json!({"k": null})] {
+            assert_eq!(arg_str(&args, "k"), Ok(None));
+            assert_eq!(arg_usize(&args, "k"), Ok(None));
+            assert_eq!(arg_bool(&args, "k"), Ok(false));
+            assert_eq!(arg_f64(&args, "k"), Ok(None));
+            assert_eq!(arg_str_array(&args, "k"), Ok(None));
+        }
+    }
+
+    #[test]
+    fn optional_args_accept_their_own_type() {
+        assert_eq!(arg_str(&json!({"k": "a"}), "k"), Ok(Some("a".into())));
+        assert_eq!(arg_usize(&json!({"k": 0}), "k"), Ok(Some(0)));
+        assert_eq!(arg_usize(&json!({"k": 7}), "k"), Ok(Some(7)));
+        assert_eq!(arg_bool(&json!({"k": true}), "k"), Ok(true));
+        assert_eq!(arg_f64(&json!({"k": 1.5}), "k"), Ok(Some(1.5)));
+        assert_eq!(arg_f64(&json!({"k": 2}), "k"), Ok(Some(2.0)));
+        assert_eq!(arg_str_array(&json!({"k": []}), "k"), Ok(Some(vec![])));
+    }
+
+    #[test]
+    fn optional_args_reject_wrong_types() {
+        let cases: [(Result<(), String>, &str); 10] = [
+            (
+                arg_usize(&json!({"depth": "2"}), "depth").map(drop),
+                "expected integer for `depth`, got string",
+            ),
+            (
+                arg_usize(&json!({"depth": 1.5}), "depth").map(drop),
+                "expected integer for `depth`, got number",
+            ),
+            (
+                arg_usize(&json!({"depth": -1}), "depth").map(drop),
+                "expected non-negative integer for `depth`, got -1",
+            ),
+            (
+                arg_usize(&json!({"limit": true}), "limit").map(drop),
+                "expected integer for `limit`, got boolean",
+            ),
+            (
+                arg_bool(&json!({"children": "true"}), "children").map(drop),
+                "expected boolean for `children`, got string",
+            ),
+            (
+                arg_bool(&json!({"children": 1}), "children").map(drop),
+                "expected boolean for `children`, got number",
+            ),
+            (
+                arg_f64(&json!({"scale": "2"}), "scale").map(drop),
+                "expected number for `scale`, got string",
+            ),
+            (
+                arg_str(&json!({"page": ["0:1"]}), "page").map(drop),
+                "expected string for `page`, got array",
+            ),
+            (
+                arg_str_array(&json!({"fields": "name"}), "fields").map(drop),
+                "expected array for `fields`, got string",
+            ),
+            (
+                arg_str_array(&json!({"fields": ["name", {}]}), "fields").map(drop),
+                "expected string for `fields[1]`, got object",
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, Err(want.to_string()));
+        }
+    }
+
+    #[test]
+    fn infer_file_ignores_wrong_typed_node_refs() {
+        assert_eq!(infer_file_from_node_ref(&json!({"id": 12})), None);
     }
 }

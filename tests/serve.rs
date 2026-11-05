@@ -404,6 +404,33 @@ fn serve_e2e_initialize_tools_list_and_tool_calls() {
     );
     assert_eq!(resp["result"]["isError"], json!(true));
 
+    // -- NWS-2944: wrong-typed optional args are tool errors (isError, the
+    // same shape as a missing required field), never silently "absent" --
+    for (id, tool, args, want) in [
+        (
+            10,
+            "figmog_subtree",
+            json!({"id": "1:1", "depth": "2"}),
+            "expected integer for `depth`, got string",
+        ),
+        (
+            11,
+            "figmog_node",
+            json!({"id": "1:2", "file": 12}),
+            "expected string for `file`, got number",
+        ),
+        (
+            12,
+            "figmog_images",
+            json!({"ids": ["1:2"], "format": 1}),
+            "expected string for `format`, got number",
+        ),
+    ] {
+        let resp = call(&mut stdin, &rx, id, tool, args);
+        assert_eq!(resp["result"]["isError"], json!(true), "{tool}: {resp}");
+        assert_eq!(resp["result"]["content"][0]["text"], json!(want), "{tool}");
+    }
+
     // Closing stdin is what makes the (`--no-watch`) serve loop exit: its
     // reader thread sees EOF and drops the sender, so the main loop's
     // blocking `rx.recv()` returns `Disconnected` and the process exits 0.

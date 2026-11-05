@@ -929,7 +929,7 @@ fn handle_tool_call<U: UpstreamMcp>(
         // stored (default false for a brand-new mirror) — the worker's
         // stored-flag union handles that, so `false` here is exactly "no
         // new override" rather than "force off".
-        let geometry = dispatch::arg_bool(args, "geometry");
+        let geometry = dispatch::arg_bool(args, "geometry")?;
         let session = manager.open(&file)?;
         return Ok(ToolOutput::Json(session.request_pull(geometry, interval)));
     }
@@ -941,7 +941,13 @@ fn handle_tool_call<U: UpstreamMcp>(
     // are present and disagree, the explicit arg still wins — the
     // disagreement is only surfaced as a note on a not-found error below,
     // never silently overridden the other way.
-    let explicit_file = args.get("file").and_then(Value::as_str).map(str::to_string);
+    // Desktop tools' arguments are the upstream's own business; only a
+    // local tool's `file` is figmog's routing property to type-check.
+    let explicit_file = if proxy::is_local_tool(name) {
+        dispatch::arg_str(args, "file")?
+    } else {
+        None
+    };
     let url_file_key = dispatch::infer_file_from_node_ref(args);
     let file_arg = explicit_file.clone().or_else(|| url_file_key.clone());
     let mut call_args = args.clone();
@@ -969,8 +975,9 @@ fn handle_tool_call<U: UpstreamMcp>(
             // Once ready, image fetching retains its own synchronous
             // networking/cache contract, separate from pull scheduling.
             let ids = dispatch::require_str_array(args, "ids")?;
-            let format = args.get("format").and_then(Value::as_str).unwrap_or("png");
-            let scale = dispatch::arg_f64(args, "scale");
+            let format = dispatch::arg_str(args, "format")?;
+            let format = format.as_deref().unwrap_or("png");
+            let scale = dispatch::arg_f64(args, "scale")?;
             let items = session.images(&ids, format, scale)?;
             return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
         }

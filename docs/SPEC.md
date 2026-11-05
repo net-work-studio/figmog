@@ -481,6 +481,18 @@ variable snapshot summary under `variables` (§9).
 The 19 per-file tools each carry the optional `file` property described
 above; `figmog_open` and `figmog_files` don't.
 
+**Argument types (NWS-2944):** local tool arguments are type-checked
+whether required or optional. A missing required field is `missing
+required field: <name>`; a present field of the wrong JSON type is
+``expected <type> for `<name>`, got <json type>`` (e.g. ``expected
+integer for `depth`, got string``), and a negative integer argument
+(`depth`, `limit`) is ``expected non-negative integer for `<name>`, got
+<n>``. An omitted optional argument or an explicit JSON `null` keeps the
+default (`figmog_where`'s `equals` is a value, not an option: `null`
+there still means equality to null). These are ordinary tool errors —
+`isError` on stdio, the socket's `-32000` error (§6a), and `figmog
+call`'s stderr error. Desktop tools' arguments are forwarded unchecked.
+
 **Protocol (`mcp.rs`):** pure JSON-RPC 2.0 over stdio frames, no store,
 no I/O. `initialize` echoes the client's `protocolVersion` (or
 `2025-06-18` if omitted) and returns steering `instructions` telling an
