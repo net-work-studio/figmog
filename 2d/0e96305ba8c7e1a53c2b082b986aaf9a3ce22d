@@ -1,0 +1,31 @@
+examples/slice/evidence/broken/390/manifest.json
+  s_d336666e6b7163::t_5d23de8aa55c23 6,12,18,28,64,72,108,116,152,195-196,200-201
+examples/slice/evidence/COMMENT.md
+  s_d336666e6b7163::t_9003ec34a5258b 39-41
+  s_d336666e6b7163::t_610f01cee6ebd1 9,11
+examples/slice/evidence/correct/1440/manifest.json
+  s_d336666e6b7163::t_5d23de8aa55c23 6,12,18,28,64,72,108,116,152,200-201
+examples/slice/evidence/evidence.json
+  s_d336666e6b7163::t_9003ec34a5258b 5,14,23
+  s_d336666e6b7163::t_610f01cee6ebd1 60,64,69-70,81,85,89,93,97,101,106-107,114,118,122,126,130,134,139-140,149,153,157,161,165,169,175,182,186,190,194,198,202,208
+examples/slice/evidence/broken/1440/manifest.json
+  s_d336666e6b7163::t_5d23de8aa55c23 6,12,18,28,64,72,108,116,152,195-196,200-201
+examples/slice/evidence/correct/390/manifest.json
+  s_d336666e6b7163::t_5d23de8aa55c23 6,12,18,28,64,72,108,116,152,200-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2d0e96305ba8c7e1a53c2b082b986aaf9a3ce22d",
+  "prompts": {},
+  "sessions": {
+    "s_d336666e6b7163": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa8-a0b6-7dc1-bd6e-bc0081b6f0e4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
