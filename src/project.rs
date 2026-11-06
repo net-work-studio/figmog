@@ -536,7 +536,10 @@ pub(crate) struct LegacyStore {
 impl Layout {
     /// `Some` exactly when `path` is `key`'s old per-checkout store.
     pub(crate) fn legacy_store(&self, key: &str, path: &Path) -> Option<LegacyStore> {
-        (self.has_legacy_root() && path == self.legacy_dir(key).join("db")).then(|| LegacyStore {
+        (path != self.shared_dir(key).join("db")
+            && self.has_legacy_root()
+            && path == self.legacy_dir(key).join("db"))
+        .then(|| LegacyStore {
             layout: self.clone(),
             key: key.to_string(),
             path: path.to_path_buf(),
@@ -1116,5 +1119,36 @@ mod tests {
         let error = layout.active_store(KEY).unwrap_err();
         assert!(error.contains("multiple legacy mirrors"), "{error}");
         assert!(error.contains(&old.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn selected_per_checkout_store_is_never_classified_as_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout_with_legacy(dir.path());
+        // Non-Git and group-shared Git select this mirror root. An older
+        // cwd-relative root may still exist below the project directory.
+        layout.mirror_root = layout.local_root.clone();
+        let nested_root = layout.project_root.join("packages/app/.figmog");
+        std::fs::create_dir_all(&nested_root).unwrap();
+        layout.legacy_roots = vec![nested_root.clone()];
+        assert!(layout.has_legacy_root());
+
+        let selected = layout.shared_dir(KEY).join("db");
+        std::fs::create_dir_all(&selected).unwrap();
+        assert_eq!(layout.legacy_dir(KEY).join("db"), selected);
+        let active = layout.active_store(KEY).unwrap();
+        assert_eq!(active.path, selected);
+        assert!(!active.migration_pending);
+        assert!(layout.legacy_store(KEY, &selected).is_none());
+
+        // An actual legacy store for another key retains its guard.
+        let legacy = nested_root.join(OTHER).join("db");
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert!(layout.legacy_store(OTHER, &legacy).is_some());
+        assert!(
+            layout
+                .legacy_store(OTHER, &layout.shared_dir(OTHER).join("db"))
+                .is_none()
+        );
     }
 }
