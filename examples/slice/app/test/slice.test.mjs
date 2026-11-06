@@ -22,8 +22,10 @@ import {
   shot,
   SNAPSHOT,
   SPEC_JSON,
+  STANDIN_DIR,
   standinPng,
   TOKENS_CSS,
+  validateStandin,
   variantTree,
   VIEWPORTS,
   withBuild,
@@ -145,6 +147,16 @@ describe("evidence record", () => {
       assert.match(evidence.builds[name].tree.sha256, /^[0-9a-f]{64}$/);
     }
     assert.notEqual(evidence.builds.before.tree.sha256, evidence.builds.after.tree.sha256);
+  });
+
+  test("pins the stand-in's Figma file, HTML source and captured PNGs", async () => {
+    const record = JSON.parse(await readFile(join(STANDIN_DIR, "card-render.json"), "utf8"));
+    const file = JSON.parse(await readFile(FIGMA_FILE, "utf8"));
+    await validateStandin(record, { version: file.version });
+    assert.equal(evidence.figma.file.sha256, record.file.sha256);
+    assert.equal(evidence.figma.render.source, record.source);
+    assert.equal(evidence.figma.render.sourceSha256, record.sourceSha256);
+    assert.deepEqual(evidence.figma.render.images, record.images);
   });
 
   test("COMMENT.md image links resolve from its own directory", async () => {

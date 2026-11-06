@@ -37,7 +37,10 @@ PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers examples/slice/run.sh --test
       `figmog tokens export --out app/src/tokens.css`.
    2. **Spec.** `figmog spec 1:1 > spec/card.spec.json`.
    3. Checks that the stand-in render is pinned to the mirrored version
-      (`figma/card-render.json` `file.version` = `figmog status` version).
+      (`figma/card-render.json` `file.version` = `figmog status` version),
+      and that the synthetic file, stand-in HTML and both PNGs match their
+      recorded SHA-256 hashes. Editing an input without changing the file
+      version still requires re-rendering the stand-in.
    4. **Builds.** `vite build` of three app trees: **before** (a temporary
       copy of the app with `baseline/Card.jsx` swapped in for
       `src/Card.jsx`), **after** (the app as committed) and **broken**
@@ -51,10 +54,15 @@ PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers examples/slice/run.sh --test
 4. With `--test`: `npm test` in the app.
 
 The temporary store, app trees and captures are deleted afterwards. The run
-is deterministic: running it twice gives byte-identical outputs.
+is deterministic within the same OS, installed fonts and browser environment:
+running it twice there gives byte-identical outputs. A different environment
+can change text rasterisation; regenerate the stand-in and evidence together
+when moving between environments.
 
 `node scripts/slice.mjs standin` re-renders the stand-in PNGs and
 `figma/card-render.json`; `run.sh` never does.
+Run it once to upgrade older stand-in records that lack the file and HTML
+hashes; the evidence command refuses such records.
 
 ## Layout
 
@@ -105,6 +113,8 @@ which `tokens export` skips, so `Inter, sans-serif` is written directly.
   version; the token snapshot's file SHA-256 and figmog digest; the token
   CSS and spec digests; and per run and viewport the scores and the SHA-256
   of every image.
+- Build identity is sampled after the token CSS and spec are generated, so
+  changed generated inputs are included in the `dirty` flag.
 - Score: advisory, `100 * (1 - mismatched / (W*H))` against the Figma
   render (see `packages/react/README.md`); never a pass/fail gate.
 - Captured URLs are recorded as `http://127.0.0.1:<port>/`: the port is
