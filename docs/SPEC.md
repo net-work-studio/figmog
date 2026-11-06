@@ -472,11 +472,12 @@ client and never runs a whole-mirror scan.
   `tools/call` from it is refused at once with `too many pending
   requests on this connection (limit 32); …` (socket `-32000`, stdio
   `isError`).
-- *Global bounds.* At most 128 reads wait in the shared read queue,
-  plus the running workers. At most 128 desktop calls wait behind its
-  active operation. A full queue answers with a busy tool error. The
-  socket admits at most 64 connections, including writers still flushing
-  after their readers close; excess connections are closed.
+- *Queue and connection bounds.* At most 128 reads wait in the shared read
+  queue, plus the running workers. At most 128 desktop calls wait behind
+  its active operation. Each file retains at most 128 queued image requests,
+  regardless of requester connection turnover. A full queue answers with a
+  busy tool error. The socket admits at most 64 connections, including
+  writers still flushing after their readers close; excess connections are closed.
 - *Dropped connections cost nothing more.* A read or desktop call whose
   connection has closed or been dropped is not started (if queued) or
   accepted. An already-running upstream operation cannot be cancelled.
@@ -521,7 +522,9 @@ dropped. A worker that stops before answering still answers with an error.
 When a file's worker is occupied by a pull or metadata poll,
 `figmog_images` returns a prompt busy error (including for cache hits),
 rather than waiting behind that operation. While it is busy with another
-image request, a new one queues behind it (FIFO). A watch poll that came
+image request, a new one queues behind it (FIFO), up to 128 queued requests
+per file. Further requests receive a prompt busy error. Accepted image
+work remains queued after its requester disconnects. A watch poll that came
 due meanwhile, or a due watch retry, gets the worker before the next queued
 image request (outside the global two-second dispatch floor, at most once
 per due poll), so continuous image traffic cannot starve watch; queued
@@ -779,8 +782,9 @@ triggers. When a check changes the exposed upstream tool list, the
 registry is re-merged under the namespace rule below and every client that
 sent `initialize` gets `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`
 (`initialize` advertises `capabilities.tools.listChanged: true` when the
-desktop worker is enabled, and `false` under `--no-upstream`). Tool lists
-are sorted before comparison, and notifications compare the merged,
+desktop worker is enabled, and `false` under `--no-upstream`). Desktop
+tools use a canonical order based only on their client-visible definitions.
+Unsupported metadata cannot change that order. Notifications compare the merged,
 client-visible registry: reordering, changes to filtered collisions, or
 unsupported upstream fields send nothing. Dynamic tool names and
 descriptions are owned by the current registry and released when replaced.

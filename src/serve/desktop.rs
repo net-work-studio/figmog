@@ -432,10 +432,24 @@ fn probe<U: UpstreamMcp>(upstream: &mut U, live: bool) -> Result<Vec<Value>, Str
     Ok(upstream.tools().to_vec())
 }
 
-/// Tool arrays have no semantic order. Compare and expose a canonical
-/// order so a desktop reorder alone cannot emit list_changed.
+/// Tool arrays have no semantic order. Sort by name, then the fields
+/// `merge_registry` exposes, so ignored metadata cannot change tool order
+/// or which definition wins a duplicate-name collision.
 fn normalized_tools(mut tools: Vec<Value>) -> Vec<Value> {
-    tools.sort_by_cached_key(Value::to_string);
+    tools.sort_by_cached_key(|tool| {
+        (
+            tool.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            tool.get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            tool.get("inputSchema")
+                .map_or_else(|| r#"{"type":"object"}"#.to_string(), Value::to_string),
+        )
+    });
     tools
 }
 
@@ -746,5 +760,25 @@ mod tests {
         let before = worker.tools().to_vec();
         worker.apply_probe(Ok(tools.into_iter().rev().collect()), Instant::now());
         assert_eq!(worker.tools(), before);
+    }
+
+    #[test]
+    fn unsupported_tool_metadata_does_not_change_duplicate_selection() {
+        let tools = vec![
+            json!({"name":"get_a", "description":"A"}),
+            json!({"name":"get_z", "description":"A"}),
+            json!({"name":"get_z", "description":"Z"}),
+        ];
+        let (mut worker, _, _) = scripted(false);
+        worker.apply_probe(Ok(tools.clone()), Instant::now());
+        let before = proxy::merge_registry(Vec::new(), worker.tools()).0;
+        assert_eq!(before[1].description, "[via Figma desktop] A");
+
+        let mut changed = tools;
+        changed[2]["_meta"] = json!({"internal":true});
+        changed.reverse();
+        worker.apply_probe(Ok(changed), Instant::now());
+        let after = proxy::merge_registry(Vec::new(), worker.tools()).0;
+        assert_eq!(before, after);
     }
 }
