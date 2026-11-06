@@ -50,24 +50,25 @@ pub const RENDER: &str = "render";
 pub const FILL: &str = "fill";
 
 /// Current render cache generation (NWS-2960). A render row is a cache
-/// hit only when its [`ImagePinRec`] marker carries this generation:
-/// generation 1 means "requested with `version=<the row's file_version>`",
-/// so the bytes really are that version's render. Render rows an older
-/// binary stored (requested unpinned — possibly showing a newer design
-/// than their label) have no marker and read as misses, so they get
+/// hit only when its [`ImagePinRec`] marker carries this generation.
+/// Generation 1 added version-pinned requests but retained stale rows when
+/// live edits reused that version. Generation 2 also invalidates images
+/// when a same-version pull changes metadata or records. Older rows may
+/// not match the mirror and read as misses, so they get
 /// refetched and overwritten when the file key and credentials are
-/// available. Explicit stores cannot refresh these unverified renders;
-/// they return an upgrade-specific error. Fill rows never need a marker.
-pub const RENDER_PIN_GENERATION: u32 = 1;
+/// available. Without either, they return an upgrade-specific error.
+/// Fill rows never need a marker.
+pub const RENDER_PIN_GENERATION: u32 = 2;
 
 /// A caller with no Figma API token still gets every cache hit for free
 /// (spec §5: "a repeat request on an unchanged file spends zero budget");
-/// every miss gets this exact per-item manifest error instead of a wasted
-/// (guaranteed-401) network attempt.
+/// ordinary misses get this per-item manifest error instead of a wasted
+/// (guaranteed-401) network attempt. Unverified renders prepend their
+/// upgrade-specific explanation.
 const NO_TOKEN_MSG: &str = "FIGMA_TOKEN is unset or empty and no saved token is available — required for image downloads; an empty FIGMA_TOKEN disables saved credentials, so unset it to use saved credentials; run `figmog auth login` or set FIGMA_TOKEN";
 
 /// Distinguish an upgrade's unverified bytes from a genuinely absent row.
-const UNVERIFIED_RENDER_MSG: &str = "cached render bytes lack a valid version pin (for example, cached before this upgrade), so their mirrored version cannot be verified; --db cannot refresh them without a file key. Run `figmog pull <file-key-or-url>`, then `figmog images <node-id>...` without --db to fetch a verified render; the existing bytes remain on disk";
+const UNVERIFIED_RENDER_MSG: &str = "cached render bytes lack a valid version pin (for example, cached before this upgrade), so their mirrored version cannot be verified; the existing bytes remain on disk";
 
 /// An explicit store can serve cached bytes, but its records do not
 /// establish the file key needed to fetch a miss safely.
@@ -355,19 +356,22 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
         match api {
             None => {
                 for id in &render_misses {
+                    let message = if unverified_renders.contains(id) {
+                        if file_key.is_none() {
+                            format!(
+                                "{UNVERIFIED_RENDER_MSG}; --db cannot refresh them without a file key. Run `figmog pull <file-key-or-url>`, then `figmog images <node-id>...` without --db to fetch a verified render"
+                            )
+                        } else {
+                            format!(
+                                "{UNVERIFIED_RENDER_MSG}; {NO_TOKEN_MSG}. After restoring credentials, restart any running `figmog serve` (if using `FIGMA_TOKEN`, start the server with the updated environment), then retry `figmog images <node-id>...` to fetch a verified render"
+                            )
+                        }
+                    } else {
+                        unavailable_reason.to_string()
+                    };
                     render_hits.insert(
                         id.clone(),
-                        error_item(
-                            RENDER,
-                            id,
-                            format.to_string(),
-                            if file_key.is_none() && unverified_renders.contains(id) {
-                                UNVERIFIED_RENDER_MSG
-                            } else {
-                                unavailable_reason
-                            }
-                            .to_string(),
-                        ),
+                        error_item(RENDER, id, format.to_string(), message),
                     );
                 }
             }
@@ -1271,6 +1275,7 @@ mod tests {
 
         for (generation, version, expect_hit) in [
             (RENDER_PIN_GENERATION, "100", true),
+            (RENDER_PIN_GENERATION - 1, "100", false),
             (RENDER_PIN_GENERATION + 1, "100", false),
             (RENDER_PIN_GENERATION, "99", false),
         ] {
@@ -1477,6 +1482,103 @@ mod tests {
         assert!(message.contains("figmog auth login"));
         assert!(message.contains("set FIGMA_TOKEN"));
         assert_eq!(*download_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn unverified_renders_without_credentials_or_identity_explain_how_to_refresh() {
+        for legacy_pin in [
+            None,
+            Some(ImagePinRec {
+                generation: 1,
+                file_version: "100".to_string(),
+            }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut st = crate::open_store!(dir.path().join("db"));
+            insert_meta(&mut st, "100");
+            let key = image_key(RENDER, "1:2", "png", 1000);
+            let legacy = ImageBlobRec {
+                key_hash: key.clone(),
+                kind: RENDER.to_string(),
+                subject: "1:2".to_string(),
+                format: "png".to_string(),
+                scale_milli: 1000,
+                file_version: "100".to_string(),
+                bytes: vec![7, 7, 7],
+            };
+            st.wtx(|tx| {
+                tx.upsert(&Id::ImageBlob(key.clone()), &Rec::ImageBlob(legacy.clone()));
+                if let Some(pin) = &legacy_pin {
+                    tx.upsert(&Id::ImagePin(key.clone()), &Rec::ImagePin(pin.clone()));
+                }
+            });
+            store_image(
+                &mut st,
+                &image_key(RENDER, "1:3", "png", 1000),
+                RENDER,
+                "1:3",
+                "png",
+                1000,
+                "100",
+                &[1],
+                true,
+            );
+            let ids = vec!["1:2".to_string(), "1:3".to_string(), "1:4".to_string()];
+            let script = Script::new();
+            let (download, calls) = downloader(HashMap::new());
+            for (api, file_key) in [
+                (None, Some("FILE")),
+                (None, None),
+                (Some(&script as &dyn FigmaApi), None),
+            ] {
+                let scanned = st.rtx(
+                    |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
+                        scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
+                    },
+                );
+                let items = resolve(
+                    &mut st, scanned, api, &download, file_key, &ids, "png", None,
+                );
+                let error = items[0].error.as_deref().unwrap();
+                assert!(
+                    error.contains("cached render bytes lack a valid version pin"),
+                    "{error}"
+                );
+                assert!(error.contains("existing bytes remain on disk"), "{error}");
+                assert!(error.contains("figmog images"), "{error}");
+                assert!(!items[0].cached);
+                assert!(items[0].bytes.is_empty());
+                if file_key.is_some() {
+                    assert!(error.contains(NO_TOKEN_MSG), "{error}");
+                    assert!(
+                        error.contains("restart any running `figmog serve`"),
+                        "{error}"
+                    );
+                    assert!(error.contains("updated environment"), "{error}");
+                    assert!(error.contains("`FIGMA_TOKEN`"), "{error}");
+                    assert!(!error.contains("--db"), "{error}");
+                    assert_eq!(items[2].error.as_deref(), Some(NO_TOKEN_MSG));
+                } else {
+                    assert!(error.contains("--db cannot refresh"), "{error}");
+                    assert!(error.contains("figmog pull"), "{error}");
+                    assert_eq!(items[2].error.as_deref(), Some(NO_FILE_KEY_MSG));
+                }
+                assert!(items[1].cached);
+                assert_eq!(items[1].bytes, vec![1]);
+                assert!(items[1].error.is_none());
+                assert_eq!(
+                    st.get(&Id::ImageBlob(key.clone())),
+                    Some(Rec::ImageBlob(legacy.clone()))
+                );
+                assert_eq!(
+                    st.get(&Id::ImagePin(key.clone())),
+                    legacy_pin.clone().map(Rec::ImagePin)
+                );
+            }
+            assert_eq!(*calls.borrow(), 0);
+            assert!(script.render_calls.borrow().is_empty());
+            assert_eq!(*script.fills_calls.borrow(), 0);
+        }
     }
 
     /// NWS-2960: a render requested while the mirror is at "100" asks
