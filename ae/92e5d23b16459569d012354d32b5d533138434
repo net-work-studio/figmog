@@ -1,0 +1,50 @@
+examples/slice/app/scripts/lib.mjs
+  s_d336666e6b7163::t_a83dbf65c032b6 141-142,147-152
+  s_d336666e6b7163::t_6c14e3f59b9495 153,246-268
+  s_d00caf59bef041::t_f99e1d05c661a5 154
+examples/slice/figma/card-render-390.manifest.json
+  s_d336666e6b7163::t_177e3e49de7fd3 5
+examples/slice/app/scripts/slice.mjs
+  s_d336666e6b7163::t_b022b0f96aac3b 233-234
+  s_d336666e6b7163::t_a83dbf65c032b6 24,159,161
+  s_d336666e6b7163::t_6c14e3f59b9495 38,75,80,166
+examples/slice/app/test/slice.test.mjs
+  s_d336666e6b7163::t_1025e465006fad 25,28,152-159
+  s_d336666e6b7163::t_bf5e9ceb30a895 160-161
+tests/owner.rs
+  s_d336666e6b7163::t_4c5395da97b47f 1135
+examples/slice/app/test/provenance.test.mjs
+  s_d336666e6b7163::t_b022b0f96aac3b 1-2,5-8,39-96
+  s_d336666e6b7163::t_a83dbf65c032b6 3-4,9-38
+examples/slice/README.md
+  s_d336666e6b7163::t_4c5395da97b47f 57-60
+  s_d336666e6b7163::t_b022b0f96aac3b 40-43,64-65,116-117
+examples/slice/figma/card-render.json
+  s_d336666e6b7163::t_177e3e49de7fd3 6,12,16,21-22
+examples/slice/figma/card-render-1440.manifest.json
+  s_d336666e6b7163::t_c22ea9ceba7f6d 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ae92e5d23b16459569d012354d32b5d533138434",
+  "prompts": {},
+  "sessions": {
+    "s_d00caf59bef041": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa7-9721-7ac1-9380-ea52571e7db3",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    },
+    "s_d336666e6b7163": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa8-a0b6-7dc1-bd6e-bc0081b6f0e4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
