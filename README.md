@@ -279,9 +279,38 @@ file is rejected and the last good snapshot kept. `figmog vars --snapshot`
 and `figmog status` report the snapshot's state and provenance. See
 `docs/SPEC.md` §9.
 
+`figmog tokens export [--out tokens.css]` turns the imported snapshot into
+one CSS file: custom properties for the default modes, one collection's
+light/dark modes as `:root` and `[data-theme="dark"]`, and a Tailwind v4
+`@theme` (`@theme inline` for aliases), so `bg-brand` or `p-card` follow the
+theme. Names come from each variable's WEB code syntax, else its kebab-cased
+path; a name collision is an error. See `docs/SPEC.md` §9 "Token export".
+
+### A spec of one component
+
+`figmog spec <node>` (tool `figmog_spec`) describes an auto-layout card the
+way you rebuild it: direction, gap, padding, alignment and hug/fill/fixed
+sizing for every frame, and fill, stroke, radius and typography for every
+layer. Each value is shown as the variable token it is bound to, with the
+CSS name `figmog tokens export` gives it and the raw value beside it. An
+unbound value is flagged as untokenized, and named "matches X" when it
+equals a token's light/default value. Grid layout, absolutely positioned
+children, mixed text runs, gradients and the like are listed under
+`unsupported` instead of being guessed. See `docs/SPEC.md` §17.
+
+### The vertical slice example
+
+`examples/slice/` runs the whole loop offline on a synthetic file: a
+variables snapshot is imported and exported as tokens, `figmog spec`
+describes one card, a sample React + Tailwind v4 app builds that card from
+the exported tokens only, and `figmog-shot` captures before/after evidence
+at 1440 px and 390 px against a committed **stand-in** for the Figma render
+(no Figma access is involved). `examples/slice/run.sh` reproduces it from a
+clean checkout; see `examples/slice/README.md`.
+
 ### The tools
 
-`figmog serve` exposes 21 `figmog_*` tools: 17 reads of the local mirror,
+`figmog serve` exposes 22 `figmog_*` tools: 18 reads of the local mirror,
 `figmog_sync`, `figmog_images`, and the two mirror-management tools. Unless
 `--no-upstream`, it also proxies Figma's desktop Dev Mode MCP server (paid
 Dev or Full seat, desktop app running), merging those tools into the same

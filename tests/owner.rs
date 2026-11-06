@@ -1131,8 +1131,8 @@ fn three_worktrees_share_one_mirror_and_one_edit_pulls_once() {
     // errors anywhere.
     let readers: Vec<_> = cwds
         .iter()
-        .cloned()
         .map(|cwd| {
+            let cwd = cwd.clone();
             std::thread::spawn(move || {
                 for _ in 0..5 {
                     let out = common::command()

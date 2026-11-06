@@ -450,6 +450,31 @@ pub fn subtree<R: Readable>(
     )
 }
 
+/// Binding-aware spec of the subtree rooted at `id` (NWS-2968): the
+/// [`subtree`] answer and the [`vars`] `{snapshot, variables}` answer,
+/// rendered by [`crate::spec::build`].
+pub fn spec<R: Readable>(
+    nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    snapshot: &TableReader<'_, R, u8, VariableSnapshotRec>,
+    id: String,
+) -> Result<Value, String> {
+    let tree = subtree(
+        nodes,
+        children,
+        variables,
+        variable_collections,
+        id,
+        None,
+        None,
+        false,
+    )?;
+    let vars = vars(nodes, variables, variable_collections, snapshot, None, true)?;
+    Ok(crate::spec::build(&tree, &vars))
+}
+
 /// Nodes by type, optionally within one page and/or scoped to `under`'s
 /// subtree (spec §3: intersects with the page filter). `page` and `under`
 /// both accept a full Figma URL (spec §2b), same as any other node-id
@@ -806,7 +831,19 @@ pub fn vars<R: Readable>(
                     "remote": code.map(|c| c.remote),
                     "name": var.name,
                     "resolved_type": var.resolved_type,
-                    "collection": collection.map(|c| c.name),
+                    "collection": collection.as_ref().map(|c| c.name.clone()),
+                    // The collection's default mode, by name (mode id when
+                    // the collection doesn't name it), and the variable's
+                    // Figma scopes — what `figmog tokens export` needs to
+                    // pick each value and unit (NWS-2967).
+                    "default_mode": collection.as_ref().map(|c| {
+                        c.modes
+                            .iter()
+                            .find(|(mid, _)| *mid == c.default_mode_id)
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_else(|| c.default_mode_id.clone())
+                    }),
+                    "scopes": var.scopes,
                     "values_by_mode": Value::Object(values_by_mode),
                     "sites": sites,
                     "observed": observed,

@@ -1,0 +1,231 @@
+{
+  "builds": {
+    "after": {
+      "card": "examples/slice/app/src/Card.jsx",
+      "commit": "ae92e5d23b16459569d012354d32b5d533138434",
+      "dirty": false,
+      "tree": {
+        "files": 8,
+        "sha256": "78595d5aa820902a186a113cf7fbc34b7ff917eae4a24f7ae05b02396be5bdd5"
+      }
+    },
+    "before": {
+      "card": "examples/slice/app/baseline/Card.jsx",
+      "commit": "ae92e5d23b16459569d012354d32b5d533138434",
+      "dirty": false,
+      "tree": {
+        "files": 8,
+        "sha256": "f61789bb6dcba66c74430cf069b7a5e61b2e47ab7478ec6ed0587bdf8767364c"
+      }
+    },
+    "broken": {
+      "card": "examples/slice/app/variants/Card.wrong-padding.jsx",
+      "commit": "ae92e5d23b16459569d012354d32b5d533138434",
+      "dirty": false,
+      "tree": {
+        "files": 8,
+        "sha256": "c81174f45258da41b5730052f32adc41d7e678b26da6bcd7cbbc0f266ed31a25"
+      }
+    }
+  },
+  "contract": {
+    "colorScheme": "light",
+    "local": true,
+    "selector": "[data-testid=\"slice-card\"]",
+    "state": "default",
+    "viewports": [
+      {
+        "height": 900,
+        "width": 1440
+      },
+      {
+        "height": 844,
+        "width": 390
+      }
+    ]
+  },
+  "figma": {
+    "file": {
+      "name": "Synthetic card (vertical slice)",
+      "path": "examples/slice/figma/card-file.json",
+      "sha256": "af4a3b6ce1240cbac378955967d4cdcb38ec6f31a5e47c3e7a65e411e704f913",
+      "version": "4243"
+    },
+    "node": "1:1",
+    "render": {
+      "caveat": "STAND-IN, not a Figma export: figma/standin/index.html re-draws node 1:1 of figma/card-file.json from its raw values in plain CSS and is captured with figmog-shot in the same Chromium as the app. No Figma access was used.",
+      "images": {
+        "390": {
+          "path": "examples/slice/figma/card-render-390.png",
+          "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
+        },
+        "1440": {
+          "path": "examples/slice/figma/card-render-1440.png",
+          "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
+        }
+      },
+      "kind": "figma-render-stand-in",
+      "record": "examples/slice/figma/card-render.json",
+      "source": "examples/slice/figma/standin/index.html",
+      "sourceSha256": "e23a7904b3ae50cad155ffb8e9a5609a38aec6aa2729b203d4da32683d96faa0",
+      "version": "4243"
+    }
+  },
+  "kind": "figmog-slice/evidence",
+  "runs": {
+    "broken": {
+      "390": {
+        "images": {
+          "after": {
+            "path": "examples/slice/evidence/broken/390/after.png",
+            "sha256": "e2d1068bd7ddd77fe0a9fa7b0a674976648b71d2fa2c216dfcf56565eb120a25"
+          },
+          "before": {
+            "path": "examples/slice/evidence/broken/390/before.png",
+            "sha256": "1228017d6668afb3fad38ceec4b711d15e3acaf1f18acf308041bd51e9a02184"
+          },
+          "composite": {
+            "path": "examples/slice/evidence/broken/390/composite.png",
+            "sha256": "cc35c30963cfc738ad10ad47a42707882d5e23f9dba3793351091f2b0b30b937"
+          },
+          "diffAfter": {
+            "path": "examples/slice/evidence/broken/390/diff-after.png",
+            "sha256": "02026dda398b955169d34f4107fe696b116d63287d695524fa770eb77f87a4ab"
+          },
+          "diffBefore": {
+            "path": "examples/slice/evidence/broken/390/diff-before.png",
+            "sha256": "f802f123031bb689d1b85f6450c41418f57bef29256feeb484f33c17624eb014"
+          },
+          "figma": {
+            "path": "examples/slice/evidence/broken/390/figma.png",
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
+          }
+        },
+        "manifest": "examples/slice/evidence/broken/390/manifest.json",
+        "score": {
+          "after": 73.83,
+          "before": 39.97
+        }
+      },
+      "1440": {
+        "images": {
+          "after": {
+            "path": "examples/slice/evidence/broken/1440/after.png",
+            "sha256": "e2d1068bd7ddd77fe0a9fa7b0a674976648b71d2fa2c216dfcf56565eb120a25"
+          },
+          "before": {
+            "path": "examples/slice/evidence/broken/1440/before.png",
+            "sha256": "a446a4fa699bb09fb2b94e68a440d149d3b08da3222127ff754815dd0a1149bd"
+          },
+          "composite": {
+            "path": "examples/slice/evidence/broken/1440/composite.png",
+            "sha256": "5e39aa3e4d46d829c26bdbf8db9fc8efa89a1c922c2ae2ff4f9821197cb7dc9a"
+          },
+          "diffAfter": {
+            "path": "examples/slice/evidence/broken/1440/diff-after.png",
+            "sha256": "02026dda398b955169d34f4107fe696b116d63287d695524fa770eb77f87a4ab"
+          },
+          "diffBefore": {
+            "path": "examples/slice/evidence/broken/1440/diff-before.png",
+            "sha256": "cde07b3c6397ab37dbe7015255ca5d50a7898cd44745b12455ca31e5c254f0b2"
+          },
+          "figma": {
+            "path": "examples/slice/evidence/broken/1440/figma.png",
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
+          }
+        },
+        "manifest": "examples/slice/evidence/broken/1440/manifest.json",
+        "score": {
+          "after": 73.83,
+          "before": 9.73
+        }
+      }
+    },
+    "correct": {
+      "390": {
+        "images": {
+          "after": {
+            "path": "examples/slice/evidence/correct/390/after.png",
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
+          },
+          "before": {
+            "path": "examples/slice/evidence/correct/390/before.png",
+            "sha256": "1228017d6668afb3fad38ceec4b711d15e3acaf1f18acf308041bd51e9a02184"
+          },
+          "composite": {
+            "path": "examples/slice/evidence/correct/390/composite.png",
+            "sha256": "06e23aae957f522398ee5329bbac2b919a5992483dd9d25507ab808c123642ec"
+          },
+          "diffAfter": {
+            "path": "examples/slice/evidence/correct/390/diff-after.png",
+            "sha256": "8688579461f7c84eb4bb23d54946910da9470bd35e52ed029e08d26ae35338b5"
+          },
+          "diffBefore": {
+            "path": "examples/slice/evidence/correct/390/diff-before.png",
+            "sha256": "f802f123031bb689d1b85f6450c41418f57bef29256feeb484f33c17624eb014"
+          },
+          "figma": {
+            "path": "examples/slice/evidence/correct/390/figma.png",
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
+          }
+        },
+        "manifest": "examples/slice/evidence/correct/390/manifest.json",
+        "score": {
+          "after": 100,
+          "before": 39.97
+        }
+      },
+      "1440": {
+        "images": {
+          "after": {
+            "path": "examples/slice/evidence/correct/1440/after.png",
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
+          },
+          "before": {
+            "path": "examples/slice/evidence/correct/1440/before.png",
+            "sha256": "a446a4fa699bb09fb2b94e68a440d149d3b08da3222127ff754815dd0a1149bd"
+          },
+          "composite": {
+            "path": "examples/slice/evidence/correct/1440/composite.png",
+            "sha256": "d6fab5ed1e41c23fcfdbea38c0a0a684a9e239cf0ba7999ca6ae78d5570d3e79"
+          },
+          "diffAfter": {
+            "path": "examples/slice/evidence/correct/1440/diff-after.png",
+            "sha256": "8688579461f7c84eb4bb23d54946910da9470bd35e52ed029e08d26ae35338b5"
+          },
+          "diffBefore": {
+            "path": "examples/slice/evidence/correct/1440/diff-before.png",
+            "sha256": "cde07b3c6397ab37dbe7015255ca5d50a7898cd44745b12455ca31e5c254f0b2"
+          },
+          "figma": {
+            "path": "examples/slice/evidence/correct/1440/figma.png",
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
+          }
+        },
+        "manifest": "examples/slice/evidence/correct/1440/manifest.json",
+        "score": {
+          "after": 100,
+          "before": 9.73
+        }
+      }
+    }
+  },
+  "scoreNote": "advisory: 100 * (1 - mismatched / (W*H)) against the Figma render; never a pass/fail gate",
+  "spec": {
+    "path": "examples/slice/spec/card.spec.json",
+    "sha256": "11cc71c173e857257d00a6e4f41748f4b2f7a375fdf3dcedfabdfcaa89868e92"
+  },
+  "tokens": {
+    "css": {
+      "path": "examples/slice/app/src/tokens.css",
+      "sha256": "e93ad00bdcda567267874b977d716bec584fc4abba087e6e132312e522c8da80"
+    },
+    "snapshot": {
+      "digest": "fnv1a64:fd631e535712b153",
+      "exportedAt": "2026-11-02T09:00:00Z",
+      "path": "tests/fixtures/spec/variables.json",
+      "sha256": "1e939da8dc19798cde492a7b4c1df99fd90438bc5512ac6c47d2027cb6b7f0ba"
+    }
+  },
+  "version": 1
+}
