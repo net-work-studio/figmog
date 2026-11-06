@@ -1,0 +1,19 @@
+src/serve/async_tests/isolation.rs
+  s_d336666e6b7163::t_b74e56439f230b 580-584,747-751
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8db23fcca13ed6ebfb2d4dc92cdf0521b4a091e0",
+  "prompts": {},
+  "sessions": {
+    "s_d336666e6b7163": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa8-a0b6-7dc1-bd6e-bc0081b6f0e4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
