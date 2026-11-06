@@ -114,6 +114,10 @@ struct Server {
 
 impl Server {
     fn start(worker: Option<DesktopWorker>) -> Self {
+        Self::start_with_offload(Offload::new(worker))
+    }
+
+    fn start_with_offload(offload: Offload) -> Self {
         let Harness {
             release,
             entered,
@@ -131,9 +135,9 @@ impl Server {
         });
         let (stdout_tx, stdout) = mpsc::channel::<Value>();
         let thread = std::thread::spawn(move || {
-            serve_loop_with_output(
+            serve_loop_with_offload(
                 manager,
-                worker,
+                offload,
                 true,
                 false,
                 Duration::from_secs(3600),
@@ -419,6 +423,71 @@ fn calling_a_missing_desktop_tool_rechecks_the_desktop_at_once() {
     assert_eq!(response["result"]["isError"], true);
     server.assert_stdio_silent(Duration::from_millis(100));
     assert_eq!(desktop.handshakes.load(Ordering::Relaxed), handshakes + 1);
+    server.finish();
+}
+
+#[test]
+fn failed_call_reply_precedes_its_recovery_notification_across_channels() {
+    struct GatedFailure {
+        entered: mpsc::Sender<&'static str>,
+        release: mpsc::Receiver<()>,
+        tools: Vec<Value>,
+    }
+
+    impl UpstreamMcp for GatedFailure {
+        fn initialize(&mut self) -> Result<(), UpstreamError> {
+            self.entered.send("probe").unwrap();
+            self.release.recv_timeout(EXPECT).unwrap();
+            Err(down())
+        }
+
+        fn tools(&self) -> &[Value] {
+            &self.tools
+        }
+
+        fn call(&mut self, _: &str, _: &Value) -> Result<Value, UpstreamError> {
+            self.entered.send("call").unwrap();
+            self.release.recv_timeout(EXPECT).unwrap();
+            Err(down())
+        }
+    }
+
+    let (entered, trace) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let upstream = GatedFailure {
+        entered,
+        release: gate,
+        tools: desktop_tools(),
+    };
+    let mut offload = Offload::new(Some(DesktopWorker::spawn_with(upstream, true, never())));
+    let mut synchronized = false;
+    offload.before_desktop_maintain = Some(Box::new(move |desktop| {
+        if synchronized || trace.try_recv().is_err() {
+            return;
+        }
+        synchronized = true;
+        // Finish the failed call only at the desktop-sampling boundary.
+        release.send(()).unwrap();
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "probe");
+        desktop.submit(DesktopJob::Probe {
+            call_triggered: false,
+        });
+        release.send(()).unwrap();
+        // Starting another probe proves the first event was sent, while
+        // the main loop has not yet sampled it or delivered the reply.
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "probe");
+        release.send(()).unwrap();
+    }));
+    let mut server = Server::start_with_offload(offload);
+    initialize_clients(&mut server, true);
+    server
+        .tx
+        .send(Incoming::Stdio(call(json!(2), "get_code")))
+        .unwrap();
+    let response = server.next_stdio();
+    assert_eq!(response["id"], 2, "{response}");
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert_eq!(server.next_stdio(), list_changed());
     server.finish();
 }
 

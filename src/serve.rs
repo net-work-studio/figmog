@@ -669,6 +669,9 @@ impl Pending {
     }
 }
 
+#[cfg(test)]
+type DesktopMaintainHook = Box<dyn FnMut(&DesktopWorker) + Send>;
+
 /// The main loop's side of off-loop work: the completion channel, token
 /// allocation, the read pool, and the desktop worker (if an upstream is
 /// attached).
@@ -690,6 +693,9 @@ struct Offload {
     /// Observe the shutdown boundary without scheduling sleeps in tests.
     #[cfg(test)]
     stopped: Option<mpsc::Sender<()>>,
+    /// Pause before sampling desktop events to exercise cross-channel ordering.
+    #[cfg(test)]
+    before_desktop_maintain: Option<DesktopMaintainHook>,
 }
 
 /// Completion polling interval while worker reads are outstanding, so a
@@ -710,6 +716,8 @@ impl Offload {
             exit_drain: EXIT_DRAIN,
             #[cfg(test)]
             stopped: None,
+            #[cfg(test)]
+            before_desktop_maintain: None,
         }
     }
 
@@ -980,6 +988,19 @@ fn request_loop(
         for key in published {
             refresh_current(manager, track_current, &key);
         }
+        #[cfg(test)]
+        if let Some(hook) = &mut offload.before_desktop_maintain
+            && let Some(desktop) = &offload.desktop
+        {
+            hook(desktop);
+        }
+        // Sample desktop events before draining replies. The worker sends a
+        // failed call's reply before its recovery probe's event; observing the
+        // event here therefore guarantees that reply is available below.
+        let desktop_changed = offload
+            .desktop
+            .as_mut()
+            .is_some_and(|desktop| desktop.maintain(Instant::now()));
         // Deferred results go back to whoever asked. A token with no
         // pending entry was never parked (its call failed before
         // deferring), so its result has no requester.
@@ -999,13 +1020,11 @@ fn request_loop(
         // Desktop re-detection (NWS-2959): probes run on the desktop
         // worker; only a change in the exposed tool list re-merges and is
         // announced, queued behind every response already sent.
-        if let Some(desktop) = &mut offload.desktop
-            && desktop.maintain(Instant::now())
-        {
+        if desktop_changed {
             // Raw upstream changes may affect only filtered collisions or
             // unsupported metadata. Notify clients only if their exposed
             // registry changes after the merge's filtering/transforms.
-            let updated = merged_registry(Some(desktop));
+            let updated = merged_registry(offload.desktop.as_ref());
             if updated != tools {
                 tools = updated;
                 let note = frame(&mcp::tools_list_changed());
