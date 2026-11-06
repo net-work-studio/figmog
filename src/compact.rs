@@ -241,10 +241,10 @@ mod tests {
         assert!(error.contains("time budget"));
     }
 
-    /// Write enough synthetic proxy-cache rows through fold that the
-    /// journal crosses fjall's sealing threshold. Returns the rows written.
-    fn large_store(path: &Path) -> Vec<(Id, Rec)> {
-        let rows: Vec<(Id, Rec)> = (0..48)
+    const FIXTURE_PATH_ENV: &str = "FIGMOG_TEST_COMPACT_FIXTURE_PATH";
+
+    fn large_rows() -> Vec<(Id, Rec)> {
+        (0..48)
             .map(|i| {
                 let key = format!("synthetic-{i:03}");
                 let rec = ProxyCacheRec {
@@ -259,8 +259,60 @@ mod tests {
                 };
                 (Id::ProxyCache(key), Rec::ProxyCache(rec))
             })
-            .collect();
-        let mut st = crate::open_store!(path);
+            .collect()
+    }
+
+    /// Build the committed fixture without depending on fjall's Drop:
+    /// under load, its blocking Close send was observed stuck after the
+    /// last worker exited. Checkpoint then exit the child; the parent still
+    /// exercises the real compaction, locking and recovery assertions.
+    fn large_store(path: &Path) -> Vec<(Id, Rec)> {
+        let rows = large_rows();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "compact::tests::populate_large_store_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FIXTURE_PATH_ENV, path)
+            .env_remove("FIGMOG_TEST_COMPACT_CHILD")
+            .env_remove("FIGMOG_TEST_COMPACT_ABORT")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("start compaction fixture builder");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(
+                        status.success(),
+                        "compaction fixture builder failed: {status}"
+                    );
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                outcome => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "compaction fixture builder did not finish within its budget: {outcome:?}"
+                    );
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn populate_large_store_fixture() {
+        let Some(path) = std::env::var_os(FIXTURE_PATH_ENV) else {
+            return;
+        };
+        let rows = large_rows();
+        let mut st = crate::open_store!(Path::new(&path));
         st.wtx(|tx| {
             for (id, rec) in &rows {
                 tx.upsert(id, rec);
@@ -275,7 +327,8 @@ mod tests {
                 }),
             );
         });
-        rows
+        st.checkpoint();
+        std::process::exit(0);
     }
 
     fn manager(dir: &Path, db: &Path) -> crate::sessions::SessionManager {
