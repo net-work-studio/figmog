@@ -75,14 +75,14 @@ $ claude mcp remove figma
 ```
 
 Run one or the other, not both. figmog forwards the tools of Figma's
-**desktop** MCP server when the Figma desktop app is running with Dev Mode
-MCP enabled. Calls are uncached and results pass through verbatim; tool
-descriptions get a `[via Figma desktop] ` prefix. figmog checks for the
-desktop app only once, when `figmog serve` starts, so start the desktop
-app before your agent (or restart the agent after opening it). By default
-only the desktop server's tools are forwarded. `--upstream-url` can target
-another HTTP MCP server, but sends no authentication for Figma's remote
-server. Keep both connections and the agent sees two overlapping Figma
+**desktop** MCP server (uncached, verbatim) when the Figma desktop app is
+running with Dev Mode MCP enabled. Open or quit the desktop app whenever
+you like: figmog re-checks for it (about every 30 seconds while it is
+missing) and tells your agent when its tools appear or go away. Only the
+desktop server's tools are forwarded by default. `--upstream-url` can
+target another HTTP MCP server, but sends no authentication for Figma's
+remote server. Tool descriptions get a `[via Figma desktop] ` prefix.
+Keep both connections and the agent sees two overlapping Figma
 servers, then picks tools badly.
 
 ### 4. Ask for something

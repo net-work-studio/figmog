@@ -14,6 +14,13 @@
 //! progress. Each file's worker owns its writer and metadata polling.
 //! Requests use its last published committed snapshot while the worker
 //! fetches, flattens, applies indexes and evicts caches.
+//! `figmog_images` and desktop proxy calls are answered later: their
+//! network work runs on the file's worker or the desktop worker, and the
+//! loop writes each response to its requester when it completes (NWS-2955).
+//! Heavy local reads run on a read-worker pool against a leased published
+//! view, and every response is written by a per-requester writer thread
+//! with a bounded queue and a per-response deadline, so neither a slow
+//! client nor a whole-mirror scan holds the loop (NWS-2962).
 //!
 //! **Desktop context:** the upstream answers for the file active in Figma,
 //! independently of the mirrors. It supplies no authoritative file/revision
@@ -28,28 +35,40 @@
 //! `tools/call` routes by the namespace rule (`proxy::is_local_tool`).
 //! Upstream routing is global, not per-session: the desktop server serves
 //! whatever file is open in the Figma app, independent of any mirror this
-//! process manages — spec §14's documented caveat. No mid-session
-//! re-probe: an unreachable upstream at startup means local-only tools
-//! for the life of the process.
+//! process manages — spec §14's documented caveat. The desktop is
+//! re-detected after startup (NWS-2959): the desktop worker keeps probing
+//! it, and when its tools appear or disappear the registry is re-merged
+//! and clients that sent `initialize` get `notifications/tools/list_changed`
+//! (see `desktop.rs`).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::dispatch;
 use crate::ident::parse_file_ref;
-use crate::mcp::{self, FnHandler, ToolOutput};
+#[cfg(test)]
+use crate::mcp::FnHandler;
+use crate::mcp::{self, PendingCall, Reply, ToolErrorMode, ToolOutput};
 use crate::proxy;
 use crate::sessions::{self, SessionManager};
+
+mod desktop;
+mod output;
+mod reads;
+
 use crate::upstream::{HttpUpstream, UpstreamMcp};
+use desktop::{DesktopJob, DesktopWorker, ProbeCadence};
+use output::{ConnRegistry, StdioWriter};
+use reads::{ReadPool, ReadTask, StagedRead};
 
 /// Default streamable-HTTP URL of Figma desktop app's Dev Mode MCP server
 /// (build design §12).
@@ -82,7 +101,8 @@ fn clamp_interval(interval: u64) -> Duration {
 // (`Incoming::Socket`) so the single-threaded main loop below can route
 // each response back to the connection that asked for it. The main loop
 // handles routing, scheduling and committed read views; per-file workers
-// own all writes and blocking pull/poll work.
+// own all writes and blocking pull/poll work; read workers run heavy
+// reads; writer threads (`output.rs`) write every response.
 
 /// One message the serve loop can receive from either its stdin reader
 /// thread or a socket connection's reader thread.
@@ -99,16 +119,6 @@ enum Incoming {
     /// One line from socket connection `conn_id`.
     Socket(u64, String),
 }
-
-/// Registry of a socket connection's write half, keyed by connection id —
-/// the main loop's only way to route a response back to the connection
-/// that asked for it (its own thread only ever *reads*; writing back
-/// happens from the main loop, which is the only place a `ToolHandler` may
-/// touch the store). An entry is removed the moment its reader thread ends
-/// (EOF or any read error — see [`spawn_socket_acceptor`]), so a client
-/// that vanishes mid-request simply has no entry left to write a response
-/// to by the time one's ready.
-type ConnRegistry = Arc<Mutex<HashMap<u64, UnixStream>>>;
 
 /// `<figmog_root>/serve.sock` — must match `cli::socket`'s own derivation
 /// exactly, since that's how the CLI finds this process.
@@ -276,18 +286,6 @@ impl Drop for SocketGuard {
 /// — is orders of magnitude smaller than this.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
-/// Generous but bounded: a socket client that never reads what serve
-/// writes back (accidentally or maliciously) must not be able to stall
-/// this connection's response forever (review I1); well-behaved clients
-/// (the CLI's own `cli::socket`, any well-formed automation) read
-/// promptly and never come close to this. Set once per connection, at
-/// accept time, on a handle that's `dup()`-shared with every later
-/// `try_clone()` of the same connection (a unix-domain socket's send
-/// timeout is a property of the underlying OS socket, not of any one
-/// process-side handle to it), so [`write_socket_response`]'s later clones
-/// inherit it automatically.
-const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Read one newline-delimited frame from `reader`, capped at
 /// [`MAX_FRAME_BYTES`] (review m4). `Ok(None)` on a clean EOF with no
 /// partial data; `Err` on an oversized frame (no newline found within the
@@ -335,13 +333,13 @@ fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Strin
 /// Accept loop for the control-plane socket, on its own thread: each
 /// connection gets its own reader thread forwarding newline-delimited
 /// frames (bounded per [`read_bounded_line`]) into `tx` tagged with a
-/// fresh connection id, with its write half — a non-blocking-forever send
-/// timeout applied ([`SOCKET_WRITE_TIMEOUT`]) — stored in `registry` first
-/// (so a request that arrives and is answered before the *next* line is
-/// even read still has somewhere to route its response). An accept, clone,
-/// or timeout-configuration failure for one connection is skipped rather
-/// than tearing down the whole listener — a transient per-connection
-/// hiccup shouldn't take the control plane down.
+/// fresh connection id, with its write half registered (and its writer
+/// thread started, [`output::Connections::register`]) first — so a request
+/// that arrives and is answered before the *next* line is even read still
+/// has somewhere to route its response. An accept, clone, or registration
+/// failure for one connection is skipped rather than tearing down the
+/// whole listener — a transient per-connection hiccup shouldn't take the
+/// control plane down.
 fn spawn_socket_acceptor(
     listener: UnixListener,
     tx: mpsc::Sender<Incoming>,
@@ -354,72 +352,39 @@ fn spawn_socket_acceptor(
             let Ok(write_half) = stream.try_clone() else {
                 continue;
             };
-            if write_half
-                .set_write_timeout(Some(SOCKET_WRITE_TIMEOUT))
-                .is_err()
-            {
+            let conn_id = next_id.fetch_add(1, Ordering::Relaxed);
+            if registry.register(conn_id, write_half).is_err() {
                 continue;
             }
-            let conn_id = next_id.fetch_add(1, Ordering::Relaxed);
-            registry.lock().unwrap().insert(conn_id, write_half);
 
             let tx = tx.clone();
-            let registry = registry.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream);
-                loop {
-                    match read_bounded_line(&mut reader) {
-                        Ok(None) => break,
-                        Ok(Some(l)) => {
-                            if tx.send(Incoming::Socket(conn_id, l)).is_err() {
-                                break;
+            let reader_registry = registry.clone();
+            let reader = std::thread::Builder::new()
+                .name(format!("figmog-socket-reader-{conn_id}"))
+                .spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        match read_bounded_line(&mut reader) {
+                            Ok(None) => break,
+                            Ok(Some(l)) => {
+                                if tx.send(Incoming::Socket(conn_id, l)).is_err() {
+                                    break;
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
-                }
-                // The client disconnected (or sent something unreadable):
-                // drop its write half so a response computed just before
-                // this point (still in flight through `tx`) finds no entry
-                // to write to instead of writing into a dead socket.
-                registry.lock().unwrap().remove(&conn_id);
-            });
+                    // The client disconnected, sent something unreadable, or
+                    // was dropped by its writer: a response computed after this
+                    // point finds no entry, and its pending reads are skipped.
+                    reader_registry.unregister(conn_id);
+                });
+            if let Err(error) = reader {
+                registry.unregister(conn_id);
+                eprintln!("figmog: could not start socket reader: {error}");
+            }
         }
     });
-}
-
-/// Write one response frame back to `conn_id`'s socket connection, if it's
-/// still registered — a client that vanished mid-request (its reader
-/// thread already removed the entry) simply has nothing to write to,
-/// matching every other "vanished client" path in this file: the response
-/// is dropped, not a panic and not a wedged loop. A write failure (the
-/// connection died, or [`SOCKET_WRITE_TIMEOUT`] elapsed against a
-/// non-reading client) removes the now-dead entry too, so a later response
-/// for the same id doesn't retry a broken pipe.
-///
-/// Review I1: the actual (bounded, per [`SOCKET_WRITE_TIMEOUT`]) write
-/// happens on a handle cloned *out from behind* the registry lock — cloning
-/// a `UnixStream` is a cheap `dup()`, not I/O — rather than while holding
-/// it. Holding the lock across a blocking write would stall every other
-/// connection's registry bookkeeping (a new connection's accept-time
-/// `insert`, another connection's disconnect-time `remove`) behind however
-/// long this one write takes to time out, on top of the (unavoidable,
-/// single-threaded-loop) delay to every other queued message this causes
-/// regardless.
-fn write_socket_response(registry: &ConnRegistry, conn_id: u64, resp: &Value) {
-    let stream = {
-        let reg = registry.lock().unwrap();
-        match reg.get(&conn_id).and_then(|s| s.try_clone().ok()) {
-            Some(s) => s,
-            None => return,
-        }
-    };
-
-    let text = crate::deep_json::to_string(resp).expect("Value serializes");
-    let ok = writeln!(&stream, "{text}").is_ok() && (&stream).flush().is_ok();
-    if !ok {
-        registry.lock().unwrap().remove(&conn_id);
-    }
 }
 
 /// How long to wait before the next watch tick, given how many sessions
@@ -466,7 +431,7 @@ pub(crate) fn run_serve(
     // for the rest of this function purely for its `Drop` impl (unlinking
     // the socket file) — every return point below drops it implicitly.
     let (tx, rx) = mpsc::channel::<Incoming>();
-    let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let registry: ConnRegistry = Arc::default();
     let _socket_guard: Option<SocketGuard> = if no_socket {
         None
     } else {
@@ -506,29 +471,31 @@ pub(crate) fn run_serve(
         interval_dur,
     )?;
 
-    // Upstream probe: no mid-session re-probe in v3 — an unreachable
-    // desktop server at startup means local-only tools for the process's
-    // whole life (build design §12). Global, not per-session (see this
-    // module's doc comment).
-    let upstream: Option<HttpUpstream> = if no_upstream {
+    // Upstream probe: once here, so the first `tools/list` already has the
+    // desktop's tools when it is running; the desktop worker re-checks it
+    // from then on (NWS-2959). Global, not per-session (see this module's
+    // doc comment). `--no-upstream` starts no worker and never probes.
+    let desktop: Option<DesktopWorker> = if no_upstream {
         None
     } else {
         let mut client = HttpUpstream::new(upstream_url);
-        match client.initialize() {
-            Ok(()) => Some(client),
+        let connected = match client.initialize() {
+            Ok(()) => true,
             Err(e) => {
-                eprintln!("figmog: upstream unreachable, serving local tools only: {e}");
-                None
+                eprintln!(
+                    "figmog: upstream unreachable, serving local tools only (re-checking every {}s): {e}",
+                    ProbeCadence::default().missing.as_secs()
+                );
+                false
             }
-        }
+        };
+        Some(DesktopWorker::spawn_with(
+            client,
+            connected,
+            ProbeCadence::default(),
+        ))
     };
-    let upstream_status: &'static str = if no_upstream {
-        "disabled"
-    } else if upstream.is_some() {
-        "connected"
-    } else {
-        "unreachable"
-    };
+    let upstream_status = desktop.as_ref().map_or("disabled", DesktopWorker::status);
 
     eprintln!(
         "{} serving {} file(s) (watch {}, upstream {upstream_status}, socket {})",
@@ -540,8 +507,7 @@ pub(crate) fn run_serve(
 
     serve_loop(
         manager,
-        upstream,
-        upstream_status,
+        desktop,
         no_watch,
         track_current,
         interval_dur,
@@ -556,8 +522,7 @@ pub(crate) fn run_serve(
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(
     manager: SessionManager,
-    upstream: Option<HttpUpstream>,
-    upstream_status: &'static str,
+    desktop: Option<DesktopWorker>,
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
@@ -567,117 +532,659 @@ fn serve_loop(
     let first_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
     serve_loop_with_output(
         manager,
-        upstream,
-        upstream_status,
+        desktop,
         no_watch,
         track_current,
         interval_dur,
         first_deadline,
         rx,
         registry,
-        |response| {
+        |frame| {
             let mut stdout = std::io::stdout();
-            let text = crate::deep_json::to_string(response).expect("Value serializes");
-            writeln!(stdout, "{text}").is_ok() && stdout.flush().is_ok()
+            writeln!(stdout, "{frame}").is_ok() && stdout.flush().is_ok()
         },
     )
 }
 
+// ---- off-loop work (NWS-2955, NWS-2962) ----
+//
+// Image requests run on their file's worker, desktop proxy calls on one
+// desktop worker thread, and heavy local reads on the read pool
+// (`reads.rs`). A handler that hands work off answers
+// `ToolOutput::Deferred(token)`; the loop parks the call's `PendingCall`
+// with where to answer it (stdio or a socket connection id) and writes the
+// response when the token's `Done` arrives on the completion channel, which
+// it drains every iteration exactly like session completions. JSON-RPC
+// matches responses by id, so a deferred response may overtake or trail
+// other responses on the same stream; the CLI's socket client sends one
+// request per connection, so it never sees reordering. Two connections may
+// reuse the same id: routing is by token, never by JSON-RPC id.
+//
+// Nothing on the loop writes to a client: every response frame is queued
+// on its requester's writer thread (`output.rs`).
+
+/// What a deferred call produced.
+enum Answer {
+    /// A tool result the loop frames with its parked `PendingCall`.
+    Output(Result<ToolOutput, String>),
+    /// A complete newline-terminated response frame, framed and
+    /// serialized off the loop by a read worker.
+    Frame(String),
+}
+
+/// A deferred tool call's result, sent to the main loop's completion
+/// channel.
+struct Done {
+    token: u64,
+    answer: Answer,
+    /// A successful likely-write desktop call (spec §8): expedite every
+    /// session's metadata poll on delivery.
+    expedite_polls: bool,
+}
+
+/// Answers one deferred call exactly once. Dropping it unsent — a worker
+/// that died mid-request, or queued work discarded at shutdown — still
+/// answers, with an error, so no caller waits for a response that never
+/// comes. A send after the loop exited is silently dropped.
+pub(crate) struct DeferredReply {
+    token: u64,
+    done: Option<mpsc::Sender<Done>>,
+}
+
+impl DeferredReply {
+    fn answer(&mut self, answer: Answer, expedite_polls: bool) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(Done {
+                token: self.token,
+                answer,
+                expedite_polls,
+            });
+        }
+    }
+
+    fn send(mut self, output: Result<ToolOutput, String>, expedite_polls: bool) {
+        self.answer(Answer::Output(output), expedite_polls);
+    }
+
+    fn send_frame(mut self, frame: String) {
+        self.answer(Answer::Frame(frame), false);
+    }
+}
+
+impl Drop for DeferredReply {
+    fn drop(&mut self) {
+        self.answer(
+            Answer::Output(Err(
+                "request abandoned: its worker stopped before answering".into(),
+            )),
+            false,
+        );
+    }
+}
+
+/// Where a deferred call's response is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ReplyTo {
+    Stdio,
+    Socket(u64),
+}
+
+/// Calls one requester may have pending (deferred and unanswered) at once.
+/// Beyond it, a further `tools/call` from that requester is refused
+/// immediately with a tool error rather than queued without bound.
+const MAX_PENDING_PER_REQUESTER: usize = 32;
+
+/// Deferred calls awaiting their `Done`, by token, with a per-requester
+/// count. Ordered maps: nothing here ever iterates a `HashMap` toward
+/// output.
+#[derive(Default)]
+struct Pending {
+    calls: BTreeMap<u64, (ReplyTo, PendingCall)>,
+    per_requester: BTreeMap<ReplyTo, usize>,
+}
+
+impl Pending {
+    fn insert(&mut self, to: ReplyTo, call: PendingCall) {
+        *self.per_requester.entry(to).or_default() += 1;
+        self.calls.insert(call.token(), (to, call));
+    }
+
+    fn remove(&mut self, token: u64) -> Option<(ReplyTo, PendingCall)> {
+        let (to, call) = self.calls.remove(&token)?;
+        if let Some(count) = self.per_requester.get_mut(&to) {
+            *count -= 1;
+            if *count == 0 {
+                self.per_requester.remove(&to);
+            }
+        }
+        Some((to, call))
+    }
+
+    fn count(&self, to: ReplyTo) -> usize {
+        self.per_requester.get(&to).copied().unwrap_or(0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+}
+
+#[cfg(test)]
+type DesktopMaintainHook = Box<dyn FnMut(&DesktopWorker) + Send>;
+
+/// The main loop's side of off-loop work: the completion channel, token
+/// allocation, the read pool, and the desktop worker (if an upstream is
+/// attached).
+struct Offload {
+    done_tx: mpsc::Sender<Done>,
+    done_rx: mpsc::Receiver<Done>,
+    next_token: u64,
+    desktop: Option<DesktopWorker>,
+    reads: ReadPool,
+    /// A read the handler accepted, submitted once its `PendingCall` is
+    /// known ([`Offload::park`]).
+    staged: Option<StagedRead>,
+    /// Tokens of reads submitted to the pool and not yet answered: while
+    /// any is outstanding the loop polls for completions every
+    /// [`READ_POLL`] instead of every 20ms.
+    reads_in_flight: std::collections::BTreeSet<u64>,
+    /// How long shutdown may take: [`EXIT_DRAIN`] (tests shorten it).
+    exit_drain: Duration,
+    /// Observe the shutdown boundary without scheduling sleeps in tests.
+    #[cfg(test)]
+    stopped: Option<mpsc::Sender<()>>,
+    /// Pause before sampling desktop events to exercise cross-channel ordering.
+    #[cfg(test)]
+    before_desktop_maintain: Option<DesktopMaintainHook>,
+}
+
+/// Completion polling interval while worker reads are outstanding, so a
+/// read answered off the loop gains at most this much latency.
+const READ_POLL: Duration = Duration::from_millis(2);
+
+impl Offload {
+    fn new(desktop: Option<DesktopWorker>) -> Self {
+        let (done_tx, done_rx) = mpsc::channel();
+        Self {
+            done_tx,
+            done_rx,
+            next_token: 0,
+            desktop,
+            reads: ReadPool::default(),
+            staged: None,
+            reads_in_flight: std::collections::BTreeSet::new(),
+            exit_drain: EXIT_DRAIN,
+            #[cfg(test)]
+            stopped: None,
+            #[cfg(test)]
+            before_desktop_maintain: None,
+        }
+    }
+
+    /// A fresh token (never reused, so a stale result can't match a later
+    /// call) and the reply handle that answers it.
+    fn reply(&mut self) -> (u64, DeferredReply) {
+        let token = self.next_token;
+        self.next_token += 1;
+        (
+            token,
+            DeferredReply {
+                token,
+                done: Some(self.done_tx.clone()),
+            },
+        )
+    }
+
+    /// Accept `task` for the read pool. A requester that is already gone
+    /// gets nothing computed.
+    fn defer_read(
+        &mut self,
+        cancel: &Arc<AtomicBool>,
+        task: ReadTask,
+    ) -> Result<ToolOutput, String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("request cancelled: its connection closed".into());
+        }
+        let (token, reply) = self.reply();
+        self.staged = Some(StagedRead {
+            token,
+            task,
+            reply,
+            cancel: cancel.clone(),
+        });
+        Ok(ToolOutput::Deferred(token))
+    }
+
+    /// Hand a staged read its `PendingCall` and submit it to the pool.
+    fn park(&mut self, call: &PendingCall) {
+        // A stale stage (another token) is dropped and answers an error
+        // to a token nobody parked.
+        if let Some(staged) = self.staged.take()
+            && staged.token == call.token()
+        {
+            self.reads_in_flight.insert(staged.token);
+            self.reads.submit(staged, call.clone());
+        }
+    }
+}
+
+/// Apply a deferred result's loop-side effects and return its answer.
+fn apply_done(
+    manager: &mut SessionManager,
+    no_watch: bool,
+    interval: Duration,
+    next_deadline: &mut Instant,
+    done: Done,
+) -> Answer {
+    if done.expedite_polls && !no_watch {
+        manager.expedite_polls(interval);
+        *next_deadline = Instant::now();
+    }
+    done.answer
+}
+
+/// One response as a newline-terminated frame (compact JSON, as always).
+fn frame(response: &Value) -> String {
+    let mut frame = crate::deep_json::to_string(response).expect("Value serializes");
+    frame.push('\n');
+    frame
+}
+
+/// The response frame for a deferred call's answer.
+fn answer_frame(answer: Answer, call: PendingCall) -> String {
+    match answer {
+        Answer::Frame(frame) => frame,
+        Answer::Output(output) => frame(&crate::deep_json::OwnedValue(call.finish(output))),
+    }
+}
+
+/// Queue one response frame for its requester. `false` means the stdio
+/// writer is gone, which shuts the server down cleanly.
+fn deliver(to: ReplyTo, frame: String, registry: &ConnRegistry, stdio: &StdioWriter) -> bool {
+    match to {
+        ReplyTo::Stdio => stdio.send(frame),
+        ReplyTo::Socket(conn_id) => {
+            registry.send(conn_id, frame);
+            true
+        }
+    }
+}
+
+/// How long stdin EOF waits for deferred responses still owed (and then
+/// for writers to flush them). Covers a desktop call (10s upstream
+/// timeout) with margin; an image request that runs longer loses its
+/// response (its file's worker still finishes it before exit, like a
+/// running pull).
+const EXIT_DRAIN: Duration = Duration::from_secs(15);
+
+/// Shutdown: answer the deferred calls already accepted before exiting, so
+/// `printf '<request>\n' | figmog serve` still gets its response. Accepts
+/// no new requests and starts no new work (queued image requests and
+/// queued desktop calls — the desktop queue was already stopped by the
+/// caller — are answered with an error; running ones finish and answer);
+/// waits until `deadline`. A vanished stdout or closed socket
+/// just drops that response.
+fn drain_on_exit(
+    manager: &mut SessionManager,
+    offload: &Offload,
+    pending: &mut Pending,
+    registry: &ConnRegistry,
+    stdio: &StdioWriter,
+    deadline: Instant,
+) {
+    for session in &mut manager.sessions {
+        session.abandon_queued_images();
+    }
+    while !pending.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(done) = offload.done_rx.recv_timeout(left) else {
+            return;
+        };
+        let Some((to, call)) = pending.remove(done.token) else {
+            continue;
+        };
+        // No poll expedite: the server is exiting.
+        if !deliver(to, answer_frame(done.answer, call), registry, stdio) {
+            return;
+        }
+    }
+}
+
+/// Why the request loop returned.
+enum LoopExit {
+    /// Stdin EOF or the request channel closed: drain owed responses.
+    Drain,
+    /// Stdout is gone: nobody to drain to on stdio.
+    StdoutGone,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_loop_with_output(
-    mut manager: SessionManager,
-    mut upstream: Option<HttpUpstream>,
-    upstream_status: &'static str,
+    manager: SessionManager,
+    desktop: Option<DesktopWorker>,
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
     first_deadline: Instant,
     rx: mpsc::Receiver<Incoming>,
     registry: ConnRegistry,
-    mut write_stdio: impl FnMut(&Value) -> bool,
+    write_stdio: impl FnMut(&str) -> bool + Send + 'static,
 ) -> Result<(), String> {
-    let (tools, dropped) = match &upstream {
-        Some(u) => proxy::merge_registry(dispatch::tool_registry(), u.tools()),
-        None => (dispatch::tool_registry(), Vec::new()),
-    };
-    for name in &dropped {
-        eprintln!("figmog: dropping upstream tool named like a local tool: {name}");
-    }
+    serve_loop_with_offload(
+        manager,
+        Offload::new(desktop),
+        no_watch,
+        track_current,
+        interval_dur,
+        first_deadline,
+        rx,
+        registry,
+        write_stdio,
+    )
+}
 
+/// [`serve_loop_with_output`] with a caller-built [`Offload`] (tests set
+/// read-pool hooks on it).
+#[allow(clippy::too_many_arguments)]
+fn serve_loop_with_offload(
+    mut manager: SessionManager,
+    mut offload: Offload,
+    no_watch: bool,
+    track_current: bool,
+    interval_dur: Duration,
+    first_deadline: Instant,
+    rx: mpsc::Receiver<Incoming>,
+    registry: ConnRegistry,
+    write_stdio: impl FnMut(&str) -> bool + Send + 'static,
+) -> Result<(), String> {
+    let stdio = StdioWriter::spawn(write_stdio);
+    let mut pending = Pending::default();
+    let exit = request_loop(
+        &mut manager,
+        &mut offload,
+        &mut pending,
+        no_watch,
+        track_current,
+        interval_dur,
+        first_deadline,
+        &rx,
+        &registry,
+        &stdio,
+    );
+    // On every exit, before anything waits (the drain below, or the read
+    // pool's shutdown on a vanished stdout): the desktop worker must not
+    // pick up a queued (possibly mutating) call while in-flight work
+    // finishes. Queued calls get the shutting-down error.
+    if let Some(desktop) = &offload.desktop {
+        desktop.stop_taking_jobs();
+    }
+    #[cfg(test)]
+    if let Some(stopped) = offload.stopped.take() {
+        let _ = stopped.send(());
+    }
+    let deadline = Instant::now() + offload.exit_drain;
+    if matches!(exit, LoopExit::Drain) {
+        drain_on_exit(
+            &mut manager,
+            &offload,
+            &mut pending,
+            &registry,
+            &stdio,
+            deadline,
+        );
+    }
+    // Stop the read pool within the deadline (queued reads are skipped; a
+    // read still running then is detached with its own lease), then close
+    // every store behind the reset barrier — waiting at most until the
+    // same deadline — before the sessions drop. Nothing reopens a store.
+    offload.reads.shutdown(deadline);
+    drop(offload);
+    manager.close_reads(deadline);
+    registry.finish(deadline);
+    stdio.finish(deadline);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_loop(
+    manager: &mut SessionManager,
+    offload: &mut Offload,
+    pending: &mut Pending,
+    no_watch: bool,
+    track_current: bool,
+    interval_dur: Duration,
+    first_deadline: Instant,
+    rx: &mpsc::Receiver<Incoming>,
+    registry: &ConnRegistry,
+    stdio: &StdioWriter,
+) -> LoopExit {
+    let mut tools = merged_registry(offload.desktop.as_ref());
     let mut watch = WatchScheduler::new(first_deadline);
+    // Stdio is never cancelled: it is the only client of its stream.
+    let stdio_live = Arc::new(AtomicBool::new(false));
+    // Stdio sent `initialize`, so it gets notifications (NWS-2959).
+    let mut stdio_subscribed = false;
 
     loop {
+        // A vanished stdio reader is a clean shutdown; accepted running
+        // pulls drain through FileSession's drop handler.
+        if stdio.gone() {
+            return LoopExit::StdoutGone;
+        }
         // Completions and due watch work run even under continuous traffic.
         // Polling this in-memory channel never waits on a pull or HTTP.
         let mut published = Vec::new();
         for session in &mut manager.sessions {
-            if session.maintain() {
+            if session.maintain(!no_watch) {
                 published.push(session.key.clone());
             }
         }
+        for (key, outcome) in manager.service_resets() {
+            match outcome {
+                Ok(()) => published.push(key),
+                Err(error) => eprintln!("figmog: reopening {key} after a reset failed: {error}"),
+            }
+        }
         for key in published {
-            refresh_current(&manager, track_current, &key);
+            refresh_current(manager, track_current, &key);
+        }
+        #[cfg(test)]
+        if let Some(hook) = &mut offload.before_desktop_maintain
+            && let Some(desktop) = &offload.desktop
+        {
+            hook(desktop);
+        }
+        // Sample desktop events before draining replies. The worker sends a
+        // failed call's reply before its recovery probe's event; observing the
+        // event here therefore guarantees that reply is available below.
+        let desktop_changed = offload
+            .desktop
+            .as_mut()
+            .is_some_and(|desktop| desktop.maintain(Instant::now()));
+        // Deferred results go back to whoever asked. A token with no
+        // pending entry was never parked (its call failed before
+        // deferring), so its result has no requester.
+        while let Ok(done) = offload.done_rx.try_recv() {
+            offload.reads_in_flight.remove(&done.token);
+            let Some((to, call)) = pending.remove(done.token) else {
+                continue;
+            };
+            let answer = apply_done(manager, no_watch, interval_dur, &mut watch.next_round, done);
+            if !deliver(to, answer_frame(answer, call), registry, stdio) {
+                return LoopExit::StdoutGone;
+            }
         }
         if !no_watch {
-            watch.service_at(&mut manager, interval_dur, Instant::now());
+            watch.service_at(manager, interval_dur, Instant::now());
         }
-        let wait = Duration::from_millis(20).min(if no_watch {
+        // Desktop re-detection (NWS-2959): probes run on the desktop
+        // worker; only a change in the exposed tool list re-merges and is
+        // announced, queued behind every response already sent.
+        if desktop_changed {
+            // Raw upstream changes may affect only filtered collisions or
+            // unsupported metadata. Notify clients only if their exposed
+            // registry changes after the merge's filtering/transforms.
+            let updated = merged_registry(offload.desktop.as_ref());
+            if updated != tools {
+                tools = updated;
+                let note = frame(&mcp::tools_list_changed());
+                registry.broadcast(&note);
+                if stdio_subscribed && !stdio.send(note) {
+                    return LoopExit::StdoutGone;
+                }
+            }
+        }
+        let poll = if offload.reads_in_flight.is_empty() {
+            Duration::from_millis(20)
+        } else {
+            READ_POLL
+        };
+        let wait = poll.min(if no_watch {
             Duration::from_millis(20)
         } else {
             watch
-                .next_deadline(&manager)
+                .next_deadline(manager)
                 .saturating_duration_since(Instant::now())
         });
         let msg = match rx.recv_timeout(wait) {
             Ok(msg) => msg,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return LoopExit::Drain,
         };
 
-        let line = match msg {
-            Incoming::StdinClosed => return Ok(()),
-            Incoming::Stdio(l) => l,
-            Incoming::Socket(conn_id, l) => {
-                let mut handler =
-                    FnHandler(|name: &str, args: &Value| -> Result<ToolOutput, String> {
-                        handle_tool_call(
-                            &mut manager,
-                            &mut upstream,
-                            upstream_status,
-                            no_watch,
-                            interval_dur,
-                            &mut watch.next_round,
-                            name,
-                            args,
-                        )
-                    });
-                if let Some(resp) = mcp::handle_socket_message(&l, &tools, &mut handler) {
-                    write_socket_response(&registry, conn_id, &crate::deep_json::OwnedValue(resp));
+        let (to, line, mode, cancel) = match msg {
+            Incoming::StdinClosed => return LoopExit::Drain,
+            Incoming::Stdio(l) => (
+                ReplyTo::Stdio,
+                l,
+                ToolErrorMode::McpContent,
+                stdio_live.clone(),
+            ),
+            Incoming::Socket(conn_id, l) => (
+                ReplyTo::Socket(conn_id),
+                l,
+                ToolErrorMode::JsonRpc,
+                registry.cancel_flag(conn_id),
+            ),
+        };
+
+        let over_limit = pending.count(to) >= MAX_PENDING_PER_REQUESTER;
+        offload.staged = None;
+        let upstream_status = offload
+            .desktop
+            .as_ref()
+            .map_or("disabled", DesktopWorker::status);
+        let list_changes = offload.desktop.is_some();
+        let mut handler = LoopHandler::new(
+            |name: &str, args: &Value| -> Result<ToolOutput, String> {
+                if over_limit {
+                    return Err(format!(
+                        "too many pending requests on this connection (limit {MAX_PENDING_PER_REQUESTER}); wait for responses before sending more"
+                    ));
                 }
-                continue;
+                handle_tool_call(
+                    manager,
+                    offload,
+                    &cancel,
+                    upstream_status,
+                    interval_dur,
+                    name,
+                    args,
+                )
+            },
+        );
+        handler.list_changes = list_changes;
+        let reply = mcp::dispatch_message(&line, &tools, &mut handler, mode);
+        let LoopHandler {
+            initialized,
+            unknown_tool,
+            ..
+        } = handler;
+        if initialized {
+            match to {
+                ReplyTo::Stdio => stdio_subscribed = true,
+                ReplyTo::Socket(conn_id) => registry.subscribe(conn_id),
             }
-        };
-
-        let mut handler = FnHandler(|name: &str, args: &Value| -> Result<ToolOutput, String> {
-            handle_tool_call(
-                &mut manager,
-                &mut upstream,
-                upstream_status,
-                no_watch,
-                interval_dur,
-                &mut watch.next_round,
-                name,
-                args,
-            )
-        });
-
-        if let Some(response) = mcp::handle_message(&line, &tools, &mut handler)
-            && !write_stdio(&crate::deep_json::OwnedValue(response))
-        {
-            // A vanished stdio reader is a clean shutdown; accepted
-            // running pulls drain through FileSession's drop handler.
-            return Ok(());
         }
+        // A desktop tool called while the desktop is missing: re-check now.
+        // The call itself is refused as an unknown tool, not held for the
+        // probe; a client that sent `initialize` hears about the tools
+        // through `tools/list_changed` and can retry.
+        if let Some(name) = unknown_tool
+            && !cancel.load(Ordering::Relaxed)
+            && !proxy::is_local_tool(&name)
+            && let Some(desktop) = &mut offload.desktop
+            && !desktop.connected()
+        {
+            desktop.request_probe(Instant::now());
+        }
+        match reply {
+            None => {}
+            Some(Reply::Later(call)) => {
+                offload.park(&call);
+                pending.insert(to, call);
+            }
+            Some(Reply::Now(response)) => {
+                let response = crate::deep_json::OwnedValue(response);
+                if !deliver(to, frame(&response), registry, stdio) {
+                    return LoopExit::StdoutGone;
+                }
+            }
+        }
+    }
+}
+
+/// The local registry merged with the desktop's current tools (none when
+/// it is missing or disabled). Collisions are dropped and logged on every
+/// merge (spec §8); the order is local tools, then canonical desktop order.
+fn merged_registry(desktop: Option<&DesktopWorker>) -> Vec<mcp::ToolDef> {
+    let (tools, dropped) = match desktop {
+        Some(desktop) => proxy::merge_registry(dispatch::tool_registry(), desktop.tools()),
+        None => (dispatch::tool_registry(), Vec::new()),
+    };
+    for name in &dropped {
+        eprintln!("figmog: dropping upstream tool named like a local tool: {name}");
+    }
+    tools
+}
+
+/// The loop's tool handler: runs calls through `call`, and records the
+/// protocol events the loop acts on after dispatch (NWS-2959).
+struct LoopHandler<F> {
+    call: F,
+    list_changes: bool,
+    /// The client sent `initialize`.
+    initialized: bool,
+    /// A `tools/call` was refused as an unknown tool.
+    unknown_tool: Option<String>,
+}
+
+impl<F> LoopHandler<F> {
+    fn new(call: F) -> Self {
+        Self {
+            call,
+            list_changes: false,
+            initialized: false,
+            unknown_tool: None,
+        }
+    }
+}
+
+impl<F: FnMut(&str, &Value) -> Result<ToolOutput, String>> mcp::ToolHandler for LoopHandler<F> {
+    fn tools_list_changes(&self) -> bool {
+        self.list_changes
+    }
+
+    fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String> {
+        (self.call)(name, args)
+    }
+
+    fn initialized(&mut self) {
+        self.initialized = true;
+    }
+
+    fn unknown_tool(&mut self, name: &str) {
+        self.unknown_tool = Some(name.to_string());
     }
 }
 
@@ -901,6 +1408,25 @@ fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
     }
 }
 
+/// spec §2b: note an explicit-file/URL-file disagreement on a failed call
+/// (almost always "no node ... in the mirror" — the node genuinely isn't in
+/// the file the explicit arg picked) rather than staying silent about why a
+/// URL that looks right didn't resolve. `explicit_key` is the explicit
+/// `file` argument's *normalized* key, not its raw text — it can itself be
+/// a full Figma URL (or a bare key) naming the very same file `url_key`
+/// already extracted, and a raw-string compare would false-positive on
+/// that (same file, different spelling). A `file` arg `parse_file_ref`
+/// can't make sense of at all falls back to the raw text so a genuine
+/// mismatch still shows.
+fn file_mismatch_note(msg: String, explicit_key: Option<&str>, url_key: Option<&str>) -> String {
+    match (explicit_key, url_key) {
+        (Some(ef), Some(uf)) if ef != uf => format!(
+            "{msg} (note: the id/under URL names file {uf}, but the explicit `file` argument {ef} was used instead)"
+        ),
+        _ => msg,
+    }
+}
+
 /// Route one `tools/call`. `figmog_files`/`figmog_open` aren't per-file
 /// and are handled first; every other local tool's optional `file`
 /// argument is extracted (and stripped before tool-specific arg parsing)
@@ -908,19 +1434,39 @@ fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
 /// proxied — see this module's doc comment for the cache-routing choice.
 /// Open/sync and implicit first reads schedule workers; they never perform
 /// a pull on the request thread. Status and files report job completion.
-#[allow(clippy::too_many_arguments)]
-fn handle_tool_call<U: UpstreamMcp>(
+///
+/// Images and desktop calls answer [`ToolOutput::Deferred`]: their network
+/// work runs off the loop (on the file's worker and the desktop worker) and
+/// their result arrives later through `offload`'s completion channel.
+///
+/// Heavy local reads, `figmog_status` and `figmog_files` (NWS-2962) also
+/// answer [`ToolOutput::Deferred`]: they run on the read pool against a
+/// leased published view; `cancel` (the requester's) lets the pool skip
+/// them once nobody is left to answer.
+fn handle_tool_call(
     manager: &mut SessionManager,
-    upstream: &mut Option<U>,
+    offload: &mut Offload,
+    cancel: &Arc<AtomicBool>,
     upstream_status: &'static str,
-    no_watch: bool,
     interval: Duration,
-    next_deadline: &mut Instant,
     name: &str,
     args: &Value,
 ) -> Result<ToolOutput, String> {
+    // Reject disconnected requests before any store open, pull, or upstream
+    // operation; frames can outlive their connection in the input channel.
+    if cancel.load(Ordering::Relaxed) {
+        return Err("request cancelled: its connection closed".into());
+    }
+    if proxy::is_local_tool(name) {
+        dispatch::validate_object_args(args)?;
+        // Type errors must win over routing/not-ready errors and must not
+        // auto-open a mirror or queue a pull. Execution keeps using the
+        // shared dispatcher against the selected published view below.
+        dispatch::ReadCommand::from_tool_args(name, args)?;
+    }
     if name == "figmog_files" {
-        return Ok(ToolOutput::Json(manager.list()));
+        let read = manager.files_read();
+        return offload.defer_read(cancel, ReadTask::Files(read));
     }
 
     if name == "figmog_open" {
@@ -930,7 +1476,7 @@ fn handle_tool_call<U: UpstreamMcp>(
         // stored (default false for a brand-new mirror) — the worker's
         // stored-flag union handles that, so `false` here is exactly "no
         // new override" rather than "force off".
-        let geometry = dispatch::arg_bool(args, "geometry");
+        let geometry = dispatch::arg_bool(args, "geometry")?;
         let session = manager.open(&file)?;
         return Ok(ToolOutput::Json(session.request_pull(geometry, interval)));
     }
@@ -942,7 +1488,13 @@ fn handle_tool_call<U: UpstreamMcp>(
     // are present and disagree, the explicit arg still wins — the
     // disagreement is only surfaced as a note on a not-found error below,
     // never silently overridden the other way.
-    let explicit_file = args.get("file").and_then(Value::as_str).map(str::to_string);
+    // Desktop tools' arguments are the upstream's own business; only a
+    // local tool's `file` is figmog's routing property to type-check.
+    let explicit_file = if proxy::is_local_tool(name) {
+        dispatch::arg_str(args, "file")?
+    } else {
+        None
+    };
     let url_file_key = dispatch::infer_file_from_node_ref(args);
     let file_arg = explicit_file.clone().or_else(|| url_file_key.clone());
 
@@ -953,9 +1505,14 @@ fn handle_tool_call<U: UpstreamMcp>(
             return Ok(ToolOutput::Json(session.request_pull(false, interval)));
         }
         if name == "figmog_status" {
-            let mut status = session.status()?;
-            status["upstream"] = json!(upstream_status);
-            return Ok(ToolOutput::Json(status));
+            let read = session.status_read();
+            return offload.defer_read(
+                cancel,
+                ReadTask::Status {
+                    read,
+                    upstream: upstream_status,
+                },
+            );
         }
 
         if !(session.mirrored || name == "figmog_vars" && session.has_variable_state()) {
@@ -963,57 +1520,77 @@ fn handle_tool_call<U: UpstreamMcp>(
         }
         if name == "figmog_images" {
             // Failed first mirrors share the data-read retry path above.
-            // Once ready, image fetching retains its own synchronous
-            // networking/cache contract, separate from pull scheduling.
+            // Once ready, the file's worker scans, fetches and caches;
+            // the response is delivered when it finishes.
             let ids = dispatch::require_str_array(args, "ids")?;
-            let format = args.get("format").and_then(Value::as_str).unwrap_or("png");
-            let scale = dispatch::arg_f64(args, "scale");
-            let items = session.images(&ids, format, scale)?;
-            return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
+            let format = dispatch::arg_str(args, "format")?;
+            let format = format.as_deref().unwrap_or("png");
+            let scale = dispatch::arg_f64(args, "scale")?;
+            let (token, reply) = offload.reply();
+            session.images(
+                &ids,
+                format,
+                scale,
+                Box::new(move |result| {
+                    let output =
+                        result.map(|items| ToolOutput::Raw(crate::images::to_mcp_content(&items)));
+                    reply.send(output, false);
+                }),
+            )?;
+            return Ok(ToolOutput::Deferred(token));
         }
 
-        let result = session.dispatch(name, args).map_err(|msg| {
-            // spec §2b: note an explicit-file/URL-file disagreement on a
-            // failed call (almost always "no node ... in the mirror" —
-            // the node genuinely isn't in the file the explicit arg
-            // picked) rather than staying silent about why a URL that
-            // looks right didn't resolve. `explicit_file` is compared by
-            // its *normalized* key, not its raw text — it can itself be a
-            // full Figma URL (or a bare key) naming the very same file
-            // `url_file_key` already extracted, and a raw-string compare
-            // would false-positive on that (same file, different spelling).
-            // A `file` arg `parse_file_ref` can't make sense of at all
-            // falls back to the raw text so a genuine mismatch still shows.
-            let explicit_key = explicit_file
-                .as_deref()
-                .map(|f| parse_file_ref(f).unwrap_or_else(|| f.to_string()));
-            match (&explicit_key, &url_file_key) {
-                (Some(ef), Some(uf)) if ef != uf => {
-                    format!(
-                        "{msg} (note: the node URL names file {uf}, but the explicit `file` argument {ef} was used instead)"
-                    )
-                }
-                _ => msg,
-            }
-        })?;
-        return Ok(result);
+        // The worker owns these arguments. Clone through the growing-stack
+        // parser/serializer so arbitrarily deep equality values remain safe.
+        let mut call_args = crate::deep_json::from_str(
+            &crate::deep_json::to_string(args).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(obj) = call_args.0.as_object_mut() {
+            obj.remove("file");
+        }
+        let explicit_key = explicit_file
+            .as_deref()
+            .map(|f| parse_file_ref(f).unwrap_or_else(|| f.to_string()));
+        if !reads::is_inline_read(name) {
+            let lease = session.lease_for(name)?;
+            return offload.defer_read(
+                cancel,
+                ReadTask::Tool {
+                    lease,
+                    name: name.to_string(),
+                    args: call_args,
+                    explicit_key,
+                    url_key: url_file_key,
+                },
+            );
+        }
+        return session.dispatch(name, &call_args).map_err(|msg| {
+            file_mismatch_note(msg, explicit_key.as_deref(), url_file_key.as_deref())
+        });
     }
 
     // Desktop context is independent of every mirror. Never route its
-    // responses through a session's version-keyed cache.
-    let up = upstream
-        .as_mut()
-        .ok_or_else(|| format!("upstream not attached: {name}"))?;
-    let (value, trigger_poll) = proxy::proxy_call(up, name, args)?;
-    if trigger_poll && !no_watch {
-        manager.expedite_polls(interval);
-        *next_deadline = Instant::now();
+    // responses through a session's version-keyed cache. The desktop
+    // worker forwards it; a likely write's poll expedite is applied when
+    // the result is delivered (see `apply_done`).
+    if offload.desktop.is_none() {
+        return Err(format!("upstream not attached: {name}"));
     }
-    // A proxied result is already a complete MCP `CallToolResult` from the
-    // upstream — emit it verbatim (spec §11/§12; see `mcp::ToolOutput::Raw`'s
-    // doc comment) rather than re-wrapping it as figmog's own text-block
-    // shape.
-    Ok(ToolOutput::Raw(value))
+    let (token, reply) = offload.reply();
+    if let Some(desktop) = &offload.desktop {
+        desktop.submit(DesktopJob::Call {
+            name: name.to_string(),
+            args: crate::deep_json::from_str(
+                &crate::deep_json::to_string(args).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
+            .into_inner(),
+            reply,
+            cancel: cancel.clone(),
+        });
+    }
+    Ok(ToolOutput::Deferred(token))
 }
 
 #[cfg(test)]
@@ -1023,6 +1600,7 @@ mod tests {
     use crate::api::{FigmaApi, UreqApi};
     use crate::mcp::ToolDef;
     use crate::upstream::FakeUpstream;
+    use serde_json::json;
 
     #[test]
     fn watch_tick_reconciles_once_despite_different_endpoint_timestamps() {
@@ -1077,7 +1655,7 @@ mod tests {
         watch_tick_at(&mut manager, &mut next_idx, interval, Instant::now());
         let deadline = Instant::now() + Duration::from_secs(5);
         while manager.list()[0]["pull"]["job"]["state"] != "succeeded" {
-            manager.sessions[0].maintain();
+            manager.sessions[0].maintain(true);
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
@@ -1089,12 +1667,12 @@ mod tests {
         manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
         let deadline = Instant::now() + Duration::from_secs(5);
         while api.meta_calls.load(Ordering::Relaxed) < 2 {
-            manager.sessions[0].maintain();
+            manager.sessions[0].maintain(true);
             manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
-        manager.sessions[0].maintain();
+        manager.sessions[0].maintain(true);
         assert_eq!(api.file_calls.load(Ordering::Relaxed), 1);
     }
 
@@ -1175,12 +1753,11 @@ mod tests {
                 default_key: Some("ABC123".into()),
                 api: None,
             };
-            let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-            registry.lock().unwrap().insert(1, socket);
+            let registry: ConnRegistry = Arc::default();
+            registry.register(1, socket).unwrap();
             serve_loop(
                 manager,
                 None,
-                "disabled",
                 false,
                 false,
                 Duration::from_secs(2),
@@ -1389,17 +1966,17 @@ mod tests {
     }
 
     #[test]
-    fn write_socket_response_delivers_to_the_registered_connection() {
+    fn socket_response_is_delivered_to_the_registered_connection() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let client = UnixStream::connect(&path).unwrap();
         let (server_side, _) = listener.accept().unwrap();
 
-        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-        registry.lock().unwrap().insert(1, server_side);
+        let registry: ConnRegistry = Arc::default();
+        registry.register(1, server_side).unwrap();
 
-        write_socket_response(&registry, 1, &json!({"hello": "world"}));
+        registry.send(1, frame(&json!({"hello": "world"})));
 
         let mut reader = BufReader::new(client);
         let mut line = String::new();
@@ -1408,17 +1985,19 @@ mod tests {
         assert_eq!(v, json!({"hello": "world"}));
         // The write succeeded, so the entry is still there for a
         // subsequent response on the same connection.
-        assert!(registry.lock().unwrap().contains_key(&1));
+        assert!(registry.is_registered(1));
+        assert!(!registry.cancel_flag(1).load(Ordering::Relaxed));
     }
 
     #[test]
-    fn write_socket_response_for_an_unregistered_connection_is_a_silent_no_op() {
+    fn socket_response_for_an_unregistered_connection_is_a_silent_no_op() {
         // A response for a connection id that was never registered (or
         // whose entry was already removed — the client vanished) must not
         // panic; the response is simply dropped.
-        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-        write_socket_response(&registry, 999, &json!({"ignored": true}));
-        assert!(registry.lock().unwrap().is_empty());
+        let registry: ConnRegistry = Arc::default();
+        registry.send(999, frame(&json!({"ignored": true})));
+        assert!(!registry.is_registered(999));
+        assert!(registry.cancel_flag(999).load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1612,49 +2191,46 @@ mod tests {
     }
 
     #[test]
-    fn write_socket_response_disconnects_a_non_reading_client_within_a_bounded_time() {
-        // review I1: a client that never drains what serve writes back
-        // must not be able to hang `write_socket_response` (and therefore
-        // the single-threaded main loop) forever. A short write timeout —
-        // independent of the production `SOCKET_WRITE_TIMEOUT`, which
-        // stays generous for real clients — proves the *mechanism*
-        // (bounded write ⇒ disconnect ⇒ registry cleanup) without waiting
-        // out the production timeout in a unit test.
+    fn a_non_reading_client_is_dropped_without_blocking_the_sender() {
+        // review I1 / NWS-2962: a client that never drains what serve
+        // writes back can neither hang the loop (queueing never blocks)
+        // nor hold memory without bound: once its queue is full the
+        // connection is dropped, its socket shut down and its pending
+        // reads cancelled.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sock");
         let listener = UnixListener::bind(&path).unwrap();
-        let _client = UnixStream::connect(&path).unwrap(); // never read from
+        let client = UnixStream::connect(&path).unwrap(); // never read from
         let (server_side, _) = listener.accept().unwrap();
-        server_side
-            .set_write_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
 
-        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
-        registry.lock().unwrap().insert(1, server_side);
+        let registry: ConnRegistry = Arc::default();
+        registry.register(1, server_side).unwrap();
+        let cancel = registry.cancel_flag(1);
 
-        // A sizeable payload, written repeatedly with nothing ever
-        // draining the client's receive buffer: the OS socket buffer WILL
-        // fill eventually (its exact size varies by platform, so this
-        // doesn't assume a specific threshold) and a subsequent write
-        // times out. Bounded overall by the loop's own deadline — if
-        // `write_socket_response` ever blocked indefinitely (the pre-fix
-        // behavior), this loop would hang the test past that deadline
-        // instead of completing.
-        let big = json!({"padding": "x".repeat(64 * 1024)});
+        let big = frame(&json!({"padding": "x".repeat(64 * 1024)}));
         let start = Instant::now();
-        while registry.lock().unwrap().contains_key(&1) && start.elapsed() < Duration::from_secs(10)
-        {
-            write_socket_response(&registry, 1, &big);
+        // The kernel's socket buffer absorbs a few frames before the
+        // writer blocks; the queue then fills behind it.
+        for _ in 0..1000 {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            registry.send(1, big.clone());
         }
-
         assert!(
-            !registry.lock().unwrap().contains_key(&1),
-            "a non-reading client's connection should eventually be dropped, not held forever"
+            start.elapsed() < Duration::from_secs(1),
+            "queueing a response must never wait on the client"
         );
         assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "write_socket_response must not block indefinitely on a non-reading client"
+            cancel.load(Ordering::Relaxed),
+            "a non-reading client's connection is dropped once its queue is full"
         );
+        // The socket was shut down: the client reads what was flushed, then EOF.
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut sink = Vec::new();
+        std::io::Read::read_to_end(&mut &client, &mut sink).unwrap();
     }
 }
 

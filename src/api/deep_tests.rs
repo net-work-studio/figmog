@@ -38,7 +38,7 @@ fn pulls_500_nested_frames_over_rest() {
     session.request_pull(false, Duration::from_secs(300));
     let deadline = Instant::now() + budget;
     loop {
-        session.maintain();
+        session.maintain(false);
         let status = session.status().unwrap();
         match status["pull"]["job"]["state"].as_str() {
             Some("succeeded") => {

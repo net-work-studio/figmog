@@ -239,3 +239,170 @@ pub fn store_snapshot(
     visit(path, path, &mut out);
     out
 }
+
+/// [`fixture_v1`] plus twelve "garden bed" TEXT nodes on the Empty page, so
+/// `search garden` has more hits than the default limit of 10 — the
+/// read-adapter parity tests (NWS-2902) need omission of `limit` to be
+/// observable, not just "every hit fits either way". Additional nested,
+/// sibling and cross-page nodes make each scope and depth flag observable.
+#[allow(dead_code)]
+pub fn parity_fixture() -> Value {
+    let mut v = fixture_v1();
+    let beds: Vec<Value> = (0..12)
+        .map(|i| {
+            json!({
+                "id": format!("4:{i}"), "name": format!("Bed {i}"), "type": "TEXT",
+                "characters": format!("garden bed {i}"), "children": [],
+            })
+        })
+        .collect();
+    v["document"]["children"][2]["children"] = Value::Array(beds);
+    // Depth, equality, page and subtree scopes must each remove results,
+    // otherwise dropping one flag in an adapter would still pass parity.
+    v["document"]["children"][0]["children"][0]["children"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "1:4", "name": "Nested", "type": "FRAME", "children": [
+                {"id": "1:5", "name": "Nested text", "type": "TEXT",
+                 "characters": "A deeper title", "children": []}
+            ]
+        }));
+    v["document"]["children"][0]["children"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!({"id": "1:6", "name": "Outside text", "type": "TEXT",
+               "characters": "Outside the hero", "children": []}),
+            json!({"id": "1:7", "name": "Row", "type": "FRAME",
+               "layoutMode": "HORIZONTAL", "children": []}),
+        ]);
+    v["document"]["children"][1]["children"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": "2:4", "name": "Column", "type": "FRAME",
+               "layoutMode": "VERTICAL", "children": []}));
+    v
+}
+
+/// One local read exercised through every adapter (NWS-2902): the direct
+/// CLI command, the equivalent local tool name, and the tool arguments a
+/// `figmog call`/MCP client would send for the same query. Covers every
+/// local read tool with representative defaults, options and omission
+/// forms (subtree `fields`, search's default `limit`, `where` with no
+/// `equals` vs `equals: null`). Null optionals are covered by parser tests.
+#[allow(dead_code)]
+pub fn read_parity_cases() -> Vec<(Vec<&'static str>, &'static str, Value)> {
+    vec![
+        (vec!["status"], "figmog_status", json!({})),
+        (vec!["pages"], "figmog_pages", json!({})),
+        (vec!["tree"], "figmog_tree", json!({})),
+        (
+            vec!["tree", "1:1", "--depth", "1"],
+            "figmog_tree",
+            json!({"id": "1:1", "depth": 1}),
+        ),
+        (vec!["get", "1:1"], "figmog_node", json!({"id": "1:1"})),
+        (
+            vec!["get", "1:1", "--children", "--resolve-vars"],
+            "figmog_node",
+            json!({"id": "1:1", "children": true, "resolve_vars": true}),
+        ),
+        (vec!["dump", "1:1"], "figmog_subtree", json!({"id": "1:1"})),
+        (
+            vec!["dump", "1:1", "--depth", "1", "--fields", "id,name,fills"],
+            "figmog_subtree",
+            json!({"id": "1:1", "depth": 1, "fields": ["id", "name", "fills"]}),
+        ),
+        (
+            vec!["dump", "1:1", "--fields", "styles", "--resolve-vars"],
+            "figmog_subtree",
+            json!({"id": "1:1", "fields": ["styles"], "resolve_vars": true}),
+        ),
+        (
+            vec!["find", "--type", "TEXT"],
+            "figmog_find",
+            json!({"type": "TEXT"}),
+        ),
+        (
+            vec!["find", "--type", "TEXT", "--page", "0:1"],
+            "figmog_find",
+            json!({"type": "TEXT", "page": "0:1"}),
+        ),
+        (
+            vec!["find", "--type", "TEXT", "--under", "1:1"],
+            "figmog_find",
+            json!({"type": "TEXT", "under": "1:1", "page": null}),
+        ),
+        (
+            vec!["search", "garden"],
+            "figmog_search",
+            json!({"query": "garden"}),
+        ),
+        (
+            vec!["search", "garden", "-n", "3", "--under", "0:3"],
+            "figmog_search",
+            json!({"query": "garden", "limit": 3, "under": "0:3"}),
+        ),
+        (
+            vec!["instances", "Button"],
+            "figmog_instances",
+            json!({"target": "Button"}),
+        ),
+        (vec!["components"], "figmog_components", json!({})),
+        (vec!["styles"], "figmog_styles", json!({})),
+        (
+            vec!["styles", "--type", "TEXT", "--values", "--resolve-vars"],
+            "figmog_styles",
+            json!({"type": "TEXT", "values": true, "resolve_vars": true}),
+        ),
+        (vec!["uses", "S:1"], "figmog_uses", json!({"id": "S:1"})),
+        (vec!["vars"], "figmog_vars", json!({})),
+        (
+            vec!["vars", "--snapshot"],
+            "figmog_vars",
+            json!({"snapshot": true}),
+        ),
+        (
+            vec!["vars", "VariableID:100"],
+            "figmog_vars",
+            json!({"id": "VariableID:100"}),
+        ),
+        (vec!["stats"], "figmog_stats", json!({})),
+        (vec!["path", "1:2"], "figmog_path", json!({"id": "1:2"})),
+        (vec!["text"], "figmog_text", json!({})),
+        (
+            vec!["text", "--page", "0:1", "--under", "1:1"],
+            "figmog_text",
+            json!({"page": "0:1", "under": "1:1"}),
+        ),
+        (
+            vec!["where", "--pointer", "/layoutMode"],
+            "figmog_where",
+            json!({"pointer": "/layoutMode"}),
+        ),
+        (
+            vec!["where", "--pointer", "/layoutMode", "--equals", "null"],
+            "figmog_where",
+            json!({"pointer": "/layoutMode", "equals": null}),
+        ),
+        (
+            vec![
+                "where",
+                "--pointer",
+                "/layoutMode",
+                "--equals",
+                "VERTICAL",
+                "--page",
+                "0:1",
+            ],
+            "figmog_where",
+            json!({"pointer": "/layoutMode", "equals": "VERTICAL", "page": "0:1"}),
+        ),
+        (
+            vec!["at", "--x", "10", "--y", "10", "--page", "0:1"],
+            "figmog_at",
+            json!({"x": 10, "y": 10, "page": "0:1"}),
+        ),
+    ]
+}

@@ -140,13 +140,17 @@ fn tools_list_over(stream: UnixStream) -> Result<Vec<Value>, String> {
         .unwrap_or_default())
 }
 
-/// One newline-delimited JSON-RPC frame out, one line back — the wire
+/// One newline-delimited JSON-RPC frame out, its response back — the wire
 /// mechanics every call in this module shares. `initialize` is
 /// deliberately skipped: spec §1 makes it optional for socket clients, and
-/// `mcp::handle_socket_message` treats every frame independently regardless of
+/// `mcp::dispatch_message` treats every frame independently regardless of
 /// handshake state (verified by `serve.rs`'s socket-loop tests), so a bare
 /// `tools/call`/`tools/list` is answered exactly as if a handshake had
-/// happened first.
+/// happened first. Skipping it also means serve never sends this client
+/// notifications (only connections that sent `initialize` get them), but
+/// the reader still tolerates them: frames carrying a `method` (a
+/// notification or a server request) and responses for another id are
+/// skipped until the response to `frame`'s own id arrives (NWS-2959).
 fn send_and_recv(stream: UnixStream, frame: &Value) -> Result<Value, String> {
     stream
         .set_read_timeout(Some(SOCKET_TIMEOUT))
@@ -155,13 +159,44 @@ fn send_and_recv(stream: UnixStream, frame: &Value) -> Result<Value, String> {
         .set_write_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
-    let frame = crate::deep_json::to_string(frame).map_err(|e| e.to_string())?;
-    writeln!(writer, "{frame}").map_err(|e| format!("writing to serve socket: {e}"))?;
+    let request = crate::deep_json::to_string(frame).map_err(|e| e.to_string())?;
+    writeln!(writer, "{request}").map_err(|e| format!("writing to serve socket: {e}"))?;
     writer
         .flush()
         .map_err(|e| format!("writing to serve socket: {e}"))?;
 
     let mut reader = BufReader::new(stream);
+    let id = crate::deep_json::from_str(
+        &crate::deep_json::to_string(frame.get("id").unwrap_or(&Value::Null))
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    loop {
+        let line = read_frame(&mut reader)?;
+        let resp = crate::deep_json::from_str(&line)
+            .map_err(|e| format!("serve socket sent invalid JSON: {e}"))?;
+        if is_response_to(&resp, &id) {
+            return Ok(resp.into_inner());
+        }
+    }
+}
+
+/// Whether `resp` is the response to the request with `id`: a response
+/// (no `method`) carrying that id, or an error with a null id (serve could
+/// not read the request's id at all, e.g. a parse error).
+fn is_response_to(resp: &Value, id: &Value) -> bool {
+    if resp.get("method").is_some() {
+        return false;
+    }
+    match resp.get("id") {
+        Some(got) if got == id => true,
+        Some(Value::Null) | None => resp.get("error").is_some(),
+        Some(_) => false,
+    }
+}
+
+/// One newline-terminated frame from serve, as text.
+fn read_frame(reader: &mut BufReader<UnixStream>) -> Result<String, String> {
     let mut line = String::new();
     let n = reader.read_line(&mut line).map_err(|e| {
         // Review m2: a timed-out read (the timeout set above) reads as a
@@ -184,9 +219,10 @@ fn send_and_recv(stream: UnixStream, frame: &Value) -> Result<Value, String> {
     if n == 0 {
         return Err("serve socket closed before responding".to_string());
     }
-    crate::deep_json::from_str(&line)
-        .map(crate::deep_json::OwnedValue::into_inner)
-        .map_err(|e| format!("serve socket sent invalid JSON: {e}"))
+    if !line.ends_with('\n') {
+        return Err("serve socket closed during a response".to_string());
+    }
+    Ok(line)
 }
 
 fn protocol_error_message(err: &Value) -> String {
@@ -300,6 +336,48 @@ mod tests {
             interpret_call_response("get_screenshot", resp).unwrap(),
             raw_result
         );
+    }
+
+    /// A notification (or another id's response) arriving before the reply
+    /// is skipped, not printed as the answer (NWS-2959).
+    #[test]
+    fn send_and_recv_skips_notifications_and_matches_the_reply_by_id() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let serve = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            let mut out = server;
+            for frame in [
+                json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+                json!({"jsonrpc": "2.0", "id": 7, "result": {"other": true}}),
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": {"mine": true}}),
+            ] {
+                writeln!(out, "{frame}").unwrap();
+            }
+        });
+        let resp = send_and_recv(
+            client,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .unwrap();
+        assert_eq!(resp["result"], json!({"mine": true}));
+        serve.join().unwrap();
+    }
+
+    #[test]
+    fn a_null_id_error_still_answers_the_request() {
+        let error = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}});
+        assert!(is_response_to(&error, &json!(1)));
+        assert!(!is_response_to(
+            &json!({"jsonrpc": "2.0", "id": null, "result": {}}),
+            &json!(1)
+        ));
+        assert!(!is_response_to(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            &json!(1)
+        ));
     }
 
     #[test]

@@ -34,19 +34,38 @@ pub enum UpstreamError {
     Protocol(String),
 }
 
-/// The three calls figmog's proxy needs from an upstream MCP server.
+/// The calls figmog's proxy needs from an upstream MCP server.
 pub trait UpstreamMcp {
     /// Perform the MCP handshake (`initialize` + `notifications/initialized`)
     /// and populate the tool list returned by [`tools`](Self::tools).
     fn initialize(&mut self) -> Result<(), UpstreamError>;
     /// The tools discovered by the most recent [`initialize`](Self::initialize)
-    /// call, verbatim as returned by the upstream's `tools/list`.
+    /// or [`refresh_tools`](Self::refresh_tools) call, verbatim as returned
+    /// by the upstream's `tools/list`.
     fn tools(&self) -> &[Value];
+    /// Refresh the current session's tool registry without a new handshake.
+    /// Static implementations may keep their existing registry.
+    fn refresh_tools(&mut self) -> Result<(), UpstreamError> {
+        Ok(())
+    }
     /// Invoke `tools/call` on the upstream and return the JSON-RPC `result`
     /// value (the same shape the MCP spec gives a client: typically
     /// `{"content": [...], "isError": bool}`).
     fn call(&mut self, name: &str, args: &Value) -> Result<Value, UpstreamError>;
+    /// Liveness check on the current session (`figmog serve`'s periodic
+    /// re-detection, NWS-2959). The default re-runs the handshake, which
+    /// proves liveness just as well; [`HttpUpstream`] sends MCP's `ping`
+    /// instead so a live session is not re-created every check.
+    fn ping(&mut self) -> Result<(), UpstreamError> {
+        self.initialize()
+    }
 }
+
+/// Connect timeout for the desktop server. It is on the loopback
+/// interface, so a refused or silent connect is answered quickly; serve's
+/// periodic re-detection (NWS-2959) must not sit on a dead address for the
+/// whole request timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// MCP protocol version figmog's `initialize` request declares.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -75,6 +94,7 @@ impl HttpUpstream {
     pub fn new(url: String) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(10))
+            .timeout_connect(CONNECT_TIMEOUT)
             .build();
         HttpUpstream {
             url,
@@ -158,6 +178,10 @@ impl HttpUpstream {
 
 impl UpstreamMcp for HttpUpstream {
     fn initialize(&mut self) -> Result<(), UpstreamError> {
+        // A re-handshake (serve's re-detection) starts a fresh session: a
+        // restarted desktop app does not know the old session id.
+        self.session_id = None;
+        self.protocol_version = None;
         let id = self.next_request_id();
         let init_req = json!({
             "jsonrpc": "2.0",
@@ -183,6 +207,10 @@ impl UpstreamMcp for HttpUpstream {
             "method": "notifications/initialized",
         }))?;
 
+        self.refresh_tools()
+    }
+
+    fn refresh_tools(&mut self) -> Result<(), UpstreamError> {
         let list_id = self.next_request_id();
         let list_req = json!({
             "jsonrpc": "2.0",
@@ -232,6 +260,15 @@ impl UpstreamMcp for HttpUpstream {
         };
         let resp = self.send_request(&req)?;
         extract_result(resp)
+    }
+
+    fn ping(&mut self) -> Result<(), UpstreamError> {
+        if self.session_id.is_none() && self.protocol_version.is_none() {
+            return self.initialize();
+        }
+        let id = self.next_request_id();
+        let resp = self.send_request(&json!({"jsonrpc": "2.0", "id": id, "method": "ping"}))?;
+        extract_result(resp).map(|_| ())
     }
 }
 
@@ -368,6 +405,93 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn http_ping_refresh_and_reinitialize_use_the_expected_session_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let methods = [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "ping",
+                "tools/list",
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+            ];
+            for (index, method) in methods.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let (headers, body) = read_request(&mut stream);
+                let request: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(request["method"], method);
+                let headers = headers.to_ascii_lowercase();
+                if method == "initialize" {
+                    assert!(!headers.contains("mcp-session-id:"), "{headers}");
+                    assert!(!headers.contains("mcp-protocol-version:"), "{headers}");
+                } else {
+                    let session = if index < 5 { "first" } else { "second" };
+                    assert!(
+                        headers.contains(&format!("mcp-session-id: {session}")),
+                        "{headers}"
+                    );
+                    assert!(
+                        headers.contains("mcp-protocol-version: 2025-06-18"),
+                        "{headers}"
+                    );
+                }
+                match method {
+                    "notifications/initialized" => {
+                        write_response(&mut stream, "202 Accepted", &[], "")
+                    }
+                    "initialize" => {
+                        let session = if index == 0 { "first" } else { "second" };
+                        let response = json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {"protocolVersion": "2025-06-18"},
+                        });
+                        write_response(
+                            &mut stream,
+                            "200 OK",
+                            &[
+                                ("Content-Type", "application/json"),
+                                ("Mcp-Session-Id", session),
+                            ],
+                            &response.to_string(),
+                        );
+                    }
+                    _ => {
+                        let result = if method == "tools/list" {
+                            json!({"tools":[{"name":format!("tool_{index}")}]})
+                        } else {
+                            json!({})
+                        };
+                        write_response(
+                            &mut stream,
+                            "200 OK",
+                            &[("Content-Type", "application/json")],
+                            &json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        });
+        let mut upstream = HttpUpstream::new(format!("http://{addr}/mcp"));
+        upstream.initialize().unwrap();
+        assert_eq!(upstream.tools()[0]["name"], "tool_2");
+        upstream.ping().unwrap();
+        upstream.refresh_tools().unwrap();
+        assert_eq!(upstream.tools()[0]["name"], "tool_4");
+        upstream.initialize().unwrap();
+        assert_eq!(upstream.tools()[0]["name"], "tool_7");
+        server.join().unwrap();
+    }
 
     // --- pure helper tests -------------------------------------------------
 

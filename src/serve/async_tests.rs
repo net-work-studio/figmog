@@ -2,11 +2,99 @@
 use super::*;
 use crate::api::{ApiError, FigmaApi, FileMetaResp};
 use crate::store;
+use serde_json::json;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 fn fixture(version: &str) -> Value {
     json!({"name": "Synthetic", "version": version, "lastModified": "2026-01-01T12:00:00Z",
         "document": {"id": "0:0", "name": version, "type": "DOCUMENT"}})
+}
+
+#[test]
+fn invalid_local_arguments_do_not_open_or_pull_a_mirror() {
+    let mut h = Harness::new();
+    let missing = "NEW1234567890";
+    for (name, args) in [
+        ("figmog_tree", json!({"file": missing, "depth": "bad"})),
+        (
+            "figmog_search",
+            json!({"file": missing, "query": "q", "limit": false}),
+        ),
+        ("figmog_tree", json!([1, 2])),
+    ] {
+        let response = h.call(name, args);
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let error = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("expected"), "{error}");
+        assert!(!error.contains("not ready"), "{error}");
+    }
+    assert_eq!(h.manager.sessions.len(), 1);
+    assert!(!h.manager.root.join(missing).exists());
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn cancelled_socket_calls_cannot_open_sync_or_forward() {
+    let mut h = Harness::new();
+    let mut offload = Offload::new(None);
+    let cancelled = Arc::new(AtomicBool::new(true));
+    for name in ["figmog_open", "figmog_sync", "figmog_tree", "set_node_name"] {
+        let result = handle_tool_call(
+            &mut h.manager,
+            &mut offload,
+            &cancelled,
+            "disabled",
+            Duration::ZERO,
+            name,
+            &json!({"file": "NEW1234567890"}),
+        );
+        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+    }
+    assert_eq!(h.manager.sessions.len(), 1);
+    assert!(!h.manager.root.join("NEW1234567890").exists());
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn detached_read_keeps_fjall_store_locked_after_session_closes() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    let lease = h.manager.sessions[0].lease().unwrap();
+    let path = h.manager.root.join("ABC1234567890/db");
+    h.manager.close_reads(Instant::now());
+    h.manager.sessions.clear();
+    let result = crate::cli::open_store_checked(&path, |path| crate::open_store!(path));
+    assert!(matches!(result, Err(error) if error.contains("locked")));
+    assert!(sessions::read_tool(lease.view(), "figmog_node", &json!({"id":"0:0"})).is_ok());
+    drop(lease);
+    assert!(crate::cli::open_store_checked(&path, |path| crate::open_store!(path)).is_ok());
+}
+
+#[test]
+fn reset_preserves_a_pull_acknowledged_while_reads_drain() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    let lease = h.manager.sessions[0].lease().unwrap();
+    h.manager
+        .begin_reset("ABC1234567890", sessions::StoreReset::Reopen)
+        .unwrap();
+    let accepted = h.value("figmog_sync", json!({}));
+    assert!(h.manager.service_resets().is_empty());
+    drop(lease);
+    assert!(h.manager.service_resets().pop().unwrap().1.is_ok());
+    h.manager.sessions[0].maintain(false);
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    let status = h.wait_for("succeeded");
+    assert_eq!(status["pull"]["last_success"]["job_id"], accepted["job_id"]);
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 2);
 }
 
 struct Api {
@@ -18,6 +106,8 @@ struct Api {
     release: Arc<Mutex<mpsc::Receiver<()>>>,
     block_meta: AtomicBool,
     metadata_error: Mutex<Option<ApiError>>,
+    /// Gate every render request (a slow image cache miss).
+    block_images: AtomicBool,
 }
 
 impl FigmaApi for Api {
@@ -48,6 +138,73 @@ impl FigmaApi for Api {
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
         std::mem::replace(&mut *self.response.lock().unwrap(), Ok(fixture("2")))
+    }
+    fn images_render(
+        &self,
+        _: &str,
+        _: &[String],
+        _: &str,
+        _: Option<f64>,
+        _: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        if self.block_images.load(Ordering::Relaxed) {
+            self.entered.send("render").unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+        Ok(json!({"images": {}}))
+    }
+}
+
+/// Dispatch one stdio frame through `handle_tool_call` and, when the call
+/// is deferred, wait for its result and apply it exactly as the serve loop
+/// does.
+fn call_and_wait(
+    manager: &mut SessionManager,
+    offload: &mut Offload,
+    upstream_status: &'static str,
+    no_watch: bool,
+    interval: Duration,
+    tools: &[mcp::ToolDef],
+    message: &Value,
+) -> Value {
+    let live = Arc::new(AtomicBool::new(false));
+    let mut handler = FnHandler(|name: &str, args: &Value| {
+        handle_tool_call(
+            manager,
+            offload,
+            &live,
+            upstream_status,
+            interval,
+            name,
+            args,
+        )
+    });
+    let reply = mcp::dispatch_message(
+        &message.to_string(),
+        tools,
+        &mut handler,
+        ToolErrorMode::McpContent,
+    )
+    .unwrap();
+    let call = match reply {
+        Reply::Now(response) => return response,
+        Reply::Later(call) => call,
+    };
+    offload.park(&call);
+    let mut deadline = Instant::now();
+    loop {
+        let done = offload
+            .done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deferred call answers");
+        if done.token == call.token() {
+            let answer = apply_done(manager, no_watch, interval, &mut deadline, done);
+            return serde_json::from_str(&answer_frame(answer, call)).unwrap();
+        }
     }
 }
 
@@ -101,6 +258,7 @@ impl Harness {
             release: gate,
             block_meta: AtomicBool::new(false),
             metadata_error: Mutex::new(None),
+            block_images: AtomicBool::new(false),
         });
         let session = sessions::open_session_with_hooks(
             dir.path().join("ABC1234567890/db"),
@@ -131,29 +289,19 @@ impl Harness {
 
     fn call(&mut self, name: &str, args: Value) -> Value {
         for session in &mut self.manager.sessions {
-            session.maintain();
+            session.maintain(false);
         }
-        let mut upstream: Option<HttpUpstream> = None;
-        let mut deadline = Instant::now();
-        let mut handler = FnHandler(|name: &str, args: &Value| {
-            handle_tool_call(
-                &mut self.manager,
-                &mut upstream,
-                "disabled",
-                true,
-                Duration::ZERO,
-                &mut deadline,
-                name,
-                args,
-            )
-        });
+        let mut offload = Offload::new(None);
         let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}});
-        mcp::handle_message(
-            &message.to_string(),
+        call_and_wait(
+            &mut self.manager,
+            &mut offload,
+            "disabled",
+            true,
+            Duration::ZERO,
             &dispatch::tool_registry(),
-            &mut handler,
+            &message,
         )
-        .unwrap()
     }
 
     fn value(&mut self, name: &str, args: Value) -> Value {
@@ -567,13 +715,12 @@ fn async_socket_cli_acknowledges_open_and_sync_before_worker_release() {
     let (listener, path) = bind_socket(&_dir.path().join(".figmog")).unwrap();
     let _socket_guard = SocketGuard::new(path).unwrap();
     let (tx, rx) = mpsc::channel();
-    let registry = Arc::new(Mutex::new(HashMap::new()));
+    let registry: ConnRegistry = Arc::default();
     spawn_socket_acceptor(listener, tx.clone(), registry.clone());
     let server = std::thread::spawn(move || {
         serve_loop(
             manager,
             None,
-            "disabled",
             true,
             false,
             Duration::from_secs(10),
@@ -664,14 +811,17 @@ fn async_stdio_open_acknowledges_and_accepts_requests_while_fetch_is_gated() {
         serve_loop_with_output(
             manager,
             None,
-            "disabled",
             true,
             false,
             Duration::from_secs(10),
             Instant::now() + Duration::from_secs(10),
             rx,
             Arc::default(),
-            |response| output.send(response.clone()).is_ok(),
+            move |frame: &str| {
+                output
+                    .send(serde_json::from_str::<Value>(frame).unwrap())
+                    .is_ok()
+            },
         )
     });
     let call = |id, name, arguments| {
@@ -799,7 +949,7 @@ impl Harness {
         self.manager.sessions[0].poll_at(Duration::ZERO, Instant::now());
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.api.calls.load(Ordering::Relaxed) == 0 {
-            self.manager.sessions[0].maintain();
+            self.manager.sessions[0].maintain(true);
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
@@ -814,7 +964,7 @@ impl Harness {
     fn finish_poll_at(&mut self, now: Instant) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            self.manager.sessions[0].maintain_at(now);
+            self.manager.sessions[0].maintain_at(now, true);
             if self.manager.sessions[0].status().unwrap()["pull"]["polling"] == false {
                 return;
             }
@@ -826,7 +976,7 @@ impl Harness {
     fn finish_pull_at(&mut self, now: Instant) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            self.manager.sessions[0].maintain_at(now);
+            self.manager.sessions[0].maintain_at(now, true);
             if self.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] == "succeeded" {
                 return;
             }
@@ -875,28 +1025,17 @@ impl Harness {
         })]);
         desktop.push_result(Ok(json!({"content":[], "isError":false})));
         let (tools, _) = proxy::merge_registry(dispatch::tool_registry(), desktop.tools());
-        let mut upstream = Some(desktop);
-        let mut deadline = Instant::now() + Duration::from_secs(3600);
-        let mut handler = FnHandler(|name: &str, args: &Value| {
-            handle_tool_call(
-                &mut self.manager,
-                &mut upstream,
-                "connected",
-                no_watch,
-                Duration::from_secs(3600),
-                &mut deadline,
-                name,
-                args,
-            )
-        });
-        let response = mcp::handle_message(
-            &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
-            "params":{"name":"set_node_name", "arguments":{}}})
-            .to_string(),
+        let mut offload = Offload::new(Some(DesktopWorker::spawn(desktop)));
+        let response = call_and_wait(
+            &mut self.manager,
+            &mut offload,
+            "connected",
+            no_watch,
+            Duration::from_secs(3600),
             &tools,
-            &mut handler,
-        )
-        .unwrap();
+            &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"set_node_name", "arguments":{}}}),
+        );
         assert_eq!(response["result"]["isError"], false, "{response}");
     }
 
@@ -907,7 +1046,7 @@ impl Harness {
     fn wait_for_event_at(&mut self, now: Instant, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            self.manager.sessions[0].maintain_at(now);
+            self.manager.sessions[0].maintain_at(now, true);
             if let Ok(event) = self.entered.try_recv() {
                 assert_eq!(event, expected);
                 return;
@@ -967,7 +1106,7 @@ fn desktop_write_expedites_recent_poll_and_retains_writes_during_poll() {
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 1);
 
     h.desktop_write(true);
-    h.manager.sessions[0].maintain_at(base + Duration::from_secs(1));
+    h.manager.sessions[0].maintain_at(base + Duration::from_secs(1), true);
     assert_eq!(
         h.manager.sessions[0].status().unwrap()["pull"]["polling"],
         false,
@@ -994,7 +1133,7 @@ fn desktop_write_during_pull_is_polled_immediately_after_publication() {
         "fetch"
     );
     h.desktop_write(false);
-    h.manager.sessions[0].maintain_at(base + Duration::from_millis(200));
+    h.manager.sessions[0].maintain_at(base + Duration::from_millis(200), true);
     assert_eq!(
         h.manager.sessions[0].status().unwrap()["pull"]["polling"],
         false
@@ -1023,7 +1162,7 @@ fn expedited_poll_retries_honor_metadata_retry_after_and_network_backoff() {
         *h.api.metadata_error.lock().unwrap() = Some(error);
         let base = Instant::now() + Duration::from_secs(60);
         h.desktop_write(false);
-        h.manager.sessions[0].maintain_at(base);
+        h.manager.sessions[0].maintain_at(base, true);
         assert_eq!(
             h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
             "metadata"
@@ -1035,7 +1174,7 @@ fn expedited_poll_retries_honor_metadata_retry_after_and_network_backoff() {
         if seconds == 90 {
             h.desktop_write(false);
         }
-        h.manager.sessions[0].maintain_at(base + Duration::from_secs(seconds - 1));
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(seconds - 1), true);
         assert_eq!(
             h.manager.sessions[0].status().unwrap()["pull"]["polling"],
             false
@@ -1067,14 +1206,14 @@ fn expedited_poll_preserves_pull_retry_after() {
     h.release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] != "failed" {
-        h.manager.sessions[0].maintain_at(base);
+        h.manager.sessions[0].maintain_at(base, true);
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
     h.desktop_write(false);
     // Pull rate limits retain the existing max(interval, Retry-After)
     // cooldown, even when an expedited metadata request is pending.
-    h.manager.sessions[0].maintain_at(base + Duration::from_secs(3599));
+    h.manager.sessions[0].maintain_at(base + Duration::from_secs(3599), true);
     assert_eq!(
         h.manager.sessions[0].status().unwrap()["pull"]["polling"],
         false
@@ -1167,7 +1306,7 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
         h.release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while h.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] != "succeeded" {
-            h.manager.sessions[0].maintain_at(due + Duration::from_millis(200));
+            h.manager.sessions[0].maintain_at(due + Duration::from_millis(200), true);
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
@@ -1176,6 +1315,9 @@ fn watch_cadence_does_not_skip_round_after_changed_poll_publishes() {
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 4);
 }
 
+mod desktop;
+mod isolation;
+mod offload;
 mod watch_and_cache;
 
 #[test]
@@ -1265,7 +1407,7 @@ fn successful_explicit_sync_preserves_metadata_retry_after_and_expedited_reconci
         if expedited {
             h.desktop_write(false);
         }
-        h.manager.sessions[0].maintain_at(base + Duration::from_secs(sync_finished));
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(sync_finished), true);
         assert_eq!(
             h.manager.sessions[0].status().unwrap()["pull"]["polling"],
             false,
@@ -1289,7 +1431,7 @@ fn successful_explicit_sync_preserves_metadata_retry_after_and_expedited_reconci
         );
         if sync_finished < seconds {
             let before = base + Duration::from_secs(seconds - 1);
-            h.manager.sessions[0].maintain_at(before);
+            h.manager.sessions[0].maintain_at(before, true);
             watch.service_at(&mut h.manager, interval, before);
             assert_eq!(
                 h.manager.sessions[0].status().unwrap()["pull"]["polling"],
@@ -1310,7 +1452,7 @@ fn successful_explicit_sync_preserves_metadata_retry_after_and_expedited_reconci
         h.release.send(()).unwrap();
         h.finish_pull_at(recovery);
         assert_eq!(h.manager.sessions[0].status().unwrap()["version"], "3");
-        h.manager.sessions[0].maintain_at(recovery + Duration::from_secs(1));
+        h.manager.sessions[0].maintain_at(recovery + Duration::from_secs(1), true);
         assert!(matches!(
             h.entered.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -1395,7 +1537,7 @@ fn ordinary_metadata_failure_retries_at_backoff_before_next_hourly_round() {
     h.release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.manager.sessions[0].status().unwrap()["version"] != "2" {
-        h.manager.sessions[0].maintain_at(base + Duration::from_secs(15));
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(15), true);
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
@@ -1436,7 +1578,7 @@ fn ordinary_watch_pull_failure_retries_at_backoff_before_next_hourly_round() {
     h.release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.manager.sessions[0].status().unwrap()["pull"]["job"]["state"] != "failed" {
-        h.manager.sessions[0].maintain_at(base);
+        h.manager.sessions[0].maintain_at(base, true);
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
@@ -1469,7 +1611,7 @@ fn ordinary_watch_pull_failure_retries_at_backoff_before_next_hourly_round() {
     h.release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.manager.sessions[0].status().unwrap()["version"] != "2" {
-        h.manager.sessions[0].maintain_at(base + Duration::from_secs(5));
+        h.manager.sessions[0].maintain_at(base + Duration::from_secs(5), true);
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
@@ -1515,7 +1657,7 @@ fn ordinary_retries_share_rate_limit_and_do_not_starve_normal_rounds() {
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while first.manager.sessions[index].status().unwrap()["pull"]["polling"] == true {
-            first.manager.sessions[index].maintain_at(now);
+            first.manager.sessions[index].maintain_at(now, true);
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }

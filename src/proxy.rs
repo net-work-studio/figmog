@@ -2,10 +2,12 @@
 //! registry merge, and uncached forwarding. Desktop calls have no authoritative
 //! file/revision context and must not reuse a mirror's response cache.
 
+use std::borrow::Cow;
+
 use serde_json::{Value, json};
 
 use crate::mcp::ToolDef;
-use crate::upstream::UpstreamMcp;
+use crate::upstream::{UpstreamError, UpstreamMcp};
 
 /// The namespace rule (spec §12, §11 point 3): `figmog_*` tools are always
 /// local; every other name is proxied to the upstream (when attached).
@@ -34,7 +36,8 @@ pub(crate) fn merge_registry(
     mut local: Vec<ToolDef>,
     upstream_tools: &[Value],
 ) -> (Vec<ToolDef>, Vec<String>) {
-    let mut seen_names: std::collections::BTreeSet<&str> = local.iter().map(|t| t.name).collect();
+    let mut seen_names: std::collections::BTreeSet<String> =
+        local.iter().map(|tool| tool.name.to_string()).collect();
     let mut dropped = Vec::new();
     for tool in upstream_tools {
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
@@ -52,15 +55,10 @@ pub(crate) fn merge_registry(
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| json!({"type": "object"}));
-        // Upstream tool names/descriptions are only known once, at startup
-        // (no mid-session re-probe in v3 — spec §12), and figmog serves for
-        // the life of the process: leaking these few dozen strings to get
-        // the `&'static str` `ToolDef` needs is bounded and never repeats.
-        let leaked_name: &'static str = Box::leak(name.to_string().into_boxed_str());
-        seen_names.insert(leaked_name);
+        seen_names.insert(name.to_string());
         local.push(ToolDef {
-            name: leaked_name,
-            description: Box::leak(format!("[via Figma desktop] {description}").into_boxed_str()),
+            name: Cow::Owned(name.to_string()),
+            description: Cow::Owned(format!("[via Figma desktop] {description}")),
             input_schema,
         });
     }
@@ -79,8 +77,8 @@ pub(crate) fn proxy_call<U: UpstreamMcp>(
     upstream: &mut U,
     name: &str,
     args: &Value,
-) -> Result<(Value, bool), String> {
-    let result = upstream.call(name, args).map_err(|e| e.to_string())?;
+) -> Result<(Value, bool), UpstreamError> {
+    let result = upstream.call(name, args)?;
     Ok((result, !is_read_tool(name)))
 }
 
@@ -91,8 +89,8 @@ mod tests {
 
     fn local_tool(name: &'static str) -> ToolDef {
         ToolDef {
-            name,
-            description: "d",
+            name: Cow::Borrowed(name),
+            description: Cow::Borrowed("d"),
             input_schema: json!({"type": "object"}),
         }
     }
@@ -192,6 +190,39 @@ mod tests {
     }
 
     #[test]
+    fn changing_upstream_metadata_is_owned_by_each_registry() {
+        let (first, _) = merge_registry(
+            vec![local_tool("figmog_status")],
+            &[json!({"name": "get_first", "description": "initial metadata"})],
+        );
+        assert!(matches!(first[0].name, Cow::Borrowed(_)));
+        assert!(matches!(first[0].description, Cow::Borrowed(_)));
+        assert!(matches!(first[1].name, Cow::Owned(_)));
+        assert!(matches!(first[1].description, Cow::Owned(_)));
+
+        for revision in 0..64 {
+            let name = format!("get_revision_{revision}");
+            let description = format!("metadata revision {revision}");
+            let (registry, _) = merge_registry(
+                Vec::new(),
+                &[json!({"name": name, "description": description})],
+            );
+            // Each registry owns the changing strings rather than leaving
+            // their allocations in a process-global interner. Dropping the
+            // source JSON or a later registry cannot invalidate the first.
+            assert!(matches!(registry[0].name, Cow::Owned(_)));
+            assert!(matches!(registry[0].description, Cow::Owned(_)));
+            assert_eq!(registry[0].name, name);
+            assert_eq!(
+                registry[0].description,
+                format!("[via Figma desktop] {description}")
+            );
+        }
+        assert_eq!(first[1].name, "get_first");
+        assert_eq!(first[1].description, "[via Figma desktop] initial metadata");
+    }
+
+    #[test]
     fn desktop_reads_always_reach_upstream_without_triggering_a_poll() {
         for (name, args) in [
             ("get_code", json!({"nodeId": "1:2"})),
@@ -240,6 +271,6 @@ mod tests {
         let mut upstream = FakeUpstream::new(vec![]);
         upstream.push_result(Err(UpstreamError::Protocol("boom".into())));
         let err = proxy_call(&mut upstream, "get_code", &json!({})).unwrap_err();
-        assert!(err.contains("boom"));
+        assert!(err.to_string().contains("boom"));
     }
 }
