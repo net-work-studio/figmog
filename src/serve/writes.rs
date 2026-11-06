@@ -14,7 +14,8 @@
 //! requester's connection gets a `notifications/figmog/operation` frame
 //! carrying that id; the `tools/call` itself is answered (a deferred
 //! response, NWS-2955) only once the write committed and its view was
-//! published — or failed, in which case nothing was changed. The answer is
+//! published. Validation failures change nothing; a failure after a fresh
+//! clear is explicitly reported as an unknown outcome. The answer is
 //! `{"operation": id, "result": ...}`. Every finished operation's outcome
 //! is also kept as a receipt for [`RECEIPT_RETENTION`], readable with
 //! [`OPERATION`] `{id}` from any connection (a reconnecting client); a

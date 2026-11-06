@@ -621,7 +621,7 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   write committed **and** its view was published — `{"operation": id,
   "result": <churn | {"imported","removed"}>}` — or a `-32000` error if it
   failed, before changing the store. A failed reopen/apply after a fresh clear is
-  reported as outcome unknown, since the previous mirror may already have
+  reported as outcome unknown (`-32002`), since the previous mirror may already have
   been cleared. The wait is the requester's own
   connection; the loop never blocks on it.
 - *Receipts.* A finished operation's outcome is kept for 10 minutes;
@@ -638,7 +638,8 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   with another write (an import, a saved-file, fresh or differently
   configured pull) queued after it: they share one fetch and apply, each
   keeping its own operation id. A network write uses
-  serve's credentials. While a write is pending on a not-yet-mirrored
+  serve's credentials, read at startup. Restart it after changing credentials,
+  or use `--no-socket` to use the invoking CLI's credentials. While a write is pending on a not-yet-mirrored
   store, reads queue no implicit first pull. A successful routed pull
   updates `last_success` (`"job_id": null`, plus `"operation"`); it is not
   a lifecycle job.
