@@ -233,6 +233,99 @@ inverted index: `InvertedIndex` is set-semantic, so duplicate `(node,
 var)` edges (a variable bound at multiple property paths on the same
 node) collapse harmlessly to the same membership.
 
+### Maintenance keyspace and post-write compaction (NWS-2941)
+
+fold opens fjall with its default configuration and never flushes a
+memtable itself, so everything a large pull writes stays in fjall's
+journal, and every later open of the store replays the whole journal
+before it can answer anything. On a synthetic 100,001-node mirror that
+is a 93 MB journal and ~1.33 s for even `figmog path 0:1`.
+
+figmog therefore compacts a store after large writes (`src/compact.rs`),
+with fold's handle closed and the store's `.figmog-lock` ownership
+anchor (§5, fresh replacement) held for the whole pass. It reopens the
+same directory with fjall's own API — the default builder, exactly as
+fold opens it — and:
+
+1. flushes every keyspace's memtable into tables
+   (`rotate_memtable` on each of `list_keyspace_names()`, followed by
+   bounded waits that check poisoning through `persist(Buffer)`);
+2. commits one tiny constant row (`compacted` → `1`) to the
+   **`figmog_maintenance`** keyspace. After a reopen fjall's
+   append-mode journal writer reports stream position 0 until something
+   is written, and fjall seals the active journal only during a flush
+   that finds that position past 64,000,000 bytes;
+3. flushes that keyspace: fjall seals the old journal and, every
+   keyspace having persisted past it, deletes it (figmog waits on
+   `journal_count()` for the deletion);
+4. persists (`PersistMode::SyncAll`) and closes.
+
+`figmog_maintenance` is not a pipeline sink — fold names those
+`sink_<name>` and never opens anything else — so the frozen sink table
+above is unchanged, and a binary without compaction opens a compacted
+store as ordinary fjall data (it just never looks at that keyspace).
+Outputs are byte-identical with and without compaction.
+
+**When.** A journal smaller than fjall's 64 MB sealing threshold can't be
+retired this way and is left alone (checked first from the journal files'
+allocated size, without opening the store, then again after fjall's
+recovery truncates its preallocated tail); its replay costs in proportion.
+Otherwise compaction runs:
+
+- after a CLI `pull` (direct, including `figmog call figmog_sync`) that
+  added, changed or removed records, or was `--fresh` — never after a
+  zero-churn re-pull;
+- after a CLI `import-variables` that changed the snapshot;
+- at `figmog serve` shutdown, per store, after the close barrier
+  (`close_reads`) and after clients have their answers: each session is
+  closed (its worker joined within the remaining drain budget, its published view dropped) while its
+  ownership anchor is kept, then compacted. A store that a detached read
+  still holds a view of keeps fjall's own lock, so compaction's open fails
+  and that store is left untouched (one stderr line). Serve never compacts
+  under live views: not after an individual write job, and not during a
+  reset-barrier reopen (which releases the store unchanged). A worker still
+  blocked at the deadline is detached while retaining its store ownership;
+  process exit terminates it, and that store is not compacted.
+
+Compaction is best effort over already-committed data: a failure prints
+`figmog: store compaction skipped: …` on stderr and never fails the
+command that wrote. `FIGMOG_NO_COMPACT=1` (any value but empty or `0`)
+disables it. CLI output is flushed before compaction. Flush/retirement waits
+share a 15-second budget and stop after five seconds without progress or
+on poisoning. Serve skips compaction after its shutdown deadline.
+
+**Crash safety.** Every step is an ordinary fjall operation with fjall's
+own crash safety (table writes and version swaps, journal sealing and
+deletion after the data is persisted). A process killed at any point
+leaves a store fjall recovers normally — at worst with the old journal
+still in place, replayed as before — and the next compaction finishes the
+job. `compact::tests::a_crash_during_compaction_leaves_a_readable_store`
+aborts a child process after each step and re-reads every row.
+
+**Measured** (synthetic 100,001-node file, `figmog pull --from-file`,
+best of 3 cold CLI processes, 4-core Linux; `cargo test --test compact --
+--ignored --nocapture`):
+
+| command | journal replayed | compacted |
+|---|---|---|
+| journal on disk | 93.2 MB | 0 B |
+| `path 0:1` | 1.328 s | 0.004 s |
+| `get 500:3` | 1.327 s | 0.004 s |
+| `status` | 1.347 s | 0.084 s |
+| `search "copy number 7"` | 1.334 s | 0.076 s |
+| `vars` | 1.478 s | 0.220 s |
+
+The pull itself pays one more replay plus the flush (6.5 s → 8.7 s here).
+An unchanged re-pull of the compacted store is still zero churn.
+
+**Pin bumps.** `rotate_memtable` / `sealed_memtable_count` (`Keyspace`) and the
+`SingleWriterTxKeyspace::inner()` accessor are `#[doc(hidden)]` in fjall
+3.1.9 — public but undocumented — and the 64 MB sealing rule is
+fjall-internal behavior. fjall is pinned `=3.1.9`; `AGENTS.md`'s
+pin-bump checklist requires re-verifying both on any fjall or fold bump
+(`compact::tests::journal_shrinks_after_compaction` fails if the journal
+stops being retired).
+
 ## 5. Sync, churn, and sweep
 
 `store::sync` applies one flattened file in a single write transaction:
@@ -326,6 +419,11 @@ promise recovery from an unopenable/corrupt store or rollback after filesystem
 failures during reset.
 
 ## 6. `figmog serve`: multi-file sessions, watch, MCP
+
+By default `figmog serve` is a stdio relay to the repository's shared
+background owner (§6b), and this section describes that owner's engine.
+`--db`, `--figmog-root` and `--no-socket` run the same engine in the
+`figmog serve` process itself, with stdio as one more client.
 
 One `figmog serve` process owns every mirrored file's store via a
 [`SessionManager`](../src/sessions.rs). Each `FileSession` has one background
@@ -452,14 +550,20 @@ client and never runs a whole-mirror scan.
   `figmog_find`, `figmog_search`, `figmog_instances`, `figmog_styles`,
   `figmog_uses`, `figmog_vars`, `figmog_stats`, `figmog_text`,
   `figmog_where`, `figmog_at`, plus `figmog_status` and `figmog_files`
-  (their node count scans the mirror) — runs on a pool of
-  `min(4, available_parallelism)` read workers. Classification is by
-  measured cost on a synthetic 100k-node mirror: the inline lookups take
-  under 0.2 ms. Node reads always run on workers because a single raw
-  payload or its direct child list can be arbitrarily large; `figmog_components` is O(sets × components) — 0.34 s on
-  a 2k-set × 20k-component library (`measure_components_cost`); status ~90 ms, stats ~0.5 s, a whole-document subtree
-  ~0.4 s (≈20 MB), vars ~0.3 s, tree/where ~0.2–0.4 s, the rest 25–150 ms
-  (`measure_read_costs`, an ignored test). Routing, the not-ready check
+  — runs on a pool of `min(4, available_parallelism)` read workers. Node
+  reads always use workers because raw payloads and child lists can be
+  arbitrarily large.
+  Classification is by measured cost on a synthetic 100k-node mirror: the
+  inline three take under 0.2 ms; `figmog_components` is linear in sets +
+  components (NWS-2942) — 65 ms on a 2k-set × 20k-component library
+  (`measure_components_cost`); a whole-document subtree ~0.4 s (≈20 MB),
+  stats ~0.2 s, vars ~0.1 s, tree/where ~0.2–0.4 s, the rest 25–150 ms
+  (`measure_read_costs`, an ignored test). Status and files are O(1) in
+  the mirror's size: each published view carries its node count in
+  memory (from the pull that published it, or counted once by the
+  session worker when an existing mirror is opened), so a status poll
+  never scans the `nodes` table. Direct CLI `figmog status` still counts
+  the table (one-shot). Routing, the not-ready check
   and status's `ready`/`pull` lifecycle (as of the request) are decided on
   the loop; the worker reads a leased published view (no store lock),
   then frames and serializes the response itself, so even a 20 MB answer
@@ -492,13 +596,81 @@ client and never runs a whole-mirror scan.
   applies steps 2–3 (bounded by the exit drain) before closing stores; a
   worker read still running at the exit deadline is detached with its own
   lease rather than awaited, so shutdown stays within the deadline and no
-  store is reset or reopened under it: the leased fold readers retain
-  fjall's own keyspace lock even after `.figmog-lock` is released. A pull
-  acknowledged while reset is pending retains its job id and runs after
-  reopening. No
-  tool resets a store yet; `SessionManager::begin_reset` /
-  `service_resets` are the mechanism NWS-2963 builds on (its only
-  operation today is a close-and-reopen, which clears completed job history).
+  store is reset or reopened under it. The operations behind it are a
+  close-and-reopen (`StoreReset::Reopen`, tests only) and a routed `pull
+  --fresh` (`StoreReset::Fresh`, below): step 1 is the worker's fetch,
+  parse and flatten, and step 4 clears the store's contents (its ownership
+  anchor stays) under the same ownership before reopening it empty.
+  Fresh apply keeps the read gate closed until publication. Acknowledged
+  lifecycle jobs and queued CLI writes carry over to the reopened session.
+
+**CLI writers through serve (NWS-2963):** when its socket answers, `figmog
+pull` (plain, `--geometry`, `--from-file`, `--fresh`) and `figmog
+import-variables` run as *operations* of serve instead of opening the
+store (§10). They are internal socket-only tools — `figmog_internal_pull
+{file, db, fresh?, geometry?, from_file?}`, `figmog_internal_import_variables
+{file, db, content, name, allow_empty?, dry_run?}` and the receipt read `figmog_internal_operation
+{id}` — never listed by `tools/list` and refused on stdio as unknown, so
+the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
+
+- *Operation ids.* Each accepted write gets id `<generation>-<seq>`: the
+  generation is this process's pid and start time (hex), the sequence
+  counts from 1. The requester's connection first receives
+  `{"method": "notifications/figmog/operation", "params": {"id": ...}}`;
+  the `tools/call` is a deferred response (NWS-2955) sent only once the
+  write committed **and** its view was published — `{"operation": id,
+  "result": <churn | {"imported","removed"}>}` — or a `-32000` error if it
+  failed, before changing the store. A failed reopen/apply after a fresh clear is
+  reported as outcome unknown (`-32002`), since the previous mirror may already have
+  been cleared. The wait is the requester's own
+  connection; the loop never blocks on it.
+- *Receipts.* A finished operation's outcome is kept for 10 minutes;
+  `figmog_internal_operation {id}` (any connection) returns `{"id",
+  "state": "succeeded", "result"}`, `{"id", "state": "failed", "error"}`,
+  `{"id", "state": "running"}`, or an unknown-operation error (another
+  process's id, or expired). Receipts and ids are in memory only.
+- *Ordering and coalescing.* Writes run on the file's worker (still its
+  only writer) in arrival order, ahead of queued watch/sync jobs, and,
+  like a direct pull, without waiting out a failed pull's backoff. Two
+  writes are never merged, except identical plain pulls (network, not
+  fresh, same `geometry`) that have not started yet *and are adjacent in
+  the queue* — a plain pull joins only the last queued write, never one
+  with another write (an import, a saved-file, fresh or differently
+  configured pull) queued after it: they share one fetch and apply, each
+  keeping its own operation id. A network write uses
+  serve's credentials, read at startup. Restart it after changing credentials,
+  or use `--no-socket` to use the invoking CLI's credentials. While a write is pending on a not-yet-mirrored
+  store, reads queue no implicit first pull. A successful routed pull
+  updates `last_success` (`"job_id": null`, plus `"operation"`); it is not
+  a lifecycle job.
+- *Validation first.* `from_file` (a parsed `GET /v1/files/:key`
+  response) and `content` (an export's exact text; the snapshot digest is
+  over it) are checked — parse, flatten, variable entries — before any
+  store change, exactly like the direct path. A fresh pull's fetch and
+  flatten run on the worker before its reset barrier closes.
+- *Owner loss.* A write whose worker stops before reporting is answered
+  `outcome unknown: ...`; if the connection ends first, the CLI reports
+  `outcome unknown` with the announced operation id (exit 1) and never
+  retries or falls back to a direct open.
+- *Shutdown.* When serve shuts down (stdin EOF, or a background owner's
+  loop exiting), a write already running still finishes within the
+  15-second drain (§6a "Shutdown with deferred work"): its session keeps
+  processing completions — a fresh pull's reset and apply included — so
+  it commits, publishes and is answered as usual. A write still queued is
+  not started: it is answered JSON-RPC error `-32001` `not accepted: ...
+  reconnect and retry` even though its operation id was announced, and
+  the CLI treats it like any "not accepted" answer (nothing was applied).
+  Only the shared background owner's refusal is retried on a new
+  connection (a new owner may take over, §16); an in-process serve's
+  refusal is not sent again to that exiting process — the CLI reports
+  `figmog serve shut down before accepting this write; nothing was
+  applied — rerun the command` (exit 1). A reconnect that fails after a
+  refusal reports the same "nothing was applied", never `outcome unknown`.
+- *Store owner records.* A serve writes `figmog serve (pid N, socket
+  <path>)` (or `no socket`) into each store lock (`.figmog-lock`) it
+  takes; every other opener clears it. A command finding a store held
+  (`--db`, `--no-socket`) names that owner in its `store is locked by ...`
+  error.
 
 **Off-loop images and desktop calls (NWS-2955):** `figmog_images` and
 proxied desktop calls are answered later instead of on the loop, so a slow
@@ -539,7 +711,9 @@ two-second global dispatch floor (≤ 30 requests/min). The session's
 worker performs the blocking HTTP call. Busy files are skipped, and each
 file retains its own retry/poll deadline, so a delayed poll or rate-limited
 file never pauses other files' reads or polling. `--interval` is clamped
-to a one-day maximum. On `Tick::Changed`, completion queues a pull through
+to a one-day maximum; `0` is accepted and means "as fast as the floors
+allow". With no sessions the idle watch wakeup is also floored at 2 s, so
+an empty `--interval 0` server never busy-waits. On `Tick::Changed`, completion queues a pull through
 the same lifecycle as explicit open/sync. Failure leaves the observation
 pending for retry; Retry-After or exponential backoff (capped at 5 minutes)
 is per file. Outstanding metadata and pull failures wake the scheduler at
@@ -657,7 +831,10 @@ type like `get_screenshot`'s image block).
 
 ## 6a. The unix-socket control plane
 
-`figmog serve` binds `<figmog-root>/serve.sock` (mode 0600, inside a root
+The background owner's socket, election and handshake are §6b. An
+in-process serve (`--figmog-root`, or `--db` with a socket) binds
+`<figmog-root>/serve.sock` — `--db` serves use the
+working-directory-relative `.figmog/` — (mode 0600, inside a root
 tightened to 0700) before it opens any session store, and unlinks it on
 exit through a guard held for `run_serve`'s whole scope. A pre-existing
 socket file is probed with a connect first (`serve::classify_probe`):
@@ -671,7 +848,12 @@ This preserves default socket startup in deep checkouts. `--no-socket`
 skips binding.
 
 Frames on the socket are the same newline-delimited JSON-RPC the stdio
-loop reads. `initialize` is optional for socket clients: `tools/call` is
+loop reads. Ordinary frames are capped at 8 MiB. A socket-only
+`notifications/figmog/write-frame` prelude grants exactly the following
+hidden routed pull/import frame a 256 MiB cap; other methods cannot use
+that allowance. The CLI sends the prelude for large saved-file or variable
+imports and refuses writes above 256 MiB before sending. Oversized frames
+drop the connection. Output is bounded separately (below). `initialize` is optional for socket clients: `tools/call` is
 accepted directly, since dispatch treats every frame independently.
 Sending `initialize` is also how a connection opts in to notifications
 (`notifications/tools/list_changed`, §8); stdio gets them once its client
@@ -712,7 +894,12 @@ writes the responses it owes, to stdio and to still-open sockets, for up to
 15 seconds, so `printf
 '<request>\n' | figmog serve` gets its image or desktop response. Image
 requests still queued (not started) are answered with a shutting-down
-error, and the desktop worker stops taking queued calls (and skips queued
+error, CLI writes still queued with "not accepted" (§6 "CLI writers through
+serve"), and no pull or watch poll is started from then on — neither a
+queued watch/sync pull nor one a metadata poll still in flight asks for
+when it completes `Changed`; running work —
+including a routed write and its fresh-pull reset — keeps being serviced
+(no watch polls) until it publishes and answers. The desktop worker stops taking queued calls (and skips queued
 desktop checks) at once: its
 in-flight call still finishes and is answered, while each queued one is
 answered with a shutting-down error without being sent upstream (it may be
@@ -735,6 +922,186 @@ tool-level `isError: true`; those are successful forwarding operations.
 Stdio retains MCP `isError` content for registry and handler failures.
 
 The CLI side of the plane is in §10.
+
+## 6b. One background owner per repository (NWS-2953)
+
+Source: `src/owner.rs` (election lock, socket address, discovery,
+handshake, launch), `src/serve/background.rs` (the owner's loop side),
+`src/serve/relay.rs` (the stdio relay).
+
+**Shape.** Every `figmog serve` without `--db`, `--figmog-root` or
+`--no-socket` is a thin relay between its agent's stdio and the
+repository's *owner*: one detached `figmog serve --background` process per
+mirror root (§16) that opens the mirrors, polls and pulls them (§6), and
+owns the desktop probe (§8). The first relay launches it; every later relay
+and CLI command connects to it. Closing an agent's session only closes that
+relay's connection. Relays never open a store, poll, pull or probe the
+desktop.
+
+SIGTERM and SIGINT enter the same graceful drain as idle shutdown. Close
+attached relays before terminating an owner, since a connected relay can
+restart a lost owner.
+
+**Project identity** is the canonical mirror root (`<git-common-dir>/figmog`
+inside Git, `<project>/.figmog` outside), the same from every worktree.
+
+**Election.** `<mirror root>/owner.lock` is a permanent lock file (0600,
+never deleted), opened close-on-exec. An owner takes an exclusive `flock`
+on it (`File::try_lock`) before anything else and holds it across stale
+socket removal, bind, readiness (discovery), serving and shutdown; it is
+released only after the stores are closed and compacted and the socket and
+discovery record are removed (or by the kernel when the process dies,
+including a crash during startup). A launched owner that cannot take it
+exits 0 at once without touching anything: another process is or is about
+to be the owner. Relays may launch concurrently (each launches at most one
+owner at a time, again only after its launched one exited with the owner
+still unreachable); exactly one wins, and every relay connects to it. A
+lock file that disappears or is replaced makes its holder shut down (see
+"Idle shutdown" below), since another process could lock the new file.
+
+**Socket.** `<runtime directory>/<16 hex>.sock`, the hex a 64-bit FNV-1a
+hash of the project identity. A valid user-owned mode-0700
+`$XDG_RUNTIME_DIR` is preferred, with a private `figmog` child; otherwise
+`/tmp/figmog-<uid>` is used. Paths that would reach macOS's 104-byte limit
+fall back to the short `/tmp` address. Directories and sockets are checked
+for ownership, modes and symlinks before connecting, and the connected
+peer must have the current uid. Discovery must name the expected socket.
+An unsafe or pre-planted runtime directory produces an actionable error;
+figmog does not connect through it. The socket is 0600. Under the lock, a file already at the address is a
+leftover of this project's previous owner: it is removed only if a connect
+to it fails and it is a socket owned by the user (a live listener or a
+foreign file is an error). On exit the socket is unlinked only if it is
+still the inode this owner bound. An owner whose socket disappears or is
+replaced (checked every second) shuts down rather than run unreachable.
+
+**Discovery.** Once it can answer, the owner writes `<mirror
+root>/owner.json` (0600; temp file, fsync, rename):
+`{"generation","pid","project","protocol","socket","version"}`. The
+generation is the owner's pid and start time (hex), also the prefix of its
+operation ids (§6). Clients validate the recorded project-specific basename and private runtime
+root independently of their own XDG environment before connecting; clients
+using incompatible runtime namespaces fail
+with a lock-held/socket-unreachable diagnostic rather than relaunching
+losing owners repeatedly. Detached owners mark inherited descriptors
+close-on-exec, leaving only their configured stdio open. The owner
+removes the record at exit if it is still its own.
+
+**Handshake.** The first frame on every owner connection is
+`{"method": "figmog/hello", "id": "figmog-hello", "params": {"client":
+"relay"|"cli", "project", "version", "protocol", "settings"?, "attach"?}}`.
+The owner refuses a different project, binary version or protocol version
+(currently 1) with error `-32002` and an explanation; the client checks the
+owner's answer `{"attach_errors", "generation", "pid", "project",
+"protocol", "settings", "version"}` the same way. Either way the relay (and
+the CLI) stops with that explanation — "let it exit (it stops on its own
+after it has had no clients for a while), or stop it now with `kill <pid>`"
+— and never starts a second owner beside it. A relay connection is then
+answered like stdio: tool failures as MCP `isError` content and no
+internal tools (`figmog_internal_*` are unknown tools there); a CLI
+connection keeps §6a's JSON-RPC errors and internal write tools. `attach`
+lists the relay's startup files: the owner opens each, queueing a first
+pull for a missing mirror when it watches (the old `figmog serve FILE...`
+startup); open failures come back in `attach_errors` and fail the relay's
+startup.
+
+**Worktree context stays in the relay.** The owner has no default file and
+writes no `.figmog/current`. For every per-file local tool call with no
+explicit `file` and no node URL naming one, the relay injects its own file:
+the first startup `FILE`, else `figmog.toml`'s default (else
+`.figmog/current`), else the single file this relay has itself referenced;
+with none it answers the "no file specified" error itself. A file whose
+mirror in this worktree is still in the old per-checkout location (§16) is
+refused with a pointer at `figmog migrate` (and a startup file fails the
+relay's start), never shadowed by a new shared mirror; the CLI likewise
+never routes such a mirror to the owner (an in-process serve's local socket
+still answers it, else it is opened directly). A file whose mirror does
+not resolve at all (two mirrors, an interrupted `figmog migrate`) is
+routed to no socket: the CLI reports the same error as with `--no-socket`,
+even while an in-process serve holds one of the two. Nor does the CLI route a
+per-file call to the owner when the invoking worktree resolves no file
+(no explicit `file`, node URL or project default): it reports that
+worktree's "no mirror here" rather than another worktree's file. The owner
+itself never treats its one open session as a default. Desktop and
+management calls pass through unchanged. Every request a relay forwards
+— any frame with an `id` that is not a `notifications/` method, including
+one whose method is empty, missing or not a string (the owner answers it
+"method not found") — goes to the owner under a relay-assigned id, mapped back to the agent's own
+id on the answer, so no agent id is ever mistaken for the relay's own
+(its replayed `initialize`).
+
+**Settings.** The owner runs with the watch, `--interval` and
+`--upstream`/`--no-upstream` settings of the relay that launched it, and
+with that relay's environment (credentials included). A later relay asking
+for different settings prints one stderr note per setting (`figmog: note:
+interval 30s was not applied — ... runs with interval 10s ...`); nothing
+changes until the owner restarts. Credentials therefore apply after the
+owner's idle restart (§10 "Credentials").
+
+**Idle shutdown.** The owner exits by itself once it has had no open
+connection, no unanswered deferred call and no pending CLI write for its
+idle timeout (10 minutes; `FIGMOG_OWNER_IDLE_MS` overrides it, for tests).
+Relays hold their connection for the agent's whole session, so an owner
+idles out only when no agent is attached. Shutdown first *closes*: every
+new request on any connection, the handshake included, is answered with
+JSON-RPC error `-32001` `not accepted: ... reconnect and retry`, and nothing
+is started for it; accepted work (deferred replies, writes) finishes; then
+the loop exits and §6a's shutdown runs (drain, store close, compaction per
+§4 "post-write compaction"), the socket and discovery record are removed,
+and only then is the lock released. A connection accepted after the loop
+exited is closed unanswered; clients treat that like "not accepted".
+
+**Reconnects.** Only a request answered "not accepted" is ever sent again:
+the relay reconnects — launching a new owner if none is left — and re-sends
+it (at most 5 times); the CLI reconnects and retries (reads and writes
+alike: nothing was started), waiting up to 60 s for the closing owner to go
+away, then falls back to a direct open if no new owner appeared — except a
+write, which then reports "nothing was applied" (§6 "CLI writers through
+serve"). A write
+the owner accepted is never retried: NWS-2963's `outcome unknown` stands.
+If the owner connection drops with requests unanswered (the owner crashed
+or was killed), the relay answers each with an `outcome unknown` tool error
+and reconnects at once. On every new connection the relay repeats the
+handshake (with its startup files) and the agent's `initialize` (under a
+relay-internal id whose answer it swallows), so notifications keep
+flowing.
+
+**Notifications.** Notifications from the owner — `tools/list_changed`
+from desktop re-detection (§8) — are forwarded verbatim to the relay's
+agent once the agent has sent `initialize` (which the relay forwarded,
+subscribing its connection).
+
+**Launch.** The relay runs its own executable as `figmog serve
+--background <settings>` with `setsid` (its own session: no terminal or
+process-group signal of the agent's reaches it), stdin and stdout on
+`/dev/null`, stderr appended to `<mirror root>/owner.log` (truncated at
+launch past 1 MiB), working directory the relay's project root. A thread
+reaps it, so it is never left a zombie. A launched owner that exits
+non-zero before becoming ready fails the relay with the log's tail; the
+relay waits at most 60 s for an owner (an old one's shutdown drain is
+bounded at 15 s).
+
+**Cost of an idle restart.** The watch watermark is not persisted (§6
+"Watch watermarks"), so a restarted owner makes one reconciliation pull
+per watched file at its first poll; no record kind was added to avoid it.
+The acceptance test measures relay spawn → owner launched → first answer
+at about 30 ms, and relay spawn → new owner → first read of an existing
+mirror at 40–65 ms (debug build, Linux, synthetic fixture).
+
+**Acceptance (tests/owner.rs).** Three worktrees (`git worktree add`), each
+with its own relay, share one owner and read one mirror concurrently
+through relays and the CLI with no lock errors, and one edit on a
+synthetic Figma API causes exactly one pull. Also tested: 10 concurrent
+relays → one owner (3 trials), 10 concurrent owner launches → one survivor,
+a SIGKILLed owner (lock released, stale socket replaced), a relay surviving
+its owner's crash, clients and relays arriving around the idle deadline
+(12 trials), a version-mismatched owner refused by relay and CLI, two
+repositories' independent owners, per-worktree default files, settings
+notes, and a mirror awaiting migration.
+
+The synthetic API is reached through `FIGMOG_API_BASE`, honored by serve's
+sessions in debug builds only (release builds always use
+`https://api.figma.com`, so no environment variable can send a token
+elsewhere).
 
 ## 7. Style values: derived, not authoritative
 
@@ -958,8 +1325,9 @@ mapping of the 17 read-only query commands onto `dispatch::ReadCommand`),
 `src/cli/call.rs`
 (`tools`, `call`, `import-variables` — the desktop-proxy CLI parity
 surface, so every tool `figmog serve` would expose is reachable without
-an MCP client), `src/cli/images.rs` (`images`, §15), and
-`src/cli/socket.rs` (the client half of the control plane, §6a).
+an MCP client), `src/cli/images.rs` (`images`, §15),
+`src/cli/socket.rs` (the client half of the control plane, §6a), and
+`src/cli/migrate.rs` (`migrate`, §16).
 `src/cli/auth.rs` handles credential commands and hidden terminal input;
 `src/auth.rs` owns credential resolution and native storage.
 
@@ -969,7 +1337,15 @@ requires a resolved mirror — no established `.figmog/current` and no
 `--db` needed. `figmog call` does need one, since local tool dispatch
 reads the store.
 
-Default mirror paths are `.figmog/<key>/db`. Persisted `.figmog/current`
+Default mirror paths come from the project layout (§16): the key's
+*active store* — `<mirror root>/<key>/db`, or an old
+`<project>/.figmog/<key>/db` that hasn't been migrated yet. The default
+file is `figmog.toml`'s `[files] default`, else `.figmog/current` (in the
+project root). Every command except `version`, `auth` and `--db`
+invocations discovers the project first, so a malformed `figmog.toml` or
+`figmog.local.toml` fails every such command with `<file>:<line>: <message>`.
+`figmog migrate [FILE]` (§16) moves old mirrors into the shared root.
+Persisted `.figmog/current`
 contents are trimmed and must be a bare key of at least 10 ASCII
 alphanumeric characters; nonempty malformed contents fail before opening
 or deleting a store, including during socket routing. Path construction
@@ -1015,7 +1391,9 @@ An explicitly empty environment value disables saved credentials. A
 locked/unavailable store is treated as no usable token for these callers,
 so cached reads and token-free idle servers still work; `auth status`
 reports the storage error for diagnosis. Credential changes take effect
-on the next CLI invocation or server restart. Tokens remain subject to
+on the next CLI invocation or, for agents, when the shared background
+owner restarts after idling out (§6b); stop it sooner with `kill <pid>`
+from `<mirror root>/owner.json`. Tokens remain subject to
 Figma expiration/revocation; this is personal-token storage, not OAuth.
 
 The new dependencies are justified by native secret storage (`keyring`)
@@ -1062,9 +1440,11 @@ sorting. `--limit N` (MCP `limit`) defaults to 100; zero returns an empty
 array. Hit testing traverses the requested page's children with cycle
 protection; no store schema change is needed.
 
-**Socket-first routing (§6a).** When neither `--no-socket` nor `--db` is
+**Socket-first routing (§6a, §6b).** When neither `--no-socket` nor `--db` is
 given, every read command, plus `tools`, `call` and `images`, first tries
-`<.figmog>/serve.sock`. Reachable ⇒ the command becomes a client of the
+the repository's background owner (through `<mirror root>/owner.json` and
+the handshake), then an in-process serve's `<.figmog>/serve.sock`.
+Reachable ⇒ the command becomes a client of the
 running `serve`: `cli::read_command` maps the subcommand to its typed
 `dispatch::ReadCommand`, whose `to_tool_call` produces the tool name and
 argument object serve parses back into the same command, so the
@@ -1099,20 +1479,33 @@ Both paths forward uncached and preserve desktop arguments exactly,
 including an absent `file` or explicit null, string, number, or object.
 Socket routing never injects `.figmog/current` into desktop arguments.
 
-`pull` is a writer and always opens the store directly. While `serve`
-holds that store, `pull`'s lock error additionally says "or ask the
-running serve: figmog call figmog_sync", which reaches the process that
-owns it and returns an immediate job acknowledgement. Inspect
-`figmog call figmog_status` or `figmog call figmog_files` for completion and
-errors. With no running server, direct `figmog call figmog_sync` remains
-synchronous and returns churn.
+**Writers (NWS-2963).** `pull` (including `--fresh`, `--from-file`,
+`--geometry`) and `import-variables` resolve their mirror exactly as
+direct mode does, then try the same socket. Reachable ⇒ they run as serve
+operations (§6 "CLI writers through serve"): a `--from-file` response is
+read and parsed in the invoking worktree (the direct path's `reading`/
+`parsing` errors) and sent as content; an import is read and fully
+validated locally (same errors, nothing sent for an invalid file) and its
+exact text sent. The command returns only after the write committed and
+was published, printing the same JSON as the direct path, byte for byte
+(churn, or `{"imported","removed"}`); a successful routed pull also
+writes `.figmog/current` and the `.gitignore` entry as a direct pull
+does. Serve-side failures are the direct path's messages. If serve goes
+away first: `outcome unknown` with the operation id, exit 1, no retry and
+no direct fallback. Unreachable ⇒ direct. `--db` and `--no-socket` never
+route. While `serve` holds a store, a direct open's lock error names it
+(`store is locked by figmog serve (pid …, socket …) — …`); an unnamed
+holder keeps the generic message, which for `pull` adds "or ask the
+running serve: figmog call figmog_sync". With no running server, direct
+`figmog call figmog_sync` remains synchronous and returns churn.
 
 **Single-writer constraint:** fjall allows only one open handle per
 store. `figmog serve` holds its `--db`'s lock for its whole life; a CLI
-command that opens the same store directly (`--no-socket`, an explicit
-`--db`, or `pull`) while `serve` runs gets a clean `store is locked — is
-figmog serve running? ...` error (exit 1), never fold's raw lock panic
-(exit 101) — see `open_store_checked`.
+command that opens the same store directly (`--no-socket` or an explicit
+`--db`) while `serve` runs gets a clean `store is locked by figmog serve
+(pid …, socket …) — ...` error (exit 1; the generic `store is locked — is
+figmog serve running? ...` when the holder left no owner record), never
+fold's raw lock panic (exit 101) — see `open_store_checked`.
 
 ## 11. Determinism and schema-stability contracts
 
@@ -1309,3 +1702,144 @@ the socket reachable it routes through serve's own `figmog_images` tool
 (serve owns the caching); with `--no-socket` or no server listening it
 fetches and writes directly, like `pull`. `--db` always bypasses the socket
 and opens the explicit store, including for cached-image extraction.
+
+## 16. Project config and mirror roots
+
+Source: `src/project.rs` (discovery, config, active-store rules),
+`src/cli/migrate.rs` (`figmog migrate`).
+
+**Project root.** The nearest directory containing a regular file named
+`figmog.toml`, walking up from the working directory but never past the
+Git top level (a stray `figmog.toml` above a repository is ignored); else
+the Git top level; else the working directory. Its `.figmog/` is the
+*local root*: per checkout, it holds `current`.
+
+**Mirror root.** Inside Git: `<git-common-dir>/figmog/`, from one
+`git rev-parse --path-format=absolute --show-toplevel --git-common-dir`
+(run via `std::process::Command` in the working directory; the path is
+then canonicalized). The common dir is the same for the main worktree, its
+subdirectories and every linked worktree, so all of them share one mirror
+per file key; Git never tracks it, so it needs no ignore entry. Git older
+than 2.31 echoes the unknown `--path-format=absolute` back and prints the
+common dir relative to the working directory: the echo is dropped and the
+relative path resolved against that directory. If an ancestor has a `.git`
+entry, Git invocation/refusal/decoding errors stop the command, including
+Git's stderr; paths are decoded as OS bytes. Outside Git the mirror root
+is the local root, `<project>/.figmog/`. An explicitly group-shared Git
+common directory uses private per-checkout mirrors instead, preserving the
+ancestor ownership and write-permission checks.
+
+**Config.** `figmog.toml` and an optional `figmog.local.toml` beside it
+(machine-specific; `pull` adds it to `.gitignore` alongside `.figmog/` when
+the project has a `figmog.toml`). Both use the same hand-parsed TOML subset
+(no `toml` dependency):
+
+```toml
+[files]
+default = "AbCdEf1234"                                  # file key or Figma URL
+design-system = "https://www.figma.com/design/XYZ/..."  # named entry
+```
+
+Supported: an optional UTF-8 BOM, `#` comments, blank lines, quoted or bare
+`[table]` headers (including `["files"]`), and inside
+`[files]` only `key = "string"` (bare or quoted keys; basic strings with
+`\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings). Every
+`[files]` value must be a file key or Figma URL and is stored as its key.
+Unsupported `files` encodings (dotted assignments, inline tables, array
+tables or subtables) are explicit errors. Other tables, top-level keys and
+`[[array]]` tables are skipped unparsed
+(reserved for later settings, never an error), except that multi-line
+strings (`"""` and `'''`) in skipped values are tracked so a `[files]`
+line inside one is content, not the table; multi-line values inside
+`[files]` itself are an error. Errors — unterminated
+headers, strings or multi-line strings, a missing `=`, a non-string value, trailing text, an
+invalid file reference, a duplicate key or a second `[files]` table — read
+`figmog.toml:<line>: <message>` (or `figmog.local.toml:...`). Local entries
+replace same-named ones. Only `default` has meaning today: it is the file
+every command uses when none is given, ahead of `.figmog/current`, which
+remains the fallback (and is still written by `pull` and serve's default
+session). Named entries are parsed and validated but not yet addressable.
+
+**Legacy roots.** Every existing `.figmog` directory between the working
+directory and project root is checked, nearest first for `current`. Old
+mirrors can be read and migrated from any of those roots. Multiple legacy
+copies of one key are an explicit ambiguity error naming their paths.
+
+**Active store.** The mirror root is where mirrors *should* live; the
+active store is where a key's mirror *is*. Outside Git both are the same
+directory. Inside Git, for each key:
+
+| `.figmog/<key>/db` (old) | `<mirror root>/<key>/db` (shared) | result |
+|---|---|---|
+| exists | absent | use the old store; stderr `{"warning": "migration pending: ..."}` |
+| absent | exists | use the shared store |
+| absent | absent | writes may create a shared mirror; reads report no mirror |
+| exists | exists | error naming both paths (never a silent pick) |
+
+With both present and a `migrated-from` marker in the shared `<key>/`,
+the error instead says a `figmog migrate` was interrupted and to rerun it.
+The warning is printed by every direct CLI command that resolves the old
+store and by serve when a session opens it; JSON outputs are unchanged.
+The old store is resolved before its lock is taken, so opening it never
+creates it: once its lock is held it must still exist and still be the
+active store, otherwise (a `figmog migrate` moved it meanwhile) the
+command fails asking for a rerun, which resolves the shared store. A
+missing old store is never recreated. Direct and served read opens never
+initialize a missing store. Routed writes include the intended database
+path; a serve configured for another database refuses without applying
+anything and points to `--no-socket`. New mirrors go to the selected mirror
+root.
+`--db` bypasses all of this. `figmog serve --figmog-root <dir>` (hidden,
+for tests) pins the socket and every store to `<dir>`/`<dir>/<key>/db`.
+
+**Socket location.** One background owner per mirror root serves every
+worktree (§6b); its lock, discovery record and log live in the mirror root
+and its socket under `/tmp/figmog-<uid>/`. An in-process serve
+(`--figmog-root`) still binds `<root>/serve.sock`.
+
+**`figmog migrate [FILE]`.** Moves each old `.figmog/<key>/` directory
+(all of it: today that is `db/`, whose image cache is an in-store sink) to
+`<mirror root>/<key>/`; with no `FILE`, every old mirror plus every
+interrupted move, in sorted key order. Prints
+`{"mirror_root", "migrated": [{"file", "from", "to", "resumed"}],
+"failed": [{"file", "error"}]}`. Every key is attempted, both lists are
+sorted, and any failure produces exit 1 after printing the complete report.
+When mirror and legacy roots coincide it is a no-op. Per key:
+
+0. Take the repository-wide migration lock
+   `<mirror root>/<key>.migrate.lock` (every worktree shares the
+   destination and staging dir), held until the end; while another
+   migration of the key holds it — from any worktree — this one is
+   refused with a message to rerun once it finishes.
+1. Refuse if `<mirror root>/<key>` already exists.
+2. Open the old store through `open_store_checked` — its ownership anchor
+   *and* fjall's own writer lock, so a running serve (even an older binary)
+   fails this with the standard "store is locked" error — then close the
+   database but keep the anchor.
+3. Remove any staging dir `<mirror root>/.<key>.migrating` left by an
+   interrupted run (safe: the migration lock excludes a live one), copy the old directory into it (regular files and
+   directories only, fsynced; the lock anchor is not copied), take a fresh
+   anchor on the staged `db/`, and write `migrated-from` naming the source.
+4. Atomically rename the staging dir to `<mirror root>/<key>`; the staged
+   anchor (still held) moves with it, so the destination is owned the
+   moment it appears.
+5. Atomically rename the old directory to its tombstone
+   `.figmog/.<key>.deleting` beside it (its anchor is still held and its
+   fjall lock was checked in 2), remove the tombstone recursively, then the
+   marker. A tombstone is never opened as a store.
+
+A crash during 3 leaves the old store intact and active (the staging dir
+is ignored and redone on rerun). A crash after 4 leaves the marker, which
+the active-store rules report and a rerun finishes by doing 5 while holding
+both stores' anchors *and* fjall writer locks (as in 2, so an older
+binary's serve on either store refuses it). The marker names the source
+checkout's old directory, and only a rerun from that checkout removes it:
+another worktree's own old mirror is an independent copy, so there the
+rerun refuses, naming the checkout that must finish — unless the recorded
+source is already gone, when it just removes the source's tombstone (if
+any) and the marker. A crash during 5's deletion leaves a half-deleted
+tombstone, which a rerun removes without opening it. An old directory an
+older binary's interrupted step 5 left half deleted in place is still
+checked for anchors and fjall locks, but failing to open as a store (it is
+not lock contention) does not stop the rerun from retiring it. A stray
+tombstone with no marker is removed by any rerun.

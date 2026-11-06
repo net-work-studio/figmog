@@ -4,7 +4,7 @@
 //! builds an owning view between jobs; serving that view never locks the
 //! pipeline, even while a transaction is applying or flushing indexes.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 use fold::pipeline::{Keyed, Push};
@@ -16,10 +16,52 @@ use crate::model::{Id, Rec};
 type ViewReaders<'a> = RootReaders<'a, fjall::Snapshot>;
 
 self_cell::self_cell! {
-    pub(crate) struct SessionView {
+    struct ViewCell {
         owner: fjall::Snapshot,
         #[covariant]
         dependent: ViewReaders,
+    }
+}
+
+/// One published snapshot and its readers, plus the snapshot's node count
+/// held in memory (never stored) so `figmog_status`/`figmog_files` answer
+/// in O(1) per publication instead of decoding the whole `nodes` table on
+/// every poll (NWS-2942).
+pub(crate) struct SessionView {
+    cell: ViewCell,
+    node_count: OnceLock<usize>,
+}
+
+impl SessionView {
+    /// Pin `snapshot` with readers built by `readers`. `node_count` is the
+    /// snapshot's node count when the publisher knows it (a pull worker
+    /// just synced exactly that many nodes); `None` leaves it for
+    /// [`node_count`](Self::node_count) to count once.
+    pub(crate) fn new(
+        snapshot: fjall::Snapshot,
+        readers: impl for<'a> FnOnce(&'a fjall::Snapshot) -> ViewReaders<'a>,
+        node_count: Option<usize>,
+    ) -> Self {
+        let cell = ViewCell::new(snapshot, readers);
+        let node_count = node_count.map(OnceLock::from).unwrap_or_default();
+        SessionView { cell, node_count }
+    }
+
+    pub(crate) fn with_dependent<'a, T>(
+        &'a self,
+        f: impl FnOnce(&'a fjall::Snapshot, &'a ViewReaders<'a>) -> T,
+    ) -> T {
+        f(self.cell.borrow_owner(), self.cell.borrow_dependent())
+    }
+
+    /// The snapshot's node count: the publisher's, or counted here once
+    /// (decoding every node) and cached for the view's lifetime. A store
+    /// opened from disk is counted by its session worker right after
+    /// opening, so polls don't pay for it.
+    pub(crate) fn node_count(&self) -> usize {
+        *self
+            .node_count
+            .get_or_init(|| self.with_dependent(|_, ((nodes, ..), ..)| nodes.iter().count()))
     }
 }
 

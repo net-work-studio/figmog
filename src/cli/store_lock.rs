@@ -2,11 +2,12 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::ops::{Deref, DerefMut};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-const LOCK_NAME: &str = ".figmog-lock";
+pub(super) const LOCK_NAME: &str = ".figmog-lock";
 
+#[derive(Debug)]
 pub(super) struct StoreOwner {
     pub(super) path: PathBuf,
     // Fresh resets preserve both this inode and its containing directory.
@@ -15,48 +16,94 @@ pub(super) struct StoreOwner {
     lock: File,
 }
 
+/// Why [`lock_file`] could not take its lock.
+enum Failure {
+    /// Held by another opener, with its owner record if it left one.
+    Locked(Option<String>),
+    Failed(String),
+}
+
+/// Open (creating if needed, never following a symlink) and exclusively
+/// lock `lock_path`, a regular, unshared file owned by the current user,
+/// then record this process as its owner. Never blocks.
+fn lock_file(lock_path: &Path) -> Result<File, Failure> {
+    use Failure::{Failed, Locked};
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(lock_path)
+        .map_err(|e| Failed(e.to_string()))?;
+    let metadata = file.metadata().map_err(|e| Failed(e.to_string()))?;
+    // SAFETY: geteuid has no preconditions or side effects.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != uid {
+        return Err(Failed(
+            "lock must be a regular, unshared file owned by the current user".into(),
+        ));
+    }
+    if let Err(e) = file.try_lock() {
+        return Err(match e {
+            TryLockError::WouldBlock => Locked(owner_record(&file)),
+            TryLockError::Error(e) => Failed(e.to_string()),
+        });
+    }
+    // Name this process as the owner (NWS-2963): a serve records
+    // itself so another command can say who holds the store; any
+    // other opener clears a record a previous owner left behind.
+    let record = super::OWNER_RECORD.get().map_or("", String::as_str);
+    file.set_len(0)
+        .and_then(|()| file.write_all_at(record.as_bytes(), 0))
+        .map_err(|e| Failed(e.to_string()))?;
+    Ok(file)
+}
+
 impl StoreOwner {
     pub(super) fn acquire(path: &Path) -> Result<Self, String> {
         let path = crate::private_dir::ensure(path)?;
+        Self::lock(path)
+    }
+
+    /// [`Self::acquire`] for a store that must already exist: never creates
+    /// the store directory or any ancestor. `Ok(None)` when the directory
+    /// is missing — before the lock, or unlinked by the time it was taken
+    /// (a `figmog migrate` that moved it away).
+    pub(super) fn acquire_existing(path: &Path) -> Result<Option<Self>, String> {
+        let path = match crate::private_dir::existing(path)? {
+            Some(path) => path,
+            None => return Ok(None),
+        };
+        let owner = match Self::lock(path.clone()) {
+            Ok(owner) => owner,
+            Err(_) if std::fs::symlink_metadata(&path).is_err() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // The anchor must still be linked where it was opened: a remover
+        // that held it until after unlinking leaves us an orphaned inode.
+        let held = owner.lock.metadata().map_err(|e| e.to_string())?;
+        match std::fs::symlink_metadata(owner.path.join(LOCK_NAME)) {
+            Ok(linked) if same_file(&held, &linked) => Ok(Some(owner)),
+            _ => Ok(None),
+        }
+    }
+
+    fn lock(path: PathBuf) -> Result<Self, String> {
         if path.parent().is_none() {
             return Err("the filesystem root cannot be a mirror directory".into());
         }
         let lock_path = path.join(LOCK_NAME);
-        let acquire = || -> Result<File, String> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(&lock_path)
-                .map_err(|e| e.to_string())?;
-            let metadata = file.metadata().map_err(|e| e.to_string())?;
-            // SAFETY: geteuid has no preconditions or side effects.
-            let uid = unsafe { libc::geteuid() };
-            if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != uid {
-                return Err(
-                    "lock must be a regular, unshared file owned by the current user".into(),
-                );
-            }
-            file.try_lock().map_err(|e| match e {
-                TryLockError::WouldBlock => super::STORE_LOCKED_MSG.to_string(),
-                TryLockError::Error(e) => e.to_string(),
-            })?;
-            Ok(file)
-        };
-        let lock = acquire().map_err(|e| {
-            if e == super::STORE_LOCKED_MSG {
-                e
-            } else {
-                format!("locking {}: {e}", lock_path.display())
-            }
+        let lock = lock_file(&lock_path).map_err(|e| match e {
+            Failure::Locked(Some(owner)) => super::store_owned_msg(&owner),
+            Failure::Locked(None) => super::STORE_LOCKED_MSG.to_string(),
+            Failure::Failed(e) => format!("locking {}: {e}", lock_path.display()),
         })?;
         Ok(Self { path, lock })
     }
 
-    fn clear_contents(&self) -> Result<(), String> {
+    pub(super) fn clear_contents(&self) -> Result<(), String> {
         let clear = || -> std::io::Result<()> {
             let held = self.lock.metadata()?;
             let linked = std::fs::symlink_metadata(self.path.join(LOCK_NAME))?;
@@ -85,6 +132,38 @@ impl StoreOwner {
     }
 }
 
+/// Repository-wide exclusion for one key's `figmog migrate` (NWS-2964): an
+/// exclusive lock on a regular file in the shared mirror root, held from
+/// before the destination is checked until the final cleanup, so two
+/// worktrees can never stage, publish or clean up the same key at once.
+pub(super) struct MigrationLock {
+    _lock: File,
+}
+
+impl MigrationLock {
+    /// Take the lock at `path` (a file; created if missing and left in
+    /// place afterwards) without waiting; `busy` is the error when another
+    /// migration holds it.
+    pub(super) fn acquire(path: &Path, busy: impl FnOnce() -> String) -> Result<Self, String> {
+        match lock_file(path) {
+            Ok(lock) => Ok(Self { _lock: lock }),
+            Err(Failure::Locked(_)) => Err(busy()),
+            Err(Failure::Failed(e)) => Err(format!("locking {}: {e}", path.display())),
+        }
+    }
+}
+
+/// The owner record a running serve left in a held lock file: one short
+/// line of printable text, or `None` (another kind of opener, or anything
+/// unexpected — the generic locked message applies then).
+fn owner_record(file: &File) -> Option<String> {
+    let mut buf = [0u8; 1024];
+    let n = file.read_at(&mut buf, 0).ok()?;
+    let text = std::str::from_utf8(&buf[..n]).ok()?.trim();
+    (text.starts_with("figmog serve") && !text.chars().any(char::is_control))
+        .then(|| text.to_string())
+}
+
 fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     (left.dev(), left.ino()) == (right.dev(), right.ino())
 }
@@ -101,6 +180,32 @@ impl<T> OwnedStore<T> {
         Self { store, owner }
     }
 
+    /// Close the store but keep ownership: no other figmog can open it
+    /// until the returned owner drops (used by `figmog migrate`, which
+    /// copies a closed store's files while holding its lock).
+    pub(super) fn into_owner(self) -> StoreOwner {
+        let Self { store, owner } = self;
+        drop(store);
+        owner
+    }
+
+    /// Close the store but keep ownership until the returned
+    /// [`Compaction`] runs or drops (NWS-2941): `figmog serve`'s workers
+    /// close their store this way and compact it only at shutdown.
+    pub(crate) fn close_for_compaction(self) -> Compaction {
+        Compaction {
+            owner: self.into_owner(),
+        }
+    }
+
+    /// Close the store and compact it ([`crate::compact`]) while still
+    /// holding its ownership anchor, then release it. Compaction is a
+    /// best-effort optimization over committed data: a failure is reported
+    /// on stderr and never fails the command that wrote.
+    pub(crate) fn close_and_compact(self) {
+        self.close_for_compaction().run();
+    }
+
     /// The initial open already checked fjall's own lock, including stores
     /// owned by older figmog binaries that don't acquire the anchor lock.
     /// Close the store, clear its contents except the ownership anchor,
@@ -113,6 +218,25 @@ impl<T> OwnedStore<T> {
         drop(store);
         owner.clear_contents()?;
         super::open_store_owned(owner, open)
+    }
+}
+
+/// A closed store whose ownership is kept for a pending compaction
+/// ([`OwnedStore::close_for_compaction`]). Dropping it unrun just releases
+/// the store.
+#[derive(Debug)]
+pub(crate) struct Compaction {
+    owner: StoreOwner,
+}
+
+impl Compaction {
+    /// Compact the closed store, then release its ownership. Any fjall
+    /// handle still open on it (a detached reader's view) makes fjall's own
+    /// open fail with its lock error: nothing is touched then.
+    pub(crate) fn run(self) {
+        if let Err(e) = crate::compact::compact(&self.owner.path) {
+            eprintln!("figmog: store compaction skipped: {e}");
+        }
     }
 }
 

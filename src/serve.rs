@@ -59,11 +59,15 @@ use crate::ident::parse_file_ref;
 use crate::mcp::FnHandler;
 use crate::mcp::{self, PendingCall, Reply, ToolErrorMode, ToolOutput};
 use crate::proxy;
-use crate::sessions::{self, SessionManager};
+use crate::sessions::{self, SessionManager, StoreRoot};
 
+mod background;
 mod desktop;
 mod output;
 mod reads;
+mod relay;
+pub(crate) use relay::run_relay;
+pub(crate) mod writes;
 
 use crate::upstream::{HttpUpstream, UpstreamMcp};
 use desktop::{DesktopJob, DesktopWorker, ProbeCadence};
@@ -279,12 +283,11 @@ impl Drop for SocketGuard {
     }
 }
 
-/// A single frame's hard ceiling (review m4): a client sending more than
-/// this without a newline is misbehaving (or hostile) and is disconnected
-/// rather than let grow this connection's read buffer without bound. Any
-/// real figmog request/response — including a large `figmog_subtree` dump
-/// — is orders of magnitude smaller than this.
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Ordinary requests are capped at 8 MiB. CLI saved-file writes may
+/// explicitly opt their next socket frame into a 256 MiB ceiling.
+pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_WRITE_FRAME_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const WRITE_FRAME_NOTICE: &str = "notifications/figmog/write-frame";
 
 /// Read one newline-delimited frame from `reader`, capped at
 /// [`MAX_FRAME_BYTES`] (review m4). `Ok(None)` on a clean EOF with no
@@ -293,6 +296,11 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// connection", exactly like every other read failure in
 /// [`spawn_socket_acceptor`].
 fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
+    read_line_within(reader, MAX_FRAME_BYTES)
+}
+
+/// [`read_bounded_line`] with an explicit cap (tests use a small one).
+fn read_line_within<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
     // Driven directly off `fill_buf`/`consume` rather than `Take` wrapping
     // `read_until`: a chunk can (and, with a client that pipelines several
@@ -306,6 +314,9 @@ fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Strin
             break; // clean EOF
         }
         if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if buf.len().saturating_add(pos) > cap {
+                return Err(std::io::Error::other(format!("frame exceeds {cap} bytes")));
+            }
             buf.extend_from_slice(&available[..=pos]);
             reader.consume(pos + 1);
             break;
@@ -313,9 +324,9 @@ fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Strin
         buf.extend_from_slice(available);
         let consumed = available.len();
         reader.consume(consumed);
-        if buf.len() > MAX_FRAME_BYTES {
+        if buf.len() > cap {
             return Err(std::io::Error::other(format!(
-                "frame exceeds {MAX_FRAME_BYTES} bytes with no newline"
+                "frame exceeds {cap} bytes with no newline"
             )));
         }
     }
@@ -363,10 +374,38 @@ fn spawn_socket_acceptor(
                 .name(format!("figmog-socket-reader-{conn_id}"))
                 .spawn(move || {
                     let mut reader = BufReader::new(stream);
+                    let mut write_frame = false;
                     loop {
-                        match read_bounded_line(&mut reader) {
+                        let cap = if write_frame {
+                            MAX_WRITE_FRAME_BYTES
+                        } else {
+                            MAX_FRAME_BYTES
+                        };
+                        match read_line_within(&mut reader, cap) {
                             Ok(None) => break,
                             Ok(Some(l)) => {
+                                let parsed = crate::deep_json::from_str(&l).ok();
+                                if parsed
+                                    .as_ref()
+                                    .is_some_and(|frame| frame["method"] == WRITE_FRAME_NOTICE)
+                                    && !reader_registry.is_relay(conn_id)
+                                {
+                                    write_frame = true;
+                                    continue;
+                                }
+                                if write_frame {
+                                    let allowed = parsed.as_ref().is_some_and(|frame| {
+                                        frame["method"] == "tools/call"
+                                            && matches!(
+                                                frame["params"]["name"].as_str(),
+                                                Some(writes::PULL | writes::IMPORT_VARIABLES)
+                                            )
+                                    });
+                                    if !allowed || reader_registry.is_relay(conn_id) {
+                                        break;
+                                    }
+                                }
+                                write_frame = false;
                                 if tx.send(Incoming::Socket(conn_id, l)).is_err() {
                                     break;
                                 }
@@ -391,10 +430,14 @@ fn spawn_socket_acceptor(
 /// are being round-robin polled: the full `interval` split evenly across
 /// them (so each file gets, on average, one Tier-3 poll per `interval`),
 /// floored at [`MIN_TICK_DEADLINE`] so total poll spend stays bounded even
-/// with many mirrored files. Zero sessions: idle at the full interval.
+/// with many mirrored files. Zero sessions: idle at the full interval,
+/// still floored at [`MIN_TICK_DEADLINE`] — `--interval 0` is accepted,
+/// and an unfloored zero idle wait would hand the request loop's
+/// `recv_timeout` a zero timeout forever, busy-looping an empty server
+/// (NWS-2938).
 fn tick_deadline(interval: Duration, session_count: usize) -> Duration {
     if session_count == 0 {
-        return interval;
+        return interval.max(MIN_TICK_DEADLINE);
     }
     (interval / session_count as u32).max(MIN_TICK_DEADLINE)
 }
@@ -417,11 +460,26 @@ pub(crate) fn run_serve(
     no_watch: bool,
     upstream_url: String,
     no_upstream: bool,
-    figmog_root: PathBuf,
+    figmog_root: Option<PathBuf>,
+    layout: Option<crate::project::Layout>,
     no_socket: bool,
 ) -> Result<(), String> {
+    let _signals = crate::owner::ShutdownSignals::install()?;
     let interval_dur = clamp_interval(interval);
     let token = crate::auth::token()?;
+    // `--figmog-root` pins both the socket and every store to one fixed
+    // directory; otherwise the socket stays in the project's per-checkout
+    // `.figmog` and stores follow the active-store rules (spec §16).
+    // `--db` (no layout) keeps the cwd-relative `.figmog` socket.
+    let socket_root = figmog_root
+        .clone()
+        .or_else(|| layout.as_ref().map(|l| l.local_root.clone()))
+        .unwrap_or_else(|| PathBuf::from(crate::project::LOCAL_DIR));
+    let store_root = match (figmog_root, layout) {
+        (Some(root), _) => StoreRoot::Fixed(root),
+        (None, Some(layout)) => StoreRoot::Project(layout),
+        (None, None) => StoreRoot::Fixed(PathBuf::from(crate::project::LOCAL_DIR)),
+    };
 
     // Bind the control-plane socket (spec §1) before anything else touches
     // the filesystem for this run: a stale-probe conflict ("another figmog
@@ -433,9 +491,11 @@ pub(crate) fn run_serve(
     let (tx, rx) = mpsc::channel::<Incoming>();
     let registry: ConnRegistry = Arc::default();
     let _socket_guard: Option<SocketGuard> = if no_socket {
+        crate::cli::record_store_owner(None);
         None
     } else {
-        let (listener, path) = bind_socket(&figmog_root)?;
+        let (listener, path) = bind_socket(&socket_root)?;
+        crate::cli::record_store_owner(Some(&path));
         let guard = SocketGuard::new(path)?;
         spawn_socket_acceptor(listener, tx.clone(), registry.clone());
         Some(guard)
@@ -448,14 +508,10 @@ pub(crate) fn run_serve(
     {
         let tx = tx.clone();
         std::thread::spawn(move || {
-            for line in std::io::stdin().lock().lines() {
-                match line {
-                    Ok(l) => {
-                        if tx.send(Incoming::Stdio(l)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => break,
+            let mut reader = std::io::stdin().lock();
+            while let Ok(Some(line)) = read_bounded_line(&mut reader) {
+                if tx.send(Incoming::Stdio(line)).is_err() {
+                    return;
                 }
             }
             let _ = tx.send(Incoming::StdinClosed);
@@ -467,34 +523,11 @@ pub(crate) fn run_serve(
         &files,
         no_watch,
         &token,
-        &figmog_root,
+        store_root,
         interval_dur,
     )?;
 
-    // Upstream probe: once here, so the first `tools/list` already has the
-    // desktop's tools when it is running; the desktop worker re-checks it
-    // from then on (NWS-2959). Global, not per-session (see this module's
-    // doc comment). `--no-upstream` starts no worker and never probes.
-    let desktop: Option<DesktopWorker> = if no_upstream {
-        None
-    } else {
-        let mut client = HttpUpstream::new(upstream_url);
-        let connected = match client.initialize() {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!(
-                    "figmog: upstream unreachable, serving local tools only (re-checking every {}s): {e}",
-                    ProbeCadence::default().missing.as_secs()
-                );
-                false
-            }
-        };
-        Some(DesktopWorker::spawn_with(
-            client,
-            connected,
-            ProbeCadence::default(),
-        ))
-    };
+    let desktop = start_desktop((!no_upstream).then_some(upstream_url));
     let upstream_status = desktop.as_ref().map_or("disabled", DesktopWorker::status);
 
     eprintln!(
@@ -508,12 +541,124 @@ pub(crate) fn run_serve(
     serve_loop(
         manager,
         desktop,
+        None,
         no_watch,
         track_current,
         interval_dur,
         rx,
         registry,
     )
+}
+
+/// Upstream probe: once at startup, so the first `tools/list` already has
+/// the desktop's tools when it is running; the desktop worker re-checks it
+/// from then on (NWS-2959). Global, not per-session (see this module's doc
+/// comment). `None` (`--no-upstream`) starts no worker and never probes.
+fn start_desktop(upstream_url: Option<String>) -> Option<DesktopWorker> {
+    let mut client = HttpUpstream::new(upstream_url?);
+    let connected = match client.initialize() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "figmog: upstream unreachable, serving local tools only (re-checking every {}s): {e}",
+                ProbeCadence::default().missing.as_secs()
+            );
+            false
+        }
+    };
+    Some(DesktopWorker::spawn_with(
+        client,
+        connected,
+        ProbeCadence::default(),
+    ))
+}
+
+/// Run as the repository's background owner (`figmog serve --background`,
+/// NWS-2953), started detached by the first relay. Takes the project's
+/// owner lock (or exits at once, successfully, when another process holds
+/// it: that one is the owner), binds the per-user socket, opens no files
+/// until relays and CLI commands name them, publishes discovery once it can
+/// answer, and serves until it has idled out. Stores are closed and
+/// compacted, then the socket and discovery record removed, before the
+/// lock is released, so a successor never finds either still in use.
+pub(crate) fn run_owner(
+    layout: crate::project::Layout,
+    settings: crate::owner::Settings,
+) -> Result<(), String> {
+    use crate::owner::{self, OwnerLock, OwnerPaths};
+    let _signals = owner::ShutdownSignals::install()?;
+    let paths = OwnerPaths::ensure(&layout.mirror_root)?;
+    let Some(lock) = OwnerLock::try_acquire(&paths)? else {
+        eprintln!(
+            "figmog: another background figmog owns {}; this one exits",
+            paths.identity()
+        );
+        return Ok(());
+    };
+    let lock = Arc::new(lock);
+    let socket = paths.socket();
+    let listener = owner::bind_socket(&socket)?;
+    let guard = SocketGuard::new(socket.clone())?;
+    crate::cli::record_store_owner(Some(&socket));
+    let token = crate::auth::token()?;
+    let interval_dur = clamp_interval(settings.interval);
+
+    let (tx, rx) = mpsc::channel::<Incoming>();
+    let registry: ConnRegistry = Arc::default();
+    spawn_socket_acceptor(listener, tx, registry.clone());
+    let manager = SessionManager {
+        sessions: Vec::new(),
+        root: StoreRoot::Fixed(paths.project.clone()),
+        token,
+        default_key: None,
+        sole_default: false,
+        #[cfg(test)]
+        api: None,
+    };
+    let desktop = start_desktop(settings.upstream.clone());
+    let generation = writes::new_generation();
+    let state = background::OwnerState::new(
+        paths.clone(),
+        lock.clone(),
+        &guard,
+        generation.clone(),
+        settings.clone(),
+        owner::idle_timeout(),
+    );
+    owner::write_discovery(
+        &paths,
+        &owner::Discovery {
+            socket: socket.clone(),
+            pid: std::process::id(),
+            generation: generation.clone(),
+            version: owner::version().to_string(),
+            protocol: owner::PROTOCOL,
+        },
+    )?;
+    eprintln!(
+        "figmog: background owner {} ready for {} (socket {}, watch {}, interval {}s, upstream {})",
+        std::process::id(),
+        paths.identity(),
+        socket.display(),
+        if settings.watch { "on" } else { "off" },
+        settings.interval,
+        desktop.as_ref().map_or("disabled", DesktopWorker::status),
+    );
+    let result = serve_loop(
+        manager,
+        desktop,
+        Some(state),
+        !settings.watch,
+        false,
+        interval_dur,
+        rx,
+        registry,
+    );
+    drop(guard);
+    owner::remove_discovery(&paths, &generation);
+    eprintln!("figmog: background owner {} exited", std::process::id());
+    drop(lock);
+    result
 }
 
 /// Dispatch requests using real stdio output. The loop accepts an output
@@ -523,6 +668,7 @@ pub(crate) fn run_serve(
 fn serve_loop(
     manager: SessionManager,
     desktop: Option<DesktopWorker>,
+    owner: Option<background::OwnerState>,
     no_watch: bool,
     track_current: bool,
     interval_dur: Duration,
@@ -530,9 +676,15 @@ fn serve_loop(
     registry: ConnRegistry,
 ) -> Result<(), String> {
     let first_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
-    serve_loop_with_output(
+    let mut offload = Offload::new(desktop);
+    if let Some(owner) = owner {
+        // The owner's operation ids carry its generation (NWS-2953).
+        offload.ops = writes::Operations::with_generation(owner.generation.clone());
+        offload.owner = Some(owner);
+    }
+    serve_loop_with_offload(
         manager,
-        desktop,
+        offload,
         no_watch,
         track_current,
         interval_dur,
@@ -589,6 +741,8 @@ struct Done {
 pub(crate) struct DeferredReply {
     token: u64,
     done: Option<mpsc::Sender<Done>>,
+    /// The error sent if this is dropped unsent.
+    abandoned: &'static str,
 }
 
 impl DeferredReply {
@@ -613,14 +767,12 @@ impl DeferredReply {
 
 impl Drop for DeferredReply {
     fn drop(&mut self) {
-        self.answer(
-            Answer::Output(Err(
-                "request abandoned: its worker stopped before answering".into(),
-            )),
-            false,
-        );
+        self.answer(Answer::Output(Err(self.abandoned.into())), false);
     }
 }
+
+/// A write dropped unanswered may or may not have committed.
+const WRITE_ABANDONED: &str = "outcome unknown: figmog serve stopped this write's worker before it reported; inspect the mirror before retrying";
 
 /// Where a deferred call's response is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -690,6 +842,14 @@ struct Offload {
     reads_in_flight: std::collections::BTreeSet<u64>,
     /// How long shutdown may take: [`EXIT_DRAIN`] (tests shorten it).
     exit_drain: Duration,
+    /// CLI write operations: ids and receipts (NWS-2963).
+    ops: writes::Operations,
+    /// The operation id of a write the handler just accepted, announced to
+    /// its requester before the write's response.
+    op_notice: Option<String>,
+    /// Set when this process is the repository's background owner
+    /// (NWS-2953): handshakes, idle shutdown, "not accepted" answers.
+    owner: Option<background::OwnerState>,
     /// Observe the shutdown boundary without scheduling sleeps in tests.
     #[cfg(test)]
     stopped: Option<mpsc::Sender<()>>,
@@ -714,6 +874,9 @@ impl Offload {
             staged: None,
             reads_in_flight: std::collections::BTreeSet::new(),
             exit_drain: EXIT_DRAIN,
+            ops: writes::Operations::default(),
+            op_notice: None,
+            owner: None,
             #[cfg(test)]
             stopped: None,
             #[cfg(test)]
@@ -731,6 +894,7 @@ impl Offload {
             DeferredReply {
                 token,
                 done: Some(self.done_tx.clone()),
+                abandoned: "request abandoned: its worker stopped before answering",
             },
         )
     }
@@ -768,6 +932,19 @@ impl Offload {
     }
 }
 
+/// Keep a finished write's receipt, whether or not its requester is still
+/// there to receive the answer.
+fn record_receipt(ops: &mut writes::Operations, done: &Done) {
+    if !ops.is_running(done.token) {
+        return;
+    }
+    match &done.answer {
+        Answer::Output(Ok(ToolOutput::Json(value))) => ops.finish(done.token, Ok(value)),
+        Answer::Output(Err(error)) => ops.finish(done.token, Err(error)),
+        _ => ops.finish(done.token, Err("unexpected write answer")),
+    }
+}
+
 /// Apply a deferred result's loop-side effects and return its answer.
 fn apply_done(
     manager: &mut SessionManager,
@@ -794,6 +971,9 @@ fn frame(response: &Value) -> String {
 fn answer_frame(answer: Answer, call: PendingCall) -> String {
     match answer {
         Answer::Frame(frame) => frame,
+        Answer::Output(Err(error)) if error.starts_with("outcome unknown:") => {
+            protocol_error_frame(&call, -32002, &error)
+        }
         Answer::Output(output) => frame(&crate::deep_json::OwnedValue(call.finish(output))),
     }
 }
@@ -817,37 +997,118 @@ fn deliver(to: ReplyTo, frame: String, registry: &ConnRegistry, stdio: &StdioWri
 /// running pull).
 const EXIT_DRAIN: Duration = Duration::from_secs(15);
 
+/// How often shutdown's drain services sessions while it waits.
+const DRAIN_POLL: Duration = Duration::from_millis(20);
+
 /// Shutdown: answer the deferred calls already accepted before exiting, so
 /// `printf '<request>\n' | figmog serve` still gets its response. Accepts
-/// no new requests and starts no new work (queued image requests and
-/// queued desktop calls — the desktop queue was already stopped by the
-/// caller — are answered with an error; running ones finish and answer);
-/// waits until `deadline`. A vanished stdout or closed socket
-/// just drops that response.
+/// no new requests and starts no new work: queued image requests, queued
+/// CLI writes and queued desktop calls (the desktop queue was already
+/// stopped by the caller) are answered with an error — a queued write with
+/// "not accepted" (code [`crate::owner::NOT_ACCEPTED`]: it never started, so
+/// the CLI may retry it). Running work finishes and answers: sessions keep
+/// processing completions (NWS-2963) — a routed write answers only once
+/// its session published it, and a fresh pull's reset and apply still run
+/// — with no watch work. Waits until `deadline`. A vanished stdout or
+/// closed socket just drops that response.
+#[allow(clippy::too_many_arguments)]
 fn drain_on_exit(
     manager: &mut SessionManager,
     offload: &Offload,
     pending: &mut Pending,
     registry: &ConnRegistry,
     stdio: &StdioWriter,
+    track_current: bool,
     deadline: Instant,
+    incoming: &mpsc::Receiver<Incoming>,
 ) {
     for session in &mut manager.sessions {
-        session.abandon_queued_images();
+        session.begin_drain();
     }
-    while !pending.is_empty() {
+    while !pending.is_empty() || manager.sessions.iter().any(sessions::FileSession::is_busy) {
+        for _ in 0..32 {
+            if Instant::now() >= deadline {
+                return;
+            }
+            let Ok(message) = incoming.try_recv() else {
+                break;
+            };
+            let (to, line) = match message {
+                Incoming::Socket(id, line) => (ReplyTo::Socket(id), line),
+                Incoming::Stdio(line) => (ReplyTo::Stdio, line),
+                Incoming::StdinClosed => continue,
+            };
+            if let Some(response) = closing_response(&line) {
+                deliver(to, frame(&response), registry, stdio);
+            }
+        }
+        let mut published = Vec::new();
+        for session in &mut manager.sessions {
+            if session.maintain(false) {
+                published.push(session.key.clone());
+            }
+        }
+        for (key, outcome) in manager.service_resets() {
+            match outcome {
+                Ok(()) => published.push(key),
+                Err(error) => eprintln!("figmog: reopening {key} after a reset failed: {error}"),
+            }
+        }
+        for key in published {
+            refresh_current(manager, track_current, &key);
+        }
         let left = deadline.saturating_duration_since(Instant::now());
-        let Ok(done) = offload.done_rx.recv_timeout(left) else {
+        if left.is_zero() {
             return;
+        }
+        let Ok(done) = offload.done_rx.recv_timeout(left.min(DRAIN_POLL)) else {
+            continue;
         };
         let Some((to, call)) = pending.remove(done.token) else {
             continue;
         };
         // No poll expedite: the server is exiting.
-        if !deliver(to, answer_frame(done.answer, call), registry, stdio) {
+        let frame = match done.answer {
+            Answer::Output(Err(error)) if error == sessions::WRITE_NOT_STARTED => {
+                not_accepted_frame(&call, &error)
+            }
+            answer => answer_frame(answer, call),
+        };
+        if !deliver(to, frame, registry, stdio) {
             return;
         }
     }
+}
+
+/// Refuse ordinary requests while still returning normal parse/method errors.
+fn closing_response(line: &str) -> Option<crate::deep_json::OwnedValue> {
+    if let Some((id, method, _)) = background::request_parts(line) {
+        return (!method.starts_with("notifications/")).then(|| background::not_accepted(id));
+    }
+    let mut handler = LoopHandler::new(false, |_: &str, _: &Value| {
+        Err("figmog serve is shutting down".into())
+    });
+    match mcp::dispatch_message(line, &[], &mut handler, ToolErrorMode::JsonRpc) {
+        Some(Reply::Now(response)) => Some(crate::deep_json::OwnedValue(response)),
+        _ => None,
+    }
+}
+
+/// A "not accepted" response frame for `call`: nothing was started for it.
+fn not_accepted_frame(call: &PendingCall, message: &str) -> String {
+    protocol_error_frame(call, crate::owner::NOT_ACCEPTED, message)
+}
+
+fn protocol_error_frame(call: &PendingCall, code: i64, message: &str) -> String {
+    let id = crate::deep_json::from_str(
+        &crate::deep_json::to_string(call.id()).expect("Value serializes"),
+    )
+    .expect("serialized Value parses");
+    let mut response = crate::deep_json::OwnedValue(serde_json::json!({
+        "jsonrpc": "2.0", "error": { "code": code, "message": message }
+    }));
+    response.insert("id".into(), id);
+    frame(&response)
 }
 
 /// Why the request loop returned.
@@ -858,6 +1119,7 @@ enum LoopExit {
     StdoutGone,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn serve_loop_with_output(
     manager: SessionManager,
@@ -923,25 +1185,41 @@ fn serve_loop_with_offload(
         let _ = stopped.send(());
     }
     let deadline = Instant::now() + offload.exit_drain;
-    if matches!(exit, LoopExit::Drain) {
-        drain_on_exit(
-            &mut manager,
-            &offload,
-            &mut pending,
-            &registry,
-            &stdio,
-            deadline,
-        );
+    // Reset reopen, database close and persistence can block inside an
+    // upstream synchronous API. Keep all shutdown state and store leases
+    // together on one cleanup worker, while the serving thread enforces
+    // the same deadline around the entire drain and teardown.
+    let cleanup = std::thread::spawn(move || {
+        if matches!(exit, LoopExit::Drain) {
+            drain_on_exit(
+                &mut manager,
+                &offload,
+                &mut pending,
+                &registry,
+                &stdio,
+                track_current,
+                deadline,
+                &rx,
+            );
+        }
+        offload.reads.shutdown(deadline);
+        drop(offload);
+        manager.close_reads(deadline);
+        registry.finish(deadline);
+        stdio.finish(deadline);
+        manager.close_and_compact(deadline);
+    });
+    while !cleanup.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
     }
-    // Stop the read pool within the deadline (queued reads are skipped; a
-    // read still running then is detached with its own lease), then close
-    // every store behind the reset barrier — waiting at most until the
-    // same deadline — before the sessions drop. Nothing reopens a store.
-    offload.reads.shutdown(deadline);
-    drop(offload);
-    manager.close_reads(deadline);
-    registry.finish(deadline);
-    stdio.finish(deadline);
+    if cleanup.is_finished() {
+        cleanup
+            .join()
+            .map_err(|_| "figmog shutdown worker panicked".to_string())?;
+    }
+    // Otherwise detach with ownership intact; returning from the executable
+    // terminates its remaining threads. No successor can write underneath
+    // the detached cleanup's still-held store locks.
     Ok(())
 }
 
@@ -966,10 +1244,23 @@ fn request_loop(
     let mut stdio_subscribed = false;
 
     loop {
+        if crate::owner::shutdown_requested() {
+            return LoopExit::Drain;
+        }
         // A vanished stdio reader is a clean shutdown; accepted running
         // pulls drain through FileSession's drop handler.
         if stdio.gone() {
             return LoopExit::StdoutGone;
+        }
+        // A background owner idles out with no connections and no work,
+        // and finishes accepted work before it exits (NWS-2953).
+        if let Some(owner) = &mut offload.owner {
+            let writing = manager.sessions.iter().any(|s| s.has_writes());
+            let busy = registry.open_count() > 0 || !pending.is_empty() || writing;
+            owner.tick(Instant::now(), busy);
+            if owner.closing {
+                return LoopExit::Drain;
+            }
         }
         // Completions and due watch work run even under continuous traffic.
         // Polling this in-memory channel never waits on a pull or HTTP.
@@ -1006,6 +1297,7 @@ fn request_loop(
         // deferring), so its result has no requester.
         while let Ok(done) = offload.done_rx.try_recv() {
             offload.reads_in_flight.remove(&done.token);
+            record_receipt(&mut offload.ops, &done);
             let Some((to, call)) = pending.remove(done.token) else {
                 continue;
             };
@@ -1068,14 +1360,49 @@ fn request_loop(
             ),
         };
 
+        // A background owner answers handshakes itself, refuses every new
+        // request once closing, and frames a relay's answers for its agent
+        // (MCP `isError` content, no internal tools) like stdio (NWS-2953).
+        let mut relay_conn = false;
+        if let (Some(owner), ReplyTo::Socket(conn_id)) = (&offload.owner, to) {
+            match background::request_parts(&line) {
+                Some((id, method, _)) if owner.closing && !method.starts_with("notifications/") => {
+                    deliver(to, frame(&background::not_accepted(id)), registry, stdio);
+                    continue;
+                }
+                Some((id, method, params)) if method == crate::owner::HELLO => {
+                    let (response, relay) = owner.hello(id, &params, manager, interval_dur);
+                    if relay {
+                        registry.set_relay(conn_id);
+                    }
+                    deliver(to, frame(&response), registry, stdio);
+                    continue;
+                }
+                _ if owner.closing => {
+                    if let Some(response) = closing_response(&line) {
+                        deliver(to, frame(&response), registry, stdio);
+                    }
+                    continue;
+                }
+                _ => relay_conn = registry.is_relay(conn_id),
+            }
+        }
+        let mode = if relay_conn {
+            ToolErrorMode::McpContent
+        } else {
+            mode
+        };
+
         let over_limit = pending.count(to) >= MAX_PENDING_PER_REQUESTER;
         offload.staged = None;
+        offload.op_notice = None;
         let upstream_status = offload
             .desktop
             .as_ref()
             .map_or("disabled", DesktopWorker::status);
         let list_changes = offload.desktop.is_some();
         let mut handler = LoopHandler::new(
+            matches!(to, ReplyTo::Socket(_)) && !relay_conn,
             |name: &str, args: &Value| -> Result<ToolOutput, String> {
                 if over_limit {
                     return Err(format!(
@@ -1122,6 +1449,11 @@ fn request_loop(
             None => {}
             Some(Reply::Later(call)) => {
                 offload.park(&call);
+                // A write's operation id reaches its requester first, so
+                // a client that loses the owner can still name it.
+                if let Some(id) = offload.op_notice.take() {
+                    deliver(to, frame(&writes::notification(&id)), registry, stdio);
+                }
                 pending.insert(to, call);
             }
             Some(Reply::Now(response)) => {
@@ -1132,6 +1464,22 @@ fn request_loop(
             }
         }
     }
+}
+
+/// Canonicalize existing ancestors too, so a not-yet-created destination
+/// compares consistently with an existing store beneath the same root.
+fn canonical_store_path(path: &std::path::Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return std::fs::canonicalize(path).map_err(|error| error.to_string());
+    }
+    let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| "store path has no parent".to_string())?;
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| "store path has no filename".to_string())?;
+    Ok(canonical_store_path(parent)?.join(name))
 }
 
 /// The local registry merged with the desktop's current tools (none when
@@ -1152,6 +1500,9 @@ fn merged_registry(desktop: Option<&DesktopWorker>) -> Vec<mcp::ToolDef> {
 /// protocol events the loop acts on after dispatch (NWS-2959).
 struct LoopHandler<F> {
     call: F,
+    /// The request came from the socket control plane, the only place
+    /// serve's hidden write operations are callable (NWS-2963).
+    socket: bool,
     list_changes: bool,
     /// The client sent `initialize`.
     initialized: bool,
@@ -1160,9 +1511,10 @@ struct LoopHandler<F> {
 }
 
 impl<F> LoopHandler<F> {
-    fn new(call: F) -> Self {
+    fn new(socket: bool, call: F) -> Self {
         Self {
             call,
+            socket,
             list_changes: false,
             initialized: false,
             unknown_tool: None,
@@ -1186,6 +1538,10 @@ impl<F: FnMut(&str, &Value) -> Result<ToolOutput, String>> mcp::ToolHandler for 
     fn unknown_tool(&mut self, name: &str) {
         self.unknown_tool = Some(name.to_string());
     }
+
+    fn accepts_hidden(&self, name: &str) -> bool {
+        self.socket && writes::is_internal(name)
+    }
 }
 
 /// Open startup stores and queue initial pulls on their workers. Store-open
@@ -1197,7 +1553,7 @@ fn build_sessions(
     files: &[String],
     no_watch: bool,
     token: &Option<String>,
-    figmog_root: &Path,
+    store_root: StoreRoot,
     interval: Duration,
 ) -> Result<(SessionManager, bool), String> {
     if let Some(path) = db_override {
@@ -1230,9 +1586,10 @@ fn build_sessions(
         )?;
         let mut manager = SessionManager {
             sessions: vec![session],
-            root: figmog_root.to_path_buf(),
+            root: store_root,
             token: token.clone(),
             default_key: Some(display_key),
+            sole_default: true,
             #[cfg(test)]
             api: None,
         };
@@ -1264,9 +1621,10 @@ fn build_sessions(
 
     let mut manager = SessionManager {
         sessions: Vec::new(),
-        root: figmog_root.to_path_buf(),
+        root: store_root,
         token: token.clone(),
         default_key: None,
+        sole_default: true,
         #[cfg(test)]
         api: None,
     };
@@ -1388,7 +1746,7 @@ fn watch_tick_at(
     now: Instant,
 ) -> (Instant, bool) {
     if manager.sessions.is_empty() {
-        return (now + interval, false);
+        return (now + tick_deadline(interval, 0), false);
     }
     let count = manager.sessions.len();
     let idx = *next_idx % count;
@@ -1404,7 +1762,7 @@ fn watch_tick_at(
 /// shape that used to do this (`figmog serve <file>`, no `--db`).
 fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
     if track && manager.effective_default_key().as_deref() == Some(key) {
-        let _ = crate::cli::write_current(key);
+        let _ = crate::cli::write_current(&manager.root.local_root(), key);
     }
 }
 
@@ -1469,6 +1827,69 @@ fn handle_tool_call(
         return offload.defer_read(cancel, ReadTask::Files(read));
     }
 
+    if name == writes::OPERATION {
+        return offload.ops.query(args).map(ToolOutput::Json);
+    }
+    if name == writes::PULL || name == writes::IMPORT_VARIABLES {
+        let (file, op) = writes::parse(name, args)?;
+        let expected = writes::expected_db(args)?;
+        let key =
+            parse_file_ref(&file).ok_or_else(|| format!("not a Figma file key or URL: {file}"))?;
+        let actual = manager
+            .sessions
+            .iter()
+            .find(|session| session.key == key)
+            .map(|session| Ok(session.path.clone()))
+            .unwrap_or_else(|| manager.root.store_path(&key))?;
+        if canonical_store_path(&expected)? != canonical_store_path(&actual)? {
+            return Err(format!(
+                "not accepted: this figmog serve would write a different store ({}) than the CLI requested ({}); nothing was applied; use --no-socket",
+                actual.display(),
+                expected.display()
+            ));
+        }
+        if let sessions::WriteOp::Import { dry_run: true, .. } = &op {
+            let empty = match std::fs::read_dir(&actual) {
+                Ok(mut entries) => entries
+                    .next()
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .is_none(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error.to_string()),
+            };
+            if empty && !manager.sessions.iter().any(|session| session.key == key) {
+                let (token, reply) = offload.reply();
+                let id = offload.ops.begin(token);
+                offload.op_notice = Some(id.clone());
+                std::thread::spawn(move || {
+                    let result = writes::preview_empty_import(op).map(|value| {
+                        ToolOutput::Json(serde_json::json!({"operation": id, "result": value}))
+                    });
+                    reply.send(result, false);
+                });
+                return Ok(ToolOutput::Deferred(token));
+            }
+        }
+        let session = manager.open(&file)?;
+        let (token, mut reply) = offload.reply();
+        reply.abandoned = WRITE_ABANDONED;
+        let id = offload.ops.begin(token);
+        offload.op_notice = Some(id.clone());
+        let operation = id.clone();
+        session.write(
+            id,
+            op,
+            Box::new(move |result| {
+                let output = result.map(|value| {
+                    ToolOutput::Json(serde_json::json!({"operation": operation, "result": value}))
+                });
+                reply.send(output, false);
+            }),
+        );
+        return Ok(ToolOutput::Deferred(token));
+    }
+
     if name == "figmog_open" {
         let file = dispatch::require_str(args, "file")?;
         // spec §4: `geometry` turns sticky vector-geometry requests on for
@@ -1499,7 +1920,14 @@ fn handle_tool_call(
     let file_arg = explicit_file.clone().or_else(|| url_file_key.clone());
 
     if proxy::is_local_tool(name) {
-        let session = manager.resolve(file_arg.as_deref(), interval)?;
+        let session = if name == "figmog_sync" {
+            match file_arg.as_deref() {
+                Some(file) => manager.open(file)?,
+                None => manager.resolve(None, interval)?,
+            }
+        } else {
+            manager.resolve(file_arg.as_deref(), interval)?
+        };
 
         if name == "figmog_sync" {
             return Ok(ToolOutput::Json(session.request_pull(false, interval)));
@@ -1515,7 +1943,10 @@ fn handle_tool_call(
             );
         }
 
-        if !(session.mirrored || name == "figmog_vars" && session.has_variable_state()) {
+        if !(session.mirrored
+            || session.has_writes()
+            || name == "figmog_vars" && session.has_variable_state())
+        {
             session.request_pull(false, interval);
         }
         if name == "figmog_images" {
@@ -1644,9 +2075,10 @@ mod tests {
         .unwrap();
         let mut manager = SessionManager {
             sessions: vec![session],
-            root: dir.path().to_path_buf(),
+            root: dir.path().to_path_buf().into(),
             token: None,
             default_key: Some("ABC123".into()),
+            sole_default: true,
             api: None,
         };
         let mut next_idx = 0;
@@ -1748,15 +2180,17 @@ mod tests {
             .unwrap();
             let manager = SessionManager {
                 sessions: vec![session],
-                root: db,
+                root: db.into(),
                 token: Some("synthetic-token".into()),
                 default_key: Some("ABC123".into()),
+                sole_default: true,
                 api: None,
             };
             let registry: ConnRegistry = Arc::default();
             registry.register(1, socket).unwrap();
             serve_loop(
                 manager,
+                None,
                 None,
                 false,
                 false,
@@ -1843,8 +2277,9 @@ mod tests {
         .unwrap();
         crate::store::sync(&mut st, &std::collections::BTreeSet::new(), &flattened, 0);
 
-        let result =
-            st.rtx(|r| dispatch::dispatch_read_tool("figmog_status", &json!({}), "connected", &r));
+        let result = st.rtx(|r| {
+            dispatch::dispatch_read_tool("figmog_status", &json!({}), "connected", &r, None)
+        });
         let value = result
             .expect("figmog_status is a recognized local tool")
             .unwrap();
@@ -1854,7 +2289,7 @@ mod tests {
         // dispatcher — proving the namespace rule routes it away from the
         // local path without needing a live upstream to demonstrate it.
         let result =
-            st.rtx(|r| dispatch::dispatch_read_tool("get_code", &json!({}), "connected", &r));
+            st.rtx(|r| dispatch::dispatch_read_tool("get_code", &json!({}), "connected", &r, None));
         assert!(result.is_none());
     }
 
@@ -1897,6 +2332,72 @@ mod tests {
             tick_deadline(Duration::from_secs(10), 100),
             Duration::from_secs(2)
         );
+        // `--interval 0` is floored too, with or without sessions
+        // (NWS-2938: an unfloored idle wait busy-looped the server).
+        for sessions in [0, 1, 5] {
+            assert_eq!(tick_deadline(Duration::ZERO, sessions), MIN_TICK_DEADLINE);
+        }
+    }
+
+    #[test]
+    fn empty_server_with_zero_interval_never_schedules_a_zero_wait() {
+        // NWS-2938: with no sessions and `--interval 0`, every idle watch
+        // round used to land at `now`, so the request loop's
+        // `recv_timeout` got a zero wait and spun. The idle wakeup must
+        // stay at least the two-second floor away, every round.
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = SessionManager {
+            sessions: Vec::new(),
+            root: dir.path().to_path_buf().into(),
+            token: None,
+            default_key: None,
+            sole_default: true,
+            api: None,
+        };
+        let mut watch = WatchScheduler::new(Instant::now());
+        let mut now = Instant::now();
+        for _ in 0..3 {
+            watch.service_at(&mut manager, Duration::ZERO, now);
+            let deadline = watch.next_deadline(&manager);
+            assert!(
+                deadline >= now + MIN_TICK_DEADLINE,
+                "idle wakeup scheduled {:?} after now",
+                deadline.saturating_duration_since(now)
+            );
+            now = deadline;
+        }
+    }
+
+    /// The shared owner (NWS-2953) holds every worktree's files: its one
+    /// open session is never a default for a request naming no file, while
+    /// an in-process serve keeps the sole-session rule.
+    #[test]
+    fn only_an_in_process_serve_defaults_to_its_sole_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "AAA1234567890".to_string();
+        let session =
+            sessions::open_session_at(dir.path().join("db"), key.clone(), None, None).unwrap();
+        let mut manager = SessionManager {
+            sessions: vec![session],
+            root: dir.path().to_path_buf().into(),
+            token: None,
+            default_key: None,
+            sole_default: true,
+            api: None,
+        };
+        assert_eq!(manager.effective_default_key(), Some(key.clone()));
+        assert_eq!(manager.resolve(None, Duration::ZERO).unwrap().key, key);
+        manager.sole_default = false;
+        assert_eq!(manager.effective_default_key(), None);
+        assert_eq!(
+            manager.resolve(None, Duration::ZERO).err().as_deref(),
+            Some(sessions::NO_DEFAULT_FILE_MSG)
+        );
+        assert_eq!(
+            manager.resolve(Some(&key), Duration::ZERO).unwrap().key,
+            key
+        );
+        manager.close_reads(Instant::now() + Duration::from_secs(5));
     }
 
     // ---- unix-socket control plane (v0.0.2 spec §1) ----
@@ -2173,7 +2674,8 @@ mod tests {
         let mut client = UnixStream::connect(&path).unwrap();
         let (server_side, _) = listener.accept().unwrap();
 
-        let oversized = vec![b'a'; MAX_FRAME_BYTES + 1];
+        const CAP: usize = 64 * 1024;
+        let oversized = vec![b'a'; CAP + 1];
         let writer = std::thread::spawn(move || {
             // Never completes the frame with a newline — the reader must
             // give up once the cap is exceeded, not once EOF arrives.
@@ -2181,7 +2683,7 @@ mod tests {
         });
 
         let mut reader = BufReader::new(server_side);
-        let result = read_bounded_line(&mut reader);
+        let result = read_line_within(&mut reader, CAP);
         assert!(
             result.is_err(),
             "an oversized frame should error, not block forever collecting it"

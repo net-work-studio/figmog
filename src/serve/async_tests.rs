@@ -30,7 +30,7 @@ fn invalid_local_arguments_do_not_open_or_pull_a_mirror() {
         assert!(!error.contains("not ready"), "{error}");
     }
     assert_eq!(h.manager.sessions.len(), 1);
-    assert!(!h.manager.root.join(missing).exists());
+    assert!(!h.manager.root.store_path(missing).unwrap().exists());
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
 }
 
@@ -52,7 +52,7 @@ fn cancelled_socket_calls_cannot_open_sync_or_forward() {
         assert!(matches!(result, Err(error) if error.contains("cancelled")));
     }
     assert_eq!(h.manager.sessions.len(), 1);
-    assert!(!h.manager.root.join("NEW1234567890").exists());
+    assert!(!h.manager.root.store_path("NEW1234567890").unwrap().exists());
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
 }
 
@@ -64,7 +64,7 @@ fn detached_read_keeps_fjall_store_locked_after_session_closes() {
     h.release.send(()).unwrap();
     h.wait_for("succeeded");
     let lease = h.manager.sessions[0].lease().unwrap();
-    let path = h.manager.root.join("ABC1234567890/db");
+    let path = h.manager.root.store_path("ABC1234567890").unwrap();
     h.manager.close_reads(Instant::now());
     h.manager.sessions.clear();
     let result = crate::cli::open_store_checked(&path, |path| crate::open_store!(path));
@@ -272,9 +272,10 @@ impl Harness {
         .unwrap();
         let manager = SessionManager {
             sessions: vec![session],
-            root: dir.path().to_path_buf(),
+            root: dir.path().to_path_buf().into(),
             token: None,
             default_key: Some("ABC1234567890".into()),
+            sole_default: true,
             api: Some(api.clone()),
         };
         Self {
@@ -519,7 +520,9 @@ fn async_malformed_document_pull_preserves_the_readable_mirror() {
         // Reopen the worker's store to prove the rejected pull never reached
         // the persisted mirror, even if a previous published snapshot survived.
         h.manager.sessions.clear();
-        let reopened = sessions::open_session(h._dir.path(), "ABC1234567890", None).unwrap();
+        let reopened =
+            sessions::open_session(&h._dir.path().to_path_buf().into(), "ABC1234567890", None)
+                .unwrap();
         let status = reopened.status().unwrap();
         assert_eq!(status["version"], "1");
         assert_eq!(status["nodes"], 3);
@@ -654,6 +657,49 @@ fn async_delayed_metadata_poll_keeps_reads_responsive_and_reconciles_once() {
     }
 }
 
+/// A metadata poll already running when shutdown's drain begins may still
+/// report `Changed`, but the drain barrier holds at pull dispatch: no new
+/// network pull starts while draining (NWS-2963, NWS-2955).
+#[test]
+fn a_poll_that_completes_changed_during_drain_starts_no_pull() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    assert!(h.manager.sessions[0].poll_at(Duration::ZERO, Instant::now()));
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.manager.sessions[0].begin_drain();
+    *h.api.metadata.lock().unwrap() = "t2".into();
+    h.api.block_meta.store(false, Ordering::Relaxed);
+    h.release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        h.manager.sessions[0].maintain(false);
+        if h.manager.sessions[0].status().unwrap()["pull"]["polling"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    for _ in 0..10 {
+        h.manager.sessions[0].maintain(false);
+        assert!(!h.manager.sessions[0].poll_at(Duration::ZERO, Instant::now()));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        h.entered.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a pull started while draining"
+    );
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 1);
+    let status = h.manager.sessions[0].status().unwrap();
+    assert_ne!(status["pull"]["job"]["state"], "running", "{status}");
+}
+
 #[test]
 fn async_graceful_shutdown_drains_running_pull_and_discards_followup() {
     let mut h = Harness::new();
@@ -720,6 +766,7 @@ fn async_socket_cli_acknowledges_open_and_sync_before_worker_release() {
     let server = std::thread::spawn(move || {
         serve_loop(
             manager,
+            None,
             None,
             true,
             false,
@@ -1319,6 +1366,7 @@ mod desktop;
 mod isolation;
 mod offload;
 mod watch_and_cache;
+mod writes;
 
 #[test]
 fn successful_explicit_sync_preserves_metadata_retry_and_normal_round() {
@@ -1735,4 +1783,214 @@ fn ordinary_metadata_retries_preserve_retry_after_before_and_after_normal_round(
         h.release.send(()).unwrap();
         h.finish_poll_at(base + Duration::from_secs(seconds));
     }
+}
+
+#[test]
+fn reads_of_missing_files_do_not_initialize_a_store() {
+    let mut h = Harness::new();
+    let missing = "NEW1234567890";
+    for name in ["figmog_status", "figmog_pages", "figmog_vars"] {
+        let result = h.call(name, json!({"file": missing}));
+        let message = result["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(message.contains("no mirror here"), "{result}");
+        assert!(!h.manager.root.store_path(missing).unwrap().exists());
+    }
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn routed_write_rejects_a_different_store_before_admission() {
+    let mut h = Harness::new();
+    let mut offload = Offload::new(None);
+    let result = handle_tool_call(
+        &mut h.manager,
+        &mut offload,
+        &Arc::new(AtomicBool::new(false)),
+        "disabled",
+        Duration::ZERO,
+        crate::serve::writes::PULL,
+        &json!({"file": "ABC1234567890", "db": h._dir.path().join("other/db"), "from_file": fixture("2")}),
+    );
+    assert!(
+        matches!(result, Err(error) if error.contains("different store") && error.contains("nothing was applied"))
+    );
+    assert!(!h._dir.path().join("other").exists());
+    assert!(!h.manager.sessions[0].has_writes());
+}
+
+#[test]
+fn session_close_obeys_the_deadline_with_a_blocked_network_worker() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let before = Instant::now();
+    h.manager.close_and_compact(before);
+    assert!(before.elapsed() < Duration::from_secs(1));
+    assert!(h.manager.sessions.is_empty());
+    h.release.send(()).unwrap();
+}
+
+#[test]
+fn closing_frames_preserve_parse_and_method_errors() {
+    let malformed = closing_response("{").unwrap();
+    assert_eq!(malformed["error"]["code"], -32700);
+    let invalid = closing_response(r#"{"jsonrpc":"2.0","id":9,"method":42}"#).unwrap();
+    assert_eq!(invalid["id"], 9);
+    assert_eq!(invalid["error"]["code"], -32601);
+    let refused = closing_response(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#).unwrap();
+    assert_eq!(refused["error"]["code"], crate::owner::NOT_ACCEPTED);
+}
+
+#[test]
+fn fresh_apply_keeps_reads_behind_the_reset_barrier_until_publication() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(30)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    h.gate_stages.store(true, Ordering::Relaxed);
+    let (answer, result) = mpsc::channel();
+    h.manager.sessions[0].write(
+        "fresh-test".into(),
+        sessions::WriteOp::Pull {
+            source: sessions::PullSource::File(crate::deep_json::OwnedValue(fixture("2"))),
+            fresh: true,
+            geometry: false,
+        },
+        Box::new(move |value| {
+            let _ = answer.send(value);
+        }),
+    );
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(30)).unwrap(),
+        "flattening"
+    );
+    h.release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        h.manager.sessions[0].maintain(false);
+        h.manager.service_resets();
+        if let Ok(stage) = h.entered.try_recv() {
+            assert_eq!(stage, "applying");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    for name in ["figmog_status", "figmog_node"] {
+        let value = h.call(name, json!({"id": "0:0"}));
+        assert!(
+            value["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("being reset"),
+            "{value}"
+        );
+    }
+    h.release.send(()).unwrap();
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(30)).unwrap(),
+        "publishing"
+    );
+    h.release.send(()).unwrap();
+    loop {
+        h.manager.sessions[0].maintain(false);
+        if let Ok(value) = result.try_recv() {
+            value.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(h.value("figmog_status", json!({}))["version"], "2");
+}
+
+#[test]
+fn fresh_apply_failure_does_not_mark_the_cleared_store_mirrored() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(30)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    let path = h.manager.sessions[0].path.clone();
+    h.manager.sessions.clear();
+    let session = sessions::open_session_with_hooks(
+        path,
+        "ABC1234567890".into(),
+        None,
+        None,
+        sessions::WorkerHooks {
+            on_phase: Some(Arc::new(|phase| {
+                if phase == "applying" {
+                    panic!("injected apply failure");
+                }
+            })),
+        },
+    )
+    .unwrap();
+    h.manager.sessions.push(session);
+    let (answer, result) = mpsc::channel();
+    h.manager.sessions[0].write(
+        "failed-fresh-test".into(),
+        sessions::WriteOp::Pull {
+            source: sessions::PullSource::File(crate::deep_json::OwnedValue(fixture("2"))),
+            fresh: true,
+            geometry: false,
+        },
+        Box::new(move |value| {
+            let _ = answer.send(value);
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        h.manager.sessions[0].maintain(false);
+        h.manager.service_resets();
+        if let Ok(value) = result.try_recv() {
+            assert!(value.unwrap_err().starts_with("outcome unknown:"));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!h.manager.sessions[0].mirrored);
+    let result = h.manager.sessions[0].dispatch("figmog_node", &json!({"id": "0:0"}));
+    assert!(matches!(result, Err(error) if error.contains("not ready")));
+}
+
+#[test]
+fn a_successful_routed_pull_clears_the_previous_pull_retry_delay() {
+    let mut h = Harness::new();
+    *h.api.response.lock().unwrap() = Err(ApiError::Network("offline".into()));
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("failed");
+    *h.api.response.lock().unwrap() = Ok(fixture("2"));
+    let (answer, result) = mpsc::channel();
+    h.manager.sessions[0].write(
+        "retry-clear-test".into(),
+        sessions::WriteOp::Pull {
+            source: sessions::PullSource::File(crate::deep_json::OwnedValue(fixture("1"))),
+            fresh: false,
+            geometry: false,
+        },
+        Box::new(move |value| {
+            let _ = answer.send(value);
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        h.manager.sessions[0].maintain(false);
+        if let Ok(value) = result.try_recv() {
+            value.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let accepted = h.value("figmog_sync", json!({}));
+    assert_eq!(accepted["state"], "running");
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
 }

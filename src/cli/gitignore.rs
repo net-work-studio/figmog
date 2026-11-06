@@ -1,5 +1,9 @@
-//! Keep cwd-relative mirrors out of Git without changing global ignore
-//! settings or touching unrelated ancestors outside the repository.
+//! Keep the project's per-checkout `.figmog/` (and, in a project with a
+//! `figmog.toml`, the machine-local `figmog.local.toml`) out of Git without
+//! changing global ignore settings or touching unrelated ancestors outside
+//! the repository. The shared mirror root lives inside the Git directory
+//! itself (`<git-common-dir>/figmog`), which Git never tracks, so it needs
+//! no entry.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -15,20 +19,36 @@ fn repository_root(cwd: &Path) -> Option<&Path> {
     cwd.ancestors().find(|dir| dir.join(".git").exists())
 }
 
-pub(super) fn ignore_local_mirror(cwd: &Path) -> Result<(), String> {
+/// `(path checked with git check-ignore, pattern appended when it isn't)`.
+const LOCAL_DIR_ENTRY: (&str, &str) = (".figmog", ".figmog/");
+const LOCAL_CONFIG_ENTRY: (&str, &str) = (
+    crate::project::LOCAL_CONFIG_FILE,
+    crate::project::LOCAL_CONFIG_FILE,
+);
+
+/// `cwd` is the project root; `local_config` adds `figmog.local.toml`.
+pub(super) fn ignore_local_mirror(cwd: &Path, local_config: bool) -> Result<(), String> {
     let Some(root) = repository_root(cwd) else {
         return Ok(());
     };
     // Git reads every ancestor's ignore file, not only our append target.
     // Reject FIFOs and other nonregular entries before launching it.
     let path = checked_ignore_path(cwd, root)?;
-    if is_ignored(cwd, GIT_IGNORE_TIMEOUT)? {
+    let mut missing = Vec::new();
+    for (name, pattern) in
+        std::iter::once(LOCAL_DIR_ENTRY).chain(local_config.then_some(LOCAL_CONFIG_ENTRY))
+    {
+        if !is_ignored(cwd, name, GIT_IGNORE_TIMEOUT)? {
+            missing.push(pattern);
+        }
+    }
+    if missing.is_empty() {
         return Ok(());
     }
-    append_ignore(&path)
+    append_ignore(&path, &missing)
 }
 
-fn is_ignored(cwd: &Path, timeout: Duration) -> Result<bool, String> {
+fn is_ignored(cwd: &Path, name: &str, timeout: Duration) -> Result<bool, String> {
     // Respect existing patterns, including broader ignores, nested
     // negations, and .git/info/exclude. --no-index also handles mirrors
     // that were already tracked (ignore rules never untrack files).
@@ -36,7 +56,7 @@ fn is_ignored(cwd: &Path, timeout: Duration) -> Result<bool, String> {
     // only pattern even when a negated subtree exposes mirror files.
     let mut command = Command::new("git");
     command
-        .args(["check-ignore", "--no-index", "--quiet", "--", ".figmog"])
+        .args(["check-ignore", "--no-index", "--quiet", "--", name])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -81,7 +101,7 @@ fn is_ignored(cwd: &Path, timeout: Duration) -> Result<bool, String> {
     }
 }
 
-fn append_ignore(path: &Path) -> Result<(), String> {
+fn append_ignore(path: &Path, patterns: &[&str]) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).append(true);
     #[cfg(unix)]
@@ -113,8 +133,10 @@ fn append_ignore(path: &Path) -> Result<(), String> {
     if !contents.is_empty() && !contents.ends_with(b"\n") {
         addition.push_str(newline);
     }
-    addition.push_str(".figmog/");
-    addition.push_str(newline);
+    for pattern in patterns {
+        addition.push_str(pattern);
+        addition.push_str(newline);
+    }
     file.write_all(addition.as_bytes())
         .map_err(|error| format!("writing {}: {error}", path.display()))
 }
@@ -156,7 +178,7 @@ mod tests {
         fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
 
-        assert!(append_ignore(&checked).is_err());
+        assert!(append_ignore(&checked, &[".figmog/"]).is_err());
         assert_eq!(fs::read_to_string(target).unwrap(), "untouched\n");
     }
 }

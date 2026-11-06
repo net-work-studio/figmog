@@ -523,6 +523,7 @@ mod tests {
             reply: DeferredReply {
                 token,
                 done: Some(done.clone()),
+                abandoned: "request abandoned: its worker stopped before answering",
             },
             cancel,
         });
@@ -720,6 +721,7 @@ mod tests {
                     reply: DeferredReply {
                         token,
                         done: Some(done.clone()),
+                        abandoned: "request abandoned: its worker stopped before answering",
                     },
                     cancel: Arc::new(AtomicBool::new(true)),
                 }

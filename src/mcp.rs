@@ -76,6 +76,14 @@ pub trait ToolHandler {
     fn unknown_tool(&mut self, name: &str) {
         let _ = name;
     }
+
+    /// Whether `name`, which is not in the registry (so never in
+    /// `tools/list`), is still callable here: serve's internal write
+    /// operations on the socket control plane (NWS-2963).
+    fn accepts_hidden(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
 }
 
 /// The notification `figmog serve` sends to clients that sent `initialize`
@@ -202,6 +210,11 @@ impl PendingCall {
         self.token
     }
 
+    /// The request's JSON-RPC id.
+    pub(crate) fn id(&self) -> &Value {
+        &self.id
+    }
+
     /// Frame the deferred handler result as this call's response.
     pub(crate) fn finish(self, output: Result<ToolOutput, String>) -> Value {
         let result = match output {
@@ -287,7 +300,11 @@ pub(crate) fn dispatch_message(
 
 /// Frame a `tools/call` outcome per the transport's error mode. Move deep
 /// IDs/results into the response rather than recursively cloning them.
-fn call_response(id: OwnedValue, mode: ToolErrorMode, result: Result<Value, String>) -> Value {
+pub(crate) fn call_response(
+    id: OwnedValue,
+    mode: ToolErrorMode,
+    result: Result<Value, String>,
+) -> Value {
     let mut response = OwnedValue(json!({"jsonrpc": "2.0"}));
     response.insert("id".into(), id);
     match result {
@@ -355,7 +372,7 @@ fn tools_call_result(
         Some(name) => name.to_string(),
         None => return Err("missing required field: name".to_string()),
     };
-    if !tools.iter().any(|t| t.name == name) {
+    if !tools.iter().any(|t| t.name == name) && !handler.accepts_hidden(&name) {
         handler.unknown_tool(&name);
         return Err(format!("unknown tool: {name}"));
     }
