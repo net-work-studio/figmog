@@ -283,16 +283,11 @@ impl Drop for SocketGuard {
     }
 }
 
-/// A single frame's hard ceiling (review m4): a client sending more than
-/// this without a newline is misbehaving (or hostile) and is disconnected
-/// rather than let grow this connection's read buffer without bound. Any
-/// real figmog request/response — including a large `figmog_subtree` dump
-/// — is orders of magnitude smaller than this.
-///
-/// Raised from 8 MiB for NWS-2963: `figmog pull --from-file` through a
-/// running serve sends the saved file response as content, in one request
-/// frame. Responses are bounded separately (`output.rs`).
-pub(crate) const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+/// Ordinary requests are capped at 8 MiB. CLI saved-file writes may
+/// explicitly opt their next socket frame into a 256 MiB ceiling.
+pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_WRITE_FRAME_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const WRITE_FRAME_NOTICE: &str = "notifications/figmog/write-frame";
 
 /// Read one newline-delimited frame from `reader`, capped at
 /// [`MAX_FRAME_BYTES`] (review m4). `Ok(None)` on a clean EOF with no
@@ -319,6 +314,9 @@ fn read_line_within<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<O
             break; // clean EOF
         }
         if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if buf.len().saturating_add(pos) > cap {
+                return Err(std::io::Error::other(format!("frame exceeds {cap} bytes")));
+            }
             buf.extend_from_slice(&available[..=pos]);
             reader.consume(pos + 1);
             break;
@@ -371,25 +369,59 @@ fn spawn_socket_acceptor(
             }
 
             let tx = tx.clone();
-            let registry = registry.clone();
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream);
-                loop {
-                    match read_bounded_line(&mut reader) {
-                        Ok(None) => break,
-                        Ok(Some(l)) => {
-                            if tx.send(Incoming::Socket(conn_id, l)).is_err() {
-                                break;
+            let reader_registry = registry.clone();
+            let reader = std::thread::Builder::new()
+                .name(format!("figmog-socket-reader-{conn_id}"))
+                .spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    let mut write_frame = false;
+                    loop {
+                        let cap = if write_frame {
+                            MAX_WRITE_FRAME_BYTES
+                        } else {
+                            MAX_FRAME_BYTES
+                        };
+                        match read_line_within(&mut reader, cap) {
+                            Ok(None) => break,
+                            Ok(Some(l)) => {
+                                let parsed = crate::deep_json::from_str(&l).ok();
+                                if parsed
+                                    .as_ref()
+                                    .is_some_and(|frame| frame["method"] == WRITE_FRAME_NOTICE)
+                                    && !reader_registry.is_relay(conn_id)
+                                {
+                                    write_frame = true;
+                                    continue;
+                                }
+                                if write_frame {
+                                    let allowed = parsed.as_ref().is_some_and(|frame| {
+                                        frame["method"] == "tools/call"
+                                            && matches!(
+                                                frame["params"]["name"].as_str(),
+                                                Some(writes::PULL | writes::IMPORT_VARIABLES)
+                                            )
+                                    });
+                                    if !allowed || reader_registry.is_relay(conn_id) {
+                                        break;
+                                    }
+                                }
+                                write_frame = false;
+                                if tx.send(Incoming::Socket(conn_id, l)).is_err() {
+                                    break;
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
-                }
-                // The client disconnected, sent something unreadable, or
-                // was dropped by its writer: a response computed after this
-                // point finds no entry, and its pending reads are skipped.
+                    // The client disconnected, sent something unreadable, or
+                    // was dropped by its writer: a response computed after this
+                    // point finds no entry, and its pending reads are skipped.
+                    reader_registry.unregister(conn_id);
+                });
+            if let Err(error) = reader {
                 registry.unregister(conn_id);
-            });
+                eprintln!("figmog: could not start socket reader: {error}");
+            }
         }
     });
 }
@@ -432,6 +464,7 @@ pub(crate) fn run_serve(
     layout: Option<crate::project::Layout>,
     no_socket: bool,
 ) -> Result<(), String> {
+    let _signals = crate::owner::ShutdownSignals::install()?;
     let interval_dur = clamp_interval(interval);
     let token = crate::auth::token()?;
     // `--figmog-root` pins both the socket and every store to one fixed
@@ -475,14 +508,10 @@ pub(crate) fn run_serve(
     {
         let tx = tx.clone();
         std::thread::spawn(move || {
-            for line in std::io::stdin().lock().lines() {
-                match line {
-                    Ok(l) => {
-                        if tx.send(Incoming::Stdio(l)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => break,
+            let mut reader = std::io::stdin().lock();
+            while let Ok(Some(line)) = read_bounded_line(&mut reader) {
+                if tx.send(Incoming::Stdio(line)).is_err() {
+                    return;
                 }
             }
             let _ = tx.send(Incoming::StdinClosed);
@@ -557,6 +586,7 @@ pub(crate) fn run_owner(
     settings: crate::owner::Settings,
 ) -> Result<(), String> {
     use crate::owner::{self, OwnerLock, OwnerPaths};
+    let _signals = owner::ShutdownSignals::install()?;
     let paths = OwnerPaths::ensure(&layout.mirror_root)?;
     let Some(lock) = OwnerLock::try_acquire(&paths)? else {
         eprintln!(
@@ -817,6 +847,9 @@ struct Offload {
     /// Set when this process is the repository's background owner
     /// (NWS-2953): handshakes, idle shutdown, "not accepted" answers.
     owner: Option<background::OwnerState>,
+    /// Observe the shutdown boundary without scheduling sleeps in tests.
+    #[cfg(test)]
+    stopped: Option<mpsc::Sender<()>>,
 }
 
 /// Completion polling interval while worker reads are outstanding, so a
@@ -838,6 +871,8 @@ impl Offload {
             ops: writes::Operations::default(),
             op_notice: None,
             owner: None,
+            #[cfg(test)]
+            stopped: None,
         }
     }
 
@@ -919,7 +954,7 @@ fn apply_done(
 
 /// One response as a newline-terminated frame (compact JSON, as always).
 fn frame(response: &Value) -> String {
-    let mut frame = response.to_string();
+    let mut frame = crate::deep_json::to_string(response).expect("Value serializes");
     frame.push('\n');
     frame
 }
@@ -928,7 +963,10 @@ fn frame(response: &Value) -> String {
 fn answer_frame(answer: Answer, call: PendingCall) -> String {
     match answer {
         Answer::Frame(frame) => frame,
-        Answer::Output(output) => frame(&call.finish(output)),
+        Answer::Output(Err(error)) if error.starts_with("outcome unknown:") => {
+            protocol_error_frame(&call, -32002, &error)
+        }
+        Answer::Output(output) => frame(&crate::deep_json::OwnedValue(call.finish(output))),
     }
 }
 
@@ -965,6 +1003,7 @@ const DRAIN_POLL: Duration = Duration::from_millis(20);
 /// its session published it, and a fresh pull's reset and apply still run
 /// — with no watch work. Waits until `deadline`. A vanished stdout or
 /// closed socket just drops that response.
+#[allow(clippy::too_many_arguments)]
 fn drain_on_exit(
     manager: &mut SessionManager,
     offload: &Offload,
@@ -973,11 +1012,28 @@ fn drain_on_exit(
     stdio: &StdioWriter,
     track_current: bool,
     deadline: Instant,
+    incoming: &mpsc::Receiver<Incoming>,
 ) {
     for session in &mut manager.sessions {
         session.begin_drain();
     }
-    while !pending.is_empty() {
+    while !pending.is_empty() || manager.sessions.iter().any(sessions::FileSession::is_busy) {
+        for _ in 0..32 {
+            if Instant::now() >= deadline {
+                return;
+            }
+            let Ok(message) = incoming.try_recv() else {
+                break;
+            };
+            let (to, line) = match message {
+                Incoming::Socket(id, line) => (ReplyTo::Socket(id), line),
+                Incoming::Stdio(line) => (ReplyTo::Stdio, line),
+                Incoming::StdinClosed => continue,
+            };
+            if let Some(response) = closing_response(&line) {
+                deliver(to, frame(&response), registry, stdio);
+            }
+        }
         let mut published = Vec::new();
         for session in &mut manager.sessions {
             if session.maintain(false) {
@@ -1016,14 +1072,35 @@ fn drain_on_exit(
     }
 }
 
+/// Refuse ordinary requests while still returning normal parse/method errors.
+fn closing_response(line: &str) -> Option<crate::deep_json::OwnedValue> {
+    if let Some((id, method, _)) = background::request_parts(line) {
+        return (!method.starts_with("notifications/")).then(|| background::not_accepted(id));
+    }
+    let mut handler = LoopHandler::new(false, |_: &str, _: &Value| {
+        Err("figmog serve is shutting down".into())
+    });
+    match mcp::dispatch_message(line, &[], &mut handler, ToolErrorMode::JsonRpc) {
+        Some(Reply::Now(response)) => Some(crate::deep_json::OwnedValue(response)),
+        _ => None,
+    }
+}
+
 /// A "not accepted" response frame for `call`: nothing was started for it.
 fn not_accepted_frame(call: &PendingCall, message: &str) -> String {
-    frame(
-        &serde_json::json!({"jsonrpc": "2.0", "id": call.id(), "error": {
-            "code": crate::owner::NOT_ACCEPTED,
-            "message": message,
-        }}),
+    protocol_error_frame(call, crate::owner::NOT_ACCEPTED, message)
+}
+
+fn protocol_error_frame(call: &PendingCall, code: i64, message: &str) -> String {
+    let id = crate::deep_json::from_str(
+        &crate::deep_json::to_string(call.id()).expect("Value serializes"),
     )
+    .expect("serialized Value parses");
+    let mut response = crate::deep_json::OwnedValue(serde_json::json!({
+        "jsonrpc": "2.0", "error": { "code": code, "message": message }
+    }));
+    response.insert("id".into(), id);
+    frame(&response)
 }
 
 /// Why the request loop returned.
@@ -1095,30 +1172,46 @@ fn serve_loop_with_offload(
     if let Some(desktop) = &offload.desktop {
         desktop.stop_taking_jobs();
     }
-    let deadline = Instant::now() + offload.exit_drain;
-    if matches!(exit, LoopExit::Drain) {
-        drain_on_exit(
-            &mut manager,
-            &offload,
-            &mut pending,
-            &registry,
-            &stdio,
-            track_current,
-            deadline,
-        );
+    #[cfg(test)]
+    if let Some(stopped) = offload.stopped.take() {
+        let _ = stopped.send(());
     }
-    // Stop the read pool within the deadline (queued reads are skipped; a
-    // read still running then is detached with its own lease), then close
-    // every store behind the reset barrier — waiting at most until the
-    // same deadline — before the sessions drop. Nothing reopens a store.
-    offload.reads.shutdown(deadline);
-    drop(offload);
-    manager.close_reads(deadline);
-    registry.finish(deadline);
-    stdio.finish(deadline);
-    // Clients have their answers; now move each store's writes out of
-    // fjall's journal so the next cold open skips it (NWS-2941).
-    manager.close_and_compact();
+    let deadline = Instant::now() + offload.exit_drain;
+    // Reset reopen, database close and persistence can block inside an
+    // upstream synchronous API. Keep all shutdown state and store leases
+    // together on one cleanup worker, while the serving thread enforces
+    // the same deadline around the entire drain and teardown.
+    let cleanup = std::thread::spawn(move || {
+        if matches!(exit, LoopExit::Drain) {
+            drain_on_exit(
+                &mut manager,
+                &offload,
+                &mut pending,
+                &registry,
+                &stdio,
+                track_current,
+                deadline,
+                &rx,
+            );
+        }
+        offload.reads.shutdown(deadline);
+        drop(offload);
+        manager.close_reads(deadline);
+        registry.finish(deadline);
+        stdio.finish(deadline);
+        manager.close_and_compact(deadline);
+    });
+    while !cleanup.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    if cleanup.is_finished() {
+        cleanup
+            .join()
+            .map_err(|_| "figmog shutdown worker panicked".to_string())?;
+    }
+    // Otherwise detach with ownership intact; returning from the executable
+    // terminates its remaining threads. No successor can write underneath
+    // the detached cleanup's still-held store locks.
     Ok(())
 }
 
@@ -1143,6 +1236,9 @@ fn request_loop(
     let mut stdio_subscribed = false;
 
     loop {
+        if crate::owner::shutdown_requested() {
+            return LoopExit::Drain;
+        }
         // A vanished stdio reader is a clean shutdown; accepted running
         // pulls drain through FileSession's drop handler.
         if stdio.gone() {
@@ -1154,7 +1250,7 @@ fn request_loop(
             let writing = manager.sessions.iter().any(|s| s.has_writes());
             let busy = registry.open_count() > 0 || !pending.is_empty() || writing;
             owner.tick(Instant::now(), busy);
-            if owner.closing && pending.is_empty() && !writing {
+            if owner.closing {
                 return LoopExit::Drain;
             }
         }
@@ -1198,11 +1294,17 @@ fn request_loop(
         if let Some(desktop) = &mut offload.desktop
             && desktop.maintain(Instant::now())
         {
-            tools = merged_registry(Some(desktop));
-            let note = frame(&mcp::tools_list_changed());
-            registry.broadcast(&note);
-            if stdio_subscribed && !stdio.send(note) {
-                return LoopExit::StdoutGone;
+            // Raw upstream changes may affect only filtered collisions or
+            // unsupported metadata. Notify clients only if their exposed
+            // registry changes after the merge's filtering/transforms.
+            let updated = merged_registry(Some(desktop));
+            if updated != tools {
+                tools = updated;
+                let note = frame(&mcp::tools_list_changed());
+                registry.broadcast(&note);
+                if stdio_subscribed && !stdio.send(note) {
+                    return LoopExit::StdoutGone;
+                }
             }
         }
         let poll = if offload.reads_in_flight.is_empty() {
@@ -1257,7 +1359,12 @@ fn request_loop(
                     deliver(to, frame(&response), registry, stdio);
                     continue;
                 }
-                _ if owner.closing => continue,
+                _ if owner.closing => {
+                    if let Some(response) = closing_response(&line) {
+                        deliver(to, frame(&response), registry, stdio);
+                    }
+                    continue;
+                }
                 _ => relay_conn = registry.is_relay(conn_id),
             }
         }
@@ -1274,6 +1381,7 @@ fn request_loop(
             .desktop
             .as_ref()
             .map_or("disabled", DesktopWorker::status);
+        let list_changes = offload.desktop.is_some();
         let mut handler = LoopHandler::new(
             matches!(to, ReplyTo::Socket(_)) && !relay_conn,
             |name: &str, args: &Value| -> Result<ToolOutput, String> {
@@ -1293,6 +1401,7 @@ fn request_loop(
                 )
             },
         );
+        handler.list_changes = list_changes;
         let reply = mcp::dispatch_message(&line, &tools, &mut handler, mode);
         let LoopHandler {
             initialized,
@@ -1310,6 +1419,7 @@ fn request_loop(
         // probe; a client that sent `initialize` hears about the tools
         // through `tools/list_changed` and can retry.
         if let Some(name) = unknown_tool
+            && !cancel.load(Ordering::Relaxed)
             && !proxy::is_local_tool(&name)
             && let Some(desktop) = &mut offload.desktop
             && !desktop.connected()
@@ -1327,17 +1437,35 @@ fn request_loop(
                 }
                 pending.insert(to, call);
             }
-            Some(Reply::Now(response)) if !deliver(to, frame(&response), registry, stdio) => {
-                return LoopExit::StdoutGone;
+            Some(Reply::Now(response)) => {
+                let response = crate::deep_json::OwnedValue(response);
+                if !deliver(to, frame(&response), registry, stdio) {
+                    return LoopExit::StdoutGone;
+                }
             }
-            Some(Reply::Now(_)) => {}
         }
     }
 }
 
+/// Canonicalize existing ancestors too, so a not-yet-created destination
+/// compares consistently with an existing store beneath the same root.
+fn canonical_store_path(path: &std::path::Path) -> Result<PathBuf, String> {
+    if path.exists() {
+        return std::fs::canonicalize(path).map_err(|error| error.to_string());
+    }
+    let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| "store path has no parent".to_string())?;
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| "store path has no filename".to_string())?;
+    Ok(canonical_store_path(parent)?.join(name))
+}
+
 /// The local registry merged with the desktop's current tools (none when
 /// it is missing or disabled). Collisions are dropped and logged on every
-/// merge (spec §8); the order is local tools, then the desktop's own order.
+/// merge (spec §8); the order is local tools, then canonical desktop order.
 fn merged_registry(desktop: Option<&DesktopWorker>) -> Vec<mcp::ToolDef> {
     let (tools, dropped) = match desktop {
         Some(desktop) => proxy::merge_registry(dispatch::tool_registry(), desktop.tools()),
@@ -1356,6 +1484,7 @@ struct LoopHandler<F> {
     /// The request came from the socket control plane, the only place
     /// serve's hidden write operations are callable (NWS-2963).
     socket: bool,
+    list_changes: bool,
     /// The client sent `initialize`.
     initialized: bool,
     /// A `tools/call` was refused as an unknown tool.
@@ -1367,6 +1496,7 @@ impl<F> LoopHandler<F> {
         Self {
             call,
             socket,
+            list_changes: false,
             initialized: false,
             unknown_tool: None,
         }
@@ -1374,6 +1504,10 @@ impl<F> LoopHandler<F> {
 }
 
 impl<F: FnMut(&str, &Value) -> Result<ToolOutput, String>> mcp::ToolHandler for LoopHandler<F> {
+    fn tools_list_changes(&self) -> bool {
+        self.list_changes
+    }
+
     fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String> {
         (self.call)(name, args)
     }
@@ -1657,6 +1791,18 @@ fn handle_tool_call(
     name: &str,
     args: &Value,
 ) -> Result<ToolOutput, String> {
+    // Reject disconnected requests before any store open, pull, or upstream
+    // operation; frames can outlive their connection in the input channel.
+    if cancel.load(Ordering::Relaxed) {
+        return Err("request cancelled: its connection closed".into());
+    }
+    if proxy::is_local_tool(name) {
+        dispatch::validate_object_args(args)?;
+        // Type errors must win over routing/not-ready errors and must not
+        // auto-open a mirror or queue a pull. Execution keeps using the
+        // shared dispatcher against the selected published view below.
+        dispatch::ReadCommand::from_tool_args(name, args)?;
+    }
     if name == "figmog_files" {
         let read = manager.files_read();
         return offload.defer_read(cancel, ReadTask::Files(read));
@@ -1667,6 +1813,45 @@ fn handle_tool_call(
     }
     if name == writes::PULL || name == writes::IMPORT_VARIABLES {
         let (file, op) = writes::parse(name, args)?;
+        let expected = writes::expected_db(args)?;
+        let key =
+            parse_file_ref(&file).ok_or_else(|| format!("not a Figma file key or URL: {file}"))?;
+        let actual = manager
+            .sessions
+            .iter()
+            .find(|session| session.key == key)
+            .map(|session| Ok(session.path.clone()))
+            .unwrap_or_else(|| manager.root.store_path(&key))?;
+        if canonical_store_path(&expected)? != canonical_store_path(&actual)? {
+            return Err(format!(
+                "not accepted: this figmog serve would write a different store ({}) than the CLI requested ({}); nothing was applied; use --no-socket",
+                actual.display(),
+                expected.display()
+            ));
+        }
+        if let sessions::WriteOp::Import { dry_run: true, .. } = &op {
+            let empty = match std::fs::read_dir(&actual) {
+                Ok(mut entries) => entries
+                    .next()
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .is_none(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error.to_string()),
+            };
+            if empty && !manager.sessions.iter().any(|session| session.key == key) {
+                let (token, reply) = offload.reply();
+                let id = offload.ops.begin(token);
+                offload.op_notice = Some(id.clone());
+                std::thread::spawn(move || {
+                    let result = writes::preview_empty_import(op).map(|value| {
+                        ToolOutput::Json(serde_json::json!({"operation": id, "result": value}))
+                    });
+                    reply.send(result, false);
+                });
+                return Ok(ToolOutput::Deferred(token));
+            }
+        }
         let session = manager.open(&file)?;
         let (token, mut reply) = offload.reply();
         reply.abandoned = WRITE_ABANDONED;
@@ -1699,7 +1884,7 @@ fn handle_tool_call(
     }
 
     // spec §2b: an explicit `file` arg always wins, but when it's absent
-    // and the call's node-id-shaped argument (`id`/`under`/`target`) is a
+    // and the call's node-id-shaped argument (`id`/`under`/`target`/`page`) is a
     // full Figma URL naming a file, that URL's file key routes the call
     // (auto-open semantics apply, same as an explicit `file`). When both
     // are present and disagree, the explicit arg still wins — the
@@ -1714,13 +1899,16 @@ fn handle_tool_call(
     };
     let url_file_key = dispatch::infer_file_from_node_ref(args);
     let file_arg = explicit_file.clone().or_else(|| url_file_key.clone());
-    let mut call_args = args.clone();
-    if let Some(obj) = call_args.as_object_mut() {
-        obj.remove("file");
-    }
 
     if proxy::is_local_tool(name) {
-        let session = manager.resolve(file_arg.as_deref(), interval)?;
+        let session = if name == "figmog_sync" {
+            match file_arg.as_deref() {
+                Some(file) => manager.open(file)?,
+                None => manager.resolve(None, interval)?,
+            }
+        } else {
+            manager.resolve(file_arg.as_deref(), interval)?
+        };
 
         if name == "figmog_sync" {
             return Ok(ToolOutput::Json(session.request_pull(false, interval)));
@@ -1736,7 +1924,10 @@ fn handle_tool_call(
             );
         }
 
-        if !session.mirrored && !session.has_writes() {
+        if !(session.mirrored
+            || session.has_writes()
+            || name == "figmog_vars" && session.has_variable_state())
+        {
             session.request_pull(false, interval);
         }
         if name == "figmog_images" {
@@ -1761,11 +1952,20 @@ fn handle_tool_call(
             return Ok(ToolOutput::Deferred(token));
         }
 
+        // The worker owns these arguments. Clone through the growing-stack
+        // parser/serializer so arbitrarily deep equality values remain safe.
+        let mut call_args = crate::deep_json::from_str(
+            &crate::deep_json::to_string(args).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(obj) = call_args.0.as_object_mut() {
+            obj.remove("file");
+        }
         let explicit_key = explicit_file
             .as_deref()
             .map(|f| parse_file_ref(f).unwrap_or_else(|| f.to_string()));
         if !reads::is_inline_read(name) {
-            let lease = session.lease()?;
+            let lease = session.lease_for(name)?;
             return offload.defer_read(
                 cancel,
                 ReadTask::Tool {
@@ -1793,8 +1993,13 @@ fn handle_tool_call(
     if let Some(desktop) = &offload.desktop {
         desktop.submit(DesktopJob::Call {
             name: name.to_string(),
-            args: args.clone(),
+            args: crate::deep_json::from_str(
+                &crate::deep_json::to_string(args).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
+            .into_inner(),
             reply,
+            cancel: cancel.clone(),
         });
     }
     Ok(ToolOutput::Deferred(token))

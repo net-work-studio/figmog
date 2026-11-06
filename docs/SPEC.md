@@ -173,6 +173,14 @@ id, with `code_syntax` as sorted `(platform, name)` pairs from
 describes. A separate record kind rather than new `VariableRec` fields
 for the same reason as `MirrorConfig`.
 
+Older builds can open these stores but do not maintain `variable_snapshot`
+or `image_pins`. Their writes can leave provenance from an earlier import
+or orphan pin markers. Markers without matching image rows are ignored
+and swept on a version-changing pull. A variable-id mismatch reports
+`legacy` with null provenance; changes to existing ids or collections
+alone cannot be detected. Re-import or an Enterprise pull refreshes the
+snapshot; avoid writing to the same store with mixed build versions.
+
 **Determinism contract:** every map-shaped field is a sorted `Vec` of
 pairs; every canonical-JSON string comes from `serde_json` without
 `preserve_order` (`serde_json::Value` is `BTreeMap`-backed here, so
@@ -238,7 +246,8 @@ same directory with fjall's own API — the default builder, exactly as
 fold opens it — and:
 
 1. flushes every keyspace's memtable into tables
-   (`rotate_memtable_and_wait` on each of `list_keyspace_names()`);
+   (`rotate_memtable` on each of `list_keyspace_names()`, followed by
+   bounded waits that check poisoning through `persist(Buffer)`);
 2. commits one tiny constant row (`compacted` → `1`) to the
    **`figmog_maintenance`** keyspace. After a reopen fjall's
    append-mode journal writer reports stream position 0 until something
@@ -267,17 +276,21 @@ Otherwise compaction runs:
 - after a CLI `import-variables` that changed the snapshot;
 - at `figmog serve` shutdown, per store, after the close barrier
   (`close_reads`) and after clients have their answers: each session is
-  closed (its worker joined, its published view dropped) while its
+  closed (its worker joined within the remaining drain budget, its published view dropped) while its
   ownership anchor is kept, then compacted. A store that a detached read
   still holds a view of keeps fjall's own lock, so compaction's open fails
   and that store is left untouched (one stderr line). Serve never compacts
   under live views: not after an individual write job, and not during a
-  reset-barrier reopen (which releases the store unchanged).
+  reset-barrier reopen (which releases the store unchanged). A worker still
+  blocked at the deadline is detached while retaining its store ownership;
+  process exit terminates it, and that store is not compacted.
 
 Compaction is best effort over already-committed data: a failure prints
 `figmog: store compaction skipped: …` on stderr and never fails the
 command that wrote. `FIGMOG_NO_COMPACT=1` (any value but empty or `0`)
-disables it.
+disables it. CLI output is flushed before compaction. Flush/retirement waits
+share a 15-second budget and stop after five seconds without progress or
+on poisoning. Serve skips compaction after its shutdown deadline.
 
 **Crash safety.** Every step is an ordinary fjall operation with fjall's
 own crash safety (table writes and version swaps, journal sealing and
@@ -303,7 +316,7 @@ best of 3 cold CLI processes, 4-core Linux; `cargo test --test compact --
 The pull itself pays one more replay plus the flush (6.5 s → 8.7 s here).
 An unchanged re-pull of the compacted store is still zero churn.
 
-**Pin bumps.** `rotate_memtable_and_wait` (`Keyspace`) and the
+**Pin bumps.** `rotate_memtable` / `sealed_memtable_count` (`Keyspace`) and the
 `SingleWriterTxKeyspace::inner()` accessor are `#[doc(hidden)]` in fjall
 3.1.9 — public but undocumented — and the 64 MB sealing rule is
 fjall-internal behavior. fjall is pinned `=3.1.9`; `AGENTS.md`'s
@@ -317,6 +330,9 @@ stops being retired).
 upsert every record and the meta row, then remove ids that were live
 before this sync but are absent from it now (the sweep). It returns a
 `Churn { added, changed, removed, unchanged }` count.
+The variable snapshot row contributes no added/unchanged count, but a
+change to an existing snapshot's per-variable code metadata contributes
+one `changed`; changes to provenance alone contribute nothing (§9).
 
 **What's sweepable:** nodes, components, component sets, and styles
 always are (`collect_sweepable`, read via `rtx` *before* `sync`, since
@@ -355,6 +371,27 @@ arrays are accepted, including on an empty DOCUMENT root. Invalid trees
 return an error with the node's location, before an ordinary CLI import,
 fresh replacement, or server pull can sync a partial tree or sweep existing
 subtrees. Other fields remain unknown-field-preserving.
+
+**Deep trees:** saved-file and REST file imports support 500 nested frames
+(and are not subject to serde_json's default 128-container parsing limit).
+Node walks, variable-binding scans, and tree/subtree reconstruction use
+explicit work stacks. File responses and emitted trees are drained
+iteratively on cleanup; JSON parsing and printing use `serde_stacker`.
+Deserialization guards partial arrays/maps and replaced duplicate-key values,
+so malformed deep input returns an error instead of overflowing during cleanup.
+Stored raw JSON and component definitions use this same guarded parser across
+variable inference, styles, image-fill scanning, and inventory reads. `where`
+moves matched values and compares containers iteratively; pending results and
+subtree frames retain guards until response handoff, including error paths.
+
+**Dependency justification:** `serde_stacker` is needed because disabling
+serde_json's recursion limit alone exposes the CLI and the server's ordinary
+worker stacks to overflow during deserialization and serialization. Its
+adapters grow the stack while retaining serde_json's validation and sorted
+object semantics; it avoids introducing a separate JSON parser or changing
+the persisted record schema. `serde_json/unbounded_depth` enables these
+adapters to accept full Figma trees beyond the default limit. The regression
+fixtures are generated synthetically as JSON text.
 
 **Fresh replacement:** file and optional variables responses are validated
 before opening or resetting the mirror. Every direct CLI and server-session
@@ -434,11 +471,11 @@ its persisted version/time; in-memory job history starts empty. A terminal
 `error` carries the actionable pull error (credentials, HTTP/Retry-After,
 parse error, etc.). Failure leaves the prior published snapshot readable.
 Before the first successful mirror, status/files remain available with
-`ready: false`, null metadata and zero nodes; data reads return a clear
-not-ready error pointing at these tools rather than an empty answer. If
-the store already holds an imported variable snapshot (§9 "Import-only
-stores"), status also carries its `variables` summary; `ready` stays
-false until a pull succeeds.
+`ready: false`, null metadata and zero nodes. Status always includes the
+`variables` summary (`state: "none"` without stored variable state).
+Data reads return a clear not-ready error pointing at these tools, except
+`figmog_vars` can read stored imports (§9 "Import-only stores"); `ready`
+stays false until a pull succeeds.
 
 Duplicate open/sync requests coalesce onto the active or queued job id.
 There is at most one worker operation and one queued pull per file. A
@@ -456,10 +493,12 @@ Polls and pulls execute serially on the file's worker. No poll observed after
 a fetch can certify it, and no stale/out-of-order completion can overwrite
 a newer publication. The main loop consumes each completion once and only
 then updates the view, version/churn and default file's `.figmog/current`.
-A socket timeout/disconnect does not cancel accepted work. Stdin EOF or a
-broken stdout pipe shuts down the server: it stops accepting work, discards
-control-plane queued follow-ups, and joins workers after commands already
-sent to them finish. Forced process termination may interrupt work; fold's
+A socket timeout/disconnect does not cancel accepted file-worker work.
+Queued reads and desktop calls are skipped once their requester disconnects;
+frames still waiting on the control plane cannot open or sync a mirror.
+Stdin EOF or a broken stdout pipe shuts down the server using the bounded
+read/desktop/writer drain described in §6a. Running file-worker commands
+finish before their stores close; control-plane follow-ups are discarded. Forced process termination may interrupt work; fold's
 atomic transaction protects the store. Job history is not persisted.
 
 **Dependency justification:** `fjall` and `self_cell` were already transitive
@@ -500,13 +539,14 @@ panic.
 client and never runs a whole-mirror scan.
 
 - *Heavy reads run on read workers.* Every local read except the point
-  lookups `figmog_pages`, `figmog_node` and `figmog_path` (bounded by the
-  page count, one node with its direct children and bindings, and its
-  depth) — i.e. `figmog_components`, `figmog_tree`, `figmog_subtree`,
+  lookups `figmog_pages` and `figmog_path` (bounded by page count and node
+  depth) — i.e. `figmog_node`, `figmog_components`, `figmog_tree`, `figmog_subtree`,
   `figmog_find`, `figmog_search`, `figmog_instances`, `figmog_styles`,
   `figmog_uses`, `figmog_vars`, `figmog_stats`, `figmog_text`,
   `figmog_where`, `figmog_at`, plus `figmog_status` and `figmog_files`
-  — runs on a pool of `min(4, available_parallelism)` read workers.
+  — runs on a pool of `min(4, available_parallelism)` read workers. Node
+  reads always use workers because raw payloads and child lists can be
+  arbitrarily large.
   Classification is by measured cost on a synthetic 100k-node mirror: the
   inline three take under 0.2 ms; `figmog_components` is linear in sets +
   components (NWS-2942) — 65 ms on a 2k-set × 20k-component library
@@ -530,8 +570,14 @@ client and never runs a whole-mirror scan.
   `tools/call` from it is refused at once with `too many pending
   requests on this connection (limit 32); …` (socket `-32000`, stdio
   `isError`).
-- *Dropped connections cost nothing more.* A read whose connection has
-  closed or been dropped is not started (if queued) or not accepted.
+- *Global bounds.* At most 128 reads wait in the shared read queue,
+  plus the running workers. At most 128 desktop calls wait behind its
+  active operation. A full queue answers with a busy tool error. The
+  socket admits at most 64 connections, including writers still flushing
+  after their readers close; excess connections are closed.
+- *Dropped connections cost nothing more.* A read or desktop call whose
+  connection has closed or been dropped is not started (if queued) or
+  accepted. An already-running upstream operation cannot be cancelled.
 - *Reset barrier (per store).* A store close or reset (1) validates its
   input, (2) stops admitting reads for that store only (its data reads,
   inline or worker, are refused with "this mirror's store is being reset;
@@ -549,15 +595,15 @@ client and never runs a whole-mirror scan.
   --fresh` (`StoreReset::Fresh`, below): step 1 is the worker's fetch,
   parse and flatten, and step 4 clears the store's contents (its ownership
   anchor stays) under the same ownership before reopening it empty.
-  Either starts fresh job history; CLI writes still queued for the store
-  carry over to the reopened session.
+  Fresh apply keeps the read gate closed until publication. Acknowledged
+  lifecycle jobs and queued CLI writes carry over to the reopened session.
 
 **CLI writers through serve (NWS-2963):** when its socket answers, `figmog
 pull` (plain, `--geometry`, `--from-file`, `--fresh`) and `figmog
 import-variables` run as *operations* of serve instead of opening the
 store (§10). They are internal socket-only tools — `figmog_internal_pull
-{file, fresh?, geometry?, from_file?}`, `figmog_internal_import_variables
-{file, content, name}` and the receipt read `figmog_internal_operation
+{file, db, fresh?, geometry?, from_file?}`, `figmog_internal_import_variables
+{file, db, content, name, allow_empty?, dry_run?}` and the receipt read `figmog_internal_operation
 {id}` — never listed by `tools/list` and refused on stdio as unknown, so
 the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
 
@@ -568,7 +614,9 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   the `tools/call` is a deferred response (NWS-2955) sent only once the
   write committed **and** its view was published — `{"operation": id,
   "result": <churn | {"imported","removed"}>}` — or a `-32000` error if it
-  failed, in which case nothing changed. The wait is the requester's own
+  failed, before changing the store. A failed reopen/apply after a fresh clear is
+  reported as outcome unknown, since the previous mirror may already have
+  been cleared. The wait is the requester's own
   connection; the loop never blocks on it.
 - *Receipts.* A finished operation's outcome is kept for 10 minutes;
   `figmog_internal_operation {id}` (any connection) returns `{"id",
@@ -624,7 +672,9 @@ call (10-second timeout) never delays other requests. `figmog_images` runs
 on its file's worker, which owns the cache writes; desktop calls run one at
 a time, in arrival order, on a single desktop worker that owns the upstream
 connection (results stay verbatim and uncached, §8); the desktop
-re-detection checks (§8) run on the same worker, between calls. The loop parks each
+re-detection checks (§8) run on the same worker, with a due recovery check
+ahead of queued calls. A check may issue several HTTP requests, each
+with its own timeout; no aggregate 10-second probe budget is promised. The loop parks each
 deferred call with its requester (stdio, or the socket connection id) and
 its JSON-RPC id, drains a completion channel every iteration (at most 20ms
 latency), and writes the response to that requester, framed exactly as an
@@ -740,6 +790,12 @@ default (`figmog_where`'s `equals` is a value, not an option: `null`
 there still means equality to null). These are ordinary tool errors —
 `isError` on stdio, the socket's `-32000` error (§6a), and `figmog
 call`'s stderr error. Desktop tools' arguments are forwarded unchecked.
+Local `arguments` must be an object or `null` (the latter means no
+arguments). Read arguments are validated before opening or pulling a
+mirror. Floating-point representations of `depth` and search `limit`
+remain rejected with `got floating-point number <value>`; point lookup's
+`limit` retains its non-negative integral-number rule (§10). CLI point
+coordinates must be finite so direct and socket serialization agree.
 
 **Read adapters (NWS-2902):** the 17 local reads (every `figmog_*` tool
 except `figmog_sync`, `figmog_images`, `figmog_open` and `figmog_files`)
@@ -785,11 +841,12 @@ This preserves default socket startup in deep checkouts. `--no-socket`
 skips binding.
 
 Frames on the socket are the same newline-delimited JSON-RPC the stdio
-loop reads. An incoming frame may be at most 256 MiB (raised from 8 MiB
-for NWS-2963: a routed `pull --from-file` sends the saved file response
-in its request); a longer line without a newline drops the connection,
-and the CLI refuses up front to send a larger write, pointing at stopping
-serve and applying it directly. Output is bounded separately (below). `initialize` is optional for socket clients: `tools/call` is
+loop reads. Ordinary frames are capped at 8 MiB. A socket-only
+`notifications/figmog/write-frame` prelude grants exactly the following
+hidden routed pull/import frame a 256 MiB cap; other methods cannot use
+that allowance. The CLI sends the prelude for large saved-file or variable
+imports and refuses writes above 256 MiB before sending. Oversized frames
+drop the connection. Output is bounded separately (below). `initialize` is optional for socket clients: `tools/call` is
 accepted directly, since dispatch treats every frame independently.
 Sending `initialize` is also how a connection opts in to notifications
 (`notifications/tools/list_changed`, §8); stdio gets them once its client
@@ -813,8 +870,10 @@ write deadline from its first byte — the remaining time is re-applied
 before every 64 KiB write call, so a client that trickle-reads cannot
 renew it. A full queue or a missed deadline drops the connection: its
 socket is shut down, queued frames discarded, and its pending reads
-skipped. A client that closes its side has frames already queued flushed
-and later responses dropped; a vanished client is a silent no-op. Stdio
+and desktop calls skipped. A client that closes its side has frames already queued flushed
+and later responses dropped. A writer closes its write half after flushing,
+so a half-closed client receives EOF without waiting for more registry
+activity; a vanished client is a silent no-op. Stdio
 has one client (the agent), so its writer thread has an unbounded queue
 and no drop policy (dropping it would be fatal); a broken stdout shuts
 serve down as before. Socket traffic interleaves with MCP frames and
@@ -825,7 +884,7 @@ off-loop work finishes (§6), to the connection that asked.
 **Shutdown with deferred work:** on stdin EOF (or the request channel
 closing) serve stops accepting requests and starts no new work, but still
 writes the responses it owes, to stdio and to still-open sockets, for up to
-15 seconds (covering the desktop's 10-second timeout), so `printf
+15 seconds, so `printf
 '<request>\n' | figmog serve` gets its image or desktop response. Image
 requests still queued (not started) are answered with a shutting-down
 error, CLI writes still queued with "not accepted" (§6 "CLI writers through
@@ -841,8 +900,12 @@ a write). Responses not ready by then are dropped. Worker reads still owed
 are answered within the same window; writer threads then get what is
 left of it to flush queued frames. A running image request
 still finishes before exit with its file's worker, like a running pull; the
-desktop worker is detached, its in-flight call bounded by the upstream
-timeout.
+desktop worker is detached. Each upstream HTTP request has a 10-second
+timeout, but a probe can need several requests and outlive this drain.
+Queued desktop calls receive their shutdown errors immediately, even when
+a probe is blocked. Socket writers still unfinished at the deadline are
+aborted; dropping a connection mid-response may leave a partial JSON frame
+followed by EOF.
 
 Socket `tools/call` registry and handler failures (including upstream
 protocol/transport failures) use a top-level JSON-RPC `error` with code
@@ -868,6 +931,10 @@ and CLI command connects to it. Closing an agent's session only closes that
 relay's connection. Relays never open a store, poll, pull or probe the
 desktop.
 
+SIGTERM and SIGINT enter the same graceful drain as idle shutdown. Close
+attached relays before terminating an owner, since a connected relay can
+restart a lost owner.
+
 **Project identity** is the canonical mirror root (`<git-common-dir>/figmog`
 inside Git, `<project>/.figmog` outside), the same from every worktree.
 
@@ -885,13 +952,15 @@ still unreachable); exactly one wins, and every relay connects to it. A
 lock file that disappears or is replaced makes its holder shut down (see
 "Idle shutdown" below), since another process could lock the new file.
 
-**Socket.** `/tmp/figmog-<uid>/<16 hex>.sock`, the hex a 64-bit FNV-1a hash
-of the project identity: under 40 bytes, so always within `sun_path`
-(104 bytes on macOS), and independent of `$TMPDIR` and
-`$XDG_RUNTIME_DIR`. The directory is created 0700 and checked like a
-mirror directory (§10: owned by the user, no replaceable ancestors; `/tmp`
-is sticky), so other OS users can neither connect nor pre-plant it; the
-socket is 0600. Under the lock, a file already at the address is a
+**Socket.** `<runtime directory>/<16 hex>.sock`, the hex a 64-bit FNV-1a
+hash of the project identity. A valid user-owned mode-0700
+`$XDG_RUNTIME_DIR` is preferred, with a private `figmog` child; otherwise
+`/tmp/figmog-<uid>` is used. Paths that would reach macOS's 104-byte limit
+fall back to the short `/tmp` address. Directories and sockets are checked
+for ownership, modes and symlinks before connecting, and the connected
+peer must have the current uid. Discovery must name the expected socket.
+An unsafe or pre-planted runtime directory produces an actionable error;
+figmog does not connect through it. The socket is 0600. Under the lock, a file already at the address is a
 leftover of this project's previous owner: it is removed only if a connect
 to it fails and it is a socket owned by the user (a live listener or a
 foreign file is an error). On exit the socket is unlinked only if it is
@@ -902,8 +971,12 @@ replaced (checked every second) shuts down rather than run unreachable.
 root>/owner.json` (0600; temp file, fsync, rename):
 `{"generation","pid","project","protocol","socket","version"}`. The
 generation is the owner's pid and start time (hex), also the prefix of its
-operation ids (§6). Clients connect to the socket it names, so every
-process finds the same endpoint whatever its environment. The owner
+operation ids (§6). Clients validate the recorded project-specific basename and private runtime
+root independently of their own XDG environment before connecting; clients
+using incompatible runtime namespaces fail
+with a lock-held/socket-unreachable diagnostic rather than relaunching
+losing owners repeatedly. Detached owners mark inherited descriptors
+close-on-exec, leaving only their configured stdio open. The owner
 removes the record at exit if it is still its own.
 
 **Handshake.** The first frame on every owner connection is
@@ -1049,13 +1122,14 @@ restart. Every check runs on the desktop worker (§6), never on the loop,
 with a 2 s connect timeout:
 
 - while the desktop is missing, a full handshake every 30 s;
-- while it is connected, an MCP `ping` on the current session every 60 s,
-  falling back to a fresh handshake if the ping fails (a restarted
+- while it is connected, an MCP `ping` and refreshed `tools/list` on the
+  current session every 60 s, falling back to a fresh handshake if it fails (a restarted
   desktop app does not know the old session);
 - immediately (at most once a second) when a desktop call fails below
   the tool level (transport or protocol error), and when a `tools/call`
   names a non-`figmog_*` tool that is not in the registry while the
-  desktop is missing.
+  desktop is missing. Recovery runs ahead of queued calls; calls wait for
+  the one-second minimum probe gap rather than using a known stale session.
 
 The desktop counts as gone only when a check fails: one failed or timed
 out call just triggers a check, and a tool-level `isError` result never
@@ -1064,12 +1138,18 @@ once with `unknown tool: <name>`; it is not held for the check it
 triggers. When a check changes the exposed upstream tool list, the
 registry is re-merged under the namespace rule below and every client that
 sent `initialize` gets `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`
-(`initialize` advertises `capabilities.tools.listChanged: true`). A check
+(`initialize` advertises `capabilities.tools.listChanged: true` when the
+desktop worker is enabled, and `false` under `--no-upstream`). Tool lists
+are sorted before comparison, and notifications compare the merged,
+client-visible registry: reordering, changes to filtered collisions, or
+unsupported upstream fields send nothing. Dynamic tool names and
+descriptions are owned by the current registry and released when replaced.
+A check
 that confirms the current state, or a reconnect with the same tools, sends
 nothing. `figmog_status`'s `upstream` follows the current state
 (`connected` / `unreachable`). `--no-upstream` starts no desktop worker,
-never probes, and reports `disabled`. Relaying serves do not forward
-these notifications yet (NWS-2953).
+never probes, and reports `disabled`. Forwarding change notifications
+through a second figmog server is deferred to NWS-2953.
 
 **Namespace rule:** `figmog_*` names are always local; every other name
 is proxied. `merge_registry` drops (and logs) any upstream tool whose
@@ -1124,12 +1204,14 @@ Three layers, each covering what the one above can't:
    `--from-file` pulls never call it (no network involved). A `Some`
    pull also writes the `VariableSnapshot` row (`source:
    "enterprise_rest"`) in the same sync transaction, but — like the meta
-   row — it is provenance, not a record: `store::sync` excludes it from
-   churn, so `pull`, `figmog_sync` and serve's `last_success.churn` count
-   only nodes/components/sets/styles/variables/collections, exactly as
-   before the row existed. An identical Enterprise re-pull reports zero
-   churn, and the first Enterprise pull onto a store that already holds
-   those variables without a snapshot row reports `added: 0`.
+   row — `store::sync` excludes it from added/unchanged counts.
+   Comparing an existing snapshot's per-variable code names and flags
+   against the new ones adds one to `changed` when they differ, so
+   code-name-only edits are visible to token consumers. Provenance-only
+   changes (source, format, export time or digest) do not count. An
+   identical Enterprise re-pull reports zero churn, and the first
+   Enterprise pull onto a store that already holds those variables
+   without a snapshot row reports `added: 0`.
 2. **Mirrored bindings + inference (always on).** Every node's
    `bound_variables` plus Figma's own baked-in resolved value are scanned
    at read time (`vars::infer_from_nodes`) into per-variable usage
@@ -1146,14 +1228,17 @@ Three layers, each covering what the one above can't:
    (`source: "file"`) and removes every stored variable and collection
    absent from the new export — whether it came from an earlier import,
    an Enterprise pull, or a pre-snapshot store. It prints `{"imported":
-   <variables>, "removed": <variables + collections swept>}`. A later
-   pull with no Enterprise export of its own never sweeps imported
+   <variables>, "removed": <variables swept>}`. Collections absent from
+   the export are swept too, but neither count includes collections.
+   A later pull with no Enterprise export of its own never sweeps imported
    records; they persist until the next import, an Enterprise pull, or
    `pull --fresh` (which wipes the whole store, imports included).
 
    **Invalid files are rejected whole.** The file is read, parsed and
    validated (top-level `variables` and `variableCollections` objects,
-   every entry an object — `vars::check_import_entries`, which only
+   non-empty variable names and resolved types, collection names and
+   defaults, valid collection/mode references, and correctly typed code
+   names and flags — `vars::check_import_entries`, which only
    `import-variables` applies; an Enterprise pull's parse stays lenient
    per entry, so one malformed `variables/local` entry never fails a
    pull) before the store is opened; an unreadable,
@@ -1162,6 +1247,16 @@ Three layers, each covering what the one above can't:
    untouched. A rejected attempt is not persisted, so "invalid" is the
    import command's error, never a stored state.
 
+   Replacing stored variables with an export containing zero variables
+   requires `--allow-empty`. `--dry-run` validates the file and reports
+   `{imported, removed, removed_ids}` with sorted removed variable ids
+   without changing records or provenance; it can preview an empty
+   replacement without `--allow-empty`.
+   Omitted `codeSyntax` becomes an empty map; omitted
+   `hiddenFromPublishing` and `remote` retain the parser's `false` defaults.
+   Duplicate JSON object keys follow JSON parsing's last-value-wins rule;
+   exporters must produce unique ids.
+
 **Snapshot states** (`query::variable_snapshot`), reported as
 `variables` in `figmog status`/`figmog_status` and as `snapshot` by
 `figmog vars --snapshot`/`figmog_vars {snapshot: true}`:
@@ -1169,7 +1264,7 @@ Three layers, each covering what the one above can't:
 | `state` | meaning |
 |---|---|
 | `none` | no snapshot row and no variables or collections stored |
-| `legacy` | variables or collections stored without a snapshot row (written before provenance existed); provenance fields are null |
+| `legacy` | variables or collections stored without a matching snapshot row (missing provenance or mismatched variable ids); provenance fields are null |
 | `empty` | a snapshot row whose export held no variables |
 | `current` | a snapshot row with at least one variable |
 
@@ -1185,8 +1280,13 @@ answers rather than erroring: `name`, `version`, `last_modified` and
 `variables` carries the snapshot summary as usual. Only a store with no
 `meta` row and state `none` keeps the "no mirror here" error. Through
 `figmog serve` the same summary appears in `figmog_status` before the
-first successful pull (with `ready: false`), and socket-routed plain
-`figmog status` prints the same output as direct `figmog status --db`.
+first successful pull (with `ready: false`). `figmog_vars`, including
+`{snapshot: true}`, and routed `figmog vars` can read these stored imports.
+Before any pull attempt, socket-routed plain `figmog status` prints the
+same output as direct `figmog status --db`. Once a first pull is queued,
+running or failed, plain routed status exits 1 with the not-ready error
+and includes the pull failure when available; `figmog call figmog_status`
+retains the full lifecycle details.
 
 `figmog vars`/`figmog_vars` prefer an authoritative record (auto-synced
 or imported) over inference whenever one exists for a given variable id.
@@ -1319,6 +1419,20 @@ Ignore-update failures emit a JSON warning on stderr without failing an
 already successful pull. This does not untrack committed files or share
 mirror data between worktrees.
 
+**Point lookup.** `figmog at --page <page-id-or-url> --x X --y Y`
+(and `figmog_at` with required `page`, `x`, `y`) searches one CANVAS's
+coordinate space. `page` must identify an existing CANVAS; a missing,
+unknown, or non-page reference is an error. Page references accept bare
+ids, hyphenated ids, and Figma page URLs. `--under <node-id-or-url>`
+intersects the page with that subtree, including its root; an unknown
+scope is an error. Hidden nodes and descendants of hidden nodes are
+excluded. Bounds use inclusive left/top and exclusive right/bottom
+edges. Matches retain the array shape `[{id, name, type, page_id, area}]`,
+sorted by area ascending then id, and are truncated after filtering and
+sorting. `--limit N` (MCP `limit`) defaults to 100; zero returns an empty
+array. Hit testing traverses the requested page's children with cycle
+protection; no store schema change is needed.
+
 **Socket-first routing (§6a, §6b).** When neither `--no-socket` nor `--db` is
 given, every read command, plus `tools`, `call` and `images`, first tries
 the repository's background owner (through `<mirror root>/owner.json` and
@@ -1338,7 +1452,7 @@ absent `equals` key from `"equals": null` the same way (`figmog call`'s own
 `--args` payload is passed through untouched). Both direct
 and socket reads for per-file local tools select an explicit `call`
 argument `file` first (key or Figma URL), then the file inferred from a
-node URL in `id`, `under`, or `target`, then `.figmog/current`.
+node URL in `id`, `under`, `target`, or `page`, then `.figmog/current`.
 An explicit `--db` takes precedence
 over all of these. Current is injected as a routed `file` argument only
 for per-file local tools, when no explicit non-null `file` was supplied
@@ -1348,7 +1462,7 @@ and the latter lists all sessions without a routing target. A routed
 `figmog_status` result drops the server-only `upstream`, `ready` and `pull`
 fields, keeping ordinary CLI output byte-identical for an existing mirror.
 Before a first successful mirror, plain `figmog status` returns a clear not-ready error
-(unless the store already holds an imported variable snapshot — §9 "Import-only stores");
+(unless the store holds imported variable state and no pull has been attempted — §9 "Import-only stores");
 `figmog call figmog_status` exposes the full lifecycle instead.
 
 Desktop-proxy calls do not interpret `file` or node URLs as mirror
@@ -1422,7 +1536,7 @@ id" wrapper the query layer calls, falling back to the raw input.
 Every node-id-shaped argument accepts both forms: the CLI's `id`,
 `target`, `--under` and `--page` arguments, and the tools' `id`, `under`,
 `target` and `page` properties. In `serve`, when a tool call omits `file`
-and one of `id`/`under`/`target` is a URL that names a file,
+and one of `id`/`under`/`target`/`page` is a URL that names a file,
 `dispatch::infer_file_from_node_ref` routes the call at that file and
 auto-opens it. An explicit `file` always wins; a disagreement between the
 two is named in the error text if the node isn't found, comparing
@@ -1441,7 +1555,7 @@ size is the caller's business: the tool description says so and points at
 `depth`/`fields`.
 
 **Subtree scoping** (`query::resolve_under` + `query::scope_ids`;
-`--under <id>` on `text`/`find`/`search`/`where` and the matching tool
+`--under <id>` on `text`/`find`/`search`/`where`/`at` and the matching tool
 argument): one BFS over the `children` index from the scope root
 (inclusive, cycle-safe via a visited set) collects the descendant id set,
 and results are filtered against it. It composes with `page` by
@@ -1493,15 +1607,24 @@ agent asks for one.
 
 **Two fetch kinds behind one command.** Renders come from `GET
 /v1/images/:key?ids=…&format=…&scale=…&version=…`, which returns per-node
-URLs that are then downloaded. `version` is always the mirror's current
+URLs that are then downloaded. `version` is the mirror's current
 `FileMeta.version` (percent-encoded), read once before the request and
 reused as the cached row's `file_version`, so a render matches the
 mirrored design even after the file is edited upstream, and a pull that
 lands mid-request can't relabel it. A node deleted upstream but still in
-the mirror renders from that version too. Fills come from the `fills` of the requested nodes:
+the mirror is requested from that version too. A rejected pinned request
+fails without an unpinned retry; HTTP 400/404 errors identify the file and
+mirrored version and advise re-pulling. Saved exports must belong to the
+selected file and reference a version Figma can still render. Live
+edit/delete behavior has not been verified against an owned test file;
+the request contract follows Figma's [image endpoint documentation](https://developers.figma.com/docs/rest-api/file-endpoints/#get-image).
+Fills come from the `fills` of the requested nodes:
 every `imageRef` hash found there is resolved through `GET
 /v1/files/:key/images` (fetched at most once per invocation) and
 downloaded. One invocation makes at most one call of each kind.
+If the mirror has no non-empty version, renders are requested unpinned
+and stored without a pin marker, so they remain cache misses on later
+requests.
 
 **Cache.** Bytes land in `images` as `Rec::ImageBlob` rows keyed by a
 hash of kind, subject, format and scale (§3). A hit requires the stored
@@ -1511,20 +1634,27 @@ unedited file spends nothing. A render hit additionally requires its
 `image_pins` marker (§3), written in the same transaction as the row.
 Renders saved by builds that requested them without `version` have no
 marker — their bytes may show a newer design than their label — so they
-read as misses and are refetched and overwritten. Fill rows need no
+read as misses. With a file identity they are refetched and overwritten;
+an explicit offline store cannot refresh them. Fill rows need no
 marker: fills are addressed by content hash, and the fills endpoint
 takes no version. Rows tagged with an older version, and their markers,
 are evicted by the same version-change pass that evicts `proxy_cache`
 (§5).
 
 **Explicit stores.** `figmog --db <store> images <node-id>...` exports
-matching cached renders and fills without a token or file key. The store
-does not record its Figma file key, and neither `.figmog/current`, the
+matching cached fills and version-verified cached renders without a
+token or file key. The store does not record its Figma file key, and
+neither `.figmog/current`, the
 store's path nor a node URL supplies that identity for an explicit store.
 Each cache miss reports an actionable file-identity error in the manifest;
 cache hits still write successfully. Fetching missing images requires
 `figmog pull <file-key-or-url>` followed by `figmog images <node-id>...`
 without `--db`.
+
+Pre-upgrade render bytes without a valid pin remain on disk but cannot be
+verified against the mirrored version. They produce a distinct upgrade
+error rather than a cache hit; offline extraction of those renders with
+the new build requires first refreshing them through a file-keyed mirror.
 
 `figmog serve --db <store> --no-watch` without a file positional supports
 the same offline cache extraction through `figmog_images`. Matching renders
@@ -1575,9 +1705,12 @@ subdirectories and every linked worktree, so all of them share one mirror
 per file key; Git never tracks it, so it needs no ignore entry. Git older
 than 2.31 echoes the unknown `--path-format=absolute` back and prints the
 common dir relative to the working directory: the echo is dropped and the
-relative path resolved against that directory. If Git is missing or the
-directory isn't in a work tree (including bare repositories), figmog is
-outside Git and the mirror root is the local root, `<project>/.figmog/`.
+relative path resolved against that directory. If an ancestor has a `.git`
+entry, Git invocation/refusal/decoding errors stop the command, including
+Git's stderr; paths are decoded as OS bytes. Outside Git the mirror root
+is the local root, `<project>/.figmog/`. An explicitly group-shared Git
+common directory uses private per-checkout mirrors instead, preserving the
+ancestor ownership and write-permission checks.
 
 **Config.** `figmog.toml` and an optional `figmog.local.toml` beside it
 (machine-specific; `pull` adds it to `.gitignore` alongside `.figmog/` when
@@ -1590,11 +1723,14 @@ default = "AbCdEf1234"                                  # file key or Figma URL
 design-system = "https://www.figma.com/design/XYZ/..."  # named entry
 ```
 
-Supported: `#` comments, blank lines, `[table]` headers, and inside
+Supported: an optional UTF-8 BOM, `#` comments, blank lines, quoted or bare
+`[table]` headers (including `["files"]`), and inside
 `[files]` only `key = "string"` (bare or quoted keys; basic strings with
 `\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings). Every
 `[files]` value must be a file key or Figma URL and is stored as its key.
-Other tables, top-level keys and `[[array]]` tables are skipped unparsed
+Unsupported `files` encodings (dotted assignments, inline tables, array
+tables or subtables) are explicit errors. Other tables, top-level keys and
+`[[array]]` tables are skipped unparsed
 (reserved for later settings, never an error), except that multi-line
 strings (`"""` and `'''`) in skipped values are tracked so a `[files]`
 line inside one is content, not the table; multi-line values inside
@@ -1607,6 +1743,11 @@ every command uses when none is given, ahead of `.figmog/current`, which
 remains the fallback (and is still written by `pull` and serve's default
 session). Named entries are parsed and validated but not yet addressable.
 
+**Legacy roots.** Every existing `.figmog` directory between the working
+directory and project root is checked, nearest first for `current`. Old
+mirrors can be read and migrated from any of those roots. Multiple legacy
+copies of one key are an explicit ambiguity error naming their paths.
+
 **Active store.** The mirror root is where mirrors *should* live; the
 active store is where a key's mirror *is*. Outside Git both are the same
 directory. Inside Git, for each key:
@@ -1615,7 +1756,7 @@ directory. Inside Git, for each key:
 |---|---|---|
 | exists | absent | use the old store; stderr `{"warning": "migration pending: ..."}` |
 | absent | exists | use the shared store |
-| absent | absent | new mirror in the shared store |
+| absent | absent | writes may create a shared mirror; reads report no mirror |
 | exists | exists | error naming both paths (never a silent pick) |
 
 With both present and a `migrated-from` marker in the shared `<key>/`,
@@ -1626,7 +1767,10 @@ The old store is resolved before its lock is taken, so opening it never
 creates it: once its lock is held it must still exist and still be the
 active store, otherwise (a `figmog migrate` moved it meanwhile) the
 command fails asking for a rerun, which resolves the shared store. A
-missing old store is never recreated; new mirrors always go to the shared
+missing old store is never recreated. Direct and served read opens never
+initialize a missing store. Routed writes include the intended database
+path; a serve configured for another database refuses without applying
+anything and points to `--no-socket`. New mirrors go to the selected mirror
 root.
 `--db` bypasses all of this. `figmog serve --figmog-root <dir>` (hidden,
 for tests) pins the socket and every store to `<dir>`/`<dir>/<key>/db`.
@@ -1640,8 +1784,10 @@ and its socket under `/tmp/figmog-<uid>/`. An in-process serve
 (all of it: today that is `db/`, whose image cache is an in-store sink) to
 `<mirror root>/<key>/`; with no `FILE`, every old mirror plus every
 interrupted move, in sorted key order. Prints
-`{"mirror_root", "migrated": [{"file", "from", "to", "resumed"}]}`.
-Outside Git it is a no-op. Per key:
+`{"mirror_root", "migrated": [{"file", "from", "to", "resumed"}],
+"failed": [{"file", "error"}]}`. Every key is attempted, both lists are
+sorted, and any failure produces exit 1 after printing the complete report.
+When mirror and legacy roots coincide it is a no-op. Per key:
 
 0. Take the repository-wide migration lock
    `<mirror root>/<key>.migrate.lock` (every worktree shares the

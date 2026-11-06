@@ -886,6 +886,101 @@ fn desktop_results() -> Vec<Value> {
 }
 
 #[test]
+fn serve_forwards_deep_arguments_to_http_desktop_without_recursive_copies() {
+    let (_dir, db) = common::fixture_db();
+    let payload = format!(
+        "{}null{}",
+        r#"{"layer":["#.repeat(30_000),
+        "]}".repeat(30_000)
+    );
+    let expected_payload = payload.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("http://{}/mcp", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let peer = std::thread::spawn(move || {
+        for method in [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "tools/call",
+        ] {
+            let deadline = Instant::now() + TIMEOUT;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "waiting for {method}");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let body = read_request(&mut stream);
+            // Check the entire payload byte-for-byte without constructing a
+            // recursive Value in the test peer, then inspect the shallow frame.
+            let body = if method == "tools/call" {
+                assert_eq!(body.matches(&expected_payload).count(), 1);
+                body.replacen(&expected_payload, "null", 1)
+            } else {
+                body
+            };
+            let request: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(request["method"], method);
+            let result = match method {
+                "initialize" => json!({
+                    "protocolVersion":"2025-06-18", "capabilities":{},
+                    "serverInfo":{"name":"synthetic-desktop", "version":"1"}
+                }),
+                "notifications/initialized" => {
+                    write_response(&mut stream, "202 Accepted", &[], "");
+                    continue;
+                }
+                "tools/list" => json!({"tools":[{
+                    "name":"get_code", "description":"Synthetic deep argument probe",
+                    "inputSchema":{"type":"object"}
+                }]}),
+                "tools/call" => {
+                    assert_eq!(request["params"]["name"], "get_code");
+                    assert_eq!(request["params"]["arguments"], json!({"payload":null}));
+                    json!({"content":[{"type":"text", "text":"received deep payload"}], "isError":false})
+                }
+                _ => unreachable!(),
+            };
+            let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":result});
+            write_response(
+                &mut stream,
+                "200 OK",
+                &[("Content-Type", "application/json")],
+                &response.to_string(),
+            );
+        }
+    });
+    let (mut guard, mut stdin, rx) = spawn_serve_with_args(&db, &["--upstream", &address]);
+    handshake(&mut stdin, &rx);
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_code","arguments":{{"payload":{payload}}}}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let response = recv(&rx);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(
+        response["result"]["content"][0]["text"],
+        "received deep payload"
+    );
+    // The same serve process must remain available for its local mirror.
+    let status = call(&mut stdin, &rx, 3, "figmog_status", json!({}));
+    assert_eq!(result_json(&status)["nodes"], 12);
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    peer.join().unwrap();
+}
+
+#[test]
 fn direct_cli_desktop_proxy_ignores_legacy_cache_and_observes_context_changes() {
     let (_dir, db) = common::fixture_db();
     let legacy =
@@ -2703,6 +2798,193 @@ fn search_ties_are_deterministic_across_direct_socket_and_mcp_after_broad_querie
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
 
+#[test]
+fn at_is_scoped_and_bounded_across_direct_socket_and_mcp_requests() {
+    const KEY_A: &str = "figmogpointaaa001";
+    const KEY_B: &str = "figmogpointbbb002";
+    let mut other = common::fixture_other();
+    other["document"]["children"][0]["children"][0]["absoluteBoundingBox"] =
+        json!({"x": 0, "y": 0, "width": 20, "height": 20});
+    let dir = default_root_fixture_multi(&[(KEY_A, common::fixture_at()), (KEY_B, other)], KEY_A);
+    let page_url = format!("https://www.figma.com/design/{KEY_B}/Fixture?node-id=0-1");
+    let run = |args: &[&str]| {
+        let out = common::command()
+            .args(["at", "--x", "0", "--y", "0"])
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .success();
+        out.get_output().stdout.clone()
+    };
+    // A page URL must select its own file, even when current names another.
+    let other_direct = run(&["--page", &page_url]);
+    let rows: Value = serde_json::from_slice(&other_direct).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["name"], "Banner");
+    let scope_args = ["--page", "0:1", "--under", "1:1", "--limit", "3"];
+    let scoped_direct = run(&scope_args);
+    let rows: Value = serde_json::from_slice(&scoped_direct).unwrap();
+    let ids: Vec<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["1:2", "1:3", "1:1"]);
+
+    let (mut guard, mut stdin, rx) =
+        spawn_default_root_serve_keys(dir.path(), &[KEY_A, KEY_B], &[]);
+    handshake(&mut stdin, &rx);
+    assert_eq!(run(&["--page", &page_url]), other_direct);
+    assert_eq!(run(&scope_args), scoped_direct);
+    send(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    );
+    let response = recv(&rx);
+    let schema = &response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "figmog_at")
+        .unwrap()["inputSchema"];
+    for required in ["x", "y", "page"] {
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(required))
+        );
+    }
+    assert_eq!(schema["properties"]["under"]["type"], "string");
+    assert_eq!(schema["properties"]["limit"]["type"], "integer");
+    assert_eq!(schema["properties"]["limit"]["minimum"], 0);
+    assert_eq!(schema["properties"]["limit"]["default"], 100);
+
+    let resp = call(
+        &mut stdin,
+        &rx,
+        3,
+        "figmog_at",
+        json!({"page": page_url, "x": 0, "y": 0}),
+    );
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        result_json(&resp),
+        serde_json::from_slice::<Value>(&other_direct).unwrap()
+    );
+    let resp = call(
+        &mut stdin,
+        &rx,
+        4,
+        "figmog_at",
+        json!({"page": "0:1", "x": 0, "y": 0, "under": "1:1", "limit": 3}),
+    );
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        result_json(&resp),
+        serde_json::from_slice::<Value>(&scoped_direct).unwrap()
+    );
+    let resp = call(
+        &mut stdin,
+        &rx,
+        5,
+        "figmog_at",
+        json!({"page": "0:1", "x": 0, "y": 0}),
+    );
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(result_json(&resp).as_array().unwrap().len(), 100);
+    for extra in [
+        json!({"limit": 0}),
+        json!({"page": "0:2", "under": "1:1"}),
+        json!({"under": "1:10"}),
+    ] {
+        let mut args = json!({"page": "0:1", "x": 0, "y": 0});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let resp = call(&mut stdin, &rx, 6, "figmog_at", args);
+        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(result_json(&resp), json!([]));
+    }
+    for args in [
+        json!({"x": 0, "y": 0}),
+        json!({"page": 1, "x": 0, "y": 0}),
+        json!({"page": "1:1", "x": 0, "y": 0}),
+        json!({"page": "99:99", "x": 0, "y": 0}),
+        json!({"page": "0:1", "x": 0, "y": 0, "under": "99:99"}),
+        json!({"page": "0:1", "x": 0, "y": 0, "under": 123}),
+        json!({"page": "0:1", "x": 0, "y": 0, "limit": -1}),
+        json!({"page": "0:1", "x": 0, "y": 0, "limit": 1.5}),
+        json!({"page": "0:1", "x": 0, "y": 0, "limit": "1"}),
+        json!({"page": "0:1", "x": 0, "y": 0, "limit": null}),
+    ] {
+        let resp = call(&mut stdin, &rx, 7, "figmog_at", args.clone());
+        assert_eq!(resp["result"]["isError"], true, "{args}: {resp}");
+    }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+#[test]
+fn at_accepts_integral_json_limit_representations_within_usize() {
+    const KEY: &str = "figmogpointnumbers01";
+    let dir = default_root_fixture(KEY, common::fixture_at());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+    let max = usize::MAX.to_string();
+    let overflow = (usize::MAX as u128 + 1).to_string();
+    let float_overflow = format!("{overflow}.0");
+    for (limit, expected_len) in [
+        ("0", Some(0)),
+        ("1", Some(1)),
+        ("0.0", Some(0)),
+        ("1.0", Some(1)),
+        ("1e2", Some(100)),
+        ("-0.0", Some(0)),
+        (max.as_str(), Some(108)),
+        ("1.5", None),
+        ("-1.0", None),
+        ("1e100", None),
+        (overflow.as_str(), None),
+        (float_overflow.as_str(), None),
+    ] {
+        // Send the original numeric spelling over the wire, including exponents.
+        let args = format!(r#"{{"page":"0:1","x":0,"y":0,"limit":{limit}}}"#);
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"figmog_at","arguments":{args}}}}}"#
+        );
+        writeln!(stdin, "{request}").unwrap();
+        stdin.flush().unwrap();
+        let response = recv(&rx);
+        if let Some(expected_len) = expected_len {
+            assert_eq!(
+                response["result"]["isError"], false,
+                "limit {limit}: {response}"
+            );
+            assert_eq!(
+                result_json(&response).as_array().unwrap().len(),
+                expected_len,
+                "limit {limit}"
+            );
+        } else {
+            assert_eq!(
+                response["result"]["isError"], true,
+                "limit {limit}: {response}"
+            );
+            assert!(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("expected non-negative integer for `limit`"),
+                "limit {limit}: {response}"
+            );
+        }
+    }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
 /// m6: a handful of read commands (deliberately including `where
 /// --pointer` with no `--equals` — C2's exact regression shape — and
 /// `status` — m1's) run once direct (before serve ever starts, so the
@@ -2804,6 +3086,15 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
         .clone();
     let direct_json: Value = serde_json::from_slice(&direct).unwrap();
     assert_eq!(direct_json["variables"]["state"], "current");
+    let direct_vars = common::command()
+        .args(["vars", "--snapshot", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let direct_vars_json: Value = serde_json::from_slice(&direct_vars).unwrap();
 
     // `spawn_serve` runs with cwd = `dir`, so serve's socket lands at
     // `<dir>/.figmog/serve.sock`, which plain CLI reads from `dir` route to.
@@ -2821,10 +3112,22 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
     assert_eq!(status["nodes"], 0);
     assert_eq!(status["variables"], direct_json["variables"], "{status}");
 
-    // Data reads keep the not-ready error: a snapshot is not a mirror.
-    let resp = call(&mut stdin, &rx, 3, "figmog_pages", json!({}));
-    assert_eq!(resp["id"], 3, "{resp}");
-    assert_eq!(resp["result"]["isError"], true, "{resp}");
+    let resp = call(&mut stdin, &rx, 3, "figmog_vars", json!({"snapshot": true}));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    assert_eq!(result_json(&resp), direct_vars_json);
+    let resp = call(&mut stdin, &rx, 4, "figmog_vars", json!({}));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    assert_eq!(result_json(&resp), direct_vars_json["variables"]);
+
+    let routed_vars = common::command()
+        .args(["vars", "--snapshot"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(routed_vars, direct_vars);
 
     // Serve holds the writer lock, so success here proves socket routing.
     let routed = common::command()
@@ -2851,6 +3154,29 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
     .unwrap();
     assert_eq!(called["ready"], false, "{called}");
     assert_eq!(called["variables"], direct_json["variables"]);
+
+    // A failed first pull must not look like a healthy import-only store
+    // after plain status strips the server's lifecycle fields.
+    let resp = call(&mut stdin, &rx, 5, "figmog_sync", json!({}));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let failed = wait_for_pull(&mut stdin, &rx, json!({}), "failed");
+    let pull_error = failed["pull"]["last_completed"]["error"].as_str().unwrap();
+    assert!(pull_error.contains("no file key"), "{failed}");
+    let routed = common::command()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .code(1);
+    assert!(routed.get_output().stdout.is_empty());
+    let error: Value = serde_json::from_slice(&routed.get_output().stderr).unwrap();
+    let error = error["error"].as_str().unwrap();
+    assert!(error.contains("pull failed"), "{error}");
+    assert!(error.contains(pull_error), "{error}");
+
+    // Data reads keep the not-ready error: a snapshot is not a mirror.
+    let resp = call(&mut stdin, &rx, 6, "figmog_pages", json!({}));
+    assert_eq!(resp["result"]["isError"], true, "{resp}");
 
     drop(stdin);
     let exit = wait_with_timeout(&mut guard.0, TIMEOUT);
@@ -2957,6 +3283,10 @@ fn routed_writers_match_the_direct_path_byte_for_byte() {
         "vars.json",
         include_bytes!("fixtures/variables-export.json").as_slice(),
     );
+    let empty_vars = input(
+        "empty-vars.json",
+        br#"{"variables":{},"variableCollections":{}}"#,
+    );
     let bad_vars = input(
         "bad-vars.json",
         json!({"meta": {"variables": {"VariableID:1": 7}, "variableCollections": {}}})
@@ -2971,6 +3301,10 @@ fn routed_writers_match_the_direct_path_byte_for_byte() {
         (vec!["pull", "--from-file", &v2], true),
         (vec!["pull", "--from-file", &other, "--geometry"], true),
         (vec!["pull", "--from-file", &other], true),
+        (vec!["import-variables", &vars], true),
+        (vec!["import-variables", &empty_vars], false),
+        (vec!["import-variables", &empty_vars, "--dry-run"], true),
+        (vec!["import-variables", &empty_vars, "--allow-empty"], true),
         (vec!["import-variables", &vars], true),
         (vec!["import-variables", &bad_vars], false),
         (vec!["import-variables", &not_json], false),
@@ -2987,13 +3321,25 @@ fn routed_writers_match_the_direct_path_byte_for_byte() {
     for (args, ok) in &steps {
         let routed = run_cli(served.path(), args);
         let direct_out = run_cli(direct.path(), args);
-        assert_eq!(
-            routed,
-            direct_out,
-            "{args:?}: routed {} / {}",
-            String::from_utf8_lossy(&routed.1),
-            String::from_utf8_lossy(&routed.2)
-        );
+        if args.as_slice() == ["pull"] || args.as_slice() == ["pull", "--fresh"] {
+            assert_eq!(routed.0, direct_out.0);
+            assert_eq!(routed.1, direct_out.1);
+            let routed_error: Value = serde_json::from_slice(&routed.2).unwrap();
+            assert!(
+                routed_error["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("credentials read by the running figmog serve at startup")
+            );
+        } else {
+            assert_eq!(
+                routed,
+                direct_out,
+                "{args:?}: routed {} / {}",
+                String::from_utf8_lossy(&routed.1),
+                String::from_utf8_lossy(&routed.2)
+            );
+        }
         assert_eq!(routed.0 == Some(0), *ok, "{args:?}: {routed:?}");
         if !ok {
             let error: Value = serde_json::from_slice(&routed.2).unwrap();
@@ -3040,6 +3386,47 @@ fn routed_writers_match_the_direct_path_byte_for_byte() {
     let receipt: Value = serde_json::from_slice(&receipt.1).unwrap();
     assert_eq!(receipt["state"], "succeeded");
     assert_eq!(receipt["id"], operation);
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+#[test]
+fn serve_e2e_empty_store_status_includes_empty_variable_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    // Create only the store's empty schema before the bounded handshake;
+    // no pull or import has written any records.
+    drop(figmog::open_store!(&db));
+    let (mut guard, mut stdin, rx) = spawn_serve(&db);
+    handshake(&mut stdin, &rx);
+
+    let resp = call(&mut stdin, &rx, 2, "figmog_status", json!({}));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let status = result_json(&resp);
+    assert_eq!(status["ready"], false, "{status}");
+    assert_eq!(status["name"], Value::Null);
+    assert_eq!(status["nodes"], 0);
+    assert_eq!(
+        status["variables"],
+        json!({
+            "state": "none", "source": null, "format": null,
+            "format_version": null, "exported_at": null, "digest": null,
+            "variables": 0, "collections": 0,
+        })
+    );
+    for (name, args) in [
+        ("figmog_vars", json!({"snapshot": true})),
+        ("figmog_pages", json!({})),
+    ] {
+        let resp = call(&mut stdin, &rx, 3, name, args);
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+    }
+    common::command()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .code(1);
 
     drop(stdin);
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
@@ -3164,4 +3551,156 @@ fn owner_vanishing_mid_write_reports_outcome_unknown_without_retry() {
         before,
         "the CLI wrote directly"
     );
+}
+
+#[test]
+fn deep_tree_reads_over_socket_match_direct_cli() {
+    #[path = "fixtures/deep_file.rs"]
+    mod deep_file;
+
+    const KEY: &str = "figmogdeepfixture01";
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("deep.json");
+    let payload = format!("{}null{}", r#"{"layer":["#.repeat(500), "]}".repeat(500));
+    let file = deep_file::file(500).replacen(
+        r#""type":"DOCUMENT","#,
+        &format!(r#""type":"DOCUMENT","payload":{payload},"#),
+        1,
+    );
+    std::fs::write(&response, file).unwrap();
+    common::command()
+        .current_dir(dir.path())
+        .args(["pull", KEY, "--from-file"])
+        .arg(&response)
+        .assert()
+        .success();
+    let mut direct = Vec::new();
+    for args in [
+        vec!["tree"],
+        vec!["dump", "0:0"],
+        vec!["where", "--pointer", "/id"],
+        vec!["where", "--pointer", "/missing"],
+        vec!["where", "--pointer", "/payload"],
+        vec!["where", "--pointer", "/payload", "--equals", &payload],
+    ] {
+        let output = common::command()
+            .current_dir(dir.path())
+            .args(&args)
+            .assert()
+            .success();
+        direct.push((args, output.get_output().stdout.clone()));
+    }
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+    for (args, expected) in direct {
+        let output = common::command()
+            .current_dir(dir.path())
+            .args(args)
+            .assert()
+            .success();
+        assert_eq!(output.get_output().stdout, expected);
+    }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+/// A local serve opened at an explicit unrelated database must refuse a
+/// routed write whose Git-shared destination differs from its own.
+#[test]
+fn git_routed_write_refuses_a_different_explicit_serve_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&cwd)
+            .status()
+            .unwrap()
+            .success()
+    );
+    const KEY: &str = "figmogroutingfixture123";
+    let response = cwd.join("response.json");
+    std::fs::write(&response, common::fixture_v1().to_string()).unwrap();
+    common::command()
+        .current_dir(&cwd)
+        .args(["pull", KEY, "--from-file"])
+        .arg(&response)
+        .assert()
+        .success();
+    let shared = cwd.join(".git/figmog").join(KEY).join("db");
+    let before = common::store_snapshot(&shared);
+    let unrelated = cwd.join("other/db");
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("figmog"));
+    cmd.current_dir(&cwd)
+        .args(["serve", KEY, "--db"])
+        .arg(&unrelated)
+        .args(["--no-watch", "--no-upstream"]);
+    let (mut guard, mut stdin, rx) = spawn_child(cmd);
+    handshake(&mut stdin, &rx);
+    let output = common::command()
+        .current_dir(&cwd)
+        .args(["pull", KEY, "--from-file"])
+        .arg(&response)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        error["error"].as_str().unwrap().contains("--no-socket"),
+        "{error}"
+    );
+    assert!(!cwd.join(".figmog").join(KEY).exists());
+    assert_eq!(common::store_snapshot(&shared), before);
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+#[test]
+fn routed_saved_file_larger_than_the_ordinary_frame_cap_is_accepted() {
+    const KEY: &str = "figmoglargewrite12345";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+    let mut file = common::fixture_v2();
+    file["synthetic_padding"] = Value::String("x".repeat(9 * 1024 * 1024));
+    let response = dir.path().join("large.json");
+    std::fs::write(&response, serde_json::to_vec(&file).unwrap()).unwrap();
+    let output = common::command()
+        .current_dir(dir.path())
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let status = result_json(&call(&mut stdin, &rx, 2, "figmog_status", json!({})));
+    assert_eq!(status["version"], "101");
+    assert!(status["pull"]["last_success"]["operation"].is_string());
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+#[test]
+fn routed_import_preview_does_not_initialize_another_missing_mirror() {
+    const KEY: &str = "figmogpreviewexisting123";
+    const MISSING: &str = "figmogpreviewmissing123";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+    std::fs::write(dir.path().join(".figmog/current"), MISSING).unwrap();
+    let export = dir.path().join("variables.json");
+    std::fs::write(&export, include_bytes!("fixtures/variables-export.json")).unwrap();
+    let output = common::command()
+        .current_dir(dir.path())
+        .arg("import-variables")
+        .arg(&export)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["imported"], 3);
+    assert_eq!(result["removed_ids"], json!([]));
+    assert!(!dir.path().join(".figmog").join(MISSING).exists());
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }

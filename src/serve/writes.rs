@@ -55,6 +55,30 @@ pub(crate) fn is_internal(name: &str) -> bool {
     matches!(name, PULL | IMPORT_VARIABLES | OPERATION)
 }
 
+/// Store paths cross the local socket as Unix bytes, preserving non-UTF8
+/// checkout names. The string spelling remains accepted for older clients.
+pub(crate) fn expected_db(args: &Value) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::ffi::OsStringExt;
+    if let Some(value) = args.get("db_bytes") {
+        let bytes = value
+            .as_array()
+            .ok_or_else(|| "db_bytes must be an array of bytes".to_string())?
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|byte| u8::try_from(byte).ok())
+                    .ok_or_else(|| "db_bytes must contain bytes between 0 and 255".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if bytes.is_empty() || bytes.contains(&0) {
+            return Err("db_bytes must be a non-empty Unix path without NUL bytes".into());
+        }
+        return Ok(std::ffi::OsString::from_vec(bytes).into());
+    }
+    dispatch::require_str(args, "db").map(Into::into)
+}
+
 /// Parse a write tool's arguments: the target file key and the operation.
 pub(crate) fn parse(name: &str, args: &Value) -> Result<(String, WriteOp), String> {
     let file = dispatch::require_str(args, "file")?;
@@ -62,7 +86,13 @@ pub(crate) fn parse(name: &str, args: &Value) -> Result<(String, WriteOp), Strin
         WriteOp::Pull {
             source: match args.get("from_file") {
                 None | Some(Value::Null) => PullSource::Network,
-                Some(response) => PullSource::File(response.clone()),
+                Some(response) => PullSource::File(
+                    crate::deep_json::from_str(
+                        &crate::deep_json::to_string(response)
+                            .map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?,
+                ),
             },
             fresh: dispatch::arg_bool(args, "fresh")?,
             geometry: dispatch::arg_bool(args, "geometry")?,
@@ -71,9 +101,35 @@ pub(crate) fn parse(name: &str, args: &Value) -> Result<(String, WriteOp), Strin
         WriteOp::Import {
             content: dispatch::require_str(args, "content")?.into_bytes(),
             label: dispatch::require_str(args, "name")?,
+            allow_empty: dispatch::arg_bool(args, "allow_empty")?,
+            dry_run: dispatch::arg_bool(args, "dry_run")?,
         }
     };
     Ok((file, op))
+}
+
+/// Preview an import when there is no destination database to inspect.
+/// Runs off the serve loop and never acquires or initializes a store.
+pub(crate) fn preview_empty_import(op: WriteOp) -> Result<Value, String> {
+    let WriteOp::Import { content, label, .. } = op else {
+        unreachable!("import preview")
+    };
+    let invalid = |error| format!("invalid variables file {label}: {error}");
+    let value: Value =
+        serde_json::from_slice(&content).map_err(|error| invalid(error.to_string()))?;
+    crate::vars::check_import_entries(&value).map_err(|error| invalid(error.to_string()))?;
+    let parsed = crate::vars::parse_variables_snapshot(
+        &value,
+        crate::vars::SOURCE_FILE,
+        crate::vars::snapshot_digest(&content),
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    let imported = parsed
+        .recs
+        .iter()
+        .filter(|(id, _)| matches!(id, crate::model::Id::Variable(_)))
+        .count();
+    Ok(json!({"imported": imported, "removed": 0, "removed_ids": []}))
 }
 
 /// Operation ids and receipts for this process.
@@ -227,5 +283,62 @@ mod tests {
         assert!(matches!(op, WriteOp::Import { .. }));
         assert!(parse(PULL, &json!({})).is_err());
         assert!(parse(PULL, &json!({"file": "ABC1234567890", "fresh": "yes"})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod deep_tests {
+    use super::*;
+
+    #[test]
+    fn saved_file_request_parsing_and_drop_are_safe_for_deep_geometry() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let value = format!("{}0{}", "[".repeat(4096), "]".repeat(4096));
+                let args = crate::deep_json::from_str(&format!(
+                    r#"{{"file":"ABC1234567890","from_file":{{"geometry":{value}}}}}"#
+                ))
+                .unwrap();
+                let (_, op) = parse(PULL, &args).unwrap();
+                assert!(matches!(
+                    op,
+                    WriteOp::Pull {
+                        source: PullSource::File(_),
+                        ..
+                    }
+                ));
+                drop(op);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn expected_database_path_preserves_unix_bytes_and_rejects_invalid_byte_arrays() {
+        let bytes = vec![b'/', b't', b'm', b'p', b'/', 255];
+        assert_eq!(
+            expected_db(&json!({"db_bytes": bytes}))
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            bytes
+        );
+        for value in [
+            json!([]),
+            json!([0]),
+            json!([256]),
+            json!([-1]),
+            json!("path"),
+        ] {
+            assert!(expected_db(&json!({"db_bytes": value})).is_err());
+        }
     }
 }

@@ -7,8 +7,9 @@
 //!
 //! - while it is missing, a full handshake every [`ProbeCadence::missing`]
 //!   (30 s);
-//! - while it is connected, a liveness `ping` every [`ProbeCadence::live`]
-//!   (60 s), falling back to a fresh handshake when the ping fails (a
+//! - while it is connected, a liveness `ping` and `tools/list` every
+//!   [`ProbeCadence::live`] (60 s), falling back to a fresh handshake when
+//!   the ping fails (a
 //!   restarted desktop app does not know the old session);
 //! - right away (at most once per [`MIN_PROBE_GAP`]) when a desktop call
 //!   fails at the transport or protocol level, and when an agent calls a
@@ -21,9 +22,10 @@
 //! only when the upstream tool list it exposes actually changes, so a probe
 //! that confirms the current state is silent.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -39,6 +41,7 @@ pub(super) const DESKTOP_SHUTDOWN: &str =
 /// a desktop tool called while the desktop is missing), so a client
 /// retrying in a tight loop cannot turn into a probe storm.
 const MIN_PROBE_GAP: Duration = Duration::from_secs(1);
+const MAX_QUEUED_CALLS: usize = 128;
 
 /// How often the desktop is re-checked (module docs).
 #[derive(Clone, Copy, Debug)]
@@ -58,7 +61,7 @@ impl Default for ProbeCadence {
     }
 }
 
-/// One job for the desktop worker. Calls and probes share one queue, so
+/// One job for the desktop worker. Probes take priority over queued calls;
 /// the upstream session's handshake state is never shared between threads.
 pub(super) enum DesktopJob {
     /// Forward one `tools/call` verbatim and uncached (spec §8).
@@ -66,32 +69,44 @@ pub(super) enum DesktopJob {
         name: String,
         args: Value,
         reply: DeferredReply,
+        cancel: Arc<AtomicBool>,
     },
     /// Check the desktop (module docs).
-    Probe,
+    Probe { call_triggered: bool },
 }
 
 /// What the worker tells the loop about the desktop.
-enum Event {
-    /// A probe finished: `Ok(None)` means the live session answered a ping
-    /// (tools unchanged); `Ok(Some(tools))` a fresh handshake succeeded.
-    Probed(Result<Option<Vec<Value>>, String>),
-    /// A forwarded call failed below the tool level: worth a probe.
-    CallFailed,
+struct Event {
+    started: Instant,
+    outcome: Result<Vec<Value>, String>,
+}
+
+#[derive(Default)]
+struct Queue {
+    calls: VecDeque<DesktopJob>,
+    probe: Option<bool>,
+    stopped: bool,
+}
+
+#[derive(Default)]
+struct Work {
+    queue: Mutex<Queue>,
+    ready: Condvar,
 }
 
 /// The thread that owns the desktop upstream connection, plus the loop's
-/// view of its state. Jobs run one at a time, in arrival order. Dropping
+/// view of its state. Calls run one at a time, in arrival order, with
+/// recovery probes ahead of queued calls. Dropping
 /// it (or [`DesktopWorker::stop_taking_jobs`]) stops it taking jobs: a
 /// call already in flight finishes within the upstream's own timeout and
 /// answers; queued calls are answered with a shutdown error without being
 /// sent (dropped if the loop has exited), and queued probes are skipped.
 pub(super) struct DesktopWorker {
-    jobs: mpsc::Sender<DesktopJob>,
+    jobs: Arc<Work>,
     stop: Arc<AtomicBool>,
     events: mpsc::Receiver<Event>,
     connected: bool,
-    /// The desktop's tools as of the last successful handshake; only
+    /// The desktop's tools as of the last successful probe; only
     /// exposed while connected.
     tools: Vec<Value>,
     cadence: ProbeCadence,
@@ -102,6 +117,7 @@ pub(super) struct DesktopWorker {
     recheck: bool,
     next_probe: Instant,
     last_probe: Option<Instant>,
+    call_probe: bool,
 }
 
 impl DesktopWorker {
@@ -119,64 +135,117 @@ impl DesktopWorker {
         cadence: ProbeCadence,
     ) -> Self {
         let tools = if connected {
-            upstream.tools().to_vec()
+            normalized_tools(upstream.tools().to_vec())
         } else {
             Vec::new()
         };
-        let (jobs, work) = mpsc::channel::<DesktopJob>();
+        let jobs = Arc::new(Work::default());
+        let work = jobs.clone();
         let (events_tx, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         std::thread::spawn(move || {
-            // Whether the session from the last handshake is believed
-            // alive: a probe then only pings it.
             let mut live = connected;
-            while let Ok(job) = work.recv() {
-                if stopped.load(Ordering::Relaxed) {
-                    // Shutdown (spec §6a): a queued call is never sent
-                    // upstream — it may be a write — and its caller gets
-                    // an error instead of silence.
-                    if let DesktopJob::Call { reply, .. } = job {
-                        reply.send(Err(DESKTOP_SHUTDOWN.into()), false);
+            let mut recover = false;
+            let mut last_probe: Option<Instant> = None;
+            loop {
+                let job = {
+                    let mut queue = work.queue.lock().unwrap();
+                    loop {
+                        if queue.stopped {
+                            return;
+                        }
+                        if recover || queue.probe == Some(true) {
+                            // A failed session is repaired before any queued
+                            // calls, including those accepted before failure.
+                            if let Some(last) = last_probe {
+                                let delay = (last + MIN_PROBE_GAP)
+                                    .saturating_duration_since(Instant::now());
+                                if !delay.is_zero() {
+                                    queue = work.ready.wait_timeout(queue, delay).unwrap().0;
+                                    continue;
+                                }
+                            }
+                            queue.probe = None;
+                            break DesktopJob::Probe {
+                                call_triggered: true,
+                            };
+                        }
+                        if queue.probe.take().is_some() {
+                            break DesktopJob::Probe {
+                                call_triggered: false,
+                            };
+                        }
+                        if let Some(job) = queue.calls.pop_front() {
+                            break job;
+                        }
+                        queue = work.ready.wait(queue).unwrap();
                     }
-                    continue;
-                }
+                };
                 match job {
-                    DesktopJob::Call { name, args, reply } => {
+                    DesktopJob::Call {
+                        name,
+                        args,
+                        reply,
+                        cancel,
+                    } => {
+                        // A socket/MCP request can contain a deeply nested
+                        // argument. Drain it iteratively on every exit path,
+                        // including cancellation and proxy panics.
+                        let args = crate::deep_json::OwnedValue(args);
+                        if stopped.load(Ordering::Relaxed) {
+                            reply.send(Err(DESKTOP_SHUTDOWN.into()), false);
+                            continue;
+                        }
+                        if cancel.load(Ordering::Relaxed) {
+                            reply.send(
+                                Err("desktop call cancelled before it was sent upstream".into()),
+                                false,
+                            );
+                            continue;
+                        }
+                        if !live {
+                            reply.send(
+                                Err("Figma desktop is unreachable; call was not sent upstream"
+                                    .into()),
+                                false,
+                            );
+                            continue;
+                        }
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             proxy::proxy_call(&mut upstream, &name, &args)
                         }));
                         match result {
-                            // A proxied result is already a complete MCP
-                            // `CallToolResult` from the upstream — emit it
-                            // verbatim (spec §11/§12; see
-                            // `mcp::ToolOutput::Raw`'s doc comment) rather
-                            // than re-wrapping it as figmog's own text-block
-                            // shape.
                             Ok(Ok((value, write))) => reply.send(Ok(ToolOutput::Raw(value)), write),
                             Ok(Err(error)) => {
                                 if matches!(error, UpstreamError::Unreachable(_)) {
                                     live = false;
                                 }
-                                let _ = events_tx.send(Event::CallFailed);
+                                // Publish the caller's answer before a probe can
+                                // publish an exposed-tool-list change.
                                 reply.send(Err(error.to_string()), false);
+                                recover = true;
                             }
-                            Err(_) => reply.send(
-                                Err(format!(
-                                    "desktop proxy worker panicked during {name}; inspect server stderr"
-                                )),
-                                false,
-                            ),
+                            Err(_) => {
+                                reply.send(Err(format!("desktop proxy worker panicked during {name}; inspect server stderr")), false);
+                                live = false;
+                                recover = true;
+                            }
                         }
                     }
-                    DesktopJob::Probe => {
+                    DesktopJob::Probe { .. } => {
+                        last_probe = Some(Instant::now());
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 probe(&mut upstream, live)
                             }))
                             .unwrap_or_else(|_| Err("desktop probe panicked".into()));
+                        recover = false;
                         live = outcome.is_ok();
-                        let _ = events_tx.send(Event::Probed(outcome));
+                        let _ = events_tx.send(Event {
+                            started: last_probe.unwrap(),
+                            outcome,
+                        });
                     }
                 }
             }
@@ -199,6 +268,7 @@ impl DesktopWorker {
             recheck: false,
             next_probe,
             last_probe: None,
+            call_probe: false,
         }
     }
 
@@ -229,29 +299,25 @@ impl DesktopWorker {
         let mut before = None;
         while let Ok(event) = self.events.try_recv() {
             before.get_or_insert_with(|| self.tools().to_vec());
-            match event {
-                Event::Probed(outcome) => {
-                    self.probing = false;
-                    self.apply_probe(outcome, now);
-                    if std::mem::take(&mut self.recheck) {
-                        self.request_probe(now);
-                    }
-                }
-                Event::CallFailed => self.request_probe(now),
+            self.last_probe = Some(event.started);
+            self.probing = false;
+            self.apply_probe(event.outcome, now);
+            if std::mem::take(&mut self.recheck) {
+                self.request_probe(now);
             }
         }
         if !self.probing && now >= self.next_probe && !self.stop.load(Ordering::Relaxed) {
             self.probing = true;
             self.last_probe = Some(now);
-            self.submit(DesktopJob::Probe);
+            let call_triggered = std::mem::take(&mut self.call_probe);
+            self.submit(DesktopJob::Probe { call_triggered });
         }
         before.is_some_and(|before| self.tools() != before.as_slice())
     }
 
-    fn apply_probe(&mut self, outcome: Result<Option<Vec<Value>>, String>, now: Instant) {
+    fn apply_probe(&mut self, outcome: Result<Vec<Value>, String>, now: Instant) {
         match outcome {
-            Ok(None) => {}
-            Ok(Some(tools)) => {
+            Ok(tools) => {
                 if !self.connected {
                     eprintln!(
                         "figmog: Figma desktop connected; serving its {} tool(s)",
@@ -259,7 +325,7 @@ impl DesktopWorker {
                     );
                 }
                 self.connected = true;
-                self.tools = tools;
+                self.tools = normalized_tools(tools);
             }
             Err(error) => {
                 if self.connected {
@@ -282,6 +348,7 @@ impl DesktopWorker {
     /// Probe as soon as the call-triggered spacing allows; with a probe in
     /// flight, once it has answered.
     pub(super) fn request_probe(&mut self, now: Instant) {
+        self.call_probe = true;
         if self.probing {
             self.recheck = true;
             return;
@@ -297,27 +364,389 @@ impl DesktopWorker {
     /// without reaching the upstream.
     pub(super) fn stop_taking_jobs(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        let calls = {
+            let mut queue = self.jobs.queue.lock().unwrap();
+            queue.stopped = true;
+            queue.probe = None;
+            std::mem::take(&mut queue.calls)
+        };
+        self.jobs.ready.notify_all();
+        for job in calls {
+            reject_call(job, DESKTOP_SHUTDOWN);
+        }
     }
 
     pub(super) fn submit(&self, job: DesktopJob) {
-        // A dead worker hands the job back; dropping it answers the
-        // caller with an error.
-        let _ = self.jobs.send(job);
+        let mut queue = self.jobs.queue.lock().unwrap();
+        if queue.stopped {
+            drop(queue);
+            reject_call(job, DESKTOP_SHUTDOWN);
+            return;
+        }
+        match job {
+            DesktopJob::Probe { call_triggered } => {
+                queue.probe = Some(queue.probe.unwrap_or(false) || call_triggered);
+            }
+            DesktopJob::Call { .. } if queue.calls.len() < MAX_QUEUED_CALLS => {
+                queue.calls.push_back(job);
+            }
+            DesktopJob::Call { .. } => {
+                drop(queue);
+                reject_call(job, "desktop call queue is full; try again later");
+                return;
+            }
+        }
+        self.jobs.ready.notify_one();
     }
 }
 
 impl Drop for DesktopWorker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop_taking_jobs();
+    }
+}
+
+/// Reject a queued call while preserving iterative cleanup of its arguments.
+fn reject_call(job: DesktopJob, message: &str) {
+    if let DesktopJob::Call { args, reply, .. } = job {
+        let _args = crate::deep_json::OwnedValue(args);
+        reply.send(Err(message.into()), false);
+    }
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        for job in self.calls.drain(..) {
+            reject_call(job, DESKTOP_SHUTDOWN);
+        }
     }
 }
 
 /// One probe on the worker: ping a session believed live, otherwise (or if
 /// the ping fails) run a fresh handshake and report its tools.
-fn probe<U: UpstreamMcp>(upstream: &mut U, live: bool) -> Result<Option<Vec<Value>>, String> {
-    if live && upstream.ping().is_ok() {
-        return Ok(None);
+fn probe<U: UpstreamMcp>(upstream: &mut U, live: bool) -> Result<Vec<Value>, String> {
+    if live && upstream.ping().is_ok() && upstream.refresh_tools().is_ok() {
+        return Ok(upstream.tools().to_vec());
     }
     upstream.initialize().map_err(|e| e.to_string())?;
-    Ok(Some(upstream.tools().to_vec()))
+    Ok(upstream.tools().to_vec())
+}
+
+/// Tool arrays have no semantic order. Compare and expose a canonical
+/// order so a desktop reorder alone cannot emit list_changed.
+fn normalized_tools(mut tools: Vec<Value>) -> Vec<Value> {
+    tools.sort_by_cached_key(Value::to_string);
+    tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const EXPECT: Duration = Duration::from_secs(3);
+
+    struct Scripted {
+        trace: mpsc::Sender<&'static str>,
+        release: mpsc::Receiver<()>,
+        calls: usize,
+        block_probe: bool,
+        fail_every_call: bool,
+        tools: Vec<Value>,
+    }
+
+    impl UpstreamMcp for Scripted {
+        fn initialize(&mut self) -> Result<(), UpstreamError> {
+            self.trace.send("initialize").unwrap();
+            if self.block_probe {
+                self.release.recv_timeout(EXPECT).unwrap();
+            }
+            Ok(())
+        }
+        fn tools(&self) -> &[Value] {
+            &self.tools
+        }
+        fn call(&mut self, _: &str, _: &Value) -> Result<Value, UpstreamError> {
+            self.calls += 1;
+            self.trace.send("call").unwrap();
+            if self.calls == 1 {
+                self.release.recv_timeout(EXPECT).unwrap();
+                Err(UpstreamError::Protocol("stale session".into()))
+            } else if self.fail_every_call {
+                Err(UpstreamError::Protocol("stale session".into()))
+            } else {
+                Ok(json!({"content": [], "isError": false}))
+            }
+        }
+        fn ping(&mut self) -> Result<(), UpstreamError> {
+            self.trace.send("ping").unwrap();
+            Err(UpstreamError::Protocol("stale session".into()))
+        }
+    }
+
+    fn scripted(
+        block_probe: bool,
+    ) -> (
+        DesktopWorker,
+        mpsc::Receiver<&'static str>,
+        mpsc::Sender<()>,
+    ) {
+        let (trace, events) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        (
+            DesktopWorker::spawn_with(
+                Scripted {
+                    trace,
+                    release: wait,
+                    calls: 0,
+                    block_probe,
+                    fail_every_call: false,
+                    tools: vec![],
+                },
+                true,
+                ProbeCadence::default(),
+            ),
+            events,
+            release,
+        )
+    }
+
+    fn call(
+        worker: &DesktopWorker,
+        token: u64,
+        cancel: Arc<AtomicBool>,
+        done: &mpsc::Sender<super::super::Done>,
+    ) {
+        worker.submit(DesktopJob::Call {
+            name: "get_code".into(),
+            args: json!({}),
+            reply: DeferredReply {
+                token,
+                done: Some(done.clone()),
+                abandoned: "request abandoned: its worker stopped before answering",
+            },
+            cancel,
+        });
+    }
+
+    #[test]
+    fn recovery_runs_before_calls_already_queued_when_a_session_fails() {
+        let (worker, trace, release) = scripted(false);
+        let (done, answers) = mpsc::channel();
+        call(&worker, 1, Arc::default(), &done);
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "call");
+        call(&worker, 2, Arc::default(), &done);
+        call(&worker, 3, Arc::default(), &done);
+        release.send(()).unwrap();
+        assert_eq!(answers.recv_timeout(EXPECT).unwrap().token, 1);
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "ping");
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "initialize");
+        for token in [2, 3] {
+            assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "call");
+            let answer = answers.recv_timeout(EXPECT).unwrap();
+            assert_eq!(answer.token, token);
+            assert!(matches!(answer.answer, super::super::Answer::Output(Ok(_))));
+        }
+    }
+
+    #[test]
+    fn a_disconnected_call_is_never_forwarded_after_waiting_in_the_queue() {
+        let (worker, trace, release) = scripted(false);
+        let (done, answers) = mpsc::channel();
+        call(&worker, 1, Arc::default(), &done);
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "call");
+        let cancel = Arc::new(AtomicBool::new(false));
+        call(&worker, 2, cancel.clone(), &done);
+        cancel.store(true, Ordering::Relaxed);
+        release.send(()).unwrap();
+        assert_eq!(answers.recv_timeout(EXPECT).unwrap().token, 1);
+        let answer = answers.recv_timeout(EXPECT).unwrap();
+        assert_eq!(answer.token, 2);
+        assert!(
+            matches!(answer.answer, super::super::Answer::Output(Err(ref e)) if e.contains("cancelled"))
+        );
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "ping");
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "initialize");
+        assert!(trace.try_recv().is_err());
+    }
+
+    #[test]
+    fn bounded_queue_and_stop_answer_immediately_even_with_a_blocked_probe() {
+        let (worker, trace, release) = scripted(true);
+        let (done, answers) = mpsc::channel();
+        worker.submit(DesktopJob::Probe {
+            call_triggered: false,
+        });
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "ping");
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "initialize");
+        for token in 0..MAX_QUEUED_CALLS as u64 {
+            call(&worker, token, Arc::default(), &done);
+        }
+        call(&worker, 999, Arc::default(), &done);
+        let rejected = answers.recv_timeout(EXPECT).unwrap();
+        assert_eq!(rejected.token, 999);
+        assert!(
+            matches!(rejected.answer, super::super::Answer::Output(Err(ref e)) if e.contains("queue is full"))
+        );
+        worker.stop_taking_jobs();
+        for token in 0..MAX_QUEUED_CALLS as u64 {
+            let answer = answers.recv_timeout(EXPECT).unwrap();
+            assert_eq!(answer.token, token);
+            assert!(
+                matches!(answer.answer, super::super::Answer::Output(Err(ref e)) if e == DESKTOP_SHUTDOWN)
+            );
+        }
+        release.send(()).unwrap();
+        assert!(trace.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn call_triggered_probe_requests_keep_the_one_second_minimum_gap() {
+        let (mut worker, trace, _) = scripted(false);
+        let now = Instant::now();
+        worker.request_probe(now);
+        worker.maintain(now);
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "ping");
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "initialize");
+        // Wait for the event, without relying on scheduling sleeps.
+        let event = worker.events.recv_timeout(EXPECT).unwrap();
+        let Event { outcome, .. } = event;
+        worker.probing = false;
+        worker.apply_probe(outcome, now);
+        worker.request_probe(now + Duration::from_millis(10));
+        worker.maintain(now + MIN_PROBE_GAP - Duration::from_nanos(1));
+        assert!(trace.try_recv().is_err());
+        worker.maintain(now + MIN_PROBE_GAP);
+        assert_eq!(trace.recv_timeout(EXPECT).unwrap(), "ping");
+    }
+
+    #[test]
+    fn actual_worker_spaces_recovery_and_delayed_call_triggered_probes() {
+        let (trace, _trace_rx) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let worker = DesktopWorker::spawn_with(
+            Scripted {
+                trace,
+                release: wait,
+                calls: 0,
+                block_probe: false,
+                fail_every_call: true,
+                tools: vec![],
+            },
+            true,
+            ProbeCadence::default(),
+        );
+        let (done, answers) = mpsc::channel();
+        call(&worker, 1, Arc::default(), &done);
+        call(&worker, 2, Arc::default(), &done);
+        release.send(()).unwrap();
+        answers.recv_timeout(EXPECT).unwrap();
+        let first = worker.events.recv_timeout(EXPECT).unwrap();
+        answers.recv_timeout(EXPECT).unwrap();
+        // Simulate the loop scheduling a call-triggered check while the
+        // worker has already started its own recovery.
+        worker.submit(DesktopJob::Probe {
+            call_triggered: true,
+        });
+        let second = worker.events.recv_timeout(EXPECT).unwrap();
+        assert!(second.started.duration_since(first.started) >= MIN_PROBE_GAP);
+        // A delayed loop request submitted after that recovery is throttled
+        // at the worker too, even without maintain applying either event.
+        worker.submit(DesktopJob::Probe {
+            call_triggered: true,
+        });
+        let third = worker.events.recv_timeout(EXPECT).unwrap();
+        assert!(third.started.duration_since(second.started) >= MIN_PROBE_GAP);
+    }
+
+    #[test]
+    fn a_live_probe_refreshes_tools_and_rehandshakes_if_refresh_fails() {
+        struct Registry {
+            tools: Vec<Value>,
+            fail_refresh: bool,
+            handshakes: usize,
+        }
+        impl UpstreamMcp for Registry {
+            fn initialize(&mut self) -> Result<(), UpstreamError> {
+                self.handshakes += 1;
+                self.tools = vec![json!({"name":"after_handshake"})];
+                Ok(())
+            }
+            fn tools(&self) -> &[Value] {
+                &self.tools
+            }
+            fn call(&mut self, _: &str, _: &Value) -> Result<Value, UpstreamError> {
+                unreachable!()
+            }
+            fn ping(&mut self) -> Result<(), UpstreamError> {
+                Ok(())
+            }
+            fn refresh_tools(&mut self) -> Result<(), UpstreamError> {
+                if self.fail_refresh {
+                    return Err(UpstreamError::Protocol("stale session".into()));
+                }
+                self.tools = vec![json!({"name":"after_refresh"})];
+                Ok(())
+            }
+        }
+        let mut upstream = Registry {
+            tools: vec![],
+            fail_refresh: false,
+            handshakes: 0,
+        };
+        assert_eq!(
+            probe(&mut upstream, true).unwrap()[0]["name"],
+            "after_refresh"
+        );
+        assert_eq!(upstream.handshakes, 0);
+        upstream.fail_refresh = true;
+        assert_eq!(
+            probe(&mut upstream, true).unwrap()[0]["name"],
+            "after_handshake"
+        );
+        assert_eq!(upstream.handshakes, 1);
+    }
+
+    #[test]
+    fn deep_arguments_are_drained_on_cancel_rejection_and_queue_drop() {
+        crate::test_support::small_stack(|| {
+            fn job(token: u64, done: &mpsc::Sender<super::super::Done>) -> DesktopJob {
+                let mut args = Value::Null;
+                for _ in 0..10_000 {
+                    args = Value::Array(vec![args]);
+                }
+                DesktopJob::Call {
+                    name: "get_code".into(),
+                    args,
+                    reply: DeferredReply {
+                        token,
+                        done: Some(done.clone()),
+                        abandoned: "request abandoned: its worker stopped before answering",
+                    },
+                    cancel: Arc::new(AtomicBool::new(true)),
+                }
+            }
+            let (worker, _, _) = scripted(false);
+            let (done, answers) = mpsc::channel();
+            worker.submit(job(1, &done));
+            assert_eq!(answers.recv_timeout(EXPECT).unwrap().token, 1);
+            worker.stop_taking_jobs();
+            worker.submit(job(2, &done));
+            assert_eq!(answers.recv_timeout(EXPECT).unwrap().token, 2);
+            let mut queue = Queue::default();
+            queue.calls.push_back(job(3, &done));
+            drop(queue);
+            assert_eq!(answers.recv_timeout(EXPECT).unwrap().token, 3);
+        });
+    }
+
+    #[test]
+    fn tool_order_does_not_change_the_exposed_registry() {
+        let (mut worker, _, _) = scripted(false);
+        let tools = vec![json!({"name":"z"}), json!({"name":"a"})];
+        worker.apply_probe(Ok(tools.clone()), Instant::now());
+        let before = worker.tools().to_vec();
+        worker.apply_probe(Ok(tools.into_iter().rev().collect()), Instant::now());
+        assert_eq!(worker.tools(), before);
+    }
 }

@@ -89,7 +89,7 @@ pub(crate) enum PullSource {
     Network,
     /// A saved `GET /v1/files/:key` response (`pull --from-file`), sent by
     /// the CLI as content.
-    File(Value),
+    File(crate::deep_json::OwnedValue),
 }
 
 /// A writer operation the CLI routes through a running serve (NWS-2963).
@@ -105,7 +105,12 @@ pub(crate) enum WriteOp {
     },
     /// `figmog import-variables`: the export's raw bytes (their digest is
     /// the snapshot's) and the name to report validation errors under.
-    Import { content: Vec<u8>, label: String },
+    Import {
+        content: Vec<u8>,
+        label: String,
+        allow_empty: bool,
+        dry_run: bool,
+    },
 }
 
 impl WriteOp {
@@ -125,7 +130,17 @@ impl WriteOp {
                 fresh,
                 geometry,
             },
-            WriteOp::Import { content, label } => WriteWork::Import { content, label },
+            WriteOp::Import {
+                content,
+                label,
+                allow_empty,
+                dry_run,
+            } => WriteWork::Import {
+                content,
+                label,
+                allow_empty,
+                dry_run,
+            },
         }
     }
 }
@@ -145,6 +160,8 @@ enum WriteWork {
     Import {
         content: Vec<u8>,
         label: String,
+        allow_empty: bool,
+        dry_run: bool,
     },
 }
 
@@ -205,6 +222,9 @@ pub(crate) struct Carry {
     fresh: Option<(Prepared, Waiters)>,
     writes: VecDeque<PendingWrite>,
     draining: bool,
+    job: Option<Job>,
+    queued: Option<Job>,
+    next_job: u64,
 }
 
 impl Carry {
@@ -269,6 +289,8 @@ impl Job {
 pub(crate) struct FileSession {
     pub(crate) key: String,
     pub(crate) mirrored: bool,
+    pub(crate) path: PathBuf,
+    fresh_applying: bool,
     view: Arc<SessionView>,
     commands: Option<mpsc::SyncSender<Command>>,
     completions: mpsc::Receiver<Completion>,
@@ -407,7 +429,12 @@ fn status_value(
             .and_then(|view| status_json(view).ok())
             .unwrap_or_else(|| {
                 json!({"name": null, "version": null, "last_modified": null,
-                    "synced_at_unix_ms": null, "nodes": 0})
+                "synced_at_unix_ms": null, "nodes": 0,
+                "variables": view.map(|view| view.with_dependent(
+                    |_, (_, _, _, _, variables, collections, _, _, _, _, _, snapshot)| {
+                        crate::query::variable_snapshot(variables, collections, snapshot)
+                    }
+                ))})
             }),
     };
     value["ready"] = json!(mirrored);
@@ -433,9 +460,27 @@ impl FileSession {
     /// Drain and close this session (as dropping it does), returning its
     /// closed but still-owned store once the session — and its published
     /// view — is gone. `None` if the worker panicked.
-    fn close(mut self) -> Option<crate::cli::Compaction> {
+    fn close_until(mut self, deadline: Instant) -> Option<crate::cli::Compaction> {
         self.commands.take();
-        self.worker.take()?.join().ok()
+        let worker = self.worker.take()?;
+        while !worker.is_finished() {
+            if Instant::now() >= deadline {
+                // The process is exiting. Detach the worker with its store
+                // ownership intact rather than blocking past the drain budget.
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        worker.join().ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_reopen(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        let reopen = self.reopen.clone();
+        self.reopen = Arc::new(move |fresh| {
+            hook();
+            reopen(fresh)
+        });
     }
 
     pub(crate) fn lifecycle(&self) -> Value {
@@ -460,15 +505,18 @@ impl FileSession {
     /// one falls back to the bare shape.
     pub(crate) fn status_read(&self) -> StatusRead {
         StatusRead {
-            mirrored: self.mirrored,
+            mirrored: self.mirrored || self.fresh_applying,
             lifecycle: self.lifecycle(),
             lease: self.gate.admit(&self.view),
         }
     }
 
     /// The not-ready and resetting refusals every data read shares.
-    pub(crate) fn check_readable(&self) -> Result<(), String> {
-        if !self.mirrored {
+    fn check_readable(&self, name: &str) -> Result<(), String> {
+        if self.gate.is_closed() {
+            return Err(format!("mirror {}: {RESETTING}", self.key));
+        }
+        if !(self.mirrored || name == "figmog_vars" && self.has_variable_state()) {
             return Err(format!(
                 "mirror {} is not ready; inspect figmog_status or figmog_files for pull progress and errors",
                 self.key
@@ -481,16 +529,33 @@ impl FileSession {
     }
 
     /// Admit one off-loop data read of the published view (NWS-2962).
+    #[cfg(test)]
     pub(crate) fn lease(&self) -> Result<ReadLease, String> {
-        self.check_readable()?;
+        self.lease_for("")
+    }
+
+    pub(crate) fn lease_for(&self, name: &str) -> Result<ReadLease, String> {
+        self.check_readable(name)?;
         self.gate
             .admit(&self.view)
             .ok_or_else(|| format!("mirror {}: {RESETTING}", self.key))
     }
 
     pub(crate) fn dispatch(&self, name: &str, args: &Value) -> Result<ToolOutput, String> {
-        self.check_readable()?;
+        self.check_readable(name)?;
         read_tool(&self.view, name, args)
+    }
+
+    fn variable_snapshot(&self) -> Value {
+        self.view.with_dependent(
+            |_, (_, _, _, _, variables, collections, _, _, _, _, _, snapshot)| {
+                crate::query::variable_snapshot(variables, collections, snapshot)
+            },
+        )
+    }
+
+    pub(crate) fn has_variable_state(&self) -> bool {
+        self.variable_snapshot()["state"] != "none"
     }
 
     fn new_job(&mut self) -> Job {
@@ -638,12 +703,19 @@ impl FileSession {
                     match result {
                         Ok(WriteResult::Applied(applied)) => {
                             self.view = applied.view;
+                            if self.fresh_applying {
+                                self.fresh_applying = false;
+                                self.gate = Arc::default();
+                            }
                             self.mirrored = applied.mirrored;
                             self.geometry |= applied.geometry;
                             if let Some(outcome) = applied.outcome {
                                 self.last_success = Some(json!({"job_id": null,
                                     "operation": waiters.operation, "name": outcome.name,
                                     "version": outcome.version, "churn": outcome.churn}));
+                                self.backoff = BACKOFF_START;
+                                self.retry_at = now;
+                                self.watch_retry_at = None;
                                 published = true;
                             }
                             // Committed and published: only now answer.
@@ -656,7 +728,18 @@ impl FileSession {
                             self.reset = Some(StoreReset::Fresh);
                             self.fresh = Some((prepared, waiters));
                         }
-                        Err(error) => waiters.answer(&Err(error)),
+                        Err(error) => {
+                            let error = if self.fresh_applying {
+                                self.fresh_applying = false;
+                                self.gate = Arc::default();
+                                format!(
+                                    "outcome unknown: fresh pull cleared the store before apply failed: {error}"
+                                )
+                            } else {
+                                error
+                            };
+                            waiters.answer(&Err(error));
+                        }
                     }
                 }
                 Completion::Pull(result) => {
@@ -769,6 +852,10 @@ impl FileSession {
 
     /// Whether a CLI write is queued, running or waiting for its reset —
     /// a not-yet-mirrored store then queues no implicit first pull.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy || self.reset.is_some()
+    }
+
     pub(crate) fn has_writes(&self) -> bool {
         !self.writes.is_empty() || self.writing.is_some() || self.fresh.is_some()
     }
@@ -799,6 +886,9 @@ impl FileSession {
             fresh: self.fresh.take(),
             writes: std::mem::take(&mut self.writes),
             draining: self.draining,
+            job: self.job.take(),
+            queued: self.queued.take(),
+            next_job: self.next_job,
         }
     }
 
@@ -807,8 +897,15 @@ impl FileSession {
     fn adopt(&mut self, carry: Carry) {
         self.writes = carry.writes;
         self.draining = carry.draining;
+        self.job = carry.job;
+        self.queued = carry.queued;
+        self.next_job = carry.next_job;
         match carry.fresh {
-            Some((prepared, waiters)) => self.run_write(WriteWork::Apply(prepared), waiters),
+            Some((prepared, waiters)) => {
+                self.fresh_applying = true;
+                self.gate.close();
+                self.run_write(WriteWork::Apply(prepared), waiters);
+            }
             None => self.start_write(),
         }
     }
@@ -986,7 +1083,6 @@ impl From<PathBuf> for StoreRoot {
 impl StoreRoot {
     /// The store `key` opens. An old per-checkout mirror is used where it
     /// is (with a stderr note); two copies are an error.
-    #[cfg(test)]
     pub(crate) fn store_path(&self, key: &str) -> Result<PathBuf, String> {
         self.store_target(key).map(|(path, _)| path)
     }
@@ -1019,6 +1115,7 @@ impl StoreRoot {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn open_session(
     root: &StoreRoot,
     key: &str,
@@ -1035,6 +1132,7 @@ pub(crate) fn open_session(
         api,
         WorkerHooks::default(),
         false,
+        true,
     )
 }
 
@@ -1085,11 +1183,12 @@ pub(crate) fn open_session_with_hooks(
     api: Option<SessionApi>,
     hooks: WorkerHooks,
 ) -> Result<FileSession, String> {
-    open_session_inner(path, None, key, network_key, api, hooks, false)
+    open_session_inner(path, None, key, network_key, api, hooks, false, true)
 }
 
 /// Open (with `fresh`: clear, then open) one session's store and start its
 /// worker.
+#[allow(clippy::too_many_arguments)]
 fn open_session_inner(
     path: PathBuf,
     legacy: Option<crate::project::LegacyStore>,
@@ -1098,6 +1197,7 @@ fn open_session_inner(
     api: Option<SessionApi>,
     hooks: WorkerHooks,
     fresh: bool,
+    create: bool,
 ) -> Result<FileSession, String> {
     let reopen: Reopen = {
         let (path, key, network_key) = (path.clone(), key.clone(), network_key.map(str::to_string));
@@ -1111,6 +1211,7 @@ fn open_session_inner(
                 api.clone(),
                 hooks.clone(),
                 fresh,
+                create,
             )
         })
     };
@@ -1124,8 +1225,10 @@ fn open_session_inner(
     };
     let mut st = if fresh {
         crate::cli::open_store_cleared(&path, legacy.as_ref(), open)?
-    } else {
+    } else if create {
         crate::cli::open_store_resolved(&path, legacy.as_ref(), open)?
+    } else {
+        crate::cli::open_store_existing_resolved(&path, legacy.as_ref(), open)?
     };
     let make_view = move |snapshot, node_count| {
         Arc::new(SessionView::new(
@@ -1141,6 +1244,7 @@ fn open_session_inner(
     let (commands, work) = mpsc::sync_channel(1);
     let (done, completions) = mpsc::channel();
     let opened = view.clone();
+    let session_path = path.clone();
     let worker = std::thread::spawn(move || {
         // Count the opened mirror's nodes here, once, so the first status
         // poll doesn't pay for it (NWS-2942). A read racing this waits for
@@ -1221,17 +1325,25 @@ fn open_session_inner(
                 ),
                 Command::Write(work) => (work, false),
             };
+            let network_write = !job
+                && matches!(
+                    &work,
+                    WriteWork::Pull {
+                        source: PullSource::Network,
+                        ..
+                    }
+                );
             // Lifecycle phases belong to jobs only.
             let phase = |name: PullPhase| {
                 if job {
                     let _ = done.send(Completion::Phase(name));
-                    hooks.phase(name.as_str());
                 }
+                hooks.phase(name.as_str());
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                 || -> Result<WriteResult, PullError> {
                     let prepared = match work {
-                        WriteWork::Import { content, label } => {
+                        WriteWork::Import { content, label, allow_empty, dry_run } => {
                             // Validated in full before any write, exactly
                             // like the direct `import-variables`.
                             let invalid = |e: String| {
@@ -1250,17 +1362,21 @@ fn open_session_inner(
                             let prior = st.rtx(|(_, (_, _, _, _, vars, collections, ..))| {
                                 collect_variable_ids(&vars, &collections)
                             });
-                            let churn = store::replace_variable_snapshot(
-                                &mut st,
-                                &prior,
-                                &parsed.recs,
-                                parsed.snapshot,
-                            );
-                            let imported = parsed
-                                .recs
-                                .iter()
-                                .filter(|(id, _)| matches!(id, Id::Variable(_)))
-                                .count();
+                            let imported = parsed.recs.iter().filter(|(id, _)| matches!(id, Id::Variable(_))).count();
+                            let live: BTreeSet<_> = parsed.recs.iter().map(|(id, _)| id).collect();
+                            let removed_ids: Vec<_> = prior.iter().filter_map(|id| match id {
+                                Id::Variable(id_string) if !live.contains(id) => Some(id_string.clone()),
+                                _ => None,
+                            }).collect();
+                            if !dry_run && imported == 0 && !allow_empty && prior.iter().any(|id| matches!(id, Id::Variable(_))) {
+                                return Err(invalid("empty export would remove stored variables; pass --allow-empty to replace them".to_string()));
+                            }
+                            if !dry_run {
+                                store::replace_variable_snapshot(&mut st, &prior, &parsed.recs, parsed.snapshot);
+                            }
+                            let value = if dry_run {
+                                json!({"imported": imported, "removed": removed_ids.len(), "removed_ids": removed_ids})
+                            } else { json!({"imported": imported, "removed": removed_ids.len()}) };
                             let (mirrored, geometry) =
                                 st.rtx(|(_, (_, _, _, _, _, _, meta, _, config, _, _, _))| {
                                     (meta.get(&0).is_some(), store::read_geometry(&config))
@@ -1270,7 +1386,7 @@ fn open_session_inner(
                                 Some(node_count),
                             );
                             return Ok(WriteResult::Applied(Applied {
-                                value: json!({"imported": imported, "removed": churn.removed}),
+                                value,
                                 view,
                                 mirrored,
                                 geometry,
@@ -1302,7 +1418,7 @@ fn open_session_inner(
                                         PullError::from(crate::auth::missing_token("network pulls"))
                                     })?;
                                     phase(PullPhase::Fetching);
-                                    let response = api.file(key, geometry)?;
+                                    let response = crate::deep_json::OwnedValue(api.file(key, geometry)?);
                                     let vars = api.variables_local(key)?;
                                     (response, vars, true)
                                 }
@@ -1360,9 +1476,9 @@ fn open_session_inner(
                     // potentially large image blobs merely to evict none.
                     if prior_version.as_deref() != Some(version.as_str()) {
                         let mut stale =
-                            st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, _, _))| {
+                            st.rtx(|(_, (_, _, _, _, _, _, _, cache, _, images, pins, _))| {
                                 let mut ids = store::stale_cache_ids(&cache, &version);
-                                ids.extend(store::stale_image_ids(&images, &version));
+                                ids.extend(store::stale_image_ids(&images, &pins, &version));
                                 ids
                             });
                         if !stale.is_empty() {
@@ -1410,7 +1526,7 @@ fn open_session_inner(
                     _ => unreachable!("a lifecycle pull applies a network pull"),
                 }))
             } else {
-                Completion::Write(result.map_err(|e| e.to_string()))
+                Completion::Write(result.map_err(|e| if network_write { format!("{e}; this routed pull uses credentials read by the running figmog serve at startup; restart it after auth login or use --no-socket with FIGMA_TOKEN") } else { e.to_string() }))
             };
             if done.send(completion).is_err() {
                 break;
@@ -1422,6 +1538,8 @@ fn open_session_inner(
     });
     Ok(FileSession {
         key,
+        path: session_path,
+        fresh_applying: false,
         mirrored,
         view,
         commands: Some(commands),
@@ -1474,23 +1592,35 @@ pub(crate) const NO_DEFAULT_FILE_MSG: &str = "no file specified and no default m
 
 impl SessionManager {
     pub(crate) fn open(&mut self, file_ref: &str) -> Result<&mut FileSession, String> {
+        self.open_mode(file_ref, true)
+    }
+
+    fn open_mode(&mut self, file_ref: &str, create: bool) -> Result<&mut FileSession, String> {
         let key = parse_file_ref(file_ref)
             .ok_or_else(|| format!("not a Figma file key or URL: {file_ref}"))?;
         if let Some(pos) = self.sessions.iter().position(|s| s.key == key) {
             return Ok(&mut self.sessions[pos]);
         }
+        let (path, legacy) = self.root.store_target(&key)?;
         #[cfg(test)]
-        let session = match &self.api {
-            Some(api) => open_session_with_api(
-                self.root.store_path(&key)?,
-                key.clone(),
-                Some(&key),
-                Some(api.clone()),
-            )?,
-            None => open_session(&self.root, &key, self.token.as_deref())?,
-        };
+        let injected = self.api.clone();
         #[cfg(not(test))]
-        let session = open_session(&self.root, &key, self.token.as_deref())?;
+        let injected: Option<SessionApi> = None;
+        let api = injected.or_else(|| {
+            self.token
+                .as_ref()
+                .map(|token| Arc::new(UreqApi::for_sessions(token.clone())) as SessionApi)
+        });
+        let session = open_session_inner(
+            path,
+            legacy,
+            key.clone(),
+            Some(&key),
+            api,
+            WorkerHooks::default(),
+            false,
+            create,
+        )?;
         self.sessions.push(session);
         Ok(self.sessions.last_mut().unwrap())
     }
@@ -1511,18 +1641,32 @@ impl SessionManager {
         interval: Duration,
     ) -> Result<&mut FileSession, String> {
         let key = file
-            .map(str::to_string)
+            .map(|file| {
+                parse_file_ref(file).ok_or_else(|| format!("not a Figma file key or URL: {file}"))
+            })
+            .transpose()?
             .or_else(|| self.effective_default_key())
             .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?;
         let session = if file.is_some() {
-            self.open(&key)?
+            if !self.sessions.iter().any(|session| session.key == key)
+                && !self.root.store_path(&key)?.is_dir()
+            {
+                return Err(format!(
+                    "no mirror here for {key}; run figmog pull or figmog_open first"
+                ));
+            }
+            self.open_mode(&key, false)?
         } else {
             self.sessions
                 .iter_mut()
                 .find(|s| s.key == key)
                 .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?
         };
-        if !session.mirrored && session.job.is_none() && !session.has_writes() {
+        if !session.mirrored
+            && session.job.is_none()
+            && !session.has_writes()
+            && !session.has_variable_state()
+        {
             session.request_pull(false, interval);
         }
         Ok(session)
@@ -1613,7 +1757,7 @@ impl SessionManager {
                     finished.push((key, Ok(())));
                 }
                 Err(error) => {
-                    carry.fail(&error);
+                    carry.fail(&if fresh { format!("outcome unknown: fresh pull may have cleared the store before reopen failed: {error}") } else { error.clone() });
                     finished.push((key, Err(error)));
                 }
             }
@@ -1625,14 +1769,23 @@ impl SessionManager {
     /// close every session, then compact each store (NWS-2941) while its
     /// ownership is still held. A store a detached read still holds a view
     /// of fails fjall's own lock check and is left as it is.
-    pub(crate) fn close_and_compact(&mut self) {
+    pub(crate) fn close_and_compact(&mut self, deadline: Instant) {
         let closed: Vec<_> = self
             .sessions
             .drain(..)
-            .filter_map(FileSession::close)
+            .filter_map(|session| session.close_until(deadline))
             .collect();
         for compaction in closed {
-            compaction.run();
+            if Instant::now() >= deadline {
+                break;
+            }
+            let worker = std::thread::spawn(move || compaction.run());
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
         }
     }
 
@@ -1644,7 +1797,14 @@ impl SessionManager {
             session.gate.close();
         }
         for session in &self.sessions {
-            session.gate.wait_drained(deadline);
+            if !session.gate.wait_drained(deadline) {
+                // A detached read still owns its SessionView. Fold's
+                // TableReaders retain the fjall Keyspace/LockedFileGuard,
+                // so releasing OwnedStore's .figmog-lock cannot let another
+                // open (and thus a reset) succeed until that view drops.
+                // Waiting here would defeat the bounded shutdown deadline.
+                debug_assert!(session.gate.is_closed());
+            }
         }
     }
 }

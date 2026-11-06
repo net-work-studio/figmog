@@ -286,7 +286,7 @@ fn slow_reader_and_heavy_stats_do_not_delay_another_clients_point_read() {
 /// under 50 ms. Slow (the synthetic pull alone takes several seconds):
 /// `cargo test --lib isolation_benchmark -- --ignored --nocapture`.
 #[test]
-#[ignore]
+#[ignore = "manual 100k-node latency benchmark; slow synthetic import"]
 fn isolation_benchmark_100k_nodes_20mb_trickle() {
     isolation_scenario(100_000, 100, Duration::from_millis(50));
 }
@@ -295,7 +295,7 @@ fn isolation_benchmark_100k_nodes_20mb_trickle() {
 /// classification in `reads.rs`:
 /// `cargo test --lib measure_read_costs -- --ignored --nocapture`.
 #[test]
-#[ignore]
+#[ignore = "manual per-tool timing on a 100k-node mirror"]
 fn measure_read_costs() {
     let dir = tempfile::tempdir().unwrap();
     let session = mirrored(dir.path(), KEY_A, 100_000);
@@ -593,7 +593,7 @@ fn pending_requests_are_bounded_per_connection_and_closed_connections_are_skippe
     );
     // Inline reads from another connection are unaffected.
     let mut other = server.connect(3);
-    server.send(3, request(json!(1), "figmog_node", json!({"id": "10:1"})));
+    server.send(3, request(json!(1), "figmog_path", json!({"id": "10:1"})));
     let node: Value = serde_json::from_str(&read_line(&mut other)).unwrap();
     assert_eq!(node["id"], 1);
     assert!(node.get("error").is_none(), "{node}");
@@ -693,7 +693,7 @@ fn mirrored_doc(dir: &std::path::Path, key: &str, doc: Value) -> FileSession {
 /// library it is far too slow for the loop, which is why it runs on a
 /// read worker: `cargo test --lib measure_components_cost -- --ignored --nocapture`.
 #[test]
-#[ignore]
+#[ignore = "manual timing on a 20k-component synthetic library"]
 fn measure_components_cost() {
     let dir = tempfile::tempdir().unwrap();
     let session = mirrored_doc(dir.path(), KEY_A, synthetic_library(2_000, 10));
@@ -748,6 +748,12 @@ fn shutdown_is_bounded_by_the_exit_deadline_despite_a_stalled_read() {
         seen.recv_timeout(Duration::from_secs(10)).unwrap(),
         "figmog_stats"
     );
+    // Configure before shutdown: macOS rejects timeout changes on an
+    // already-closed Unix socket.
+    client
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     let start = Instant::now();
     server.stop();
     let elapsed = start.elapsed();
@@ -756,10 +762,6 @@ fn shutdown_is_bounded_by_the_exit_deadline_despite_a_stalled_read() {
         "shutdown took {elapsed:?} with a {drain:?} exit deadline"
     );
     // The stalled read's response was not owed past the deadline.
-    client
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
     let mut line = String::new();
     assert!(
         client.read_line(&mut line).map_or(true, |n| n == 0),
@@ -767,4 +769,139 @@ fn shutdown_is_bounded_by_the_exit_deadline_despite_a_stalled_read() {
     );
     // The detached read still completes against its own leased view.
     release.send(()).unwrap();
+}
+
+/// All node payloads use workers, including wide children and raw geometry.
+#[test]
+fn wide_and_geometry_heavy_nodes_run_on_workers_without_blocking_inline_reads() {
+    for wide in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let children: Vec<Value> = (0..if wide { 512 } else { 1 })
+            .map(|n| {
+                json!({"id": format!("1:{n}"), "name": "Shape", "type": "VECTOR",
+                "fillGeometry": [{"path": "M0 0 L1 1 ".repeat(if wide { 1 } else { 100_000 })}]})
+            })
+            .collect();
+        let doc = json!({"name": "Wide or geometry-heavy", "version": "1",
+        "lastModified": "2026-01-01T12:00:00Z", "document": {
+            "id": "0:0", "name": "Document", "type": "DOCUMENT", "children": [{
+                "id": "0:1", "name": "Page", "type": "CANVAS", "children": children
+            }]}});
+        let session = mirrored_doc(dir.path(), KEY_A, doc);
+        let line = request(
+            json!(1),
+            "figmog_node",
+            json!({"id": if wide { "0:1" } else { "1:0" }, "children": true}),
+        );
+        let expected = inline_frame(&session, &line, ToolErrorMode::McpContent);
+        let mut manager = manager_of(dir.path(), vec![session]);
+        let (mut offload, seen, release) = gated_offload("figmog_node");
+        let call = begin(&mut manager, &mut offload, &line).expect("node is deferred");
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "figmog_node"
+        );
+        let pages = begin(
+            &mut manager,
+            &mut offload,
+            &request(json!(2), "figmog_pages", json!({})),
+        )
+        .expect_err("pages stays inline");
+        assert_eq!(pages["result"]["isError"], false, "{pages}");
+        release.send(()).unwrap();
+        assert_eq!(finish(&offload, call), expected);
+    }
+}
+
+#[test]
+fn global_read_queue_rejects_overflow_without_leaking_leases_or_replies() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = mirrored(dir.path(), KEY_A, 100);
+    let mut manager = manager_of(dir.path(), vec![session]);
+    let (mut offload, seen, release) = gated_offload("*");
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, 4);
+    let mut calls = Vec::new();
+    for id in 0..workers {
+        calls.push(
+            begin(
+                &mut manager,
+                &mut offload,
+                &request(json!(id), "figmog_stats", json!({})),
+            )
+            .unwrap(),
+        );
+    }
+    for _ in 0..workers {
+        seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+    for id in 0..super::super::reads::MAX_QUEUED_READS {
+        calls.push(
+            begin(
+                &mut manager,
+                &mut offload,
+                &request(json!(id + workers), "figmog_stats", json!({})),
+            )
+            .unwrap(),
+        );
+    }
+    let over = begin(
+        &mut manager,
+        &mut offload,
+        &request(json!("over"), "figmog_stats", json!({})),
+    )
+    .unwrap();
+    let refused: Value = serde_json::from_str(&finish(&offload, over)).unwrap();
+    assert_eq!(refused["id"], "over");
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("too many queued reads")
+    );
+
+    // Dequeuing one job frees a slot even while that next job is paused.
+    release.send(()).unwrap();
+    seen.recv_timeout(Duration::from_secs(10)).unwrap();
+    calls.push(
+        begin(
+            &mut manager,
+            &mut offload,
+            &request(json!("recovered"), "figmog_stats", json!({})),
+        )
+        .unwrap(),
+    );
+    for _ in 0..calls.len() {
+        release.send(()).unwrap();
+    }
+    let mut tokens = std::collections::BTreeSet::new();
+    for _ in 0..calls.len() {
+        let done = offload
+            .done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        assert!(tokens.insert(done.token), "duplicate reply");
+        let call = calls
+            .iter()
+            .find(|call| call.token() == done.token)
+            .unwrap()
+            .clone();
+        let response: Value = serde_json::from_str(&answer_frame(done.answer, call)).unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+    }
+    assert!(offload.done_rx.try_recv().is_err());
+    // Every accepted and refused task released its lease, so reset proceeds.
+    manager.begin_reset(KEY_A, StoreReset::Reopen).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let finished = manager.service_resets();
+        if !finished.is_empty() {
+            assert_eq!(finished, vec![(KEY_A.to_string(), Ok(()))]);
+            break;
+        }
+        assert!(Instant::now() < deadline, "read queue leaked a lease");
+        std::thread::yield_now();
+    }
 }

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 pub(super) const LOCK_NAME: &str = ".figmog-lock";
 
+#[derive(Debug)]
 pub(super) struct StoreOwner {
     pub(super) path: PathBuf,
     // Fresh resets preserve both this inode and its containing directory.
@@ -223,6 +224,7 @@ impl<T> OwnedStore<T> {
 /// A closed store whose ownership is kept for a pending compaction
 /// ([`OwnedStore::close_for_compaction`]). Dropping it unrun just releases
 /// the store.
+#[derive(Debug)]
 pub(crate) struct Compaction {
     owner: StoreOwner,
 }

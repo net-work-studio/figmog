@@ -374,7 +374,7 @@ fn concurrent_relays_elect_exactly_one_owner() {
         );
         let socket = PathBuf::from(record["socket"].as_str().unwrap());
         assert!(socket.as_os_str().len() < 104, "{}", socket.display());
-        assert!(socket.starts_with("/tmp"), "{}", socket.display());
+        assert!(socket.is_absolute(), "{}", socket.display());
         for relay in relays {
             relay.finish();
         }
@@ -533,8 +533,23 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
     let root = repo.path().join(".git/figmog");
     std::fs::create_dir_all(&root).unwrap();
     let root = std::fs::canonicalize(&root).unwrap();
-    let socket = repo.path().join("old.sock");
+    let runtime = tempfile::tempdir().unwrap();
+    let runtime_path = runtime.path().join("figmog");
+    std::fs::create_dir(&runtime_path).unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&runtime_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hash = root
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let socket = runtime_path.join(format!("{hash:016x}.sock"));
     let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let record = json!({"generation": "old", "pid": 4_000_000u64, "project": root.display().to_string(),
         "protocol": 1, "socket": socket.display().to_string(), "version": "0.0.1"});
     std::fs::write(root.join("owner.json"), record.to_string()).unwrap();
@@ -562,6 +577,7 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
         });
     }
     let output = relay_command(repo.path(), &["--no-watch", "--no-upstream"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -581,6 +597,7 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
 
     let out = common::command()
         .args(["call", "figmog_files"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
         .current_dir(repo.path())
         .output()
         .unwrap();
@@ -1131,8 +1148,8 @@ fn three_worktrees_share_one_mirror_and_one_edit_pulls_once() {
     // errors anywhere.
     let readers: Vec<_> = cwds
         .iter()
-        .cloned()
         .map(|cwd| {
+            let cwd = cwd.clone();
             std::thread::spawn(move || {
                 for _ in 0..5 {
                     let out = common::command()
@@ -1220,5 +1237,131 @@ fn three_worktrees_share_one_mirror_and_one_edit_pulls_once() {
         "{reconciled} fetches after a restart"
     );
     relay.finish();
+    wait_owner_gone(repo.path());
+}
+
+/// The detached owner must not keep a harness's inherited stream alive.
+#[test]
+fn detached_owner_closes_inherited_non_cloexec_descriptors() {
+    use std::os::fd::AsRawFd;
+    let repo = repo();
+    let (mut reader, inherited) = std::os::unix::net::UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    use std::os::unix::process::CommandExt;
+    let mut command = relay_command(repo.path(), &["--no-watch", "--no-upstream"]);
+    command.env("FIGMOG_OWNER_IDLE_MS", "60000");
+    let fd = inherited.as_raw_fd();
+    // SAFETY: only async-signal-safe fcntl runs in the child. Clear CLOEXEC
+    // there, leaving the test process unable to leak this fd to parallel tests.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut relay = spawn_relay(&mut command);
+    drop(inherited);
+    relay.initialize();
+    let pid = relay.owner_pid();
+    // SAFETY: querying the session of the live owner launched above.
+    assert_eq!(
+        unsafe { libc::getsid(pid as libc::pid_t) },
+        pid as libc::pid_t
+    );
+    relay.finish();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let result = loop {
+        match reader.read(&mut [0]) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => break result,
+        }
+    };
+    // SAFETY: this pid is the owner the test launched and kept alive above.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    wait_owner_gone(repo.path());
+    assert_eq!(
+        result.unwrap(),
+        0,
+        "the owner inherited a harness descriptor"
+    );
+}
+
+#[test]
+fn termination_signals_run_owner_cleanup() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let repo = repo();
+        let mut child = Command::new(assert_cmd::cargo::cargo_bin!("figmog"))
+            .args(["serve", "--background", "--no-watch", "--no-upstream"])
+            .current_dir(repo.path())
+            .env("FIGMA_TOKEN", "")
+            .env("FIGMOG_OWNER_IDLE_MS", "60000")
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_until("owner discovery", || discovery(repo.path()).is_some());
+        let socket = PathBuf::from(discovery(repo.path()).unwrap()["socket"].as_str().unwrap());
+        // SAFETY: the signal targets this test's live child only.
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("signal {signal} did not stop the owner");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "{status}");
+        assert!(discovery(repo.path()).is_none());
+        assert!(!socket.exists());
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(stderr.contains("exited"), "{stderr}");
+    }
+}
+
+#[test]
+fn clients_with_different_runtime_environments_share_the_existing_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo();
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut first = spawn_relay(
+        relay_command(repo.path(), &["--no-watch", "--no-upstream"])
+            .env("XDG_RUNTIME_DIR", runtime.path()),
+    );
+    first.initialize();
+    let owner = first.owner_pid();
+    let socket = PathBuf::from(discovery(repo.path()).unwrap()["socket"].as_str().unwrap());
+    assert!(socket.starts_with(runtime.path()));
+    let mut second = spawn_relay(
+        relay_command(repo.path(), &["--no-watch", "--no-upstream"]).env_remove("XDG_RUNTIME_DIR"),
+    );
+    second.initialize();
+    assert_eq!(second.owner_pid(), owner);
+    let output = common::command()
+        .args(["call", "figmog_files"])
+        .env_remove("XDG_RUNTIME_DIR")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    first.finish();
+    second.finish();
     wait_owner_gone(repo.path());
 }

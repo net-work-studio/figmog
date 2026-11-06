@@ -102,6 +102,7 @@ fn call(id: Value, name: &str) -> String {
 struct Server {
     tx: mpsc::Sender<Incoming>,
     stdout: mpsc::Receiver<Value>,
+    buffered: std::cell::RefCell<std::collections::VecDeque<Value>>,
     conns: [BufReader<UnixStream>; 2],
     thread: Option<std::thread::JoinHandle<Result<(), String>>>,
     _harness: (
@@ -149,6 +150,7 @@ impl Server {
         Self {
             tx,
             stdout,
+            buffered: Default::default(),
             conns,
             thread: Some(thread),
             _harness: (release, entered, _dir),
@@ -156,15 +158,29 @@ impl Server {
     }
 
     fn stdio(&self, line: String) -> Value {
+        let id = serde_json::from_str::<Value>(&line).unwrap()["id"].clone();
         self.tx.send(Incoming::Stdio(line)).unwrap();
-        self.next_stdio()
+        loop {
+            let frame = self.stdout.recv_timeout(EXPECT).expect("a stdio response");
+            if frame.get("id") == Some(&id) {
+                return frame;
+            }
+            self.buffered.borrow_mut().push_back(frame);
+        }
     }
 
     fn next_stdio(&self) -> Value {
-        self.stdout.recv_timeout(EXPECT).expect("a stdio frame")
+        self.buffered
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| self.stdout.recv_timeout(EXPECT).expect("a stdio frame"))
     }
 
     fn assert_stdio_silent(&self, for_: Duration) {
+        assert!(
+            self.buffered.borrow().is_empty(),
+            "unexpected buffered stdio frames"
+        );
         if let Ok(frame) = self.stdout.recv_timeout(for_) {
             panic!("unexpected stdio frame {frame}");
         }
@@ -238,22 +254,107 @@ fn list_changed() -> Value {
 /// Both initializing clients get `initialize`'s `listChanged` capability
 /// and later the notifications; the non-initializing socket client gets
 /// neither.
-fn initialize_clients(server: &mut Server) {
+fn initialize_clients(server: &mut Server, list_changed: bool) {
     let init = request(json!(1), "initialize", json!({}));
     let response = server.stdio(init.clone());
     assert_eq!(
         response["result"]["capabilities"]["tools"],
-        json!({"listChanged": true})
+        json!({"listChanged": list_changed})
     );
     let response = server.socket(0, init);
     assert_eq!(response["id"], 1);
 }
 
 #[test]
+fn only_changes_to_the_exposed_registry_notify_clients() {
+    struct ChangingRegistry {
+        current: Vec<Value>,
+        next: Arc<Mutex<Vec<Value>>>,
+        refreshes: Arc<AtomicUsize>,
+    }
+
+    impl UpstreamMcp for ChangingRegistry {
+        fn initialize(&mut self) -> Result<(), UpstreamError> {
+            self.refresh_tools()
+        }
+
+        fn tools(&self) -> &[Value] {
+            &self.current
+        }
+
+        fn refresh_tools(&mut self) -> Result<(), UpstreamError> {
+            self.current = self.next.lock().unwrap().clone();
+            self.refreshes.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+
+        fn call(&mut self, _: &str, _: &Value) -> Result<Value, UpstreamError> {
+            unreachable!("registry-only test")
+        }
+
+        fn ping(&mut self) -> Result<(), UpstreamError> {
+            Ok(())
+        }
+    }
+
+    let mut initial = desktop_tools();
+    initial.push(json!({"name":"figmog_status", "description":"hidden A"}));
+    let next = Arc::new(Mutex::new(initial.clone()));
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let worker = DesktopWorker::spawn_with(
+        ChangingRegistry {
+            current: initial,
+            next: next.clone(),
+            refreshes: refreshes.clone(),
+        },
+        true,
+        fast(),
+    );
+    let mut server = Server::start(Some(worker));
+    initialize_clients(&mut server, true);
+    let before = server.stdio(request(json!(2), "tools/list", json!({})))["result"].clone();
+
+    let count = refreshes.load(Ordering::Acquire);
+    {
+        let mut updated = next.lock().unwrap();
+        updated[1]["description"] = json!("hidden B");
+        // The proxy exposes name, prefixed description and inputSchema;
+        // an unsupported raw field cannot change tools/list either.
+        updated[0]["internalMetadata"] = json!("changed");
+        updated.push(json!({"description":"no tool name"}));
+    }
+    let deadline = Instant::now() + EXPECT;
+    while refreshes.load(Ordering::Acquire) == count {
+        assert!(Instant::now() < deadline, "desktop was not refreshed");
+        std::thread::yield_now();
+    }
+    server.assert_stdio_silent(Duration::from_millis(200));
+    server.assert_socket_silent(0);
+    let after = server.stdio(request(json!(3), "tools/list", json!({})))["result"].clone();
+    assert_eq!(before, after);
+
+    next.lock().unwrap()[0]["description"] = json!("Updated code tool");
+    assert_eq!(server.next_stdio(), list_changed());
+    assert_eq!(server.next_socket(0), list_changed());
+    let exposed = server.stdio(request(json!(4), "tools/list", json!({})));
+    assert_eq!(
+        exposed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["description"],
+        "[via Figma desktop] Updated code tool"
+    );
+    server.assert_stdio_silent(Duration::from_millis(100));
+    server.assert_socket_silent(1);
+    server.finish();
+}
+
+#[test]
 fn desktop_tools_appear_and_disappear_with_notifications_only_to_initialized_clients() {
     let (desktop, worker) = desktop(false, fast());
     let mut server = Server::start(Some(worker));
-    initialize_clients(&mut server);
+    initialize_clients(&mut server, true);
     assert!(!server.tool_names(2).contains(&"get_code".to_string()));
     assert_eq!(server.upstream_status(3), "unreachable");
 
@@ -297,7 +398,7 @@ fn desktop_tools_appear_and_disappear_with_notifications_only_to_initialized_cli
 fn calling_a_missing_desktop_tool_rechecks_the_desktop_at_once() {
     let (desktop, worker) = desktop(false, never());
     let mut server = Server::start(Some(worker));
-    initialize_clients(&mut server);
+    initialize_clients(&mut server, true);
     let handshakes = desktop.handshakes.load(Ordering::Relaxed);
     desktop.up.store(true, Ordering::Relaxed);
 
@@ -325,7 +426,7 @@ fn calling_a_missing_desktop_tool_rechecks_the_desktop_at_once() {
 fn a_failed_desktop_call_rechecks_and_removes_a_vanished_desktop() {
     let (desktop, worker) = desktop(true, never());
     let mut server = Server::start(Some(worker));
-    initialize_clients(&mut server);
+    initialize_clients(&mut server, true);
     assert_eq!(server.upstream_status(2), "connected");
     desktop.up.store(false, Ordering::Relaxed);
 
@@ -376,7 +477,7 @@ fn a_failed_call_to_a_live_desktop_changes_nothing() {
     });
     upstream.initialize().unwrap();
     let mut server = Server::start(Some(DesktopWorker::spawn_with(upstream, true, never())));
-    initialize_clients(&mut server);
+    initialize_clients(&mut server, true);
     let response = server.stdio(call(json!(2), "get_code"));
     assert!(
         response["result"]["content"][0]["text"]
@@ -402,7 +503,7 @@ fn without_an_upstream_nothing_is_probed_or_announced() {
     // `--no-upstream` builds no desktop worker: there is nothing to probe,
     // a desktop tool name is simply unknown, and status stays disabled.
     let mut server = Server::start(None);
-    initialize_clients(&mut server);
+    initialize_clients(&mut server, false);
     let response = server.stdio(call(json!(2), "get_code"));
     assert_eq!(
         response["result"]["content"][0]["text"],

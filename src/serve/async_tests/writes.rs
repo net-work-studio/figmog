@@ -14,6 +14,7 @@ struct Live {
     tx: mpsc::Sender<Incoming>,
     thread: Option<std::thread::JoinHandle<Result<(), String>>>,
     socket: PathBuf,
+    root: StoreRoot,
     _dir: tempfile::TempDir,
 }
 
@@ -28,6 +29,7 @@ impl Live {
         let (tx, rx) = mpsc::channel();
         let registry: ConnRegistry = Arc::default();
         spawn_socket_acceptor(listener, tx.clone(), registry.clone());
+        let root = manager.root.clone();
         let thread = std::thread::spawn(move || {
             serve_loop_with_offload(
                 manager,
@@ -45,6 +47,7 @@ impl Live {
             tx,
             thread: Some(thread),
             socket,
+            root,
             _dir: dir,
         }
     }
@@ -53,8 +56,17 @@ impl Live {
     fn write(
         &self,
         tool: &'static str,
-        args: Value,
+        mut args: Value,
     ) -> std::thread::JoinHandle<Result<Value, String>> {
+        args["db"] = json!(
+            canonical_store_path(
+                &self
+                    .root
+                    .store_path(args["file"].as_str().unwrap())
+                    .unwrap()
+            )
+            .unwrap()
+        );
         let stream = UnixStream::connect(&self.socket).unwrap();
         std::thread::spawn(move || crate::cli::write_over_stream(stream, tool, args))
     }
@@ -64,8 +76,17 @@ impl Live {
     fn write_local(
         &self,
         tool: &'static str,
-        args: Value,
+        mut args: Value,
     ) -> std::thread::JoinHandle<Result<Value, String>> {
+        args["db"] = json!(
+            canonical_store_path(
+                &self
+                    .root
+                    .store_path(args["file"].as_str().unwrap())
+                    .unwrap()
+            )
+            .unwrap()
+        );
         let root = self.socket.parent().unwrap().to_path_buf();
         std::thread::spawn(move || crate::cli::write_over_local(&root, tool, args))
     }
@@ -453,4 +474,46 @@ fn a_vanished_owner_leaves_the_outcome_unknown_and_is_not_retried() {
     let (request, rest) = owner.join().unwrap();
     assert!(request.contains(PULL));
     assert!(rest.is_empty(), "the write was sent again: {rest}");
+}
+
+#[test]
+fn shutdown_deadline_covers_a_blocked_synchronous_fresh_reopen() {
+    let h = Harness::new();
+    let Harness {
+        release,
+        entered,
+        mut manager,
+        ..
+    } = h;
+    let (reopening, seen_reopen) = mpsc::channel();
+    let (resume, wait) = mpsc::channel();
+    let wait = Arc::new(Mutex::new(wait));
+    manager.sessions[0].before_reopen(Arc::new(move || {
+        reopening.send(()).unwrap();
+        wait.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+    }));
+    let mut offload = Offload::new(None);
+    offload.exit_drain = Duration::from_millis(300);
+    let mut live = Live::start(manager, offload);
+    let fresh = live.write(PULL, json!({"file": KEY, "fresh": true}));
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    live.tx.send(Incoming::StdinClosed).unwrap();
+    // Give the serving thread time to enter shutdown before validation finishes.
+    std::thread::sleep(Duration::from_millis(50));
+    release.send(()).unwrap();
+    seen_reopen.recv_timeout(Duration::from_secs(5)).unwrap();
+    let returned = Instant::now() + Duration::from_secs(2);
+    while !live.thread.as_ref().unwrap().is_finished() {
+        assert!(
+            Instant::now() < returned,
+            "shutdown waited on synchronous reopen"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    live.thread.take().unwrap().join().unwrap().unwrap();
+    resume.send(()).unwrap();
+    let _ = fresh.join().unwrap();
 }
