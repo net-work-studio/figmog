@@ -1,0 +1,19 @@
+src/cli/call.rs
+  s_d00caf59bef041::t_2307ae4ebc8a3b 112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "58f876395a374d29a090cd407ceecf079aece650",
+  "prompts": {},
+  "sessions": {
+    "s_d00caf59bef041": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa7-9721-7ac1-9380-ea52571e7db3",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
