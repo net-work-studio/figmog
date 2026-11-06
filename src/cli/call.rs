@@ -109,7 +109,7 @@ pub(super) fn cmd_import_variables_routed(
 /// so an unreadable or invalid file leaves the previous snapshot untouched.
 fn load_import(path: &std::path::Path) -> Result<(Vec<u8>, crate::vars::ParsedSnapshot), String> {
     let invalid = |e: String| format!("invalid variables file {}: {e}", path.display());
-    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| invalid(e.to_string()))?;
     let v: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
     crate::vars::check_import_entries(&v).map_err(|e| invalid(e.to_string()))?;
     let parsed = crate::vars::parse_variables_snapshot(
