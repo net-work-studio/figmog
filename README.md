@@ -252,8 +252,11 @@ back off. See `docs/SPEC.md` §14.
 
 `figmog images <node-id>...` downloads node renders plus the image fills
 those nodes reference, writes them to `--out` (default `./figmog-images/`),
-and prints a manifest. Bytes are cached against the file version, so asking
-again for an unedited file spends nothing. Nothing in figmog fetches images
+and prints a manifest. Bytes are cached until a pull changes the mirrored
+version, modification time or records, so asking again for an unchanged
+mirror spends nothing. Figma can reuse a version ID across live edits;
+version-pinned requests alone do not guarantee a historical render after
+upstream edits or deletion. Nothing in figmog fetches images
 on its own, because Figma's images endpoints are its most rate-limited. See
 `docs/SPEC.md` §15.
 
@@ -263,8 +266,13 @@ misses produce per-item errors. To fetch missing images, run
 `figmog pull <file-key-or-url>`, then `figmog images <node-id>...` without
 `--db`. A node URL in the images arguments selects a node within the chosen
 store; it does not supply the store's file identity.
-Renders cached by older builds without a version pin need to be fetched
+Renders cached by older builds without a current-generation version pin need to be fetched
 again through a file-keyed mirror before this build can export them offline.
+That first refetch requires credentials and spends API budget again. If
+credentials are unavailable, the error explains how to restore them.
+Restart any running `figmog serve` with the updated environment when
+using `FIGMA_TOKEN`, then retry the image request. The existing cached
+bytes remain on disk.
 
 ### Freshness is polling, not push
 
