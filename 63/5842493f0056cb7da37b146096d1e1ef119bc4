@@ -1,0 +1,49 @@
+examples/slice/evidence/COMMENT.md
+  s_3710a1eb3547ff::t_8e85a85df0b22b 9,11,38-41
+examples/slice/app/scripts/lib.mjs
+  s_3710a1eb3547ff::t_8e85a85df0b22b 141-142,147-154,246-268
+examples/slice/evidence/broken/1440/manifest.json
+  s_3710a1eb3547ff::t_8e85a85df0b22b 6,12,18,28,64,72,108,116,152,195-196,200-201
+examples/slice/evidence/correct/390/manifest.json
+  s_3710a1eb3547ff::t_8e85a85df0b22b 6,12,18,28,64,72,108,116,152,200-201
+examples/slice/figma/card-render-1440.manifest.json
+  s_3710a1eb3547ff::t_8e85a85df0b22b 5
+examples/slice/README.md
+  s_3710a1eb3547ff::t_8e85a85df0b22b 40-43,57-60,64-65,118-119
+examples/slice/evidence/broken/390/manifest.json
+  s_3710a1eb3547ff::t_8e85a85df0b22b 6,12,18,28,64,72,108,116,152,195-196,200-201
+examples/slice/evidence/correct/1440/manifest.json
+  s_3710a1eb3547ff::t_8e85a85df0b22b 6,12,18,28,64,72,108,116,152,200-201
+examples/slice/app/test/slice.test.mjs
+  s_3710a1eb3547ff::t_8e85a85df0b22b 25,28,152-159
+  s_3710a1eb3547ff::t_9aba90fc0a972d 160-161
+examples/slice/figma/card-render.json
+  s_3710a1eb3547ff::t_8e85a85df0b22b 6,12,16,21-22
+examples/slice/app/test/provenance.test.mjs
+  s_3710a1eb3547ff::t_8e85a85df0b22b 1-96
+examples/slice/evidence/evidence.json
+  s_3710a1eb3547ff::t_8e85a85df0b22b 5,14,23,60,64,69-70,81,85,89,93,97,101,106-107,114,118,122,126,130,134,139-140,149,153,157,161,165,169,175,182,186,190,194,198,202,208
+  s_3710a1eb3547ff::t_5e4f66d8512277 9,18,27,216,221
+examples/slice/figma/card-render-390.manifest.json
+  s_3710a1eb3547ff::t_8e85a85df0b22b 5
+examples/slice/app/scripts/slice.mjs
+  s_3710a1eb3547ff::t_8e85a85df0b22b 24,38,75,80,159,161,166,233-234
+src/serve/async_tests/isolation.rs
+  s_3710a1eb3547ff::t_8e85a85df0b22b 580-584,747-751
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "635842493f0056cb7da37b146096d1e1ef119bc4",
+  "prompts": {},
+  "sessions": {
+    "s_3710a1eb3547ff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c47b-dae1-7b01-bd55-952da11daa84",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
