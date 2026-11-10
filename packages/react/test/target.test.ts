@@ -75,6 +75,25 @@ describe("target manifest", () => {
     }
     assert.throws(() => parseTargets("{", "t.json"), /t\.json: \$: not JSON/);
   });
+
+  test("rejects URL separator escapes and control characters in routes", () => {
+    const target = MANIFEST.targets[0];
+    const routes = ["/\\evil.example/x", "/\t/evil.example/x", "/\n/evil.example/x", "/\r/evil.example/x"];
+    for (let code = 0; code <= 0x9f; code++) {
+      if (code < 0x20 || code >= 0x7f) routes.push(`/card${String.fromCharCode(code)}.html`);
+    }
+    for (const route of routes) {
+      assert.throws(
+        () => parseTargets(JSON.stringify({ version: 1, targets: [{ ...target, route }] }), "t.json"),
+        /t\.json: targets\[0\]\.route: expected a path on the dev server/,
+        JSON.stringify(route),
+      );
+    }
+    assert.equal(
+      parseTargets(JSON.stringify({ version: 1, targets: [{ ...target, route: "/card.html?next=%2F%2Fevil.example" }] }))[0]?.route,
+      "/card.html?next=%2F%2Fevil.example",
+    );
+  });
 });
 
 describe("captureTarget", () => {

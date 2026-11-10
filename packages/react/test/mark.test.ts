@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
+import { transformWithOxc } from "vite";
 import { markModule, type MarkSpec } from "../src/mark.js";
 
 const SPEC: MarkSpec = { exportName: "Card", figma: "component_set:abc", node: "10:1" };
@@ -12,12 +13,12 @@ function mark(code: string, specs: MarkSpec[] = [SPEC], file = "Card.tsx") {
 describe("markModule", () => {
   test("marks the root element of a function declaration, arrow and default export", () => {
     const cases: [string, string][] = [
-      ["export function Card() { return <div className=\"c\">x</div>; }", `<div className="c"${ATTRS}>x</div>`],
+      ["export function Card() { return <div className=\"c\">x</div>; }", `<div${ATTRS} className="c">x</div>`],
       ["export const Card = () => (<section>x</section>);", `<section${ATTRS}>x</section>`],
-      ["export const Card = (p: {a: string}) => <hr />;", `<hr ${ATTRS}/>`],
+      ["export const Card = (p: {a: string}) => <hr />;", `<hr${ATTRS} />`],
       ["export default function Card() { return <main/>; }", `<main${ATTRS}/>`],
       ["function Local() { return <i>é</i>; }\nexport { Local as Card };", `<i${ATTRS}>é</i>`],
-      ["export const Card = memo(forwardRef((p, ref) => <b ref={ref} />));", `<b ref={ref} ${ATTRS}/>`],
+      ["export const Card = memo(forwardRef((p, ref) => <b ref={ref} />));", `<b${ATTRS} ref={ref} />`],
       ["export const Card = React.memo(function Card() { return <p>x</p>; });", `<p${ATTRS}>x</p>`],
     ];
     for (const [code, expected] of cases) {
@@ -25,6 +26,41 @@ describe("markModule", () => {
       assert.deepEqual(outcome.marked, ["Card"], code);
       assert.ok(outcome.code?.includes(expected), `${code}\n=> ${outcome.code}`);
     }
+  });
+
+  test("caller markers in spread props override automatic defaults", async () => {
+    const outcome = mark("export const Card = props => <div {...props}/>;", [SPEC], "Card.jsx");
+    assert.deepEqual(outcome.marked, ["Card"]);
+    assert.ok(outcome.code?.includes(`<div${ATTRS} {...props}/>`));
+    const compiled = await transformWithOxc(outcome.code ?? "", "Card.jsx", {
+      jsx: { development: false, pragma: "h", runtime: "classic" },
+    });
+    // Evaluate Vite's actual JSX transform with an element factory that exposes
+    // its final props, so the assertion checks spread precedence at runtime.
+    const render = new Function("h", `${compiled.code.replace("export const Card", "const Card")}\nreturn Card;`)(
+      (_tag: string, props: Record<string, unknown>) => props,
+    ) as (props: Record<string, unknown>) => Record<string, unknown>;
+    assert.deepEqual(render({}), { "data-figmog": SPEC.figma, "data-figmog-node": SPEC.node });
+    const explicit = { "data-figmog": "component:explicit", "data-figmog-node": "2:1" };
+    assert.deepEqual(render(explicit), explicit);
+  });
+
+  test("skips all mappings whose aliased exports resolve to one component", () => {
+    const code = "const Local = () => <div/>; export {Local as Card, Local as Panel};";
+    const specs = [SPEC, { exportName: "Panel", figma: "component:panel", node: "2:1" }];
+    const outcome = mark(code, specs);
+    assert.equal(outcome.code, null);
+    assert.deepEqual(outcome.marked, []);
+    assert.deepEqual(outcome.skipped.map(({ exportName }) => exportName), ["Card", "Panel"]);
+    for (const { reason } of outcome.skipped) assert.match(reason, /several .* entries resolve to this component/);
+    assert.deepEqual(mark(code, [...specs].reverse()), outcome);
+  });
+
+  test("skips repeated mappings of one export without inserting duplicate attributes", () => {
+    const outcome = mark("export const Card = () => <div/>;", [SPEC, { ...SPEC, figma: "component:other" }]);
+    assert.equal(outcome.code, null);
+    assert.deepEqual(outcome.marked, []);
+    assert.equal(outcome.skipped.length, 2);
   });
 
   test("marks every branch that renders an element, ignores null returns and nested functions", () => {

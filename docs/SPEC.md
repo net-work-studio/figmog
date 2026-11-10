@@ -932,8 +932,9 @@ removes the record at exit if it is still its own.
 `{"method": "figmog/hello", "id": "figmog-hello", "params": {"client":
 "relay"|"cli", "project", "version", "protocol", "settings"?, "attach"?}}`.
 The owner refuses a different project, binary version or protocol version
-(currently 1) with error `-32002` and an explanation; the client checks the
-owner's answer `{"attach_errors", "generation", "pid", "project",
+(currently 2: image refresh/reuse policies require owner support) with error
+`-32002` and an explanation; the client checks the owner's answer
+`{"attach_errors", "generation", "pid", "project",
 "protocol", "settings", "version"}` the same way. Either way the relay (and
 the CLI) stops with that explanation — "let it exit (it stops on its own
 after it has had no clients for a while), or stop it now with `kill <pid>`"
@@ -1780,7 +1781,9 @@ long as that fingerprint is unchanged — editing one frame leaves the
 cached renders of unrelated frames valid. Reuse is **off by default**:
 until the rendering contract is confirmed against Figma's images endpoint
 (below), a request without the opt-in behaves exactly as described
-above and never reads or writes the fingerprint tables.
+above and never reads or writes the fingerprint tables, except that an
+explicit refresh invalidates matching fingerprint rows after a successful
+download so a later opted-in request cannot return pre-refresh bytes.
 
 - **Fingerprint** (`images::render_fingerprint`, computed lazily at
   render time from the mirror, never during a pull): SHA-256 over the
@@ -1815,10 +1818,12 @@ above and never reads or writes the fingerprint tables.
   refetched, repairing the blob).
 - **Force refresh.** `--refresh` (tool: `refresh: true`) ignores every
   cached render, per-version and fingerprinted, and fetches again; a
+  successful download also updates or invalidates the other cache's
+  representation of that render, regardless of the reuse policy. A
   refetched fingerprinted render replaces its index row, and the blob it
   displaced is dropped once nothing references it. Fills are unaffected.
-- **Eviction**, after every opted-in request that wrote a fingerprinted
-  render or found orphans, in two separate passes over the index ordered
+- **Eviction**, during render-write maintenance, in two separate passes
+  over the index ordered
   oldest first (`seq`, then fingerprint as a deterministic tie-break;
   `images::plan_render_eviction`): **orphan cleanup** removes every row
   whose fingerprint no node has any more (its subject's current
@@ -1827,7 +1832,13 @@ above and never reads or writes the fingerprint tables.
   256 MiB of distinct blobs) removes the oldest remaining rows, still
   valid or not, until the cache fits. A blob goes when no remaining row
   references it. The version-change pass (§5) never touches these
-  tables; `pull --fresh` wipes them with the rest of the store.
+  tables; `pull --fresh` wipes them with the rest of the store. Requested
+  hits use keyed lookups; cache-only and fills-only calls never scan the
+  index for orphans. Write maintenance validates the full index, even at
+  an unchanged version (a geometry pull can change stored raw data without
+  changing the Figma version). Sibling-mask checks share one parsed prefix
+  per parent within a request. With no usable mirror version, fingerprint
+  rows are neither read nor maintained.
 - **Unconfirmed contract.** The claim that a single-node export shows
   nothing outside the node's subtree (no ancestor effects) has not been
   checked against the live REST images endpoint — figmog's suite has no
@@ -2912,9 +2923,12 @@ own body returns. It marks only when **every** return is a DOM element
 (lowercase JSX tag), `null`, or a conditional of those; a fragment, a
 component element (`<Card>` — its props may not reach the DOM), an array or
 anything else skips the whole component with a dev-server warning, and so
-does a root that already has `data-figmog` (explicit markers win) or an
-export two map entries name. Settings, map and node ids are read once,
-when the dev server starts (restart it after editing them). Dev source maps are not adjusted for the
+does a root that already has `data-figmog` (explicit markers win) or a
+component several map entries resolve to, including aliased exports and
+equivalent paths. Automatic attributes precede JSX spreads, so explicit
+markers supplied through props also win. Settings, map and node ids are
+read once, when the dev server starts (restart it after editing them).
+Dev source maps are not adjusted for the
 inserted text (columns after it on that line shift). Attributes are
 optional because one component renders many instances (every Pro and Free
 card carries the same attributes), fragments have no single root and
@@ -2942,14 +2956,20 @@ anything is forwarded:
   middleware runs first and allows every localhost origin by default, so
   another local dev server's page (another project) can send a request:
   the bridge refuses it and removes the CORS headers from every answer, so
-  no other origin can read one.
+  no other origin can read one. With the bridge enabled, cross-origin
+  requests for dev pages and assets are refused before HTML rendering,
+  removing any CORS headers Vite already added. Another localhost origin
+  cannot read the HTML's injected session token.
 - **Allowlist.** The 18 local reads (§6 "Read adapters") plus
   `figmog_images` (renders; `refresh: true` refused). Not `figmog_open`,
   `figmog_sync`, `figmog_files`, the internal write tools, `tools/list`
   or any desktop-proxy tool.
 - **This project's files.** An explicit `file`, and a Figma URL naming a
   file in `id`/`under`/`target`, must be one of figmog.toml's `[files]`
-  keys; without one, the relay's worktree default applies (§6b).
+  keys. The bridge explicitly pins every forwarded call to an allowlisted
+  file, using the declared `[files] default` when the call supplies none.
+  Without a declared default, calls must identify an allowlisted file;
+  the relay's `.figmog/current` fallback is never trusted.
 - **No credentials.** The Figma token stays in figmog's own processes; the
   bridge forwards tool calls and returns their results only.
 
@@ -2959,10 +2979,11 @@ plugin's `serveArgs` (default none: the same settings an agent's relay
 uses); line-delimited JSON-RPC `tools/call` frames over its stdio, matched
 by id, notifications ignored, no `initialize`. The relay finds or launches
 the repository's background owner, checks the handshake and injects the
-worktree default file and `figmog_spec`'s project settings — the bridge
-re-implements none of it. A relay that exits fails its pending calls (502)
+`figmog_spec`'s project settings (the bridge has already pinned the file).
+A relay that exits fails its pending calls (502)
 and is started again on the next call; closing the dev server closes its
-stdin, and the owner idles out on its own.
+stdin, and the owner idles out on its own. Each Vite plugin container owns
+its relay, so restart cleanup cannot close the replacement container's relay.
 
 **Targets.** `figmog.targets.json` at the project root:
 
@@ -2973,11 +2994,13 @@ stdin, and the owner idles out on its own.
 ```
 
 Strict: unknown keys, a duplicate or non-`[a-z0-9-]` name, a `route` that
-is not a path starting with `/` (no other host), and a `locator` that is not
-exactly one of `testid` (→ `[data-testid="…"]`) or `css` are errors naming
+is not a path starting with `/` (no other host, backslashes or control
+characters), and a `locator` that is not exactly one of `testid`
+(→ `[data-testid="…"]`) or `css` are errors naming
 the JSON path. `captureTarget` (API) / `figmog-shot target --manifest …
 --target … --base-url … --out …` (CLI, `--viewport WxH` repeatable)
-captures the target with the screenshot runner at the v1 contract viewports
+checks the resolved URL stays on the base URL's origin, then captures the
+target with the screenshot runner at the v1 contract viewports
 (1440×900 and 390×844, light) — `<target>-<W>x<H>.png` with its capture
 manifest, plus `<target>.target.json` — and fails on zero or several
 matches (`SelectorMatchError`, exit 1).

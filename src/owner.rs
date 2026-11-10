@@ -40,7 +40,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 /// Bumped whenever the relay/owner wire contract changes incompatibly.
-pub(crate) const PROTOCOL: u64 = 1;
+/// Protocol 2 requires the owner to honor image refresh/reuse policies;
+/// protocol 1 owners silently ignored those arguments at the same binary version.
+pub(crate) const PROTOCOL: u64 = 2;
 /// The handshake method, the first frame of every owner connection.
 pub(crate) const HELLO: &str = "figmog/hello";
 /// The JSON-RPC id clients use for their handshake.
@@ -824,6 +826,13 @@ mod tests {
         let mut newer = hello["params"].clone();
         newer["protocol"] = json!(PROTOCOL + 1);
         assert!(check_hello(&newer, &paths).is_err());
+        let mut policy_unaware = hello["params"].clone();
+        policy_unaware["protocol"] = json!(1);
+        assert!(
+            check_hello(&policy_unaware, &paths)
+                .unwrap_err()
+                .contains("cannot share it")
+        );
     }
 
     #[test]

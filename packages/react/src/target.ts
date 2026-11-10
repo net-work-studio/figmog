@@ -78,7 +78,7 @@ export function parseTargets(source: string, file = TARGETS_FILE): Target[] {
     names.add(name);
     const figma = object(target["figma"], file, `${at}.figma`, ["node"]);
     const route = text(target["route"], file, `${at}.route`);
-    if (!route.startsWith("/") || route.startsWith("//")) {
+    if (!route.startsWith("/") || route.startsWith("//") || /[\\\u0000-\u001f\u007f-\u009f]/u.test(route)) {
       fail(file, `${at}.route`, "expected a path on the dev server starting with /");
     }
     const locator = object(target["locator"], file, `${at}.locator`, ["css", "testid"]);
@@ -143,7 +143,12 @@ export async function captureTarget(options: TargetCaptureOptions): Promise<Targ
     const known = targets.map((t) => t.name).sort().join(", ");
     throw new Error(`${options.manifest}: no target ${JSON.stringify(options.target)} (targets: ${known || "none"})`);
   }
-  const url = new URL(target.route, options.baseUrl).href;
+  const base = new URL(options.baseUrl);
+  const resolved = new URL(target.route, base);
+  if (resolved.origin !== base.origin) {
+    throw new Error(`${options.manifest}: target ${JSON.stringify(target.name)}: route must stay on the dev server's origin`);
+  }
+  const url = resolved.href;
   const selector = locatorSelector(target.locator);
   const captures: TargetCapture[] = [];
   for (const viewport of options.viewports ?? CONTRACT_VIEWPORTS) {

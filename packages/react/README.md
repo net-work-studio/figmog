@@ -53,8 +53,10 @@ the root element of each component in `figmog.map.json` gets
 mirror knows exactly one node for it, `data-figmog-node="<id>"`. A component
 whose root is not one DOM element on every path — a fragment, another
 component, an array — is skipped with a warning on the dev server's console,
-never half-marked; so is one that already has `data-figmog`. One component
-renders many instances (every card gets the same attributes), so
+never half-marked; so is one that already has `data-figmog`, or that several
+map entries resolve to through equivalent paths or aliased exports. Explicit
+markers passed through props spreads override the automatic defaults.
+One component renders many instances (every card gets the same attributes), so
 verification captures through a `data-testid` in figmog.targets.json, not
 through these.
 
@@ -72,8 +74,11 @@ or directly: `POST /__figmog/bridge` with `{"tool", "arguments"}`, header
 `x-figmog-token: window.__FIGMOG_BRIDGE__.token`. The answer is the tool's
 MCP result. The bridge forwards to the project's background figmog through
 one `figmog serve` relay it starts on first use (the same relay an agent
-uses, so default files, the project's map and token settings, and the
-owner's handshake all come from figmog itself).
+uses, so the project's map and token settings and the owner's handshake
+come from figmog itself). The bridge pins each call to a declared file,
+using `[files] default` when none is supplied. Without a declared default,
+pass an allowlisted `file` or a Figma node URL naming one; implicit calls
+are refused even if `.figmog/current` names a mirrored file.
 
 Security (Vite's `--host` makes the dev server reachable from the network,
 so it is not a boundary on its own):
@@ -84,7 +89,8 @@ so it is not a boundary on its own):
   `localhost`, `127.0.0.1` or `[::1]`;
 - `Origin` must be the dev page's own origin — another local dev server's
   page is refused, and the CORS headers Vite adds for localhost origins are
-  removed from every answer;
+  removed from every answer; cross-origin dev-page requests are also refused
+  before the HTML can expose its session token;
 - read tools and `figmog_images` only — no `figmog_sync`/`figmog_open`,
   `figmog_files`, internal write tools or desktop-proxy tools;
 - only this project's Figma files (figmog.toml `[files]`);
@@ -104,6 +110,8 @@ so it is not a boundary on its own):
 ```
 
 `locator` is exactly one of `testid` (a `data-testid` value) or `css`.
+`route` must start with `/`, contain no backslashes or control characters,
+and resolve to the dev server's own origin.
 
 ```sh
 node dist/src/cli.js target --manifest figmog.targets.json --target pricing-pro \

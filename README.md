@@ -312,7 +312,9 @@ on its own, because Figma's images endpoints are its most rate-limited. See
 across file versions for as long as the node's own subtree and the render
 settings are unchanged, so editing one frame no longer refetches every
 other frame's render. `--refresh` ignores cached renders and fetches them
-again. The reuse cache is bounded (256 MiB, oldest first).
+again, updating or invalidating both cache representations so switching
+policies cannot bring back pre-refresh bytes. The reuse cache is bounded
+(256 MiB, oldest first).
 
 `figmog --db <store> images <node-id>...` exports matching cached renders
 and fills offline. The store does not record its Figma file key, so cache

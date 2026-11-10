@@ -3,16 +3,17 @@
 // so no Rust build is needed. The end-to-end run against the real figmog
 // binary is examples/dev-plugin's test.
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { chromium } from "playwright";
 import { build, createLogger, createServer, type InlineConfig, type ViteDevServer } from "vite";
 import { BRIDGE_PATH, fileKey, isLoopbackAddress, isLoopbackHost } from "../src/bridge.js";
 import { figmog, type FigmogPluginOptions } from "../src/vite.js";
-import { FIXTURES } from "./server.js";
+import { FIXTURES, serveFixtures } from "./server.js";
 
 const APP = join(FIXTURES, "app");
 const FAKE = join(FIXTURES, "fake-figmog.mjs");
@@ -67,6 +68,13 @@ function send(
     req.on("error", reject);
     req.end(options.body);
   });
+}
+
+async function bridgeToken(devPort: number): Promise<string> {
+  const html = await (await fetch(`http://localhost:${devPort}/`)).text();
+  const match = /window\.__FIGMOG_BRIDGE__=Object\.freeze\((\{.*?\})\);/.exec(html);
+  assert.ok(match?.[1], "the dev page carries the bridge token");
+  return (JSON.parse(match[1]) as { token: string }).token;
 }
 
 let server: ViteDevServer;
@@ -145,6 +153,26 @@ describe("attributes", () => {
     );
   });
 
+  test("equivalent map paths cannot mark the same export twice", async () => {
+    const root = join(work, "duplicate-paths");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "Card.jsx"), "export const Card = () => <div/>;");
+    await writeFile(join(root, "figmog.map.json"), JSON.stringify({
+      components: ["src/Card.jsx", "src/./Card.jsx"].map((path, index) => ({
+        figma: { component: `synthetic-component-${index}` },
+        code: { path, export: "Card" },
+      })),
+    }));
+    const off = await createServer(config({ attributes: true, bridge: false }, { root, server: { middlewareMode: true } }));
+    try {
+      const card = await off.transformRequest("/src/Card.jsx");
+      assert.doesNotMatch(card?.code ?? "", /data-figmog/);
+      assert.ok(warnings.some((warning) => /duplicate-paths.*Card.jsx#Card.*several/.test(warning)));
+    } finally {
+      await off.close();
+    }
+  });
+
   test("are off unless settings or options turn them on", async () => {
     delete process.env["FAKE_FIGMOG_ATTRIBUTES"];
     const off = await createServer(config({ bridge: false }, { server: { middlewareMode: true } }));
@@ -194,6 +222,93 @@ describe("bridge", () => {
     assert.equal(images.status, 200, images.body);
   });
 
+  test("pins implicit calls to the declared default instead of the relay's current file", async () => {
+    const reply = await call("figmog_node", { id: "1:2" });
+    assert.equal(reply.status, 200, reply.body);
+    const result = JSON.parse(reply.body) as { content: { text: string }[] };
+    assert.deepEqual(JSON.parse(result.content[0]?.text ?? ""), {
+      arguments: { file: PRODUCT, id: "1:2" },
+      tool: "figmog_node",
+    });
+  });
+
+  test("refuses stale implicit defaults for library-only and empty file allowlists", async () => {
+    for (const files of [{ library: "FakeLibraryFile01" }, {}]) {
+      const root = await mkdtemp(join(work, "stale-current-"));
+      await mkdir(join(root, ".figmog"));
+      await writeFile(join(root, ".figmog", "current"), OTHER);
+      await writeFile(join(root, "index.html"), "<!doctype html><title>synthetic stale-current fixture</title>");
+      const fake = join(root, "fake-figmog.mjs");
+      const source = (await readFile(FAKE, "utf8")).replace(
+        'const FILES = { default: "FakeProductFile01", library: "FakeLibraryFile01" };',
+        `const FILES = ${JSON.stringify(files)};`,
+      );
+      await writeFile(fake, source, { mode: 0o755 });
+      const isolated = await createServer(config({ figmog: fake, attributes: false }, {
+        root,
+        server: { host: "127.0.0.1", port: 0 },
+      }));
+      try {
+        await isolated.listen();
+        const isolatedPort = (isolated.httpServer?.address() as AddressInfo).port;
+        const isolatedToken = await bridgeToken(isolatedPort);
+        const before = await forwarded();
+        for (const tool of ["figmog_node", "figmog_images", "figmog_status"]) {
+          const reply = await send(isolatedPort, {
+            body: JSON.stringify({ tool, arguments: { id: "1:2" } }),
+            headers: page({
+              host: `localhost:${isolatedPort}`,
+              origin: `http://localhost:${isolatedPort}`,
+              "x-figmog-token": isolatedToken,
+            }),
+          });
+          assert.equal(reply.status, 403, reply.body);
+          assert.match(reply.body, /no allowlisted default/);
+        }
+        assert.deepEqual(await forwarded(), before, "stale defaults never reached the relay");
+        if ("library" in files) {
+          const reply = await send(isolatedPort, {
+            body: JSON.stringify({ tool: "figmog_node", arguments: { id: "1:2", file: files.library } }),
+            headers: page({
+              host: `localhost:${isolatedPort}`,
+              origin: `http://localhost:${isolatedPort}`,
+              "x-figmog-token": isolatedToken,
+            }),
+          });
+          assert.equal(reply.status, 200, reply.body);
+        }
+      } finally {
+        await isolated.close();
+      }
+    }
+  });
+
+  test("an inline plugin's bridge survives server.restart()", async () => {
+    const restarting = await createServer(config({ attributes: false }, { server: { host: "127.0.0.1", port: 0 } }));
+    try {
+      await restarting.listen();
+      let previousToken = "";
+      for (let generation = 0; generation < 3; generation++) {
+        const restartPort = (restarting.httpServer?.address() as AddressInfo).port;
+        const nextToken = await bridgeToken(restartPort);
+        assert.notEqual(nextToken, previousToken, "each generation gets its own credential");
+        previousToken = nextToken;
+        const reply = await send(restartPort, {
+          body: JSON.stringify({ tool: "figmog_node", arguments: { id: "1:2" } }),
+          headers: page({
+            host: `localhost:${restartPort}`,
+            origin: `http://localhost:${restartPort}`,
+            "x-figmog-token": nextToken,
+          }),
+        });
+        assert.equal(reply.status, 200, `generation ${generation}: ${reply.body}`);
+        if (generation < 2) await restarting.restart();
+      }
+    } finally {
+      await restarting.close();
+    }
+  });
+
   test("refuses requests without the session token", async () => {
     for (const headers of [{ "x-figmog-token": "" }, { "x-figmog-token": `${token.slice(1)}x` }, { "x-figmog-token": "short" }]) {
       const reply = await call("figmog_status", {}, headers);
@@ -238,6 +353,34 @@ describe("bridge", () => {
       req.end('{"tool":"figmog_status"}');
     });
     assert.deepEqual(reply, { status: 403, cors: undefined });
+  });
+
+  test("never exposes token-bearing HTML to another localhost origin", async () => {
+    const reply = await fetch(`http://localhost:${port}/`, { headers: { origin: `http://localhost:${port + 1}` } });
+    assert.equal(reply.status, 403);
+    assert.equal(reply.headers.get("access-control-allow-origin"), null);
+    assert.doesNotMatch(await reply.text(), /__FIGMOG_BRIDGE__|[A-Za-z0-9_-]{43}/);
+    const same = await fetch(`http://localhost:${port}/`, { headers: { origin: `http://localhost:${port}` } });
+    assert.equal(same.status, 200);
+    assert.match(await same.text(), /__FIGMOG_BRIDGE__/);
+
+    const other = await serveFixtures();
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const tab = await browser.newPage();
+      await tab.goto(`${other.origin}/card.html`);
+      const readable = await tab.evaluate(async (url) => {
+        try {
+          return (await (await fetch(url)).text()).includes("__FIGMOG_BRIDGE__");
+        } catch {
+          return false;
+        }
+      }, `http://127.0.0.1:${port}/`);
+      assert.equal(readable, false, "another localhost page cannot read the injected credential");
+    } finally {
+      await browser.close();
+      await other.close();
+    }
   });
 
   test("refuses peers that are not this machine, even with forged headers", async (t) => {

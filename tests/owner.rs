@@ -589,6 +589,61 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
     assert!(served.load(Ordering::SeqCst) >= 2);
 }
 
+/// Image policies cannot silently fall back to a protocol-1 owner's old semantics.
+#[test]
+fn image_policies_refuse_a_protocol_one_owner_at_the_same_binary_version() {
+    let repo = repo();
+    seed(repo.path(), KEY, &common::fixture_v1());
+    let root = mirror_root(repo.path());
+    let socket = repo.path().join("old.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let record = json!({"generation": "old", "pid": 4_000_000u64,
+        "project": root.display().to_string(), "protocol": 1,
+        "socket": socket.display().to_string(), "version": env!("CARGO_PKG_VERSION")});
+    std::fs::write(root.join("owner.json"), record.to_string()).unwrap();
+    // Model the base owner's protocol-1 handshake with the identical
+    // package version: version checking alone cannot reject this owner.
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let hello: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(hello["method"], "figmog/hello");
+            assert_eq!(hello["params"]["version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(hello["params"]["protocol"], 2);
+            let reply = json!({"jsonrpc": "2.0", "id": hello["id"], "result": {
+                "attach_errors": {}, "generation": "old", "pid": 4_000_000u64,
+                "project": root.display().to_string(), "protocol": 1,
+                "settings": {"interval": 10, "upstream": null, "watch": false},
+                "version": env!("CARGO_PKG_VERSION")}});
+            writeln!(stream, "{reply}").unwrap();
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "no image call forwarded"
+            );
+        }
+    });
+    for policy in ["--refresh", "--reuse-renders"] {
+        let out = common::command()
+            .args(["images", "1:1", policy])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("protocol 1"), "{error}");
+        assert!(error.contains("protocol 2"), "{error}");
+        assert!(error.contains("cannot share it"), "{error}");
+    }
+    server.join().unwrap();
+    assert!(owners_in(repo.path()).is_empty());
+}
+
 /// Two repositories run fully independent owners at the same time.
 #[test]
 fn two_projects_run_independent_owners() {
@@ -1131,8 +1186,8 @@ fn three_worktrees_share_one_mirror_and_one_edit_pulls_once() {
     // errors anywhere.
     let readers: Vec<_> = cwds
         .iter()
-        .cloned()
         .map(|cwd| {
+            let cwd = cwd.clone();
             std::thread::spawn(move || {
                 for _ in 0..5 {
                     let out = common::command()

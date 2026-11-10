@@ -236,45 +236,57 @@ export function markModule(code: string, filename: string, specs: readonly MarkS
   }
   const { locals, exports } = bindings(program);
   const inserts: { at: number; text: string }[] = [];
-  for (const spec of [...specs].sort((a, b) => a.exportName.localeCompare(b.exportName))) {
+  // Resolve every export before editing: several export names can refer to
+  // the same function (or return the same root). None can claim that element.
+  const candidates = [...specs].sort((a, b) => a.exportName.localeCompare(b.exportName)).map((spec) => {
+    const exported = exports.get(spec.exportName);
+    const value = typeof exported === "string" ? locals.get(exported) : exported;
+    const fn = value === undefined ? null : componentFunction(value);
+    const elements: Node[] = [];
+    let reason = value === undefined ? "no such export" : fn === null ? "not a function component" : null;
+    if (fn !== null) {
+      for (const result of returned(fn)) {
+        reason = roots(result, elements);
+        if (reason !== null) break;
+      }
+    }
+    return { spec, fn, elements, reason };
+  });
+  const functions = new Map<Node, number>();
+  const elements = new Map<Node, number>();
+  for (const candidate of candidates) {
+    if (candidate.fn !== null) functions.set(candidate.fn, (functions.get(candidate.fn) ?? 0) + 1);
+    for (const opening of new Set(candidate.elements)) {
+      elements.set(opening, (elements.get(opening) ?? 0) + 1);
+    }
+  }
+  for (const candidate of candidates) {
+    const { spec, fn, elements: roots, reason } = candidate;
     const skip = (reason: string): void => {
       skipped.push({ exportName: spec.exportName, reason });
     };
-    const exported = exports.get(spec.exportName);
-    const value = typeof exported === "string" ? locals.get(exported) : exported;
-    if (value === undefined) {
-      skip("no such export");
+    if ((fn !== null && (functions.get(fn) ?? 0) > 1) || roots.some((root) => (elements.get(root) ?? 0) > 1)) {
+      skip("several figmog.map.json entries resolve to this component; mark it explicitly");
       continue;
-    }
-    const fn = componentFunction(value);
-    if (fn === null) {
-      skip("not a function component");
-      continue;
-    }
-    const elements: Node[] = [];
-    let reason: string | null = null;
-    for (const result of returned(fn)) {
-      reason = roots(result, elements);
-      if (reason !== null) break;
     }
     if (reason !== null) {
       skip(reason);
       continue;
     }
-    if (elements.length === 0) {
+    if (roots.length === 0) {
       skip("it renders no element");
       continue;
     }
-    if (elements.some(hasFigmogAttribute)) {
+    if (roots.some(hasFigmogAttribute)) {
       skip(`its root already has ${FIGMOG_ATTRIBUTE} attributes (explicit markers win)`);
       continue;
     }
     let text = ` ${FIGMOG_ATTRIBUTE}={${JSON.stringify(spec.figma)}}`;
     if (spec.node !== null) text += ` ${NODE_ATTRIBUTE}={${JSON.stringify(spec.node)}}`;
-    for (const opening of elements) {
-      // Just before the opening tag's `>` (or the `/` of a self-closing `/>`).
-      const at = field(opening, "selfClosing") === true ? code.lastIndexOf("/", opening.end - 1) : opening.end - 1;
-      inserts.push({ at, text });
+    for (const opening of roots) {
+      // Caller props must override automatic defaults, including JSX spreads.
+      const tag = child(opening, "name");
+      if (tag !== null) inserts.push({ at: tag.end, text });
     }
     marked.push(spec.exportName);
   }

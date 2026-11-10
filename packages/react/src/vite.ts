@@ -4,8 +4,9 @@
 import { randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import type { TLSSocket } from "node:tls";
 import type { Logger, Plugin, ResolvedConfig } from "vite";
-import { BRIDGE_GLOBAL, BRIDGE_PATH, handleBridgeRequest, isBridgeUrl } from "./bridge.js";
+import { BRIDGE_GLOBAL, BRIDGE_PATH, handleBridgeRequest, isBridgeUrl, removeCorsHeaders } from "./bridge.js";
 import { figmogBinary, message, readMapTargets, readSettings, type ProjectSettings } from "./figmog.js";
 import { markModule, type MarkSpec } from "./mark.js";
 import { FigmogRelay } from "./relay.js";
@@ -49,18 +50,22 @@ async function markPlan(
   const { targets, warnings } = await readMapTargets(bin, settings.projectRoot);
   for (const warning of warnings) logger.warn(`figmog: ${warning}`);
   // One export mapped from two Figma components cannot say which one it is.
+  const canonicalTargets = targets.map((target) => ({
+    ...target,
+    path: canonical(resolve(settings.projectRoot, target.path)),
+  }));
   const seen = new Map<string, number>();
-  for (const target of targets) {
+  for (const target of canonicalTargets) {
     const id = `${target.path}#${target.export}`;
     seen.set(id, (seen.get(id) ?? 0) + 1);
   }
-  for (const target of targets) {
+  for (const target of canonicalTargets) {
     const id = `${target.path}#${target.export}`;
     if ((seen.get(id) ?? 0) > 1) {
       logger.warn(`figmog: not marking ${id}: several figmog.map.json entries name it; mark it explicitly`);
       continue;
     }
-    const file = canonical(resolve(settings.projectRoot, target.path));
+    const file = target.path;
     const specs = plan.get(file) ?? [];
     specs.push({
       exportName: target.export,
@@ -80,6 +85,9 @@ export function figmog(options: FigmogPluginOptions = {}): Plugin {
   let plan = new Map<string, MarkSpec[]>();
   let token: string | null = null;
   let relay: FigmogRelay | null = null;
+  // Inline plugin objects survive server.restart(). Each container closes
+  // only the relay created for its own resolved configuration.
+  const relays = new WeakMap<ResolvedConfig, FigmogRelay>();
   const warned = new Set<string>();
 
   return {
@@ -89,6 +97,11 @@ export function figmog(options: FigmogPluginOptions = {}): Plugin {
 
     async configResolved(config: ResolvedConfig) {
       logger = config.logger;
+      settings = null;
+      plan = new Map();
+      token = null;
+      relay = null;
+      warned.clear();
       try {
         settings = await readSettings(bin, config.root);
       } catch (error) {
@@ -105,14 +118,30 @@ export function figmog(options: FigmogPluginOptions = {}): Plugin {
       if (options.bridge ?? true) {
         token = randomBytes(32).toString("base64url");
         relay = new FigmogRelay({ bin, cwd: settings.projectRoot, args: options.serveArgs ?? [] });
+        relays.set(config, relay);
       }
     },
 
     configureServer(server) {
       if (settings === null || token === null || relay === null) return;
-      const config = { token, files: [...new Set(Object.values(settings.files))].sort(), call: relay.call.bind(relay) };
+      const config = {
+        token,
+        files: [...new Set(Object.values(settings.files))].sort(),
+        ...(settings.files["default"] === undefined ? {} : { defaultFile: settings.files["default"] }),
+        call: relay.call.bind(relay),
+      };
       server.middlewares.use((request, response, next) => {
         if (!isBridgeUrl(request.url)) {
+          // HTML carries a session credential. Refuse other origins before
+          // Vite renders it, removing any CORS permission already added.
+          const scheme = (request.socket as TLSSocket).encrypted === true ? "https" : "http";
+          const origin = request.headers.origin;
+          if (origin !== undefined && origin !== `${scheme}://${request.headers.host}`) {
+            removeCorsHeaders(response);
+            response.writeHead(403, { "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" });
+            response.end("the figmog dev server only answers its own origin");
+            return;
+          }
           next();
           return;
         }
@@ -153,7 +182,10 @@ export function figmog(options: FigmogPluginOptions = {}): Plugin {
     },
 
     async closeBundle() {
-      await relay?.close();
+      const config = this.environment.getTopLevelConfig();
+      const owned = relays.get(config);
+      relays.delete(config);
+      await owned?.close();
     },
   };
 }

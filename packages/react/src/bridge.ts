@@ -68,6 +68,8 @@ export interface BridgeConfig {
   token: string;
   /** This project's Figma file keys (figmog.toml `[files]`). */
   files: readonly string[];
+  /** Declared `[files] default`; never infer it from the relay's current file. */
+  defaultFile?: string;
   /** Forwards an allowed call to figmog; resolves with its MCP result. */
   call: (tool: string, args: Record<string, unknown>, timeoutMs: number) => Promise<unknown>;
 }
@@ -111,23 +113,30 @@ export function fileKey(input: string): string | null {
 }
 
 /** Node-id arguments that may carry a Figma URL naming a file. */
-const NODE_REF_ARGS = ["id", "target", "under"] as const;
+const NODE_REF_ARGS = ["id", "under", "target"] as const;
 
 /**
- * Checks a parsed call against the allowlist and this project's files.
+ * Validates a call and returns arguments pinned to an allowlisted file.
  * Throws a {@link BridgeError} (403) when it is refused.
  */
-export function checkCall(tool: string, args: Record<string, unknown>, files: readonly string[]): void {
+export function checkCall(
+  tool: string,
+  args: Record<string, unknown>,
+  files: readonly string[],
+  defaultFile?: string,
+): Record<string, unknown> {
   if (!ALLOWED_TOOLS.has(tool)) {
     throw new BridgeError(403, `${JSON.stringify(tool)} is not available through the bridge (read tools and renders only)`);
   }
   const allowed = new Set(files);
   const file = args["file"];
+  let effectiveFile: string | null = null;
   if (file !== undefined && file !== null) {
     const key = typeof file === "string" ? fileKey(file) : null;
     if (key === null || !allowed.has(key)) {
       throw new BridgeError(403, "file is not one of this project's Figma files (figmog.toml [files])");
     }
+    effectiveFile = key;
   }
   for (const name of NODE_REF_ARGS) {
     const value = args[name];
@@ -136,11 +145,19 @@ export function checkCall(tool: string, args: Record<string, unknown>, files: re
       if (key !== null && !allowed.has(key)) {
         throw new BridgeError(403, `${name} names a Figma file that is not one of this project's files`);
       }
+      effectiveFile ??= key;
     }
   }
   if (tool === "figmog_images" && args["refresh"] === true) {
     throw new BridgeError(403, "refresh is not available through the bridge; use `figmog images --refresh`");
   }
+  // Every allowed tool reads one file. Pin it here so the stdio relay can
+  // never fall back to an undeclared `.figmog/current` (or its own history).
+  effectiveFile ??= defaultFile ?? null;
+  if (effectiveFile === null || !allowed.has(effectiveFile)) {
+    throw new BridgeError(403, "no allowlisted default Figma file; pass one of this project's files explicitly");
+  }
+  return { ...args, file: effectiveFile };
 }
 
 function tokenMatches(expected: string, given: string | string[] | undefined): boolean {
@@ -206,9 +223,14 @@ const CORS_HEADERS = [
   "access-control-expose-headers",
 ];
 
+/** Removes any CORS permission Vite already added to a private response. */
+export function removeCorsHeaders(response: ServerResponse): void {
+  for (const header of CORS_HEADERS) response.removeHeader(header);
+}
+
 function send(response: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
-  for (const header of CORS_HEADERS) response.removeHeader(header);
+  removeCorsHeaders(response);
   response.writeHead(status, {
     "cache-control": "no-store",
     "content-length": Buffer.byteLength(text),
@@ -246,9 +268,9 @@ export async function handleBridgeRequest(
     }
     const args = body["arguments"] ?? {};
     if (!isObject(args)) throw new BridgeError(400, "arguments must be an object");
-    checkCall(body["tool"], args, config.files);
+    const checkedArgs = checkCall(body["tool"], args, config.files, config.defaultFile);
     const timeout = RENDER_TOOLS.includes(body["tool"]) ? RENDER_TIMEOUT_MS : READ_TIMEOUT_MS;
-    send(response, 200, await config.call(body["tool"], args, timeout));
+    send(response, 200, await config.call(body["tool"], checkedArgs, timeout));
   } catch (error) {
     const status = isObject(error) && typeof error["status"] === "number" ? error["status"] : 500;
     send(response, status, { error: error instanceof Error ? error.message : String(error) });
