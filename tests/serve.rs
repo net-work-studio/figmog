@@ -723,6 +723,9 @@ fn spawn_scripted_upstream(
                     Err(e) => panic!("accept: {e}"),
                 }
             };
+            // macOS can inherit the listener's nonblocking state on accept.
+            // Scripted reads must block until data arrives or the timeout expires.
+            stream.set_nonblocking(false).expect("set_blocking");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("set_read_timeout");
