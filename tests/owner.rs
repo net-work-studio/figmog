@@ -408,6 +408,9 @@ fn concurrent_relays_wait_for_a_slow_desktop_startup() {
                     Err(error) => panic!("desktop accept: {error}"),
                 }
             };
+            // Accepted sockets inherit the listener's nonblocking mode
+            // on macOS. Header reads should wait for the client's bytes.
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(TIMEOUT)).unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut content_length = 0;
