@@ -1,0 +1,21 @@
+examples/slice/evidence/COMMENT.md
+  s_3710a1eb3547ff::t_d795132e8395a7 39-41
+examples/slice/evidence/evidence.json
+  s_3710a1eb3547ff::t_0cf403b413e75b 5,14,23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "90f50f8aa5677f55d048f51fceb629f4afe60535",
+  "prompts": {},
+  "sessions": {
+    "s_3710a1eb3547ff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c47b-dae1-7b01-bd55-952da11daa84",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
