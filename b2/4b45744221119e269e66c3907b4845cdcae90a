@@ -1,0 +1,23 @@
+tests/serve.rs
+  s_d00caf59bef041::t_b210080587fda8 607-608
+src/owner.rs
+  s_d00caf59bef041::t_15f397f377aec8 685-694,771-777,1468
+  s_d00caf59bef041::t_3c923ccba9e281 674-683,1448-1467
+  s_d00caf59bef041::t_2496065720edb7 1469
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b24b45744221119e269e66c3907b4845cdcae90a",
+  "prompts": {},
+  "sessions": {
+    "s_d00caf59bef041": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa7-9721-7ac1-9380-ea52571e7db3",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
