@@ -48,6 +48,7 @@ fn cancelled_socket_calls_cannot_open_sync_or_forward() {
             Duration::ZERO,
             name,
             &json!({"file": "NEW1234567890"}),
+            sessions::SessionResolution::AutoOpen,
         );
         assert!(matches!(result, Err(error) if error.contains("cancelled")));
     }
@@ -181,6 +182,7 @@ fn call_and_wait(
             interval,
             name,
             args,
+            sessions::SessionResolution::AutoOpen,
         )
     });
     let reply = mcp::dispatch_message(
@@ -1790,12 +1792,105 @@ fn reads_of_missing_files_do_not_initialize_a_store() {
     let mut h = Harness::new();
     let missing = "NEW1234567890";
     for name in ["figmog_status", "figmog_pages", "figmog_vars"] {
-        let result = h.call(name, json!({"file": missing}));
-        let message = result["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(message.contains("no mirror here"), "{result}");
+        let result = handle_tool_call(
+            &mut h.manager,
+            &mut Offload::new(None),
+            &Arc::new(AtomicBool::new(false)),
+            "disabled",
+            Duration::ZERO,
+            name,
+            &json!({"file": missing}),
+            sessions::SessionResolution::ExistingOnly,
+        );
+        assert!(matches!(result, Err(message) if message.contains("no mirror here")));
         assert!(!h.manager.root.store_path(missing).unwrap().exists());
     }
     assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn in_process_startup_uses_the_project_default_without_an_explicit_file() {
+    const KEY: &str = "CFG1234567890";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("figmog.toml"),
+        format!("[files]\ndefault = \"{KEY}\"\n"),
+    )
+    .unwrap();
+    let layout = crate::project::Layout::discover(dir.path()).unwrap();
+    {
+        let mut store = crate::open_store!(layout.mirror_root.join(KEY).join("db"));
+        store::sync(
+            &mut store,
+            &Default::default(),
+            &crate::flatten::flatten_file(&fixture("configured")).unwrap(),
+            1,
+        );
+    }
+    let (mut manager, track_current) = build_sessions(
+        None,
+        &[],
+        true,
+        &None,
+        StoreRoot::Project(layout.clone()),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(track_current);
+    assert_eq!(manager.default_key.as_deref(), Some(KEY));
+    let response = call_and_wait(
+        &mut manager,
+        &mut Offload::new(None),
+        "disabled",
+        true,
+        Duration::ZERO,
+        &dispatch::tool_registry(),
+        &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"figmog_status", "arguments":{}}}),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let status: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(status["version"], "configured");
+    drop(manager);
+
+    let (manager, _) = build_sessions(
+        None,
+        &["EXPLICIT12345".into()],
+        true,
+        &None,
+        StoreRoot::Project(layout.clone()),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert_eq!(manager.default_key.as_deref(), Some("EXPLICIT12345"));
+    assert_eq!(manager.sessions.len(), 1);
+    drop(manager);
+
+    let (manager, _) = build_sessions(
+        None,
+        &[],
+        true,
+        &None,
+        StoreRoot::Fixed(dir.path().join("fixed")),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(manager.sessions.is_empty());
+    drop(manager);
+
+    let db = dir.path().join("override/db");
+    let (manager, track_current) = build_sessions(
+        Some(db.clone()),
+        &[],
+        true,
+        &None,
+        StoreRoot::Project(layout),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(!track_current);
+    assert_eq!(manager.sessions.len(), 1);
+    assert_eq!(manager.sessions[0].path, db);
 }
 
 #[test]
@@ -1810,6 +1905,7 @@ fn routed_write_rejects_a_different_store_before_admission() {
         Duration::ZERO,
         crate::serve::writes::PULL,
         &json!({"file": "ABC1234567890", "db": h._dir.path().join("other/db"), "from_file": fixture("2")}),
+        sessions::SessionResolution::ExistingOnly,
     );
     assert!(
         matches!(result, Err(error) if error.contains("different store") && error.contains("nothing was applied"))

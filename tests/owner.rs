@@ -385,6 +385,87 @@ fn concurrent_relays_elect_exactly_one_owner() {
     }
 }
 
+/// An owner probes desktop before publishing discovery. A second relay
+/// must give that owner the same startup budget as the relay launching it.
+#[test]
+fn concurrent_relays_wait_for_a_slow_desktop_startup() {
+    let repo = repo();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let upstream = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let (initializing_tx, initializing_rx) = mpsc::channel();
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let desktop = std::thread::spawn(move || {
+        for method in ["initialize", "notifications/initialized", "tools/list"] {
+            let deadline = Instant::now() + TIMEOUT;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "desktop never received {method}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("desktop accept: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0;
+            loop {
+                let mut header = String::new();
+                assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(length) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = length.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["method"], method);
+            if method == "initialize" {
+                initializing_tx.send(()).unwrap();
+                continue_rx.recv_timeout(TIMEOUT).unwrap();
+                // Longer than the former five-second relay cutoff, but
+                // within HttpUpstream's ten-second per-request timeout.
+                std::thread::sleep(Duration::from_millis(6250));
+            }
+            let (status, body) = if method == "notifications/initialized" {
+                ("202 Accepted", String::new())
+            } else {
+                let result = if method == "initialize" {
+                    json!({"protocolVersion": "2025-06-18", "capabilities": {},
+                        "serverInfo": {"name": "slow-desktop", "version": "1.0"}})
+                } else {
+                    json!({"tools": []})
+                };
+                (
+                    "200 OK",
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result}).to_string(),
+                )
+            };
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            stream.flush().unwrap();
+        }
+    });
+    let args = ["--no-watch", "--upstream", upstream.as_str()];
+    let mut first = spawn_relay(&mut relay_command(repo.path(), &args));
+    initializing_rx.recv_timeout(TIMEOUT).unwrap();
+    assert!(discovery(repo.path()).is_none(), "owner is still starting");
+    let mut second = spawn_relay(&mut relay_command(repo.path(), &args));
+    continue_tx.send(()).unwrap();
+    first.initialize();
+    second.initialize();
+    desktop.join().unwrap();
+    assert_eq!(first.owner_pid(), second.owner_pid());
+    assert_eq!(owners_in(repo.path()), vec![first.owner_pid() as u32]);
+    first.finish();
+    second.finish();
+    wait_owner_gone(repo.path());
+}
+
 /// Ten owners launched at once: one wins the lock, the rest exit at once,
 /// successfully, without touching its socket. A crashed owner (SIGKILL,
 /// no cleanup) releases the lock with the process and leaves a stale

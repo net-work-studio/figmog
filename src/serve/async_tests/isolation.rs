@@ -173,6 +173,106 @@ impl Server {
     }
 }
 
+fn stdio_call(server: &Server, name: &str, args: Value) -> Value {
+    server
+        .tx
+        .send(Incoming::Stdio(request(json!(1), name, args)))
+        .unwrap();
+    serde_json::from_str(&server.stdout.recv_timeout(Duration::from_secs(30)).unwrap()).unwrap()
+}
+
+#[test]
+fn empty_server_auto_opens_first_explicit_and_node_url_references_without_watch() {
+    const KEY: &str = "NEW1234567890";
+    for args in [
+        json!({"file": KEY, "id": "0:0"}),
+        json!({"id": format!("https://www.figma.com/design/{KEY}/Synthetic?node-id=0-0")}),
+    ] {
+        let mut h = Harness::new();
+        h.manager.sessions.clear();
+        h.manager.default_key = None;
+        let root = h._dir.path().join("empty");
+        std::fs::create_dir(&root).unwrap();
+        h.manager.root = root.clone().into();
+        let server = Server::start(h.manager, Offload::new(None));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let first = stdio_call(&server, "figmog_node", args.clone());
+            assert_eq!(first["result"]["isError"], true, "{first}");
+            assert!(
+                first["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not ready"),
+                "{first}"
+            );
+            assert_eq!(
+                h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+                "fetch"
+            );
+            assert!(root.join(KEY).join("db").is_dir());
+            let status = stdio_call(&server, "figmog_status", json!({"file": KEY}));
+            let status: Value =
+                serde_json::from_str(status["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(status["pull"]["job"]["id"], 1);
+            h.release.send(()).unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let status = stdio_call(&server, "figmog_status", json!({"file": KEY}));
+                let status: Value =
+                    serde_json::from_str(status["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap();
+                if status["pull"]["job"]["state"] == "succeeded" {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{status}");
+            }
+            let node = stdio_call(&server, "figmog_node", args);
+            assert_eq!(node["result"]["isError"], false, "{node}");
+            let node: Value =
+                serde_json::from_str(node["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(node["name"], "1");
+            assert_eq!(h.api.calls.load(Ordering::Relaxed), 1);
+        }));
+        // Release the worker before teardown even if an assertion fails, so
+        // its store cannot outlive the temporary root during unwinding.
+        let _ = h.release.send(());
+        server.stop();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[test]
+fn bare_socket_reads_of_an_unseen_file_never_create_a_store() {
+    let mut h = Harness::new();
+    h.manager.sessions.clear();
+    h.manager.default_key = None;
+    let root = h._dir.path().join("empty");
+    std::fs::create_dir(&root).unwrap();
+    h.manager.root = root.clone().into();
+    let server = Server::start(h.manager, Offload::new(None));
+    let mut client = server.connect(1);
+    for name in ["figmog_status", "figmog_pages", "figmog_vars"] {
+        server.send(1, request(json!(1), name, json!({"file":"NEW1234567890"})));
+        let result: Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no mirror here"),
+            "{result}"
+        );
+        assert!(!root.join("NEW1234567890").exists());
+    }
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+    server.stop();
+}
+
 /// While one client trickle-reads a whole-document subtree and another
 /// keeps `figmog_stats` running, a third client's `figmog_node` round
 /// trips stay under `bound`. Returns (worst, median) latency.
@@ -442,6 +542,7 @@ fn begin(
             Duration::ZERO,
             name,
             args,
+            sessions::SessionResolution::AutoOpen,
         )
     });
     match mcp::dispatch_message(

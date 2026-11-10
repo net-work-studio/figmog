@@ -1417,6 +1417,11 @@ fn request_loop(
                     interval_dur,
                     name,
                     args,
+                    if matches!(to, ReplyTo::Stdio) || relay_conn {
+                        sessions::SessionResolution::AutoOpen
+                    } else {
+                        sessions::SessionResolution::ExistingOnly
+                    },
                 )
             },
         );
@@ -1607,6 +1612,23 @@ fn build_sessions(
         // verbatim via `track_current = false` below.
         return Ok((manager, false));
     }
+
+    // A project default selects the same startup mirror as a relay. Fixed
+    // roots keep their explicit-file semantics, and `--db` returned above
+    // without consulting project configuration.
+    let project_default = if files.is_empty() {
+        match &store_root {
+            StoreRoot::Project(layout) => layout.default_key()?.into_iter().collect::<Vec<_>>(),
+            StoreRoot::Fixed(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let files = if files.is_empty() {
+        project_default.as_slice()
+    } else {
+        files
+    };
 
     // Watch needs a token to keep polling for the life of the process,
     // independent of whether any startup file actually needs an initial
@@ -1801,6 +1823,7 @@ fn file_mismatch_note(msg: String, explicit_key: Option<&str>, url_key: Option<&
 /// answer [`ToolOutput::Deferred`]: they run on the read pool against a
 /// leased published view; `cancel` (the requester's) lets the pool skip
 /// them once nobody is left to answer.
+#[allow(clippy::too_many_arguments)]
 fn handle_tool_call(
     manager: &mut SessionManager,
     offload: &mut Offload,
@@ -1809,6 +1832,7 @@ fn handle_tool_call(
     interval: Duration,
     name: &str,
     args: &Value,
+    resolution: sessions::SessionResolution,
 ) -> Result<ToolOutput, String> {
     // Reject disconnected requests before any store open, pull, or upstream
     // operation; frames can outlive their connection in the input channel.
@@ -1923,10 +1947,10 @@ fn handle_tool_call(
         let session = if name == "figmog_sync" {
             match file_arg.as_deref() {
                 Some(file) => manager.open(file)?,
-                None => manager.resolve(None, interval)?,
+                None => manager.resolve(None, interval, resolution)?,
             }
         } else {
-            manager.resolve(file_arg.as_deref(), interval)?
+            manager.resolve(file_arg.as_deref(), interval, resolution)?
         };
 
         if name == "figmog_sync" {
@@ -2386,15 +2410,31 @@ mod tests {
             api: None,
         };
         assert_eq!(manager.effective_default_key(), Some(key.clone()));
-        assert_eq!(manager.resolve(None, Duration::ZERO).unwrap().key, key);
+        assert_eq!(
+            manager
+                .resolve(None, Duration::ZERO, sessions::SessionResolution::AutoOpen)
+                .unwrap()
+                .key,
+            key
+        );
         manager.sole_default = false;
         assert_eq!(manager.effective_default_key(), None);
         assert_eq!(
-            manager.resolve(None, Duration::ZERO).err().as_deref(),
+            manager
+                .resolve(None, Duration::ZERO, sessions::SessionResolution::AutoOpen)
+                .err()
+                .as_deref(),
             Some(sessions::NO_DEFAULT_FILE_MSG)
         );
         assert_eq!(
-            manager.resolve(Some(&key), Duration::ZERO).unwrap().key,
+            manager
+                .resolve(
+                    Some(&key),
+                    Duration::ZERO,
+                    sessions::SessionResolution::AutoOpen
+                )
+                .unwrap()
+                .key,
             key
         );
         manager.close_reads(Instant::now() + Duration::from_secs(5));

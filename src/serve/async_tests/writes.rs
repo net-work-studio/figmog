@@ -120,6 +120,43 @@ fn churn(value: &Value) -> String {
     serde_json::to_string_pretty(&value["result"]).unwrap()
 }
 
+#[test]
+fn saved_null_rejects_before_network_or_reset_even_with_credentials() {
+    let Harness {
+        api,
+        manager,
+        _dir: _store_dir,
+        ..
+    } = Harness::new();
+    let live = Live::start(manager, Offload::new(None));
+    live.write(PULL, json!({"file": KEY, "from_file": fixture("saved")}))
+        .join()
+        .unwrap()
+        .unwrap();
+
+    for fresh in [false, true] {
+        let error = live
+            .write(
+                PULL,
+                json!({"file": KEY, "from_file": null, "fresh": fresh}),
+            )
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("missing field: name"), "{error}");
+        assert_eq!(api.calls.load(Ordering::SeqCst), 0);
+        let response = live
+            .call("figmog_node", json!({"file": KEY, "id": "0:0"}))
+            .join()
+            .unwrap();
+        let node: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(node["name"], "saved", "{node}");
+    }
+    live.stop();
+}
+
 /// Plain and `--geometry` network pulls and a variable import through the
 /// loop: each answers only once committed and published, with the direct
 /// path's output; identical plain pulls queued together share one fetch

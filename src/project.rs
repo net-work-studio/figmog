@@ -534,11 +534,15 @@ pub(crate) struct LegacyStore {
 }
 
 impl Layout {
-    /// `Some` exactly when `path` is `key`'s old per-checkout store.
+    /// `Some` when `path` belongs to a discovered old per-checkout root.
+    /// Keep that classification after migration removes the database:
+    /// callers may have resolved it before reading or fetching input.
     pub(crate) fn legacy_store(&self, key: &str, path: &Path) -> Option<LegacyStore> {
         (path != self.shared_dir(key).join("db")
-            && self.has_legacy_root()
-            && path == self.legacy_dir(key).join("db"))
+            && self
+                .legacy_roots()
+                .into_iter()
+                .any(|root| path == root.join(key).join("db")))
         .then(|| LegacyStore {
             layout: self.clone(),
             key: key.to_string(),

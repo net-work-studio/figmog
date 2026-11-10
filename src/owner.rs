@@ -1106,11 +1106,21 @@ pub(crate) fn connect_or_launch(
     settings: &Settings,
     attach: &[String],
 ) -> Result<OwnerConn, String> {
-    let deadline = std::time::Instant::now() + START_TIMEOUT;
+    connect_or_launch_with_timeout(paths, cwd, settings, attach, START_TIMEOUT)
+}
+
+fn connect_or_launch_with_timeout(
+    paths: &OwnerPaths,
+    cwd: &Path,
+    settings: &Settings,
+    attach: &[String],
+    timeout: Duration,
+) -> Result<OwnerConn, String> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut launched: Option<std::sync::mpsc::Receiver<std::process::ExitStatus>> = None;
-    let mut unreachable_since = None;
     let mut delay = Duration::from_millis(25);
     loop {
+        let mut unreachable_lock_holder = false;
         match probe(paths, Some((settings, attach)))? {
             Probe::Ready(conn) => return Ok(conn),
             Probe::Absent if launched.is_none() => {
@@ -1119,19 +1129,13 @@ pub(crate) fn connect_or_launch(
                 match OwnerLock::try_acquire(paths)? {
                     Some(lock) => {
                         drop(lock);
-                        unreachable_since = None;
                         launched = Some(launch(paths, cwd, &settings.args())?);
                     }
                     None => {
-                        let since = unreachable_since.get_or_insert_with(std::time::Instant::now);
-                        if since.elapsed() >= Duration::from_secs(5) {
-                            return Err(format!(
-                                "background figmog owner lock is held but its socket is unreachable; \
-                                 wait for startup or shutdown, and check whether the processes use \
-                                 different /tmp namespaces or XDG_RUNTIME_DIR values; see {}",
-                                paths.log().display()
-                            ));
-                        }
+                        // Desktop initialization happens before discovery
+                        // is published. Give this owner the full startup
+                        // budget, just like one launched by this relay.
+                        unreachable_lock_holder = true;
                     }
                 }
             }
@@ -1154,9 +1158,17 @@ pub(crate) fn connect_or_launch(
             launched = None;
         }
         if std::time::Instant::now() >= deadline {
+            if unreachable_lock_holder {
+                return Err(format!(
+                    "background figmog owner lock is held but its socket is unreachable; \
+                     wait for startup or shutdown, and check whether the processes use \
+                     different /tmp namespaces or XDG_RUNTIME_DIR values; see {}",
+                    paths.log().display()
+                ));
+            }
             return Err(format!(
                 "the background figmog did not become ready within {}s; see {}",
-                START_TIMEOUT.as_secs(),
+                timeout.as_secs(),
                 paths.log().display()
             ));
         }
@@ -1394,15 +1406,19 @@ mod tests {
             upstream: None,
         };
         let start = std::time::Instant::now();
-        let error = match connect_or_launch(&paths, dir.path(), &settings, &[]) {
-            Err(error) => error,
-            _ => panic!("unreachable lock holder unexpectedly connected"),
-        };
+        let timeout = Duration::from_millis(100);
+        let error =
+            match connect_or_launch_with_timeout(&paths, dir.path(), &settings, &[], timeout) {
+                Err(error) => error,
+                _ => panic!("unreachable lock holder unexpectedly connected"),
+            };
         assert!(
             error.contains("lock is held but its socket is unreachable"),
             "{error}"
         );
-        assert!(start.elapsed() < Duration::from_secs(7));
+        assert!(start.elapsed() >= timeout);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("XDG_RUNTIME_DIR"), "{error}");
         assert!(!paths.log().exists(), "no child should have been launched");
     }
 

@@ -1604,6 +1604,14 @@ pub(crate) struct SessionManager {
 
 pub(crate) const NO_DEFAULT_FILE_MSG: &str = "no file specified and no default mirrored file — pass a `file` argument, mirror one with figmog_open, or see figmog_files for the current list";
 
+/// Agent references may start an initial mirror; CLI reads only admit
+/// stores that already exist.
+#[derive(Clone, Copy)]
+pub(crate) enum SessionResolution {
+    ExistingOnly,
+    AutoOpen,
+}
+
 impl SessionManager {
     pub(crate) fn open(&mut self, file_ref: &str) -> Result<&mut FileSession, String> {
         self.open_mode(file_ref, true)
@@ -1653,6 +1661,7 @@ impl SessionManager {
         &mut self,
         file: Option<&str>,
         interval: Duration,
+        resolution: SessionResolution,
     ) -> Result<&mut FileSession, String> {
         let key = file
             .map(|file| {
@@ -1662,14 +1671,19 @@ impl SessionManager {
             .or_else(|| self.effective_default_key())
             .ok_or_else(|| NO_DEFAULT_FILE_MSG.to_string())?;
         let session = if file.is_some() {
-            if !self.sessions.iter().any(|session| session.key == key)
-                && !self.root.store_path(&key)?.is_dir()
-            {
-                return Err(format!(
-                    "no mirror here for {key}; run figmog pull or figmog_open first"
-                ));
+            match resolution {
+                SessionResolution::AutoOpen => self.open(&key)?,
+                SessionResolution::ExistingOnly => {
+                    if !self.sessions.iter().any(|session| session.key == key)
+                        && !self.root.store_path(&key)?.is_dir()
+                    {
+                        return Err(format!(
+                            "no mirror here for {key}; run figmog pull or figmog_open first"
+                        ));
+                    }
+                    self.open_mode(&key, false)?
+                }
             }
-            self.open_mode(&key, false)?
         } else {
             self.sessions
                 .iter_mut()

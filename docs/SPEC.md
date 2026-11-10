@@ -517,10 +517,14 @@ keyed writer, pipeline and schema unchanged. These are the justifications
 to carry into a PR adding these direct dependencies.
 
 **Startup:** `figmog serve [FILE]...` takes zero or more file
-URLs/keys. Zero is valid and needs no `FIGMA_TOKEN` up front — the server
-starts empty and mirrors files as an agent references them. The first
-startup `FILE` (if any) becomes the *default* file for any tool call that
-omits `file`; with none given but exactly one file later auto-opened,
+URLs/keys. With no explicit `FILE`, a project serve selects the configured
+project default (including the per-checkout current-file fallback); an
+explicit `FILE` takes precedence. `--db` bypasses project discovery, and
+`--figmog-root` uses only explicit startup files. With no selected startup
+file, zero is valid and needs no `FIGMA_TOKEN` up front — the server starts
+empty and mirrors files as an agent references them. The first selected
+startup file becomes the *default* for any tool call that omits `file`;
+with none selected but exactly one file later auto-opened,
 that one becomes the effective default (`SessionManager::effective_default_key`)
 — two or more auto-opened files with no startup default leaves no
 default at all, and an omitted `file` then errors, naming
@@ -1784,9 +1788,11 @@ The old store is resolved before its lock is taken, so opening it never
 creates it: once its lock is held it must still exist and still be the
 active store, otherwise (a `figmog migrate` moved it meanwhile) the
 command fails asking for a rerun, which resolves the shared store. A
-missing old store is never recreated. Direct and served read opens never
-initialize a missing store. Routed writes include the intended database
-path; a serve configured for another database refuses without applying
+missing old store is never recreated. Read-only CLI commands, whether
+direct or routed over a control socket, never initialize a missing store.
+MCP first references over stdio or an owner relay may open a new session
+and queue its initial asynchronous pull (§6). Routed writes include the
+intended database path; a serve configured for another database refuses without applying
 anything and points to `--no-socket`. New mirrors go to the selected mirror
 root.
 `--db` bypasses all of this. `figmog serve --figmog-root <dir>` (hidden,

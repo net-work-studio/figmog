@@ -3349,6 +3349,7 @@ fn routed_writers_match_the_direct_path_byte_for_byte() {
             .as_bytes(),
     );
     let not_json = input("not.json", b"{ not json");
+    let null_json = input("null.json", b"null");
     let vars = input(
         "vars.json",
         include_bytes!("fixtures/variables-export.json").as_slice(),
@@ -3378,6 +3379,8 @@ fn routed_writers_match_the_direct_path_byte_for_byte() {
         (vec!["import-variables", &vars], true),
         (vec!["import-variables", &bad_vars], false),
         (vec!["import-variables", &not_json], false),
+        (vec!["pull", "--from-file", &null_json], false),
+        (vec!["pull", "--fresh", "--from-file", &null_json], false),
         (vec!["pull", "--from-file", &shapeless], false),
         (vec!["pull", "--fresh", "--from-file", &shapeless], false),
         (vec!["pull", "--fresh", "--from-file", &not_json], false),

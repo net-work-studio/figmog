@@ -86,7 +86,7 @@ pub(crate) fn parse(name: &str, args: &Value) -> Result<(String, WriteOp), Strin
     let op = if name == PULL {
         WriteOp::Pull {
             source: match args.get("from_file") {
-                None | Some(Value::Null) => PullSource::Network,
+                None => PullSource::Network,
                 Some(response) => PullSource::File(
                     crate::deep_json::from_str(
                         &crate::deep_json::to_string(response)
@@ -258,6 +258,29 @@ mod tests {
         ops.retention = Duration::ZERO;
         assert!(ops.query(&json!({"id": a})).is_err());
         assert!(ops.query(&json!({"id": "nope"})).is_err());
+    }
+
+    #[test]
+    fn saved_null_is_file_content_even_for_fresh_pulls() {
+        for fresh in [false, true] {
+            let (_, op) = parse(
+                PULL,
+                &json!({"file": "ABC1234567890", "fresh": fresh, "from_file": null}),
+            )
+            .unwrap();
+            assert!(matches!(
+                op,
+                WriteOp::Pull { source: PullSource::File(response), .. } if response.is_null()
+            ));
+        }
+        let (_, op) = parse(PULL, &json!({"file": "ABC1234567890"})).unwrap();
+        assert!(matches!(
+            op,
+            WriteOp::Pull {
+                source: PullSource::Network,
+                ..
+            }
+        ));
     }
 
     #[test]
