@@ -377,6 +377,44 @@ fn spec_references_the_manifest_instead_of_raw_ids() {
 }
 
 #[test]
+fn aliased_or_ancestral_manifest_paths_fail_before_creating_any_outputs() {
+    for settings in [
+        "manifest = \"src/./icons/index.ts\"\n",
+        "manifest = \"./src/icons/index.ts\"\nicons = \"src/./icons\"\n",
+        "manifest = \"src\"\n",
+        "manifest = \"public\"\n",
+    ] {
+        let dir = project(settings, &ICONS);
+        let output = figmog(
+            dir.path(),
+            &["assets", "export", "--icons", "1:1", "--images", "2:1"],
+        )
+        .failure()
+        .code(1);
+        let error = String::from_utf8_lossy(&output.get_output().stderr);
+        assert!(error.contains("[assets] manifest"), "{error}");
+        assert!(tree(dir.path()).is_empty(), "{settings}");
+        assert!(!dir.path().join("src").exists());
+        assert!(!dir.path().join("public").exists());
+    }
+}
+
+#[test]
+fn planned_file_directory_conflicts_fail_before_any_asset_is_written() {
+    let dir = project("images = \"src/icons/index.ts\"\n", &ICONS);
+    let output = figmog(
+        dir.path(),
+        &["assets", "export", "--icons", "1:1", "--images", "2:1"],
+    )
+    .failure()
+    .code(1);
+    let error = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(error.contains("planned asset"), "{error}");
+    assert!(tree(dir.path()).is_empty());
+    assert!(!dir.path().join("src").exists());
+}
+
+#[test]
 fn hostile_svg_markup_is_sanitized() {
     let dir = project(GOLDEN_ASSETS, &ICONS);
     let root = dir.path();

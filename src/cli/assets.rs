@@ -23,7 +23,7 @@
 //! this one no longer produces are reported as `stale`, never deleted.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -89,11 +89,18 @@ pub(super) fn run(
         .ok_or("assets export writes into the project and does not take --db")?;
     let settings = layout.settings().assets;
     let root = &layout.project_root;
+    let manifest = normalized_path(&settings.manifest)?;
     for (key, dir) in [("icons", &settings.icons), ("images", &settings.images)] {
-        let dir = dir.trim_end_matches('/');
-        if settings.manifest == dir || settings.manifest.starts_with(&format!("{dir}/")) {
+        let output = normalized_path(dir)?;
+        if manifest.starts_with(&output) {
             return Err(format!(
                 "[assets] manifest ({}) must not be inside the {key} folder ({dir}): figmog writes that folder's files itself",
+                settings.manifest
+            ));
+        }
+        if output.starts_with(&manifest) {
+            return Err(format!(
+                "[assets] manifest ({}) must not contain the {key} folder ({dir}): the manifest is a file, not a directory",
                 settings.manifest
             ));
         }
@@ -653,6 +660,42 @@ fn ensure_dirs(root: &Path, rel_dir: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// A checked path's lexical destination. Keep the configured spelling in
+/// reports and manifests, but compare the components the writer will use.
+fn normalized_path(path: &str) -> Result<PathBuf, String> {
+    check_project_path(path).map_err(|e| format!("{path}: {e}"))?;
+    Ok(Path::new(path)
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .collect())
+}
+
+/// Validate the entire planned file/directory graph before looking at or
+/// writing targets. Existing-file checks cannot see directories introduced
+/// by another planned output.
+fn check_planned_paths(plan: &Plan) -> Result<(), String> {
+    let mut destinations = BTreeMap::new();
+    for path in plan.files.keys() {
+        let destination = normalized_path(path)?;
+        if let Some(previous) = destinations.insert(destination.clone(), path) {
+            return Err(format!(
+                "planned asset paths {previous:?} and {path:?} name the same file ({})",
+                destination.display()
+            ));
+        }
+    }
+    for (destination, path) in &destinations {
+        for parent in destination.ancestors().skip(1) {
+            if let Some(file) = destinations.get(parent) {
+                return Err(format!(
+                    "planned asset file {file:?} must be a directory for {path:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Check every planned file, then write the ones whose bytes (or
 /// on-disk spelling) differ. Returns each path's status (`written` /
 /// `unchanged`).
@@ -661,6 +704,7 @@ fn write_files(
     plan: &Plan,
     force: bool,
 ) -> Result<BTreeMap<String, &'static str>, String> {
+    check_planned_paths(plan)?;
     let mut statuses = BTreeMap::new();
     let mut aliases = BTreeMap::new();
     for (rel, (kind, bytes)) in &plan.files {
@@ -767,6 +811,42 @@ mod tests {
         let e = ensure_dirs(root, &["src", "icons", "svg"]).unwrap_err();
         assert!(e.starts_with("src/icons is a symlink"), "{e}");
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rejects_planned_output_collisions_before_writing() {
+        for paths in [
+            ["src/./icons/index.ts", "src/icons/index.ts"],
+            ["./src/icons/index.ts", "src//icons/index.ts"],
+            ["src", "src/icons/IconA.tsx"],
+            ["src/./icons/svg", "src/icons/svg/IconA.svg"],
+        ] {
+            for force in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let files = paths
+                    .into_iter()
+                    .map(|path| {
+                        (
+                            path.to_string(),
+                            (Kind::Generated, assets::js_header().into_bytes()),
+                        )
+                    })
+                    .collect();
+                let plan = Plan {
+                    files,
+                    icons: vec![],
+                    images: vec![],
+                    skipped: vec![],
+                };
+                let error = write_files(dir.path(), &plan, force).unwrap_err();
+                assert!(error.contains("planned asset"), "{error}");
+                assert_eq!(
+                    std::fs::read_dir(dir.path()).unwrap().count(),
+                    0,
+                    "{paths:?}"
+                );
+            }
+        }
     }
 
     /// Case-insensitive filesystems, simulated: a lookup of `IconStar.tsx`

@@ -2138,7 +2138,7 @@
               }
             },
             "name": "Eyebrow",
-            "tailwind": "shrink-0 text-text-primary [font-family:'Inter'] text-[14px] [font-weight:400] leading-[20px] tracking-[0.5px] uppercase whitespace-pre",
+            "tailwind": "shrink-0 text-text-primary [font-family:\"Inter\"] text-[14px] [font-weight:400] leading-[20px] tracking-[0.5px] uppercase whitespace-pre",
             "type": "TEXT",
             "values": {
               "fill": [
@@ -2225,7 +2225,7 @@
               }
             },
             "name": "Body",
-            "tailwind": "shrink-0 self-stretch text-text-primary [font-family:'Inter'] [font-size:var(--font-size-body)] [font-weight:400] [line-height:var(--font-line-body)] whitespace-pre-wrap",
+            "tailwind": "shrink-0 self-stretch text-text-primary [font-family:\"Inter\"] [font-size:var(--font-size-body)] [font-weight:400] [line-height:var(--font-line-body)] whitespace-pre-wrap",
             "type": "TEXT",
             "values": {
               "fill": [
@@ -2369,7 +2369,7 @@
               }
             },
             "name": "Mixed",
-            "tailwind": "shrink-0 self-stretch text-text-primary [font-family:'Inter'] text-[16px] [font-weight:400] leading-[24px] whitespace-pre-wrap",
+            "tailwind": "shrink-0 self-stretch text-text-primary [font-family:\"Inter\"] text-[16px] [font-weight:400] leading-[24px] whitespace-pre-wrap",
             "type": "TEXT",
             "values": {
               "fill": [
@@ -2470,7 +2470,7 @@
               }
             },
             "name": "Lines",
-            "tailwind": "shrink-0 self-stretch text-text-primary [font-family:'Inter'] text-[14px] [font-weight:400] leading-[20px] whitespace-pre-wrap",
+            "tailwind": "shrink-0 self-stretch text-text-primary [font-family:\"Inter\"] text-[14px] [font-weight:400] leading-[20px] whitespace-pre-wrap",
             "type": "TEXT",
             "values": {
               "fill": [
@@ -2570,7 +2570,7 @@
               }
             },
             "name": "Truncated",
-            "tailwind": "w-[160px] h-[20px] shrink-0 overflow-hidden text-text-primary [font-family:'Inter'] text-[14px] [font-weight:400] leading-[20px] whitespace-pre text-ellipsis",
+            "tailwind": "w-[160px] h-[20px] shrink-0 overflow-hidden text-text-primary [font-family:\"Inter\"] text-[14px] [font-weight:400] leading-[20px] whitespace-pre text-ellipsis",
             "type": "TEXT",
             "values": {
               "fill": [
@@ -2672,7 +2672,7 @@
               }
             },
             "name": "Clamped",
-            "tailwind": "w-[200px] h-[40px] shrink-0 overflow-hidden text-text-primary [font-family:'Inter'] text-[14px] [font-weight:400] leading-[20px] whitespace-pre-wrap line-clamp-2",
+            "tailwind": "w-[200px] h-[40px] shrink-0 overflow-hidden text-text-primary [font-family:\"Inter\"] text-[14px] [font-weight:400] leading-[20px] whitespace-pre-wrap line-clamp-2",
             "type": "TEXT",
             "values": {
               "fill": [
@@ -2894,7 +2894,7 @@
               }
             },
             "name": "Label",
-            "tailwind": "min-w-0 flex-1 text-ink-50 [font-family:'Inter'] text-[14px] [font-weight:400] leading-[16px] whitespace-pre-wrap",
+            "tailwind": "min-w-0 flex-1 text-ink-50 [font-family:\"Inter\"] text-[14px] [font-weight:400] leading-[16px] whitespace-pre-wrap",
             "type": "TEXT",
             "values": {
               "fill": [

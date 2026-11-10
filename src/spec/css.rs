@@ -295,9 +295,10 @@ fn utility(prop: &str) -> Option<(&'static str, Option<&'static str>)> {
     })
 }
 
-/// Spaces become `_` inside a Tailwind arbitrary value; `"` becomes `'`.
+/// Escape literal underscores before encoding spaces for Tailwind. CSS
+/// string delimiters and their existing escapes must retain their meaning.
 fn arbitrary(value: &str) -> String {
-    value.replace(' ', "_").replace('"', "'")
+    value.replace('_', "\\_").replace(' ', "_")
 }
 
 /// The class for one declaration (`None`: another class covers it).
@@ -414,6 +415,22 @@ mod tests {
             let length = CssVal::lit(value);
             assert_eq!(length.scaled(-0.5, "px").value, scaled);
             assert_eq!(length.inset(10.0), inset);
+        }
+    }
+
+    #[test]
+    fn arbitrary_font_strings_keep_their_quotes_and_literal_underscores() {
+        for (css_value, hint) in [
+            (r#""Foo_Bar""#, r#"[font-family:"Foo\_Bar"]"#),
+            (r#""O'Reilly""#, r#"[font-family:"O'Reilly"]"#),
+            (
+                r#""A \"Quoted\" Font""#,
+                r#"[font-family:"A_\"Quoted\"_Font"]"#,
+            ),
+        ] {
+            let mut css = Css::default();
+            css.lit("font-family", css_value);
+            assert_eq!(css.tailwind(), hint);
         }
     }
 

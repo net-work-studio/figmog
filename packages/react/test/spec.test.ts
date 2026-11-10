@@ -244,3 +244,39 @@ describe("figmog spec's CSS translation in Chromium", () => {
     });
   }
 });
+
+interface FontFamilyCase {
+  family: string;
+  css: string;
+  tailwind: string;
+}
+
+test("arbitrary font strings retain their CSS font names through Tailwind", async () => {
+  const families = JSON.parse(await readFile(join(FIXTURES, "font-families.json"), "utf8")) as FontFamilyCase[];
+  const compiler = await compile("@tailwind utilities;");
+  const css = compiler.build(families.map((entry) => entry.tailwind));
+  assert.ok(browser !== undefined);
+  const target = await browser.newPage();
+  try {
+    await target.setContent(`<!doctype html><html><head><style>${css}</style></head><body></body></html>`);
+    const declarations = await target.evaluate((cases) => cases.map((entry) => {
+      const original = document.createElement("span");
+      const hinted = document.createElement("span");
+      original.style.fontFamily = entry.css;
+      hinted.classList.add(entry.tailwind);
+      document.body.append(original, hinted);
+      return {
+        family: entry.family,
+        cssIsValid: original.style.fontFamily !== "",
+        original: getComputedStyle(original).fontFamily,
+        hinted: getComputedStyle(hinted).fontFamily,
+      };
+    }), families);
+    for (const entry of declarations) {
+      assert.ok(entry.cssIsValid, `invalid source CSS for ${entry.family}`);
+      assert.equal(entry.hinted, entry.original, entry.family);
+    }
+  } finally {
+    await target.close();
+  }
+});

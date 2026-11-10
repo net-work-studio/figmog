@@ -1125,6 +1125,51 @@ fn default_selector(collection: &str, mode: &str) -> Option<String> {
     Some(format!("[data-{}=\"{}\"]", &c[2..], &m[2..]))
 }
 
+/// Legal mode choices for the collections involved in an alias component.
+/// Each added selector switches every collection that uses it. Two selectors
+/// from one collection cannot coexist, including collections outside this
+/// component that constrain the same selectors. Every partial context can
+/// extend to a complete one by leaving later selectors inactive, so the limit
+/// counts legal contexts rather than the selector power set.
+fn mode_contexts<'a>(
+    col_keys: &[&'a str],
+    cols: &'a BTreeMap<String, ColModes>,
+) -> Option<Vec<BTreeMap<&'a str, &'a str>>> {
+    let mut selectors: BTreeMap<&str, (BTreeSet<usize>, Vec<&str>)> = BTreeMap::new();
+    for ck in col_keys {
+        for selector in cols[*ck].sels.values() {
+            selectors.entry(selector.as_str()).or_default().1.push(*ck);
+        }
+    }
+    for (i, col) in cols.values().enumerate() {
+        for selector in col.sels.values() {
+            if let Some((owners, _)) = selectors.get_mut(selector.as_str()) {
+                owners.insert(i);
+            }
+        }
+    }
+    let root: BTreeMap<_, _> = col_keys.iter().map(|ck| (*ck, ROOT)).collect();
+    let mut contexts = vec![(BTreeSet::new(), root)];
+    for (selector, (owners, switched)) in selectors {
+        let previous = contexts.len();
+        for i in 0..previous {
+            if !contexts[i].0.is_disjoint(&owners) {
+                continue;
+            }
+            if contexts.len() == MAX_CONTEXTS {
+                return None;
+            }
+            let (mut active, mut context) = contexts[i].clone();
+            active.extend(owners.iter().copied());
+            for ck in &switched {
+                context.insert(*ck, selector);
+            }
+            contexts.push((active, context));
+        }
+    }
+    Some(contexts.into_iter().map(|(_, context)| context).collect())
+}
+
 /// Every token on an alias cycle in some combination of modes → why. The
 /// alias graph over all modes is split into strongly connected components;
 /// for each that loops, every combination of modes CSS can produce is
@@ -1162,18 +1207,7 @@ fn alias_cycles(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        // The combinations CSS can produce: a set of matching mode
-        // selectors, each collection in the mode whose selector matches
-        // (its root mode when none does). Collections sharing a selector
-        // switch together; two modes of one collection never apply at once.
-        let selectors: Vec<&str> = col_keys
-            .iter()
-            .flat_map(|ck| cols[*ck].sels.values().map(String::as_str))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let max_bits = MAX_CONTEXTS.trailing_zeros() as usize;
-        if selectors.len() > max_bits {
+        let Some(contexts) = mode_contexts(&col_keys, cols) else {
             for &i in &members {
                 out.insert(
                     ids[i].to_string(),
@@ -1181,34 +1215,7 @@ fn alias_cycles(
                 );
             }
             continue;
-        }
-        let mut contexts: Vec<BTreeMap<&str, &str>> = Vec::new();
-        let mut seen: BTreeSet<Vec<&str>> = BTreeSet::new();
-        'masks: for mask in 0..(1usize << selectors.len()) {
-            let active = |s: &str| {
-                selectors
-                    .iter()
-                    .position(|x| *x == s)
-                    .is_some_and(|k| mask & (1 << k) != 0)
-            };
-            let mut ctx = BTreeMap::new();
-            for ck in &col_keys {
-                let hits: Vec<&str> = cols[*ck]
-                    .sels
-                    .values()
-                    .map(String::as_str)
-                    .filter(|s| active(s))
-                    .collect();
-                match hits.as_slice() {
-                    [] => ctx.insert(*ck, ROOT),
-                    [one] => ctx.insert(*ck, *one),
-                    _ => continue 'masks,
-                };
-            }
-            if seen.insert(ctx.values().copied().collect()) {
-                contexts.push(ctx);
-            }
-        }
+        };
         let total = contexts.len();
         // Member → (its first cycle, with the modes it closes in; how
         // many combinations close one through it).
@@ -1640,7 +1647,7 @@ fn declarations(css: &str) -> Result<Blocks, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Map, json};
 
     fn row(
         id: &str,
@@ -2299,6 +2306,181 @@ mod tests {
         );
         assert!(r[0].1.contains("not flattened"), "{r:?}");
         assert_eq!(r[1], ("V:2", "aliases V:1, which is not exported: skipped"));
+    }
+
+    #[test]
+    fn alias_loops_check_legal_modes_instead_of_selector_bit_subsets() {
+        let mut a = Map::new();
+        let mut b = Map::new();
+        for mode in 0..14 {
+            let name = format!("M{mode}");
+            a.insert(
+                name.clone(),
+                if mode == 0 {
+                    json!({"type": "VARIABLE_ALIAS", "id": "V:2"})
+                } else {
+                    json!(2)
+                },
+            );
+            b.insert(
+                name,
+                if mode == 0 {
+                    json!(1)
+                } else {
+                    json!({"type": "VARIABLE_ALIAS", "id": "V:1"})
+                },
+            );
+        }
+        let v = snap(vec![
+            in_collection(
+                row("V:1", "a", "FLOAT", Value::Object(a), json!(["GAP"]), None),
+                "Theme",
+                "M0",
+            ),
+            in_collection(
+                row("V:2", "b", "FLOAT", Value::Object(b), json!(["GAP"]), None),
+                "Theme",
+                "M0",
+            ),
+            in_collection(
+                row(
+                    "V:3",
+                    "dependent",
+                    "FLOAT",
+                    json!({"M0": {"type": "VARIABLE_ALIAS", "id": "V:1"}}),
+                    json!(["GAP"]),
+                    None,
+                ),
+                "Fixed",
+                "M0",
+            ),
+        ]);
+        let out = export_css(&v, &ExportOptions::default()).unwrap();
+        assert!(out.report.is_empty(), "{:?}", out.report);
+        assert_eq!(out.tokens, 3);
+        assert!(out.css.contains("--a: var(--b);"), "{}", out.css);
+        assert!(out.css.contains("--b: 1px;"), "{}", out.css);
+        assert!(out.css.contains("--dependent: var(--a);"), "{}", out.css);
+        for mode in 1..14 {
+            assert!(
+                out.css.contains(&format!(
+                    "[data-theme=\"m{mode}\"] {{\n  --a: 2px;\n  --b: var(--a);"
+                )),
+                "{}",
+                out.css
+            );
+        }
+    }
+
+    #[test]
+    fn legal_context_limit_allows_many_exclusive_or_coupled_modes() {
+        let collection = |name: &str, count: usize| ColModes {
+            name: name.into(),
+            root: "M0".into(),
+            sels: (1..count)
+                .map(|i| (format!("M{i}"), format!(".m{i}")))
+                .collect(),
+            skipped: BTreeSet::new(),
+        };
+        let mut cols = BTreeMap::from([
+            ("A".into(), collection("A", 14)),
+            ("B".into(), collection("B", 14)),
+        ]);
+        let contexts = mode_contexts(&["A", "B"], &cols).unwrap();
+        assert_eq!(contexts.len(), 14);
+        assert!(contexts.iter().all(|ctx| ctx["A"] == ctx["B"]));
+        cols = BTreeMap::from([("A".into(), collection("A", MAX_CONTEXTS))]);
+        assert_eq!(mode_contexts(&["A"], &cols).unwrap().len(), MAX_CONTEXTS);
+        cols.insert("A".into(), collection("A", MAX_CONTEXTS + 1));
+        assert!(mode_contexts(&["A"], &cols).is_none());
+    }
+
+    #[test]
+    fn legal_context_limit_still_bounds_independent_collection_choices() {
+        let mut cols: BTreeMap<String, ColModes> = (0..12)
+            .map(|i| {
+                let name = format!("C{i}");
+                (
+                    name.clone(),
+                    ColModes {
+                        name,
+                        root: "Base".into(),
+                        sels: BTreeMap::from([("Other".into(), format!(".c{i}"))]),
+                        skipped: BTreeSet::new(),
+                    },
+                )
+            })
+            .collect();
+        let keys: Vec<&str> = cols.keys().map(String::as_str).collect();
+        assert_eq!(mode_contexts(&keys, &cols).unwrap().len(), MAX_CONTEXTS);
+        cols.insert(
+            "C12".into(),
+            ColModes {
+                name: "C12".into(),
+                root: "Base".into(),
+                sels: BTreeMap::from([("Other".into(), ".c12".into())]),
+                skipped: BTreeSet::new(),
+            },
+        );
+        let keys: Vec<&str> = cols.keys().map(String::as_str).collect();
+        assert!(mode_contexts(&keys, &cols).is_none());
+    }
+
+    #[test]
+    fn shared_mode_constraints_outside_an_alias_component_remain_legal() {
+        let alias = |id: &str| json!({"type": "VARIABLE_ALIAS", "id": id});
+        let v = snap(vec![
+            in_collection(
+                row(
+                    "V:1",
+                    "a",
+                    "FLOAT",
+                    json!({"Base": 1, "Other": alias("V:2")}),
+                    json!(["GAP"]),
+                    None,
+                ),
+                "A",
+                "Base",
+            ),
+            in_collection(
+                row(
+                    "V:2",
+                    "b",
+                    "FLOAT",
+                    json!({"Base": 2, "Other": alias("V:1")}),
+                    json!(["GAP"]),
+                    None,
+                ),
+                "B",
+                "Base",
+            ),
+            in_collection(
+                row(
+                    "V:3",
+                    "external",
+                    "FLOAT",
+                    json!({"Base": 3, "ModeA": 4, "ModeB": 5}),
+                    json!(["GAP"]),
+                    None,
+                ),
+                "External",
+                "Base",
+            ),
+        ]);
+        let out = export_css(
+            &v,
+            &modes(&[
+                ("A/Other", ".a"),
+                ("B/Other", ".b"),
+                ("External/ModeA", ".a"),
+                ("External/ModeB", ".b"),
+            ]),
+        )
+        .unwrap();
+        assert!(out.report.is_empty(), "{:?}", out.report);
+        assert_eq!(out.tokens, 3);
+        assert!(out.css.contains("--a: var(--b);"), "{}", out.css);
+        assert!(out.css.contains("--b: var(--a);"), "{}", out.css);
     }
 
     #[test]

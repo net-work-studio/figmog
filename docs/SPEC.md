@@ -1328,9 +1328,10 @@ variable missing a needed mode's value.
   matches (its root mode when none does) — so collections sharing a
   selector (every dark mode on `[data-theme="dark"]` by default) switch
   together and a loop closing only when one is Light and the other Dark
-  is no cycle; two modes of one collection never apply at once (a
-  variable has one value per combination; more than 12 selectors ⇒ every
-  member is skipped unchecked). A member of a cycle is skipped and
+  is no cycle. Two modes of one collection never apply at once, so a
+  variable has one value per combination. The limit counts legal contexts,
+  including shared-selector coupling. Components with more than 4096
+  legal mode combinations are skipped unchecked. A member of a cycle is skipped and
   reported with the cycle and either `in every mode` or `only in some
   modes (first: "Theme" mode "Dark")`; a loop no combination closes is no
   cycle;
@@ -2089,10 +2090,14 @@ The store is never opened (a running serve may hold it). The dev
 server's `localhost` / `*.localhost` host goes straight to `127.0.0.1` and
 `::1` without a resolver, an IP literal as is; any other name is resolved
 on a detached thread abandoned after 2 s (a `warn`). Network checks
-are bounded — 10 s per Figma request, the desktop client's 2 s connect
+are bounded — 10 s per complete Figma check, the desktop client's 2 s connect
 and 10 s request timeouts, 2 s per dev-server address — and a network
 failure is a `warn` ("could not reach Figma"), so an offline machine gets
-a complete report quickly. Figma checks use serve's API client (debug
+a complete report quickly. Each Figma check runs on a worker under one
+absolute deadline, including client creation, DNS resolution and HTTP.
+The HTTP client receives only the remaining budget. Doctor abandons a
+worker that exceeds the deadline, discards its late result and continues
+with a warning. Figma checks use serve's API client (debug
 builds honor `FIGMOG_API_BASE`, for tests). The token is never printed.
 Exit 0 unless a check failed; then the report is still printed and
 `{"error": "doctor: failed checks: <names>"}` goes to stderr, exit 1.
@@ -2376,6 +2381,9 @@ theme utility (`--color-surface` → `bg-surface`, `--spacing-4` →
 `gap-4`, `p-4`, `--radius-md` → `rounded-md`); any other bound value the
 arbitrary property `[font-size:var(--font-size-title)]`; an unbound value
 an arbitrary value (`gap-[8px]`, `bg-[#1a1a1f]`) — never a theme utility.
+Arbitrary values preserve CSS string delimiters and escapes. Literal
+underscores are escaped before spaces become underscores, so a font such
+as `Foo_Bar` or `O'Reilly` keeps the same name after Tailwind compilation.
 `pt-X pb-X` / `pl-X pr-X` collapse to `py-X` / `px-X`. `box-sizing:
 border-box` has no class (Tailwind's preflight sets it).
 
@@ -2540,13 +2548,15 @@ instance it can't express:
 - `unmapped_properties`: an instance property the map has no prop for; a
   value not listed in `values`; an instance swap to a component with no
   entry, or whose entry identifies only a component set without the
-  authoritative variant properties needed to select its props; a property
-  bound to a variable (the map would pass a literal);
-  an ambiguous suffix match.
-- A **`component` entry** names one variant, so its identity already
-  expresses every VARIANT property (`Tier=Pro` needs no prop); a
-  `component_set` entry has to map them. Other properties need a prop
-  either way.
+  authoritative variant properties needed to select its props; a swap
+  target with explicit prop mappings whose property values are unavailable,
+  including a component-specific entry; a property bound to a variable
+  (the map would pass a literal); an ambiguous suffix match.
+- A **`component` entry** names one variant, so its identity covers a
+  VARIANT property with no explicit mapping (`Tier=Pro` needs no prop).
+  Explicit mappings still require the instance's property values. A
+  `component_set` entry has to map variant properties. Other properties
+  need a prop either way.
 - `unmapped_overrides` (`reason` says which kind):
   - `override` — every `overrides[].overriddenFields` entry, on the
     instance and on every nested instance, that a mapped property doesn't
@@ -2698,11 +2708,15 @@ data); node ids reach a comment only after a strict character check
 (`[A-Za-z0-9:;-]`, ≤ 128); imageRefs must be ASCII alphanumeric; file
 names are the validated component name or the content hash (SHA-256 via
 `ring`, already compiled in through rustls). Every write target is
-checked before anything is written: inside the project, no symlink
-anywhere on its path below the project root (the file or any directory;
-`--force` doesn't change this), a regular file, and no directory on the
-way spelled differently on disk (a case-insensitive filesystem: refused,
-naming the spelling on disk). Missing directories are created one at a
+checked before anything is written. Path comparisons normalize relative
+components, including `.`. The manifest must not sit inside an output
+directory or occupy one of its ancestors. The complete planned output
+graph rejects duplicate destinations and file/directory conflicts before
+any write, including with `--force`. Every target must stay inside the
+project. Symlinks anywhere below the project root are refused, including
+with `--force`. An existing target must be a regular file. Directory
+spellings must match the names on disk; case aliases produce an error
+that names the existing spelling. Missing directories are created one at a
 time, each checked (never `create_dir_all` through a link). Each file is
 written atomically: a new temporary file in the same directory (created
 exclusively, `O_NOFOLLOW`), then renamed over the target. A target that
@@ -2762,12 +2776,15 @@ pin `currentColor`). With `current_color = true` that color becomes
 icons and logos always keep their colors (`colors` in the manifest).
 Embedded color alpha is combined with effective paint opacity. Conversion
 is declined when alpha cannot be represented safely, including when
-moving embedded alpha onto referenced geometry would override use-site
-paint opacity, or mask/clip geometry could inherit a changed paint. Ids
+moving embedded alpha or materializing an implicit fill on referenced
+geometry could override use-site paints or opacity. Mask/clip geometry
+must also keep its inherited paints. Ids
 are renumbered in document order: the `.svg` file prefixes them with the
-component name; the component with React's `useId()` (reduced to
-`[A-Za-z0-9_-]`, prefixed `figmog`), so two instances on one page never
-share a gradient, mask, clip-path or filter id. Components need React 18+
+component name; the component losslessly encodes every UTF-16 code unit
+of React's `useId()` as four hexadecimal digits, prefixed with `figmog`.
+This preserves React's ID distinctions across instances and independent
+roots with distinct `identifierPrefix` values. Instances then keep their
+gradient, mask, clip-path and filter references separate. Components need React 18+
 (for `useId`) and the automatic JSX runtime, nothing else; they are
 `aria-hidden` unless given `aria-label`/`aria-labelledby`, and spread
 their props last (`className`, `width`, … override).

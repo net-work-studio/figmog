@@ -1170,6 +1170,11 @@ impl Sanitized {
             }
             // The implicit black fill, made explicit.
             if FILLED.contains(&el.name) && !has_fill && default_fill && color == DEFAULT_FILL {
+                // A referenced shape gets its fill from the use instance.
+                // Materializing it on the definition would override that paint.
+                if referenced {
+                    return false;
+                }
                 el.attrs.push(("fill", Val::Lit("currentColor".into())));
             }
             for c in &mut el.children {
@@ -1650,6 +1655,30 @@ mod tests {
                     before.to_jsx(0, "uid", &[])
                 );
             }
+        }
+    }
+
+    #[test]
+    fn current_color_preserves_use_site_fills_on_implicit_black_geometry() {
+        for uses in [
+            r##"<use href="#a" fill="none"/>"##,
+            r##"<use href="#a" fill="none"/><use href="#a" fill="black"/>"##,
+            r##"<g fill="none"><use href="#a"/></g><use href="#a" fill="#000000"/>"##,
+        ] {
+            let input = format!(
+                r##"<svg width="10" height="10"><defs><rect id="a" width="10" height="10"/></defs>{uses}</svg>"##
+            );
+            let mut sanitized = sanitize(&input).unwrap();
+            assert!(sanitized.removed.is_empty());
+            let before = sanitized.clone();
+            let color = sanitized.single_color().unwrap();
+            assert_eq!(color, DEFAULT_FILL);
+            assert!(!sanitized.use_current_color(&color), "{input}");
+            assert_eq!(sanitized.to_svg("x"), before.to_svg("x"));
+            assert_eq!(
+                sanitized.to_jsx(0, "uid", &[]),
+                before.to_jsx(0, "uid", &[])
+            );
         }
     }
 

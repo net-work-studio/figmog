@@ -378,11 +378,10 @@ pub(crate) fn react_component(
     out.push('\n');
     out.push_str(&format!("export function {name}({props}) {{\n"));
     if ids {
-        // `useId` is unique per rendered instance; its punctuation varies
-        // across React versions and isn't id/url()-safe, so it is reduced
-        // to letters, digits, `_` and `-` (still unique: the punctuation
-        // only delimits).
-        out.push_str("  const uid = `figmog${useId().replace(/[^A-Za-z0-9_-]/g, \"\")}`;\n");
+        // Encode every UTF-16 code unit at a fixed width. Removing punctuation
+        // loses uniqueness across roots whose identifierPrefix differs by it;
+        // code-unit encoding also distinguishes arbitrary Unicode prefixes.
+        out.push_str("  const uid = `figmog${useId().split(\"\").map((c) => c.charCodeAt(0).toString(16).padStart(4, \"0\")).join(\"\")}`;\n");
     }
     out.push_str("  return (\n");
     out.push_str(&svg.to_jsx(
@@ -1187,6 +1186,10 @@ mod tests {
         let mut settings = settings();
         settings.current_color = true;
         for (svg, converted) in [
+            (
+                r##"<svg><defs><rect id="a" width="10" height="10"/></defs><use href="#a" fill="none"/></svg>"##,
+                false,
+            ),
             (
                 r##"<svg><rect fill="#ff000080" width="10" height="10"/></svg>"##,
                 true,
