@@ -2761,8 +2761,9 @@ pin `currentColor`). With `current_color = true` that color becomes
 `fill="currentColor"`), so Tailwind text colors apply; multicolor
 icons and logos always keep their colors (`colors` in the manifest).
 Embedded color alpha is combined with effective paint opacity. Conversion
-is declined when alpha cannot be represented safely or mask/clip geometry
-could inherit a changed paint (including referenced shapes). Ids
+is declined when alpha cannot be represented safely, including when
+moving embedded alpha onto referenced geometry would override use-site
+paint opacity, or mask/clip geometry could inherit a changed paint. Ids
 are renumbered in document order: the `.svg` file prefixes them with the
 component name; the component with React's `useId()` (reduced to
 `[A-Za-z0-9_-]`, prefixed `figmog`), so two instances on one page never

@@ -1121,6 +1121,10 @@ impl Sanitized {
                 }
             }
             let has_fill = el.attrs.iter().any(|(n, _)| *n == "fill");
+            // Sanitization retains ids only when something references them.
+            // A reused shape inherits paint opacity through its use instance,
+            // which need not match its definition-tree ancestors.
+            let referenced = el.attrs.iter().any(|(_, v)| matches!(v, Val::Id(_)));
             let mut extra = Vec::new();
             for (name, v) in &mut el.attrs {
                 if let Val::Lit(s) = v
@@ -1131,10 +1135,10 @@ impl Sanitized {
                         return false;
                     };
                     if alpha != 1.0 {
-                        // Moving an ancestor's embedded alpha to an inherited
-                        // opacity would also affect descendants that override
-                        // its paint, so keep that conversion unchanged.
-                        if !el.children.is_empty() {
+                        // Explicit opacity would affect descendants that
+                        // override this paint, or override a use instance's
+                        // inherited opacity on referenced geometry.
+                        if !el.children.is_empty() || referenced {
                             return false;
                         }
                         let opacity_name = match *name {
@@ -1619,6 +1623,66 @@ mod tests {
         let before = unknown.to_svg("x");
         unknown.use_current_color(&unknown.single_color().unwrap());
         assert_eq!(unknown.to_svg("x"), before);
+    }
+
+    #[test]
+    fn current_color_preserves_use_site_paint_opacity_on_referenced_shapes() {
+        for (paint, opacity) in [("fill", "fill-opacity"), ("stroke", "stroke-opacity")] {
+            for use_opacities in [vec!["0"], vec!["0", "0.25", "0.75"]] {
+                let uses: String = use_opacities
+                    .iter()
+                    .map(|value| format!(r##"<use href="#a" {opacity}="{value}"/>"##))
+                    .collect();
+                let input = format!(
+                    r##"<svg width="10" height="10" fill="none"><defs><rect id="a" width="10" height="10" {paint}="#ff000080"/></defs>{uses}</svg>"##
+                );
+                let mut sanitized = sanitize(&input).unwrap();
+                assert!(sanitized.removed.is_empty());
+                let before = sanitized.clone();
+                let color = sanitized.single_color().unwrap();
+                assert!(!sanitized.use_current_color(&color), "{paint}: {input}");
+                // Declining the whole conversion preserves every instance's
+                // inherited opacity in both SVG and JSX output.
+                assert_eq!(sanitized, before);
+                assert_eq!(sanitized.to_svg("x"), before.to_svg("x"));
+                assert_eq!(
+                    sanitized.to_jsx(0, "uid", &[]),
+                    before.to_jsx(0, "uid", &[])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_color_still_converts_opaque_references_and_unreferenced_translucent_shapes() {
+        for paint in ["fill", "stroke"] {
+            let input = format!(
+                r##"<svg fill="none"><defs><rect id="a" width="10" height="10" {paint}="#ff0000"/></defs><use href="#a" fill-opacity="0" stroke-opacity="0"/><use href="#a" fill-opacity="0.25" stroke-opacity="0.75"/></svg>"##
+            );
+            let mut sanitized = sanitize(&input).unwrap();
+            let color = sanitized.single_color().unwrap();
+            assert!(sanitized.use_current_color(&color));
+            let output = sanitized.to_svg("x");
+            assert!(
+                output.contains(&format!("{paint}=\"currentColor\"")),
+                "{output}"
+            );
+            assert!(output.contains("fill-opacity=\"0\""), "{output}");
+            assert!(output.contains("stroke-opacity=\"0.75\""), "{output}");
+
+            let input = format!(
+                r##"<svg fill="none"><rect id="unused" width="10" height="10" {paint}="#ff000080"/></svg>"##
+            );
+            let mut sanitized = sanitize(&input).unwrap();
+            assert!(!sanitized.has_ids());
+            let color = sanitized.single_color().unwrap();
+            assert!(sanitized.use_current_color(&color));
+            assert!(
+                sanitized
+                    .to_svg("x")
+                    .contains(&format!("{paint}-opacity=\"0.5019607843137255\""))
+            );
+        }
     }
 
     #[test]

@@ -1199,6 +1199,14 @@ mod tests {
                 r##"<svg fill="white"><mask id="m"><rect width="10" height="10"/></mask><rect width="10" height="10" mask="url(#m)"/></svg>"##,
                 false,
             ),
+            (
+                r##"<svg fill="none"><defs><rect id="a" fill="#ff000080" width="10" height="10"/></defs><use href="#a" fill-opacity="0"/><use href="#a" fill-opacity="0.25"/></svg>"##,
+                false,
+            ),
+            (
+                r##"<svg fill="none"><defs><rect id="a" stroke="#ff000080" width="10" height="10"/></defs><use href="#a" stroke-opacity="0"/><use href="#a" stroke-opacity="0.75"/></svg>"##,
+                false,
+            ),
         ] {
             let plan = plan(
                 &settings,
