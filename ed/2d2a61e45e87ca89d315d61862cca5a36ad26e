@@ -1,0 +1,58 @@
+packages/react/test/spec.test.ts
+  s_3710a1eb3547ff::t_6637722b4a4b33 247-282
+tests/fixtures/spec/font-families.json
+  s_3710a1eb3547ff::t_6f20b1a7ad8473 1-4,6-9,11-14,16-19,21-24,26-29,31-34,36-39,41-42
+  s_3710a1eb3547ff::t_d787cb9920a2d8 5,10,15,20,25,30,35,40
+tests/fixtures/assets/export/src/icons/IconStar.jsx
+  s_3710a1eb3547ff::t_d82a1b216a06b2 6
+src/cli/assets.rs
+  s_3710a1eb3547ff::t_a2fd2a4e7e0d72 26,92,94-95,101-106,663-698,707,848-850
+  s_3710a1eb3547ff::t_374b76563714e8 816-847,851
+docs/SPEC.md
+  s_3710a1eb3547ff::t_8d569d7c026be7 1331-1334,2093,2096-2100,2384-2386,2551-2559,2711-2719
+  s_3710a1eb3547ff::t_36c91e90a8bf08 2779-2781,2783-2787
+src/assets.rs
+  s_3710a1eb3547ff::t_e4f6fd071fc915 381-384,1189-1192
+src/cli/doctor.rs
+  s_3710a1eb3547ff::t_e534b42f90a0db 13,159,163,277-307,310-314,317-329,549-589,591-639
+  s_3710a1eb3547ff::t_e256e3b6b4e8a5 590
+  s_3710a1eb3547ff::t_7cf490db9104e8 308-309,315-316,640
+src/spec/css.rs
+  s_3710a1eb3547ff::t_66ec4106003a3c 426-429
+  s_3710a1eb3547ff::t_f9898e43a69cd5 298-299,301,421-425,430-436
+src/tokens.rs
+  s_3710a1eb3547ff::t_445f0a8059e8c6 1128-1150,1152-1172,1210,1218,2373-2484
+  s_3710a1eb3547ff::t_40053e62dd9d72 1650,2311-2372
+  s_3710a1eb3547ff::t_930ad7ff752044 1151,2485
+tests/fixtures/assets/export/src/icons/IconLogo.jsx
+  s_3710a1eb3547ff::t_d82a1b216a06b2 6
+tests/spec.rs
+  s_3710a1eb3547ff::t_6637722b4a4b33 587-589,591-598,639-642
+  s_3710a1eb3547ff::t_4e2ef782f2eb88 590,599-638
+examples/slice/app/test/icons.test.mjs
+  s_3710a1eb3547ff::t_d1670ec6ee8304 89-105
+src/map.rs
+  s_3710a1eb3547ff::t_646171e4613725 628-633,1151-1197
+src/svg.rs
+  s_3710a1eb3547ff::t_6a37c7ead62447 1173-1177,1661-1684
+tests/assets.rs
+  s_3710a1eb3547ff::t_45639517e85187 379-416
+tests/fixtures/spec/edge.spec.json
+  s_3710a1eb3547ff::t_a663a9c7f09d13 2141,2228,2372,2473,2573,2675,2897
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ed2d2a61e45e87ca89d315d61862cca5a36ad26e",
+  "prompts": {},
+  "sessions": {
+    "s_3710a1eb3547ff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c47b-dae1-7b01-bd55-952da11daa84",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
