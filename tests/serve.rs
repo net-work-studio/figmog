@@ -604,6 +604,8 @@ fn fresh_pull_preserves_a_store_owned_by_serve() {
 // deriving fixtures from real files or exposing context to the proxy.
 
 fn read_request(stream: &mut TcpStream) -> String {
+    // macOS accepted sockets inherit a nonblocking listener's mode.
+    stream.set_nonblocking(false).unwrap();
     let mut header_bytes = Vec::new();
     let mut byte = [0u8; 1];
     loop {

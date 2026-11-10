@@ -671,9 +671,27 @@ pub(crate) fn probe(
         return Ok(Probe::Absent);
     };
     check_peer(&stream)?;
+    probe_connected(paths, relay, &discovery, stream)
+}
+
+/// Handshake on a connection whose address and peer have been validated.
+fn probe_connected(
+    paths: &OwnerPaths,
+    relay: Option<(&Settings, &[String])>,
+    discovery: &Discovery,
+    stream: UnixStream,
+) -> Result<Probe, String> {
     let io = |e: std::io::Error| format!("talking to the background figmog: {e}");
-    stream.set_read_timeout(Some(HELLO_TIMEOUT)).map_err(io)?;
-    stream.set_write_timeout(Some(HELLO_TIMEOUT)).map_err(io)?;
+    // On macOS, setting socket timeouts can fail with EINVAL after the
+    // peer closes. This is the same idle-exit race as a failed HELLO read
+    // or write: reconnect instead of making startup fail permanently.
+    if stream
+        .set_read_timeout(Some(HELLO_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(HELLO_TIMEOUT)))
+        .is_err()
+    {
+        return Ok(Probe::Closing);
+    }
     let mut writer = stream.try_clone().map_err(io)?;
     let mut reader = BufReader::new(stream);
     let hello = hello_request(paths, relay);
@@ -750,8 +768,13 @@ pub(crate) fn probe(
         attach_errors,
     };
     let stream = reader.get_ref();
-    stream.set_read_timeout(None).map_err(io)?;
-    stream.set_write_timeout(None).map_err(io)?;
+    if stream
+        .set_read_timeout(None)
+        .and_then(|()| stream.set_write_timeout(None))
+        .is_err()
+    {
+        return Ok(Probe::Closing);
+    }
     Ok(Probe::Ready(OwnerConn {
         reader,
         writer,
@@ -1420,6 +1443,28 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(error.contains("XDG_RUNTIME_DIR"), "{error}");
         assert!(!paths.log().exists(), "no child should have been launched");
+    }
+
+    #[test]
+    fn a_peer_closing_before_the_handshake_is_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let discovery = Discovery {
+            socket: paths.socket(),
+            pid: 42,
+            generation: "closing".into(),
+            version: version().into(),
+            protocol: PROTOCOL,
+        };
+        let (client, owner) = UnixStream::pair().unwrap();
+        drop(owner);
+        assert!(
+            matches!(
+                probe_connected(&paths, None, &discovery, client),
+                Ok(Probe::Closing)
+            ),
+            "a peer closing before HELLO must allow reconnecting"
+        );
     }
 
     #[cfg(target_os = "macos")]
