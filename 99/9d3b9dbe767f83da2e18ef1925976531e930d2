@@ -1,0 +1,24 @@
+docs/SPEC.md
+  s_3710a1eb3547ff::t_d8e4969ba8a6fc 2764-2766
+src/svg.rs
+  s_3710a1eb3547ff::t_398b321f29b203 1628-1687
+  s_3710a1eb3547ff::t_d8e4969ba8a6fc 1124-1127,1138-1141
+src/assets.rs
+  s_3710a1eb3547ff::t_398b321f29b203 1202-1209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "999d3b9dbe767f83da2e18ef1925976531e930d2",
+  "prompts": {},
+  "sessions": {
+    "s_3710a1eb3547ff": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c47b-dae1-7b01-bd55-952da11daa84",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
