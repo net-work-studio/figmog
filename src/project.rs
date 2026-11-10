@@ -467,6 +467,38 @@ impl Layout {
         Ok(None)
     }
 
+    /// Publish the fallback default and retire older nested pointers that
+    /// would otherwise mask it. Before the first publication, discovery
+    /// still honors those legacy pointers in nearest-directory order.
+    pub(crate) fn write_current(&self, key: &str) -> Result<(), String> {
+        write_current(&self.local_root, key)?;
+        let local = std::fs::canonicalize(&self.local_root)
+            .map_err(|error| format!("resolving {}: {error}", self.local_root.display()))?;
+        for root in self
+            .legacy_roots()
+            .into_iter()
+            .take_while(|root| root != &self.local_root)
+        {
+            // A discovered directory alias must not unlink the pointer we
+            // just published through its other spelling.
+            if std::fs::canonicalize(&root).ok().as_ref() == Some(&local) {
+                continue;
+            }
+            let pointer = root.join("current");
+            match std::fs::remove_file(&pointer) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "retiring legacy current pointer {}: {error}",
+                        pointer.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve where `key`'s mirror is right now:
     ///
     /// * only the old `.figmog/<key>/db` exists: use it, migration pending
@@ -586,6 +618,13 @@ pub(crate) fn migration_pending_warning(key: &str, store: &ActiveStore) -> Strin
 
 fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Record a fallback default in one explicitly selected local root.
+/// Project-aware callers should use [`Layout::write_current`] instead.
+pub(crate) fn write_current(local_root: &Path, key: &str) -> Result<(), String> {
+    let root = crate::private_dir::ensure(local_root)?;
+    std::fs::write(root.join("current"), key).map_err(|error| error.to_string())
 }
 
 /// `.figmog/current` contents: trimmed bare key, `None` when absent/empty.
@@ -1024,6 +1063,54 @@ mod tests {
                 .contains(".figmog/current")
         );
     }
+    #[test]
+    fn publishing_current_retires_every_preceding_legacy_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout_with_legacy(dir.path());
+        let deep = dir.path().join("packages/app/.figmog");
+        let parent = dir.path().join("packages/.figmog");
+        for root in [&deep, &parent] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("current"), KEY).unwrap();
+        }
+        layout.legacy_roots = vec![deep.clone(), parent.clone()];
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(KEY));
+        layout.write_current(OTHER).unwrap();
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(OTHER));
+        assert!(!deep.join("current").exists());
+        assert!(!parent.join("current").exists());
+        layout.config.files.insert("default".into(), KEY.into());
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(KEY));
+    }
+
+    #[test]
+    fn publishing_current_preserves_a_directory_alias_of_the_root_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout_with_legacy(dir.path());
+        std::fs::create_dir(&layout.local_root).unwrap();
+        let alias = dir.path().join("legacy-alias");
+        std::os::unix::fs::symlink(&layout.local_root, &alias).unwrap();
+        layout.legacy_roots = vec![alias];
+        layout.write_current(OTHER).unwrap();
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(OTHER));
+        assert_eq!(
+            std::fs::read_to_string(layout.current_file()).unwrap(),
+            OTHER
+        );
+    }
+
+    #[test]
+    fn publishing_current_reports_a_legacy_pointer_that_cannot_be_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout_with_legacy(dir.path());
+        let legacy = dir.path().join("packages/app/.figmog");
+        std::fs::create_dir_all(legacy.join("current")).unwrap();
+        layout.legacy_roots = vec![legacy.clone()];
+        let error = layout.write_current(OTHER).unwrap_err();
+        assert!(error.contains("retiring legacy current pointer"), "{error}");
+        assert!(error.contains(&legacy.display().to_string()), "{error}");
+    }
+
     #[test]
     fn config_files_spellings_never_silently_fall_back() {
         for text in [

@@ -646,8 +646,9 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   serve's credentials, read at startup. Restart it after changing credentials,
   or use `--no-socket` to use the invoking CLI's credentials. While a write is pending on a not-yet-mirrored
   store, reads queue no implicit first pull. A successful routed pull
-  updates `last_success` (`"job_id": null`, plus `"operation"`); it is not
-  a lifecycle job.
+  updates `last_success` (`"job_id": null`, plus `"operation"`) and clears
+  the failed-pull watch deferral while preserving independent metadata
+  Retry-After and ordinary cadence; it is not a lifecycle job.
 - *Validation first.* `from_file` (a parsed `GET /v1/files/:key`
   response) and `content` (an export's exact text; the snapshot digest is
   over it) are checked — parse, flatten, variable entries — before any
@@ -1491,8 +1492,9 @@ Socket routing never injects `.figmog/current` into desktop arguments.
 `--geometry`) and `import-variables` resolve their mirror exactly as
 direct mode does, then try the same socket. Reachable ⇒ they run as serve
 operations (§6 "CLI writers through serve"): a `--from-file` response is
-read and parsed in the invoking worktree (the direct path's `reading`/
-`parsing` errors) and sent as content; an import is read and fully
+read, parsed and flattened for validation in the invoking worktree
+(the direct path's errors) before any destination session is opened, then
+sent as content; an import is read and fully
 validated locally (same errors, nothing sent for an invalid file) and its
 exact text sent. The command returns only after the write committed and
 was published, printing the same JSON as the direct path, byte for byte
@@ -1769,8 +1771,11 @@ remains the fallback (and is still written by `pull` and serve's default
 session). Named entries are parsed and validated but not yet addressable.
 
 **Legacy roots.** Every existing `.figmog` directory between the working
-directory and project root is checked, nearest first for `current`. Old
-mirrors can be read and migrated from any of those roots. Multiple legacy
+directory and project root is checked, nearest first for `current`. A
+successful pull publishes the project-root pointer and retires preceding
+nested pointers, so a stale legacy default cannot mask the newly pulled
+file. In-process serve uses the same publication rule for its default
+session. Old mirrors can be read and migrated from any of those roots. Multiple legacy
 copies of one key are an explicit ambiguity error naming their paths.
 
 **Active store.** The mirror root is where mirrors *should* live; the

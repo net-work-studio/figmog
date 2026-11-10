@@ -3314,6 +3314,92 @@ fn every_local_read_matches_across_direct_socket_and_mcp() {
 
 // ---- NWS-2963: writers through a running serve ----
 
+#[test]
+fn invalid_saved_pulls_do_not_admit_a_new_routed_mirror() {
+    const KEY: &str = "SyntheticInvalidSaved0001";
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("saved.json");
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve_zero_files(dir.path(), &[]);
+    handshake(&mut stdin, &rx);
+    let mut malformed_tree = common::fixture_v1();
+    malformed_tree["document"] = json!({});
+    for value in [Value::Null, json!({}), malformed_tree] {
+        std::fs::write(&input, serde_json::to_vec(&value).unwrap()).unwrap();
+        for fresh in [false, true] {
+            let mut command = common::command();
+            command
+                .args(["pull", KEY, "--from-file"])
+                .arg(&input)
+                .current_dir(dir.path());
+            if fresh {
+                command.arg("--fresh");
+            }
+            let output = command.assert().failure();
+            let error: Value = serde_json::from_slice(&output.get_output().stderr).unwrap();
+            let message = error["error"].as_str().unwrap();
+            assert!(
+                message.contains("missing field") || message.contains("invalid node"),
+                "{error}"
+            );
+            assert!(
+                !dir.path().join(".figmog").join(KEY).exists(),
+                "invalid saved input initialized its destination (fresh={fresh})"
+            );
+            let files = call(&mut stdin, &rx, 2, "figmog_files", json!({}));
+            assert_eq!(result_json(&files), json!([]), "{files}");
+        }
+    }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    wait_for_owner_exit(&dir.path().join(".figmog"));
+}
+
+#[test]
+fn a_routed_pull_replaces_a_nested_legacy_default() {
+    const OLD: &str = "SyntheticOldCurrent0001";
+    const NEW: &str = "SyntheticNewCurrent0002";
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("packages/app");
+    std::fs::create_dir_all(&sub).unwrap();
+    let input = dir.path().join("saved.json");
+    std::fs::write(&input, serde_json::to_vec(&common::fixture_v1()).unwrap()).unwrap();
+    common::command()
+        .args(["--no-socket", "pull", OLD, "--from-file"])
+        .arg(&input)
+        .current_dir(&sub)
+        .assert()
+        .success();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(&sub, NEW, &[]);
+    handshake(&mut stdin, &rx);
+    std::fs::write(&input, serde_json::to_vec(&common::fixture_v2()).unwrap()).unwrap();
+    common::command()
+        .args(["pull", NEW, "--from-file"])
+        .arg(&input)
+        .current_dir(&sub)
+        .assert()
+        .success();
+    let output = common::command()
+        .arg("status")
+        .current_dir(&sub)
+        .assert()
+        .success();
+    let status: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(status["version"], "101");
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    wait_for_owner_exit(&dir.path().join(".git/figmog"));
+}
+
 /// One writer invocation's observable outcome: exit code, stdout, stderr.
 fn run_cli(cwd: &std::path::Path, args: &[&str]) -> (Option<i32>, Vec<u8>, Vec<u8>) {
     let output = common::command()

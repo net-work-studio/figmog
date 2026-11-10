@@ -71,9 +71,9 @@ pub(super) fn cmd_pull(
 }
 
 /// `figmog pull` through the running serve that owns the store (NWS-2963):
-/// a saved response is read and parsed here, in the invoking worktree, with
-/// the direct path's errors, and sent as content; serve validates it before
-/// touching the store, applies it on the file's worker (`--fresh` behind
+/// a saved response is read, parsed and structurally validated here, in
+/// the invoking worktree, before the server can open a destination session.
+/// Serve applies it on the file's worker (`--fresh` behind
 /// the per-store reset barrier) and answers once the pull committed and was
 /// published. The output is the direct path's.
 pub(super) fn cmd_pull_routed(
@@ -87,11 +87,15 @@ pub(super) fn cmd_pull_routed(
 ) -> Result<(), String> {
     let mut args = serde_json::json!({"file": key, "db_bytes": db.path.as_os_str().as_bytes(), "fresh": fresh, "geometry": geometry});
     if let Some(path) = from_file {
-        args["from_file"] = read_saved_response(&path)?;
+        let response = crate::deep_json::OwnedValue(read_saved_response(&path)?);
+        // Match the direct path's validation before a missing destination
+        // can be initialized. This work stays in the invoking CLI process.
+        flatten_file(&response).map_err(|error| error.to_string())?;
+        args["from_file"] = response.into_inner();
     }
     let done = super::socket::write_over(route, client, crate::serve::writes::PULL, args)?;
     if let Some(layout) = &db.layout {
-        write_current(&layout.local_root, key)?;
+        layout.write_current(key)?;
     }
     finish_pull(db, &done["result"])
 }
@@ -295,7 +299,7 @@ fn apply_pull(
     store::upsert_mirror_config(&mut st, store::effective_geometry(geometry, stored_now));
 
     if let (Some(key), Some(layout)) = (&db.key, &db.layout) {
-        write_current(&layout.local_root, key)?;
+        layout.write_current(key)?;
     }
 
     // Move what this pull wrote out of fjall's journal (NWS-2941), so the
@@ -345,8 +349,7 @@ pub(crate) fn now_ms() -> u64 {
 /// Record `key` in `<local_root>/current` (the project's per-checkout
 /// `.figmog`), the fallback default file when `figmog.toml` names none.
 pub(crate) fn write_current(local_root: &std::path::Path, key: &str) -> Result<(), String> {
-    let root = crate::private_dir::ensure(local_root)?;
-    std::fs::write(root.join("current"), key).map_err(|e| e.to_string())
+    crate::project::write_current(local_root, key)
 }
 
 #[cfg(test)]

@@ -318,6 +318,28 @@ impl Relay {
     }
 }
 
+/// EOF must not discard the response owed for a malformed input frame.
+#[test]
+fn a_one_shot_malformed_frame_receives_a_parse_error_before_relay_exit() {
+    let repo = repo();
+    let mut relay = spawn_relay(&mut relay_command(
+        repo.path(),
+        &["--no-watch", "--no-upstream"],
+    ));
+    relay.stdin.as_mut().unwrap().write_all(b"{\n").unwrap();
+    drop(relay.stdin.take());
+    let line = relay.rx.recv_timeout(TIMEOUT).unwrap_or_else(|error| {
+        panic!("no parse-error response: {error}; {}", relay.stderr_text())
+    });
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        response,
+        json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}})
+    );
+    relay.finish();
+    wait_owner_gone(repo.path());
+}
+
 /// Pull a synthetic fixture into `cwd`'s project as `key` (direct: no owner
 /// is running), landing in the shared mirror root.
 fn seed(cwd: &Path, key: &str, fixture: &Value) {

@@ -1784,7 +1784,16 @@ fn watch_tick_at(
 /// shape that used to do this (`figmog serve <file>`, no `--db`).
 fn refresh_current(manager: &SessionManager, track: bool, key: &str) {
     if track && manager.effective_default_key().as_deref() == Some(key) {
-        let _ = crate::cli::write_current(&manager.root.local_root(), key);
+        let result = match &manager.root {
+            StoreRoot::Project(layout) => layout.write_current(key),
+            StoreRoot::Fixed(_) => crate::cli::write_current(&manager.root.local_root(), key),
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "{}",
+                serde_json::json!({"warning": format!("could not update current file: {error}")})
+            );
+        }
     }
 }
 
@@ -2056,6 +2065,40 @@ mod tests {
     use crate::mcp::ToolDef;
     use crate::upstream::FakeUpstream;
     use serde_json::json;
+
+    #[test]
+    fn refresh_current_publishes_above_nested_legacy_pointers() {
+        const OLD: &str = "SyntheticOldCurrent0001";
+        const NEW: &str = "SyntheticNewCurrent0002";
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("packages/app");
+        let legacy = sub.join(".figmog/current");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(dir.path().join("figmog.toml"), "").unwrap();
+        std::fs::write(&legacy, OLD).unwrap();
+        let layout = crate::project::Layout::discover(&sub).unwrap();
+        let manager = SessionManager {
+            sessions: Vec::new(),
+            root: StoreRoot::Project(layout.clone()),
+            token: None,
+            default_key: Some(NEW.into()),
+            sole_default: true,
+            api: None,
+        };
+        refresh_current(&manager, false, NEW);
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(OLD));
+        refresh_current(&manager, true, OLD);
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(OLD));
+        refresh_current(&manager, true, NEW);
+        assert_eq!(
+            crate::project::Layout::discover(&sub)
+                .unwrap()
+                .default_key()
+                .unwrap()
+                .as_deref(),
+            Some(NEW)
+        );
+    }
 
     #[test]
     fn watch_tick_reconciles_once_despite_different_endpoint_timestamps() {

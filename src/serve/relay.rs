@@ -387,16 +387,25 @@ impl Relay {
     /// or answer it here.
     fn on_agent(&mut self, line: String) -> bool {
         let Ok(mut frame) = crate::deep_json::from_str(&line) else {
-            // The owner answers the parse error.
-            return self.forward(&line);
+            // Parse failures have no request id to track in `pending`.
+            // Answer here so an immediately queued stdin EOF cannot drop
+            // the response while it is still on its way from the owner.
+            return to_agent(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {"code": -32700, "message": "parse error"},
+                })
+                .to_string(),
+            );
         };
         let method = frame["method"].as_str().unwrap_or_default().to_string();
         // Every id-bearing frame but a notification is answered by the
         // owner — also one with an empty, missing or non-string method
         // ("method not found") — so it gets an owner-link id like any
         // request: its answer must never be matched against another
-        // pending request whose owner-link id it happens to share. Only
-        // notifications (and unparseable frames, above) pass unchanged.
+        // pending request whose owner-link id it happens to share. Frames
+        // without request ids and notifications pass unchanged.
         let id = frame
             .0
             .get_mut("id")
@@ -590,6 +599,38 @@ mod tests {
             next_id: 0,
         };
         (dir, relay, reader)
+    }
+
+    #[test]
+    fn malformed_agent_frames_are_answered_without_forwarding_to_the_owner() {
+        let (_dir, mut relay, mut reader) = configured_relay();
+        assert!(relay.on_agent("{\n".into()));
+        reader.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            std::io::Read::read(&mut reader, &mut byte)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(relay.pending.is_empty());
+    }
+
+    #[test]
+    fn valid_json_with_a_null_id_remains_a_tracked_request() {
+        let (_dir, mut relay, reader) = configured_relay();
+        assert!(relay.on_agent(json!({"jsonrpc": "2.0", "id": null}).to_string()));
+        let mut line = String::new();
+        BufReader::new(reader).read_line(&mut line).unwrap();
+        let forwarded: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(forwarded["id"], "figmog-relay-0");
+        assert!(
+            relay.pending["figmog-relay-0"]
+                .agent_id
+                .as_ref()
+                .unwrap()
+                .is_null()
+        );
     }
 
     #[test]

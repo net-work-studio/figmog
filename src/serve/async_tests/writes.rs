@@ -554,3 +554,76 @@ fn shutdown_deadline_covers_a_blocked_synchronous_fresh_reopen() {
     resume.send(()).unwrap();
     let _ = fresh.join().unwrap();
 }
+
+#[test]
+fn cli_writes_queued_during_changed_metadata_precede_its_followup_pull() {
+    for import in [false, true] {
+        let mut h = Harness::new();
+        h.mirror_from_watch();
+        h.api.block_meta.store(true, Ordering::Relaxed);
+        *h.api.metadata.lock().unwrap() = "changed".into();
+        let now = Instant::now() + Duration::from_secs(60);
+        assert!(h.manager.sessions[0].poll_at(Duration::from_secs(10), now));
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "metadata"
+        );
+        let operation = if import {
+            sessions::WriteOp::Import {
+                content: include_bytes!("../../../tests/fixtures/variables-export.json").to_vec(),
+                label: "synthetic variables".into(),
+                allow_empty: false,
+                dry_run: false,
+            }
+        } else {
+            sessions::WriteOp::Pull {
+                source: sessions::PullSource::File(crate::deep_json::OwnedValue(fixture("saved"))),
+                fresh: false,
+                geometry: false,
+            }
+        };
+        let (answer, result) = mpsc::channel();
+        h.manager.sessions[0].write(
+            "write-before-followup".into(),
+            operation,
+            Box::new(move |value| {
+                let _ = answer.send(value);
+            }),
+        );
+        assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        h.release.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            h.manager.sessions[0].maintain_at(now, true);
+            if let Ok(value) = result.try_recv() {
+                value.unwrap();
+                break;
+            }
+            if let Ok(event) = h.entered.try_recv() {
+                // Do not strand the network worker if the old ordering
+                // dispatched its gated fetch before answering this write.
+                h.release.send(()).unwrap();
+                panic!("CLI write was bypassed by the poll's {event} follow-up");
+            }
+            assert!(Instant::now() < deadline, "queued CLI write did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "fetch"
+        );
+        // The local result is already published while the following
+        // network fetch remains blocked, regardless of the local op kind.
+        let status = h.manager.sessions[0].status().unwrap();
+        if import {
+            assert_eq!(status["variables"]["state"], "current");
+            assert_eq!(status["variables"]["source"], "file");
+        } else {
+            assert_eq!(status["version"], "saved");
+        }
+        h.release.send(()).unwrap();
+        h.finish_pull_at(now + Duration::from_secs(1));
+        assert_eq!(h.api.calls.load(Ordering::Relaxed), 2);
+    }
+}

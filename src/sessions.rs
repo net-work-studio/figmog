@@ -625,8 +625,15 @@ impl FileSession {
     /// draining (NWS-2963): shutdown's barrier sits here, at the one
     /// dispatch point every pull request reaches — an explicit sync, a
     /// queued follow-up, and a completed watch poll's `Changed` alike.
+    /// Pending CLI writes keep the next free slot even when a completed
+    /// poll requests its follow-up before the completion loop finishes.
     fn start_if_ready_at(&mut self, now: Instant) {
-        if self.draining || self.busy || self.reset.is_some() || now < self.retry_at {
+        if self.draining
+            || self.busy
+            || self.reset.is_some()
+            || !self.writes.is_empty()
+            || now < self.retry_at
+        {
             return;
         }
         let Some(geometry) = self
@@ -720,7 +727,17 @@ impl FileSession {
                                     "version": outcome.version, "churn": outcome.churn}));
                                 self.backoff = BACKOFF_START;
                                 self.retry_at = now;
-                                self.watch_retry_at = None;
+                                // A failed lifecycle pull defers both its
+                                // retry and ordinary watch rounds. Retire
+                                // only that deferral; metadata rate limits
+                                // still apply through `poll_retry_at`.
+                                if self
+                                    .watch_retry_at
+                                    .take()
+                                    .is_some_and(|retry| self.next_poll == retry)
+                                {
+                                    self.next_poll = now;
+                                }
                                 published = true;
                             }
                             // Committed and published: only now answer.

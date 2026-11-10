@@ -466,3 +466,124 @@ fn round_robin_watch_preserves_per_file_retry_after_without_blocking_other_files
     assert_eq!(files[0]["version"], "1");
     assert_eq!(files[1]["version"], "1");
 }
+
+/// Complete one saved-file CLI pull at a controlled control-plane time.
+fn saved_pull_at(h: &mut Harness, now: Instant) {
+    let (answer, result) = mpsc::channel();
+    h.manager.sessions[0].write(
+        "saved-watch-recovery".into(),
+        sessions::WriteOp::Pull {
+            source: sessions::PullSource::File(crate::deep_json::OwnedValue(fixture("saved"))),
+            fresh: false,
+            geometry: false,
+        },
+        Box::new(move |value| {
+            let _ = answer.send(value);
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        h.manager.sessions[0].maintain_at(now, false);
+        if let Ok(value) = result.try_recv() {
+            value.unwrap();
+            return;
+        }
+        assert!(Instant::now() < deadline, "saved pull did not finish");
+        std::thread::yield_now();
+    }
+}
+
+fn fail_pull_at(h: &mut Harness, error: ApiError, now: Instant, interval: Duration) {
+    *h.api.response.lock().unwrap() = Err(error);
+    h.manager.sessions[0].request_pull(false, interval);
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "fetch"
+    );
+    h.release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        h.manager.sessions[0].maintain_at(now, false);
+        if h.manager.sessions[0].lifecycle()["job"]["state"] == "failed" {
+            return;
+        }
+        assert!(Instant::now() < deadline, "failed pull did not finish");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn routed_pull_recovery_restores_the_next_normal_metadata_round() {
+    for error in [
+        ApiError::Network("synthetic offline".into()),
+        ApiError::RateLimited {
+            retry_after: Duration::from_secs(7200),
+        },
+    ] {
+        let mut h = Harness::new();
+        h.mirror_from_watch();
+        let interval = Duration::from_secs(10);
+        let base = Instant::now() + Duration::from_secs(60);
+        fail_pull_at(&mut h, error, base, interval);
+        let recovered = base + Duration::from_secs(1);
+        assert!(!h.manager.sessions[0].poll_at(interval, recovered));
+        saved_pull_at(&mut h, recovered);
+        h.api.block_meta.store(true, Ordering::Relaxed);
+        assert!(
+            h.manager.sessions[0].poll_at(interval, recovered),
+            "a successful routed pull must retire the failed pull's watch cooldown"
+        );
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "metadata"
+        );
+        h.release.send(()).unwrap();
+        h.finish_poll_at(recovered);
+        assert_eq!(h.api.calls.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[test]
+fn routed_pull_recovery_preserves_independent_metadata_retry_after() {
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    let interval = Duration::from_secs(10);
+    let base = Instant::now() + Duration::from_secs(60);
+    *h.api.metadata_error.lock().unwrap() = Some(ApiError::RateLimited {
+        retry_after: Duration::from_secs(3600),
+    });
+    assert!(h.manager.sessions[0].poll_at(interval, base));
+    h.finish_poll_at(base);
+    fail_pull_at(
+        &mut h,
+        ApiError::RateLimited {
+            retry_after: Duration::from_secs(7200),
+        },
+        base + Duration::from_secs(1),
+        interval,
+    );
+    saved_pull_at(&mut h, base + Duration::from_secs(2));
+    assert!(!h.manager.sessions[0].poll_at(interval, base + Duration::from_secs(3599)));
+    h.api.block_meta.store(true, Ordering::Relaxed);
+    assert!(h.manager.sessions[0].poll_at(interval, base + Duration::from_secs(3600)));
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "metadata"
+    );
+    h.release.send(()).unwrap();
+    h.finish_poll_at(base + Duration::from_secs(3600));
+}
+
+#[test]
+fn routed_pull_without_a_failed_lifecycle_pull_preserves_normal_poll_cadence() {
+    let mut h = Harness::new();
+    h.mirror_from_watch();
+    let interval = Duration::from_secs(10);
+    let base = Instant::now() + Duration::from_secs(60);
+    assert!(h.manager.sessions[0].poll_at(interval, base));
+    h.finish_poll_at(base);
+    saved_pull_at(&mut h, base + Duration::from_secs(1));
+    assert!(!h.manager.sessions[0].poll_at(interval, base + Duration::from_secs(2)));
+    assert!(h.manager.sessions[0].poll_at(interval, base + Duration::from_secs(10)));
+    h.finish_poll_at(base + Duration::from_secs(10));
+}

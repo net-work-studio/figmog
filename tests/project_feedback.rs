@@ -97,6 +97,51 @@ fn an_old_subdirectory_mirror_remains_readable_and_can_be_migrated() {
 }
 
 #[test]
+fn an_explicit_pull_replaces_the_nested_legacy_default_before_and_after_migration() {
+    const NEXT: &str = "AnotherSyntheticFeedback0002";
+    for migrate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("packages/app");
+        fs::create_dir_all(&sub).unwrap();
+        figmog(&sub)
+            .args(["--no-socket", "pull", "--from-file"])
+            .arg(fixture(dir.path()))
+            .arg(KEY)
+            .assert()
+            .success();
+        git(dir.path(), &["init", "--quiet"]);
+        if migrate {
+            figmog(&sub).args(["migrate", KEY]).assert().success();
+        }
+        let before = figmog(&sub)
+            .args(["--no-socket", "status"])
+            .assert()
+            .success();
+        let before: Value = serde_json::from_slice(&before.get_output().stdout).unwrap();
+        assert_eq!(before["version"], "100");
+        let next = dir.path().join("next.json");
+        fs::write(&next, serde_json::to_vec(&common::fixture_v2()).unwrap()).unwrap();
+        figmog(&sub)
+            .args(["--no-socket", "pull", "--from-file"])
+            .arg(next)
+            .arg(NEXT)
+            .assert()
+            .success();
+        let after = figmog(&sub)
+            .args(["--no-socket", "status"])
+            .assert()
+            .success();
+        let after: Value = serde_json::from_slice(&after.get_output().stdout).unwrap();
+        assert_eq!(after["version"], "101", "migrated: {migrate}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".figmog/current")).unwrap(),
+            NEXT
+        );
+        assert!(!sub.join(".figmog/current").exists());
+    }
+}
+
+#[test]
 fn a_nested_legacy_mirror_migrated_during_a_saved_pull_is_never_recreated() {
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("packages/app");
