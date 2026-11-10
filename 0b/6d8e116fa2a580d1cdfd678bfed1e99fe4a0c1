@@ -1,0 +1,38 @@
+src/serve/async_tests/offload.rs
+  s_d00caf59bef041::t_1ceebca3f4fee7 401
+  s_7b2d0a021b12c5::t_0593eae478c115 377-378,380-400,402-424,429-451,456-468,475-484,489-502,507-515
+  s_7b2d0a021b12c5::t_b5c9f7ae29003b 425-428,452-455,469-474,485-488,503-506
+  s_7b2d0a021b12c5::t_22c03085ac300d 379
+docs/SPEC.md
+  s_d00caf59bef041::t_e9d9cd03966b53 583-588,701-703,1156-1158
+src/serve/async_tests/desktop.rs
+  s_d00caf59bef041::t_dddb4561d4dcd2 304-307,327,331-333,354-355
+src/serve/desktop.rs
+  s_d00caf59bef041::t_181d3b78550976 435-437,439-452,766-785
+src/sessions.rs
+  s_d00caf59bef041::t_b50dcb7d3ea453 35-38,307-308,1019-1020,1046-1051
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0b6d8e116fa2a580d1cdfd678bfed1e99fe4a0c1",
+  "prompts": {},
+  "sessions": {
+    "s_7b2d0a021b12c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1af9f-bdce-74f1-9342-a26458b54604",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": null
+    },
+    "s_d00caf59bef041": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa7-9721-7ac1-9380-ea52571e7db3",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
