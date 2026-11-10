@@ -2,29 +2,29 @@
   "builds": {
     "after": {
       "card": "examples/slice/app/src/Card.jsx",
-      "commit": "63ef8a3448348fd4b44c390ed16e31745ff83771",
+      "commit": "ae92e5d23b16459569d012354d32b5d533138434",
       "dirty": false,
       "tree": {
         "files": 8,
-        "sha256": "3455ed7a112be4f5c24dad122bb65f41f9eae80b47d3d6139344f1d00e8a8607"
+        "sha256": "78595d5aa820902a186a113cf7fbc34b7ff917eae4a24f7ae05b02396be5bdd5"
       }
     },
     "before": {
       "card": "examples/slice/app/baseline/Card.jsx",
-      "commit": "63ef8a3448348fd4b44c390ed16e31745ff83771",
+      "commit": "ae92e5d23b16459569d012354d32b5d533138434",
       "dirty": false,
       "tree": {
         "files": 8,
-        "sha256": "1903f5cdc1899e48430b8cde302c81ce068b3475f8225f6218353d6e8bf5cfa3"
+        "sha256": "f61789bb6dcba66c74430cf069b7a5e61b2e47ab7478ec6ed0587bdf8767364c"
       }
     },
     "broken": {
       "card": "examples/slice/app/variants/Card.wrong-padding.jsx",
-      "commit": "63ef8a3448348fd4b44c390ed16e31745ff83771",
+      "commit": "ae92e5d23b16459569d012354d32b5d533138434",
       "dirty": false,
       "tree": {
         "files": 8,
-        "sha256": "86ceccf29172a727059881928d38fe3639dd156fef9e177909eb703a0f457e9c"
+        "sha256": "c81174f45258da41b5730052f32adc41d7e678b26da6bcd7cbbc0f266ed31a25"
       }
     }
   },
@@ -57,15 +57,17 @@
       "images": {
         "390": {
           "path": "examples/slice/figma/card-render-390.png",
-          "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+          "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
         },
         "1440": {
           "path": "examples/slice/figma/card-render-1440.png",
-          "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+          "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
         }
       },
       "kind": "figma-render-stand-in",
       "record": "examples/slice/figma/card-render.json",
+      "source": "examples/slice/figma/standin/index.html",
+      "sourceSha256": "e23a7904b3ae50cad155ffb8e9a5609a38aec6aa2729b203d4da32683d96faa0",
       "version": "4243"
     }
   },
@@ -76,66 +78,66 @@
         "images": {
           "after": {
             "path": "examples/slice/evidence/broken/390/after.png",
-            "sha256": "883bc611054fb32d1aa8d49ed132374828a5f1ac35f8c95745c2f253e27fbfb4"
+            "sha256": "e2d1068bd7ddd77fe0a9fa7b0a674976648b71d2fa2c216dfcf56565eb120a25"
           },
           "before": {
             "path": "examples/slice/evidence/broken/390/before.png",
-            "sha256": "6f4d2e9a9ab6e36e8b655c080b549f684e82cbf077fd8bf96e779dc20d52c722"
+            "sha256": "1228017d6668afb3fad38ceec4b711d15e3acaf1f18acf308041bd51e9a02184"
           },
           "composite": {
             "path": "examples/slice/evidence/broken/390/composite.png",
-            "sha256": "77f5813c194d0d9da9e6136b9073dd5b0f30114fef83081c6315ff50156309dd"
+            "sha256": "cc35c30963cfc738ad10ad47a42707882d5e23f9dba3793351091f2b0b30b937"
           },
           "diffAfter": {
             "path": "examples/slice/evidence/broken/390/diff-after.png",
-            "sha256": "b2ab3eece943c9ef52c00f14d531c356b983fff021cf75c076f28cfbb758128a"
+            "sha256": "02026dda398b955169d34f4107fe696b116d63287d695524fa770eb77f87a4ab"
           },
           "diffBefore": {
             "path": "examples/slice/evidence/broken/390/diff-before.png",
-            "sha256": "277783c45936bb29ed7af16cd5b8a25f6ec83fcbc2d523f2f38adf2dccc0576c"
+            "sha256": "f802f123031bb689d1b85f6450c41418f57bef29256feeb484f33c17624eb014"
           },
           "figma": {
             "path": "examples/slice/evidence/broken/390/figma.png",
-            "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
           }
         },
         "manifest": "examples/slice/evidence/broken/390/manifest.json",
         "score": {
-          "after": 75.24,
-          "before": 41.02
+          "after": 73.83,
+          "before": 39.97
         }
       },
       "1440": {
         "images": {
           "after": {
             "path": "examples/slice/evidence/broken/1440/after.png",
-            "sha256": "883bc611054fb32d1aa8d49ed132374828a5f1ac35f8c95745c2f253e27fbfb4"
+            "sha256": "e2d1068bd7ddd77fe0a9fa7b0a674976648b71d2fa2c216dfcf56565eb120a25"
           },
           "before": {
             "path": "examples/slice/evidence/broken/1440/before.png",
-            "sha256": "c26ba93f5efa32a0466835250e1d89eb7acb79ab122d9bae0d9bb726cb50e4da"
+            "sha256": "a446a4fa699bb09fb2b94e68a440d149d3b08da3222127ff754815dd0a1149bd"
           },
           "composite": {
             "path": "examples/slice/evidence/broken/1440/composite.png",
-            "sha256": "b684ef8bae81d9f634d3e11e7a53c095ca60101497c24b278a0d81db6a7fd19a"
+            "sha256": "5e39aa3e4d46d829c26bdbf8db9fc8efa89a1c922c2ae2ff4f9821197cb7dc9a"
           },
           "diffAfter": {
             "path": "examples/slice/evidence/broken/1440/diff-after.png",
-            "sha256": "b2ab3eece943c9ef52c00f14d531c356b983fff021cf75c076f28cfbb758128a"
+            "sha256": "02026dda398b955169d34f4107fe696b116d63287d695524fa770eb77f87a4ab"
           },
           "diffBefore": {
             "path": "examples/slice/evidence/broken/1440/diff-before.png",
-            "sha256": "debab757d5655468313742c50cc3301d73367ed05b999777d79a27b19b519af1"
+            "sha256": "cde07b3c6397ab37dbe7015255ca5d50a7898cd44745b12455ca31e5c254f0b2"
           },
           "figma": {
             "path": "examples/slice/evidence/broken/1440/figma.png",
-            "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
           }
         },
         "manifest": "examples/slice/evidence/broken/1440/manifest.json",
         "score": {
-          "after": 75.24,
-          "before": 9.98
+          "after": 73.83,
+          "before": 9.73
         }
       }
     },
@@ -144,66 +146,66 @@
         "images": {
           "after": {
             "path": "examples/slice/evidence/correct/390/after.png",
-            "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
           },
           "before": {
             "path": "examples/slice/evidence/correct/390/before.png",
-            "sha256": "6f4d2e9a9ab6e36e8b655c080b549f684e82cbf077fd8bf96e779dc20d52c722"
+            "sha256": "1228017d6668afb3fad38ceec4b711d15e3acaf1f18acf308041bd51e9a02184"
           },
           "composite": {
             "path": "examples/slice/evidence/correct/390/composite.png",
-            "sha256": "0b03379afeb97030d045369ba8ebe5becb2f49df2f6ab2b01639939852517e3a"
+            "sha256": "06e23aae957f522398ee5329bbac2b919a5992483dd9d25507ab808c123642ec"
           },
           "diffAfter": {
             "path": "examples/slice/evidence/correct/390/diff-after.png",
-            "sha256": "ff5e23216879613696456c7ffd14814dbf3c40edd1421042c9249921d9213f6f"
+            "sha256": "8688579461f7c84eb4bb23d54946910da9470bd35e52ed029e08d26ae35338b5"
           },
           "diffBefore": {
             "path": "examples/slice/evidence/correct/390/diff-before.png",
-            "sha256": "277783c45936bb29ed7af16cd5b8a25f6ec83fcbc2d523f2f38adf2dccc0576c"
+            "sha256": "f802f123031bb689d1b85f6450c41418f57bef29256feeb484f33c17624eb014"
           },
           "figma": {
             "path": "examples/slice/evidence/correct/390/figma.png",
-            "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
           }
         },
         "manifest": "examples/slice/evidence/correct/390/manifest.json",
         "score": {
           "after": 100,
-          "before": 41.02
+          "before": 39.97
         }
       },
       "1440": {
         "images": {
           "after": {
             "path": "examples/slice/evidence/correct/1440/after.png",
-            "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
           },
           "before": {
             "path": "examples/slice/evidence/correct/1440/before.png",
-            "sha256": "c26ba93f5efa32a0466835250e1d89eb7acb79ab122d9bae0d9bb726cb50e4da"
+            "sha256": "a446a4fa699bb09fb2b94e68a440d149d3b08da3222127ff754815dd0a1149bd"
           },
           "composite": {
             "path": "examples/slice/evidence/correct/1440/composite.png",
-            "sha256": "b2706ca4717b167f555e2f4e44cea746e1e97b12f62cf738620aeae31ad976f9"
+            "sha256": "d6fab5ed1e41c23fcfdbea38c0a0a684a9e239cf0ba7999ca6ae78d5570d3e79"
           },
           "diffAfter": {
             "path": "examples/slice/evidence/correct/1440/diff-after.png",
-            "sha256": "ff5e23216879613696456c7ffd14814dbf3c40edd1421042c9249921d9213f6f"
+            "sha256": "8688579461f7c84eb4bb23d54946910da9470bd35e52ed029e08d26ae35338b5"
           },
           "diffBefore": {
             "path": "examples/slice/evidence/correct/1440/diff-before.png",
-            "sha256": "debab757d5655468313742c50cc3301d73367ed05b999777d79a27b19b519af1"
+            "sha256": "cde07b3c6397ab37dbe7015255ca5d50a7898cd44745b12455ca31e5c254f0b2"
           },
           "figma": {
             "path": "examples/slice/evidence/correct/1440/figma.png",
-            "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf"
+            "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad"
           }
         },
         "manifest": "examples/slice/evidence/correct/1440/manifest.json",
         "score": {
           "after": 100,
-          "before": 9.98
+          "before": 9.73
         }
       }
     }
@@ -211,12 +213,12 @@
   "scoreNote": "advisory: 100 * (1 - mismatched / (W*H)) against the Figma render; never a pass/fail gate",
   "spec": {
     "path": "examples/slice/spec/card.spec.json",
-    "sha256": "ba3d594867c63767b888f91776da7ed6757c70ee6692feb91eb180e40b2d3e56"
+    "sha256": "11cc71c173e857257d00a6e4f41748f4b2f7a375fdf3dcedfabdfcaa89868e92"
   },
   "tokens": {
     "css": {
       "path": "examples/slice/app/src/tokens.css",
-      "sha256": "06d51aab01d30d9b0a495141bc06fcc5a64b87e21c00ce02ba66b373ae62c021"
+      "sha256": "e93ad00bdcda567267874b977d716bec584fc4abba087e6e132312e522c8da80"
     },
     "snapshot": {
       "digest": "fnv1a64:fd631e535712b153",

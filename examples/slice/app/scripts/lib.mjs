@@ -138,10 +138,18 @@ export async function treeDigest(root) {
 }
 
 /** The checkout's commit and whether the slice's inputs differ from it. */
-export function gitIdentity() {
-  const git = (...args) => execFileSync("git", args, { cwd: REPO, encoding: "utf8" }).trim();
+export function gitIdentity(repo = REPO) {
+  const git = (...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
   const paths = ["examples/slice/app", "examples/slice/figma", "examples/slice/spec", "tests/fixtures/spec/variables.json"];
   return { commit: git("rev-parse", "HEAD"), dirty: git("status", "--porcelain", "--", ...paths) !== "" };
+}
+
+/** Generate build inputs before sampling their checkout identity. */
+export async function generateInputs(m, { tokensCss = TOKENS_CSS, specJson = SPEC_JSON, repo = REPO } = {}) {
+  const status = m.status();
+  m.exportTokens(tokensCss);
+  await writeFile(specJson, m.spec());
+  return { status, identity: gitIdentity(repo) };
 }
 
 /**
@@ -234,4 +242,27 @@ export async function withBuild(root, fn) {
 /** Stand-in render paths for one viewport width. */
 export function standinPng(width) {
   return join(STANDIN_DIR, `card-render-${width}.png`);
+}
+
+/** Refuse stale or altered stand-in inputs, even when the file version is unchanged. */
+export async function validateStandin(record, status, { figmaFile = FIGMA_FILE, standinDir = STANDIN_DIR } = {}) {
+  const stale = (detail) => {
+    throw new Error(`the Figma render stand-in ${detail}: re-render it with \`node scripts/slice.mjs standin\``);
+  };
+  if (record.kind !== "figma-render-stand-in" || record.node !== CARD_NODE) stale("has an unexpected kind or node");
+  if (record.file?.version !== status.version) stale(`is for version ${record.file?.version} but the mirror is at ${status.version}`);
+  if (record.file.path !== repoPath(figmaFile) || record.file.sha256 !== sha256(await readFile(figmaFile))) {
+    stale("does not match the synthetic Figma file");
+  }
+  const source = join(standinDir, "standin", "index.html");
+  if (record.source !== repoPath(source) || record.sourceSha256 !== sha256(await readFile(source))) {
+    stale("does not match its HTML source");
+  }
+  for (const { width } of VIEWPORTS) {
+    const path = join(standinDir, `card-render-${width}.png`);
+    const image = record.images?.[String(width)];
+    if (image?.path !== repoPath(path) || image.sha256 !== sha256(await readFile(path))) {
+      stale(`does not match its ${width}px PNG`);
+    }
+  }
 }

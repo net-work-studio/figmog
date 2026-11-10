@@ -3,19 +3,19 @@
     "composite": {
       "file": "composite.png",
       "height": 158,
-      "sha256": "b2706ca4717b167f555e2f4e44cea746e1e97b12f62cf738620aeae31ad976f9",
+      "sha256": "d6fab5ed1e41c23fcfdbea38c0a0a684a9e239cf0ba7999ca6ae78d5570d3e79",
       "width": 5520
     },
     "diffAfter": {
       "file": "diff-after.png",
       "height": 100,
-      "sha256": "ff5e23216879613696456c7ffd14814dbf3c40edd1421042c9249921d9213f6f",
+      "sha256": "8688579461f7c84eb4bb23d54946910da9470bd35e52ed029e08d26ae35338b5",
       "width": 320
     },
     "diffBefore": {
       "file": "diff-before.png",
       "height": 100,
-      "sha256": "debab757d5655468313742c50cc3301d73367ed05b999777d79a27b19b519af1",
+      "sha256": "cde07b3c6397ab37dbe7015255ca5d50a7898cd44745b12455ca31e5c254f0b2",
       "width": 1360
     }
   },
@@ -25,7 +25,7 @@
         "image": {
           "file": "after.png",
           "height": 100,
-          "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf",
+          "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad",
           "width": 320
         },
         "kind": "figmog-shot/capture",
@@ -61,7 +61,7 @@
       },
       "file": "after.png",
       "height": 100,
-      "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf",
+      "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad",
       "width": 320
     },
     "before": {
@@ -69,7 +69,7 @@
         "image": {
           "file": "before.png",
           "height": 48,
-          "sha256": "c26ba93f5efa32a0466835250e1d89eb7acb79ab122d9bae0d9bb726cb50e4da",
+          "sha256": "a446a4fa699bb09fb2b94e68a440d149d3b08da3222127ff754815dd0a1149bd",
           "width": 1360
         },
         "kind": "figmog-shot/capture",
@@ -105,7 +105,7 @@
       },
       "file": "before.png",
       "height": 48,
-      "sha256": "c26ba93f5efa32a0466835250e1d89eb7acb79ab122d9bae0d9bb726cb50e4da",
+      "sha256": "a446a4fa699bb09fb2b94e68a440d149d3b08da3222127ff754815dd0a1149bd",
       "width": 1360
     },
     "figma": {
@@ -113,7 +113,7 @@
         "image": {
           "file": "card-render-1440.png",
           "height": 100,
-          "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf",
+          "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad",
           "width": 320
         },
         "kind": "figmog-shot/capture",
@@ -149,7 +149,7 @@
       },
       "file": "figma.png",
       "height": 100,
-      "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf",
+      "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad",
       "width": 320
     }
   },
@@ -197,8 +197,8 @@
       "total": 32000
     },
     "before": {
-      "mismatched": 122433,
-      "score": 9.98,
+      "mismatched": 122768,
+      "score": 9.73,
       "total": 136000
     },
     "formula": "score = round2(100 * (1 - mismatched / (W * H))), where W x H is the larger width x the larger height of the two images, mismatched counts pixels pixelmatch (threshold 0.1, anti-aliasing ignored) finds different inside the area both images cover, plus every pixel only one image covers (or neither does); round2 rounds to two decimals; 100 means pixel-identical. Advisory only."

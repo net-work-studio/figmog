@@ -577,6 +577,11 @@ fn pending_requests_are_bounded_per_connection_and_closed_connections_are_skippe
     let server = Server::start(manager_of(dir.path(), vec![a]), offload);
     let mut busy = server.connect(1);
     let mut closing = server.connect(2);
+    // macOS rejects changing the timeout after the peer shuts down.
+    closing
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
     for id in 0..MAX_PENDING_PER_REQUESTER {
         server.send(1, request(json!(id), "figmog_stats", json!({})));
     }
@@ -601,11 +606,6 @@ fn pending_requests_are_bounded_per_connection_and_closed_connections_are_skippe
     // Connection 2 queues a read behind the stalled pool, then closes.
     server.send(2, request(json!(1), "figmog_text", json!({})));
     std::thread::sleep(Duration::from_millis(50));
-    // macOS rejects setting a timeout after the socket is shut down.
-    closing
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
     server.registry.unregister(2);
     for _ in 0..MAX_PENDING_PER_REQUESTER {
         release.send(()).unwrap();
@@ -744,16 +744,16 @@ fn shutdown_is_bounded_by_the_exit_deadline_despite_a_stalled_read() {
     offload.exit_drain = drain;
     let server = Server::start(manager_of(dir.path(), vec![a]), offload);
     let mut client = server.connect(1);
+    // Configure the read before shutdown; macOS rejects it afterwards.
+    client
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     server.send(1, request(json!(1), "figmog_stats", json!({})));
     assert_eq!(
         seen.recv_timeout(Duration::from_secs(10)).unwrap(),
         "figmog_stats"
     );
-    // Set the read deadline while the socket is still live (also on macOS).
-    client
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
     let start = Instant::now();
     server.stop();
     let elapsed = start.elapsed();
