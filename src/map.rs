@@ -616,6 +616,15 @@ pub(crate) fn code_component(
             (None, Some(rec)) => {
                 let target = map.lookup(rec["key"].as_str(), rec["component_set"]["key"].as_str());
                 match target {
+                    Some(t) if matches!(t.figma, Target::ComponentSet(_)) => {
+                        // Component records carry the variant's name and
+                        // identity, but no authoritative variant properties.
+                        // A set mapping alone cannot select its code variant.
+                        unmapped_properties.push(unmapped(
+                            "the swapped-in component maps to a component set, but its variant properties are unavailable".into(),
+                        ));
+                        continue;
+                    }
                     Some(t) => json!({
                         "jsx": format!("<{} />", t.export),
                         "path": t.path,
@@ -1095,6 +1104,42 @@ mod tests {
             out["jsx"],
             "<PricingCard icon={<StarIcon />} tier=\"free\" />"
         );
+    }
+
+    #[test]
+    fn set_based_instance_swaps_are_partial_without_authoritative_variant_properties() {
+        let mut m = pricing();
+        m["components"][0]["props"]["Icon"] = json!({"prop": "icon"});
+        m["components"].as_array_mut().unwrap().push(json!({
+            "figma": {"component_set": "icons-key"},
+            "code": {"path": "src/Icon.tsx", "export": "Icon"},
+            "props": {"Size": {"prop": "size", "values": {"Large": "lg"}}}
+        }));
+        let mut recs = records();
+        recs["20:1"] = json!({"name": "Size=Large", "key": "large-key", "component_set": {"key": "icons-key"}});
+        let n = instance(
+            json!({"Tier": {"type": "VARIANT", "value": "Pro"},
+                   "Icon#1:2": {"type": "INSTANCE_SWAP", "value": "20:1"}}),
+            json!([]),
+        );
+        let map = parse(m.clone()).unwrap();
+        let out = code_component(Some(&map), &n, &recs["10:1"], &recs);
+        assert_eq!(out["coverage"], "partial", "{out}");
+        assert_eq!(out["unmapped_properties"][0]["name"], "Icon#1:2");
+        assert!(
+            out["unmapped_properties"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("variant properties are unavailable")
+        );
+        assert!(out["props"].get("icon").is_none());
+
+        // Explicit values still select the variant without needing its properties.
+        m["components"][0]["props"]["Icon"]["values"] = json!({"large-key": "large"});
+        let map = parse(m).unwrap();
+        let out = code_component(Some(&map), &n, &recs["10:1"], &recs);
+        assert_eq!(out["coverage"], "full", "{out}");
+        assert_eq!(out["props"]["icon"], "large");
     }
 
     #[test]

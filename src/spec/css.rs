@@ -36,18 +36,25 @@ impl CssVal {
         self.value.starts_with("var(")
     }
 
-    /// `self × factor` (a `calc()` for a `var()`), for derived lengths
-    /// such as an outline offset.
+    /// A numeric literal with the requested unit; expressions stay symbolic.
+    pub(super) fn literal_number(&self, unit: &str) -> Option<f64> {
+        self.value.strip_suffix(unit)?.parse().ok()
+    }
+
+    /// `self × factor`, retaining symbolic lengths in a multiplication calc.
     pub(super) fn scaled(&self, factor: f64, unit: &str) -> CssVal {
-        if self.is_var() {
-            return CssVal::lit(format!("calc({} * {})", self.value, num(factor)));
+        match self.literal_number(unit) {
+            Some(n) => CssVal::lit(format!("{}{unit}", num(n * factor))),
+            None => CssVal::lit(format!("calc({} * {})", self.value, num(factor))),
         }
-        let n: f64 = self
-            .value
-            .trim_end_matches(unit)
-            .parse()
-            .unwrap_or_default();
-        CssVal::lit(format!("{}{unit}", num(n * factor)))
+    }
+
+    /// An inset measured inside this border, retaining symbolic lengths.
+    pub(super) fn inset(&self, value: f64) -> String {
+        match self.literal_number("px") {
+            Some(n) => px(value - n),
+            None => format!("calc({} - {})", px(value), self.value),
+        }
     }
 }
 
@@ -383,6 +390,32 @@ fn class(prop: &str, v: &CssVal) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_lengths_distinguish_literals_from_expressions() {
+        for (value, scaled, inset) in [
+            ("2px", "-1px", "8px"),
+            (
+                "var(--stroke)",
+                "calc(var(--stroke) * -0.5)",
+                "calc(10px - var(--stroke))",
+            ),
+            (
+                "calc(var(--stroke) * 1px)",
+                "calc(calc(var(--stroke) * 1px) * -0.5)",
+                "calc(10px - calc(var(--stroke) * 1px))",
+            ),
+            (
+                "min(2px, 1vw)",
+                "calc(min(2px, 1vw) * -0.5)",
+                "calc(10px - min(2px, 1vw))",
+            ),
+        ] {
+            let length = CssVal::lit(value);
+            assert_eq!(length.scaled(-0.5, "px").value, scaled);
+            assert_eq!(length.inset(10.0), inset);
+        }
+    }
 
     #[test]
     fn numbers_are_short_and_stable() {

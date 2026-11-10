@@ -229,7 +229,7 @@ pub struct Export {
     pub theme: Option<Theme>,
     /// Every collection's modes, by collection name then root first.
     pub modes: Vec<ModeMapping>,
-    /// Collection name → its root mode.
+    /// Collection id → its root mode (collection name for older snapshots).
     pub root_modes: BTreeMap<String, String>,
     /// Sorted by variable id, then reason.
     pub report: Vec<ReportEntry>,
@@ -840,9 +840,9 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         tokens: tokens.len(),
         theme,
         modes,
-        root_modes: by_name_cols
+        root_modes: cols
             .iter()
-            .map(|c| (c.name.clone(), c.root.clone()))
+            .map(|(key, c)| (key.clone(), c.root.clone()))
             .collect(),
         report: report.into_iter().collect(),
         theme_names: theme_by_id,
@@ -961,15 +961,11 @@ fn block<K: AsRef<str>>(css: &mut String, selector: &str, decls: &BTreeMap<K, St
     css.push_str("}\n");
 }
 
-/// `own` outside `other`, or both on one element: `a b, ab` (`a:is(b)`
-/// when `b` starts with a type selector, which can't follow `a`).
+/// `own` outside `other`, or both selectors matching one element. Keep
+/// complete selectors inside `:is()` so combinators retain their original
+/// ancestor requirements when intersecting the matched elements.
 fn combined_selector(own: &str, other: &str) -> String {
-    let same = if other.starts_with(['[', '.', ':', '#']) {
-        format!("{own}{other}")
-    } else {
-        format!("{own}:is({other})")
-    };
-    format!("{own} {other}, {same}")
+    format!(":is({own}) :is({other}), :is({own}):is({other})")
 }
 
 /// Text safe inside a `/* ... */` comment on one line.
@@ -2083,13 +2079,117 @@ mod tests {
         let expected = "\n:root {\n  --space-card: 24px;\n  --space-section: var(--space-card);\n}\n\
              \n[data-density=\"compact\"] {\n  --space-card: 12px;\n  --space-section: var(--space-card);\n}\n\
              \n[data-theme=\"dark\"] {\n  --space-section: 32px;\n}\n\
-             \n[data-theme=\"dark\"] [data-density=\"compact\"], [data-theme=\"dark\"][data-density=\"compact\"] {\n  --space-section: 32px;\n}\n";
+             \n:is([data-theme=\"dark\"]) :is([data-density=\"compact\"]), :is([data-theme=\"dark\"]):is([data-density=\"compact\"]) {\n  --space-section: 32px;\n}\n";
         assert!(out.css.contains(expected), "{}", out.css);
         assert!(out.css.contains(" * theme: collection \"Density\": mode \"Comfortable\" -> :root, mode \"Compact\" -> [data-density=\"compact\"]\n"), "{}", out.css);
         assert_eq!(
             combined_selector(".a", "html.b"),
-            ".a html.b, .a:is(html.b)"
+            ":is(.a) :is(html.b), :is(.a):is(html.b)"
         );
+    }
+
+    #[test]
+    fn combined_modes_preserve_complex_selector_ancestor_requirements() {
+        let v = snap(vec![
+            in_collection(
+                row(
+                    "V:1",
+                    "brand",
+                    "FLOAT",
+                    json!({"Base": 1, "Alt": 2}),
+                    json!(["GAP"]),
+                    None,
+                ),
+                "Brand",
+                "Base",
+            ),
+            in_collection(
+                row(
+                    "V:2",
+                    "card",
+                    "FLOAT",
+                    json!({"Light": {"type": "VARIABLE_ALIAS", "id": "V:1"}, "Dark": 3}),
+                    json!(["GAP"]),
+                    None,
+                ),
+                "Theme",
+                "Light",
+            ),
+        ]);
+        let out = export_css(
+            &v,
+            &modes(&[("Brand/Alt", ".brand .alt"), ("Theme/Dark", ".dark")]),
+        )
+        .unwrap();
+        // For .brand > .alt.dark, the two complete selectors intersect on
+        // .alt.dark; .brand may lie outside the .dark element.
+        assert!(
+            out.css.contains(
+                ":is(.dark) :is(.brand .alt), :is(.dark):is(.brand .alt) {\n  --card: 3px;\n}"
+            ),
+            "{}",
+            out.css
+        );
+        assert!(!out.css.contains(".dark.brand .alt"));
+    }
+
+    #[test]
+    fn root_modes_keep_collection_identity_when_display_names_match() {
+        let mut a = in_collection(
+            row(
+                "V:1",
+                "a",
+                "FLOAT",
+                json!({"DefaultA": 1, "OtherA": 2}),
+                json!(["GAP"]),
+                None,
+            ),
+            "Same",
+            "DefaultA",
+        );
+        let mut b = in_collection(
+            row(
+                "V:2",
+                "b",
+                "FLOAT",
+                json!({"DefaultB": 3, "OtherB": 4}),
+                json!(["GAP"]),
+                None,
+            ),
+            "Same",
+            "DefaultB",
+        );
+        a["collection_id"] = json!("C:1");
+        b["collection_id"] = json!("C:2");
+        let out = export_css(
+            &snap(vec![a, b]),
+            &modes(&[("Same/OtherA", ":root"), ("Same/OtherB", ":root")]),
+        )
+        .unwrap();
+        assert_eq!(
+            out.root_modes,
+            BTreeMap::from([
+                ("C:1".into(), "OtherA".into()),
+                ("C:2".into(), "OtherB".into())
+            ])
+        );
+        assert!(
+            out.css.contains(":root {\n  --a: 2px;\n  --b: 4px;\n}"),
+            "{}",
+            out.css
+        );
+
+        // Snapshots predating collection_id retain their name fallback.
+        let legacy = snap(vec![row(
+            "V:3",
+            "legacy",
+            "FLOAT",
+            json!({"light": 5}),
+            json!(["GAP"]),
+            None,
+        )]);
+        let out = export_css(&legacy, &ExportOptions::default()).unwrap();
+        assert_eq!(out.root_modes.get("c").map(String::as_str), Some("light"));
     }
 
     #[test]

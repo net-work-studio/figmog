@@ -211,15 +211,11 @@ pub(super) fn run(
     } else {
         BTreeMap::new()
     };
-    let stale = stale(
-        previous.iter().flat_map(|p| {
-            p.icons
-                .iter()
-                .flat_map(|i| [i.path.as_str(), i.svg.as_str()])
-                .chain(p.images.iter().map(|i| i.path.as_str()))
-        }),
-        &plan.files,
-    );
+    let previous_paths: BTreeSet<String> = previous
+        .iter()
+        .flat_map(AssetIndex::generated_paths)
+        .collect();
+    let stale = stale(root, previous_paths.iter().map(String::as_str), &plan.files);
     let written = statuses.values().filter(|s| **s == "written").count();
     let files: Vec<Value> = statuses
         .iter()
@@ -453,12 +449,28 @@ fn fetch_routed(
 /// path that differs from a new one only in case (a renamed icon on a
 /// case-insensitive filesystem is the same, live file).
 fn stale<'a>(
+    root: &Path,
     previous: impl Iterator<Item = &'a str>,
     files: &BTreeMap<String, (Kind, Vec<u8>)>,
 ) -> Vec<&'a str> {
-    let live: BTreeSet<String> = files.keys().map(|p| p.to_lowercase()).collect();
+    let live_casefolded: BTreeSet<String> = files.keys().map(|p| p.to_lowercase()).collect();
     previous
-        .filter(|p| !live.contains(&p.to_lowercase()))
+        .filter(|p| {
+            if files.contains_key(*p) {
+                return false;
+            }
+            if !live_casefolded.contains(&p.to_lowercase()) {
+                return true;
+            }
+            // A differently spelled old path is live only if looking it
+            // up actually aliases a new filename on this filesystem.
+            let alias = check_target(root, p).ok().and_then(|e| e.alias);
+            let actual = alias.map(|name| match p.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/{name}"),
+                None => name,
+            });
+            !actual.is_some_and(|actual| files.contains_key(&actual))
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -775,16 +787,20 @@ mod tests {
     }
 
     #[test]
-    fn a_case_alias_of_a_live_file_is_not_stale() {
-        let mut files = BTreeMap::new();
-        files.insert(
+    fn case_differences_are_not_assumed_to_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [(
             "src/icons/IconStar.tsx".to_string(),
             (Kind::Generated, vec![]),
-        );
-        let previous = ["src/icons/Iconstar.tsx", "src/icons/IconGone.tsx"];
+        )]
+        .into();
         assert_eq!(
-            stale(previous.into_iter(), &files),
-            ["src/icons/IconGone.tsx"]
+            stale(
+                dir.path(),
+                ["src/icons/Iconstar.tsx", "src/icons/IconGone.tsx"].into_iter(),
+                &files
+            ),
+            ["src/icons/IconGone.tsx", "src/icons/Iconstar.tsx"]
         );
     }
 
@@ -816,6 +832,12 @@ mod tests {
         // is left for `stale`); case-insensitive: only the new spelling.
         assert!(names.contains(&"IconStar.tsx".to_string()), "{names:?}");
         assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+        let stale_paths = stale(root, ["icons/Iconstar.tsx"].into_iter(), &plan.files);
+        if names.contains(&"Iconstar.tsx".to_string()) {
+            assert_eq!(stale_paths, ["icons/Iconstar.tsx"]);
+        } else {
+            assert!(stale_paths.is_empty(), "{stale_paths:?}");
+        }
         assert_eq!(std::fs::read(root.join("icons/IconStar.tsx")).unwrap(), new);
         // Unchanged bytes: nothing written.
         assert_eq!(

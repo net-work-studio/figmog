@@ -31,8 +31,8 @@
 //! Every removal is reported ([`Sanitized::removed`]).
 //!
 //! **Optimizing** (lightly, never touching geometry): comments, PIs,
-//! whitespace-only text, empty `<defs>`, unreferenced ids and attribute-less
-//! `<g>` wrappers are removed. Numbers and path data are kept verbatim.
+//! whitespace outside text-bearing elements, empty `<defs>`, unreferenced ids
+//! and attribute-less `<g>` wrappers are removed. Numbers and path data are kept verbatim.
 //!
 //! **Ids.** Every kept id is renumbered in document order and rendered
 //! with a caller-chosen prefix, so two inlined copies never share a
@@ -46,7 +46,9 @@
 //! when it uses several, none, or any gradient, pattern, filter, image or
 //! `color` attribute.
 //! [`Sanitized::use_current_color`] replaces that color with
-//! `currentColor`.
+//! `currentColor`, retaining embedded paint alpha where it can do so exactly.
+//! Conversion is declined when ancestor alpha or protected geometry makes
+//! an equivalent replacement uncertain.
 //!
 //! **Limitations.** Not a general XML or SVG implementation: no namespaces
 //! beyond dropping prefixed names (and reading `xlink:href` as `href`), no
@@ -610,7 +612,7 @@ enum PreNode {
 
 struct Sanitizer {
     removed: BTreeSet<String>,
-    /// Every id defined, in document order (first definition wins), with
+    /// Every id defined, in document order, with
     /// the element defining it.
     defined: Vec<(String, &'static str)>,
 }
@@ -658,9 +660,15 @@ impl Sanitizer {
                 RawNode::Text(t) if keeps_text => {
                     let text: String = t
                         .chars()
-                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .map(|c| {
+                            if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+                                ' '
+                            } else {
+                                c
+                            }
+                        })
                         .collect();
-                    if !text.trim().is_empty() {
+                    if !text.is_empty() {
                         children.push(PreNode::Text(text));
                     }
                 }
@@ -877,6 +885,23 @@ impl Numbering {
 /// Parse and sanitize `input` (see the module doc).
 pub(crate) fn sanitize(input: &str) -> Result<Sanitized, String> {
     let raw = parse(input)?;
+    // Check the parsed tree before any parent or reference can disappear.
+    // Otherwise a surviving duplicate can acquire a discarded shape's id
+    // after `<use>` validation and turn a shape reference into container fan-out.
+    fn unique_ids(el: &RawEl, seen: &mut BTreeSet<String>) -> Result<(), String> {
+        for (name, value) in &el.attrs {
+            if name == "id" && !seen.insert(value.trim().to_string()) {
+                return Err("invalid SVG: duplicate id".into());
+            }
+        }
+        for child in &el.children {
+            if let RawNode::El(child) = child {
+                unique_ids(child, seen)?;
+            }
+        }
+        Ok(())
+    }
+    unique_ids(&raw, &mut BTreeSet::new())?;
     let mut s = Sanitizer {
         removed: BTreeSet::new(),
         defined: Vec::new(),
@@ -938,6 +963,96 @@ fn color_of(value: &str) -> Option<String> {
     Some(v)
 }
 
+/// Alpha encoded in an understood CSS color. Unknown syntax is left alone.
+fn paint_alpha(value: &str) -> Option<f64> {
+    fn opacity(value: &str) -> Option<f64> {
+        let value = value.trim();
+        let (number, divisor) = value.strip_suffix('%').map_or((value, 1.0), |v| (v, 100.0));
+        number
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| (v / divisor).clamp(0.0, 1.0))
+    }
+    let value = value.trim().to_ascii_lowercase();
+    if let Some(hex) = value.strip_prefix('#') {
+        if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        return match hex.len() {
+            3 | 6 => Some(1.0),
+            4 => u8::from_str_radix(&hex[3..], 16)
+                .ok()
+                .map(|a| f64::from(a) / 15.0),
+            8 => u8::from_str_radix(&hex[6..], 16)
+                .ok()
+                .map(|a| f64::from(a) / 255.0),
+            _ => None,
+        };
+    }
+    if value.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Some(1.0);
+    }
+    let (function, args) = value.split_once('(')?;
+    if !matches!(function, "rgb" | "rgba" | "hsl" | "hsla") {
+        return None;
+    }
+    let args = args.strip_suffix(')')?;
+    let (channels, alpha) = if let Some((channels, alpha)) = args.split_once('/') {
+        (channels.to_string(), opacity(alpha)?)
+    } else {
+        let mut components: Vec<_> = args.split(',').collect();
+        let alpha = if components.len() == 4 {
+            opacity(components.pop()?)?
+        } else {
+            1.0
+        };
+        (components.join(" "), alpha)
+    };
+    let channels: Vec<_> = channels.split_whitespace().collect();
+    if channels.len() != 3
+        || !channels.iter().all(|channel| {
+            let number = channel.strip_suffix('%').unwrap_or(channel);
+            let number = ["deg", "grad", "rad", "turn"]
+                .iter()
+                .find_map(|unit| number.strip_suffix(unit))
+                .unwrap_or(number);
+            number.parse::<f64>().is_ok_and(|v| v.is_finite())
+        })
+    {
+        return None;
+    }
+    Some(alpha)
+}
+
+/// Decline conversion if a mask/clip shape would inherit a changed paint,
+/// or references outside geometry whose paints might be converted.
+fn protected_paints_change(el: &El, color: &str, inherited: [bool; 4], protected: bool) -> bool {
+    let protected = protected || matches!(el.name, "mask" | "clipPath");
+    let mut changed = inherited;
+    for (i, paint) in PAINT_ATTRS.iter().enumerate() {
+        if let Some((_, value)) = el.attrs.iter().find(|(name, _)| name == paint) {
+            match value {
+                Val::Lit(value) if value == "inherit" => {}
+                Val::Lit(value) => {
+                    changed[i] = !protected && color_of(value).as_deref() == Some(color)
+                }
+                _ => changed[i] = false,
+            }
+        }
+    }
+    if protected
+        && (el.name == "use"
+            || ((FILLED.contains(&el.name) || el.name == "line") && changed.iter().any(|v| *v)))
+    {
+        return true;
+    }
+    el.children.iter().any(|child| match child {
+        Node::El(child) => protected_paints_change(child, color, changed, protected),
+        Node::Text(_) => false,
+    })
+}
+
 impl Sanitized {
     /// The icon's one paint color (see the module doc), normalized.
     pub(crate) fn single_color(&self) -> Option<String> {
@@ -982,31 +1097,97 @@ impl Sanitized {
 
     /// Replace `color` (as [`Sanitized::single_color`] returned it) with
     /// `currentColor` wherever it paints, outside `<clipPath>`/`<mask>`.
-    pub(crate) fn use_current_color(&mut self, color: &str) {
-        fn walk(el: &mut El, default_fill: bool, color: &str) {
+    /// Returns whether a conversion was applied; uncertain conversions leave
+    /// the whole document unchanged.
+    pub(crate) fn use_current_color(&mut self, color: &str) -> bool {
+        fn walk(
+            el: &mut El,
+            default_fill: bool,
+            color: &str,
+            inherited_opacity: &BTreeMap<&'static str, String>,
+        ) -> bool {
             if matches!(el.name, "clipPath" | "mask") {
-                return;
+                return true;
+            }
+            let mut opacity = inherited_opacity.clone();
+            for (name, value) in &el.attrs {
+                if matches!(
+                    *name,
+                    "fill-opacity" | "stroke-opacity" | "stop-opacity" | "flood-opacity"
+                ) && let Val::Lit(value) = value
+                    && value != "inherit"
+                {
+                    opacity.insert(*name, value.clone());
+                }
             }
             let has_fill = el.attrs.iter().any(|(n, _)| *n == "fill");
+            let mut extra = Vec::new();
             for (name, v) in &mut el.attrs {
                 if let Val::Lit(s) = v
                     && PAINT_ATTRS.contains(name)
                     && color_of(s).as_deref() == Some(color)
                 {
+                    let Some(alpha) = paint_alpha(s) else {
+                        return false;
+                    };
+                    if alpha != 1.0 {
+                        // Moving an ancestor's embedded alpha to an inherited
+                        // opacity would also affect descendants that override
+                        // its paint, so keep that conversion unchanged.
+                        if !el.children.is_empty() {
+                            return false;
+                        }
+                        let opacity_name = match *name {
+                            "fill" => "fill-opacity",
+                            "stroke" => "stroke-opacity",
+                            "stop-color" => "stop-opacity",
+                            "flood-color" => "flood-opacity",
+                            _ => unreachable!("paint attribute checked above"),
+                        };
+                        let existing = opacity.get(opacity_name).map(String::as_str).unwrap_or("1");
+                        let (number, divisor) = existing
+                            .strip_suffix('%')
+                            .map_or((existing, 1.0), |v| (v, 100.0));
+                        let Some(existing) = number.parse::<f64>().ok().filter(|v| v.is_finite())
+                        else {
+                            return false;
+                        };
+                        extra.push((
+                            opacity_name,
+                            Val::Lit((alpha * (existing / divisor).clamp(0.0, 1.0)).to_string()),
+                        ));
+                    }
                     *s = "currentColor".into();
                 }
+            }
+            for (name, value) in extra {
+                el.attrs.retain(|(n, _)| *n != name);
+                el.attrs.push((name, value));
             }
             // The implicit black fill, made explicit.
             if FILLED.contains(&el.name) && !has_fill && default_fill && color == DEFAULT_FILL {
                 el.attrs.push(("fill", Val::Lit("currentColor".into())));
             }
             for c in &mut el.children {
-                if let Node::El(e) = c {
-                    walk(e, default_fill && !has_fill, color);
+                if let Node::El(e) = c
+                    && !walk(e, default_fill && !has_fill, color, &opacity)
+                {
+                    return false;
                 }
             }
+            true
         }
-        walk(&mut self.root, true, color);
+        if protected_paints_change(&self.root, color, [false; 4], false) {
+            return false;
+        }
+        let mut converted = self.root.clone();
+        if walk(&mut converted, true, color, &BTreeMap::new()) {
+            let changed = converted != self.root;
+            self.root = converted;
+            changed
+        } else {
+            false
+        }
     }
 
     /// Whether the output defines any id (and so needs a per-instance
@@ -1021,12 +1202,16 @@ impl Sanitized {
     /// `<prefix>-<n>`. `prefix` must be id-safe.
     pub(crate) fn to_svg(&self, prefix: &str) -> String {
         let mut out = String::new();
-        self.svg_el(&self.root, 0, prefix, &mut out);
+        self.svg_el(&self.root, 0, false, prefix, &mut out);
         out
     }
 
-    fn svg_el(&self, el: &El, depth: usize, prefix: &str, out: &mut String) {
-        let indent = "  ".repeat(depth);
+    fn svg_el(&self, el: &El, depth: usize, compact: bool, prefix: &str, out: &mut String) {
+        let indent = if compact {
+            String::new()
+        } else {
+            "  ".repeat(depth)
+        };
         out.push_str(&indent);
         out.push('<');
         out.push_str(el.name);
@@ -1048,19 +1233,20 @@ impl Sanitized {
             out.push_str(&format!(" {name}=\"{value}\""));
         }
         if el.children.is_empty() {
-            out.push_str("/>\n");
+            out.push_str("/>");
+            if !compact {
+                out.push('\n');
+            }
             return;
         }
-        let texty = el.children.iter().any(|c| matches!(c, Node::Text(_)));
+        let texty = compact || TEXT_ELEMENTS.contains(&el.name);
         if texty {
             out.push('>');
             for c in &el.children {
                 match c {
                     Node::Text(t) => out.push_str(&xml_escape(t)),
                     Node::El(e) => {
-                        let mut inner = String::new();
-                        self.svg_el(e, 0, prefix, &mut inner);
-                        out.push_str(inner.trim_end());
+                        self.svg_el(e, depth + 1, true, prefix, out);
                     }
                 }
             }
@@ -1068,12 +1254,15 @@ impl Sanitized {
             out.push_str(">\n");
             for c in &el.children {
                 if let Node::El(e) = c {
-                    self.svg_el(e, depth + 1, prefix, out);
+                    self.svg_el(e, depth + 1, false, prefix, out);
                 }
             }
             out.push_str(&indent);
         }
-        out.push_str(&format!("</{}>\n", el.name));
+        out.push_str(&format!("</{}>", el.name));
+        if !compact {
+            out.push('\n');
+        }
     }
 
     /// JSX for the element tree, indented by `depth` levels of two spaces.
@@ -1380,6 +1569,106 @@ mod tests {
         // A `color` attribute pins currentColor: not convertible.
         let pinned = r##"<svg viewBox="0 0 1 1" fill="none" color="#f00"><path d="M0 0" stroke="currentColor"/></svg>"##;
         assert_eq!(sanitize(pinned).unwrap().single_color(), None);
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected_before_discarded_parents_and_use_validation() {
+        for svg in [
+            r##"<svg><image><path id="a"/><path id="b"/></image><defs><g id="a"><use href="#b"/><use href="#b"/></g><g id="b"><path d="M0 0h1"/></g></defs><use href="#a"/></svg>"##,
+            r##"<svg><script><path id="a"/></script><path id="a"/></svg>"##,
+            r##"<svg><path id="a"/><path id="a"/></svg>"##,
+        ] {
+            assert_eq!(sanitize(svg).unwrap_err(), "invalid SVG: duplicate id");
+        }
+    }
+
+    #[test]
+    fn current_color_preserves_embedded_alpha_and_effective_paint_opacity() {
+        for (paint, opacity, color, alpha) in [
+            ("fill", "fill-opacity", "#ff000080", 128.0 / 255.0),
+            ("stroke", "stroke-opacity", "#f008", 8.0 / 15.0),
+            ("fill", "fill-opacity", "rgba(255, 0, 0, 0.5)", 0.5),
+            ("fill", "fill-opacity", "rgb(255 0 0 / 50%)", 0.5),
+        ] {
+            for existing in [None, Some("0.4"), Some("40%")] {
+                let attr = existing
+                    .map(|v| format!(" {opacity}=\"{v}\""))
+                    .unwrap_or_default();
+                let input = format!(
+                    "<svg fill=\"none\"{attr}><rect width=\"10\" height=\"10\" {paint}=\"{color}\"/></svg>"
+                );
+                let mut sanitized = sanitize(&input).unwrap();
+                let single = sanitized.single_color().unwrap();
+                assert!(sanitized.use_current_color(&single));
+                let svg = sanitized.to_svg("x");
+                assert!(svg.contains(&format!("{paint}=\"currentColor\"")), "{svg}");
+                let expected = alpha * if existing.is_some() { 0.4 } else { 1.0 };
+                assert!(svg.contains(&format!("{opacity}=\"{expected}\"")), "{svg}");
+                assert!(sanitize(&svg).unwrap().removed.is_empty());
+            }
+        }
+        // An ancestor alpha cannot become inherited fill-opacity without
+        // also changing children that replace the ancestor's paint.
+        let mut inherited =
+            sanitize(r##"<svg fill="#ff000080"><rect width="1" height="1"/></svg>"##).unwrap();
+        let before = inherited.to_svg("x");
+        assert!(!inherited.use_current_color("#ff000080"));
+        assert_eq!(inherited.to_svg("x"), before);
+        let mut unknown =
+            sanitize(r##"<svg><rect fill="color(srgb 1 0 0 / 0.5)"/></svg>"##).unwrap();
+        let before = unknown.to_svg("x");
+        unknown.use_current_color(&unknown.single_color().unwrap());
+        assert_eq!(unknown.to_svg("x"), before);
+    }
+
+    #[test]
+    fn current_color_does_not_change_inherited_or_referenced_mask_paints() {
+        for svg in [
+            r##"<svg fill="white"><mask id="m"><rect width="10" height="10"/></mask><rect width="10" height="10" mask="url(#m)"/></svg>"##,
+            r##"<svg><defs><rect id="shape" width="10" height="10" fill="white"/><mask id="m"><use href="#shape"/></mask></defs><rect width="10" height="10" fill="white" mask="url(#m)"/></svg>"##,
+            r##"<svg stroke="white" fill="none"><clipPath id="m"><path d="M0 0h1"/></clipPath><path d="M0 0h1" clip-path="url(#m)"/></svg>"##,
+        ] {
+            let mut s = sanitize(svg).unwrap();
+            let before = s.to_svg("x");
+            let color = s.single_color().unwrap();
+            assert!(!s.use_current_color(&color));
+            assert_eq!(s.to_svg("x"), before);
+        }
+    }
+
+    #[test]
+    fn significant_text_whitespace_survives_both_serializers() {
+        for (input, expected) in [
+            (
+                r#"<svg><text xml:space="preserve"><tspan>A</tspan> <tspan>B</tspan></text></svg>"#,
+                r#"<text xml:space="preserve"><tspan>A</tspan> <tspan>B</tspan></text>"#,
+            ),
+            (
+                r#"<svg xml:space="preserve"><text><tspan>A</tspan><tspan>B</tspan></text></svg>"#,
+                "<text><tspan>A</tspan><tspan>B</tspan></text>",
+            ),
+            (
+                "<svg><text xml:space=\"preserve\"><tspan>A</tspan> \n\t<tspan>B</tspan></text></svg>",
+                "<text xml:space=\"preserve\"><tspan>A</tspan> \n\t<tspan>B</tspan></text>",
+            ),
+        ] {
+            let s = sanitize(input).unwrap();
+            assert!(s.removed.is_empty(), "{:?}", s.removed);
+            let svg = s.to_svg("x");
+            assert!(svg.contains(expected), "{svg}");
+            assert_eq!(sanitize(&svg).unwrap(), s);
+            let jsx = s.to_jsx(0, "uid", &[]);
+            if input.contains("</tspan> ") {
+                let whitespace = if input.contains('\t') { " \n\t" } else { " " };
+                assert!(
+                    jsx.contains(&format!(
+                        "{{{}}}",
+                        serde_json::to_string(whitespace).unwrap()
+                    )),
+                    "{jsx}"
+                );
+            }
+        }
     }
 
     #[test]

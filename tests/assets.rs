@@ -160,8 +160,7 @@ fn assert_golden(files: &BTreeMap<String, Vec<u8>>) {
     );
     for (rel, bytes) in files {
         assert_eq!(
-            String::from_utf8_lossy(bytes),
-            String::from_utf8_lossy(&expected[rel]),
+            bytes, &expected[rel],
             "tests/fixtures/assets/export/{rel} is stale — rerun with FIGMOG_BLESS=1 if the change is intended"
         );
     }
@@ -243,6 +242,58 @@ fn synthetic_icon_set_exports_to_react_components_and_reexport_changes_nothing()
         assert_eq!(tree(root), first);
         assert_eq!(mtimes(root), before);
     }
+}
+
+#[test]
+fn abandoned_barrels_are_reported_when_icons_are_removed_moved_or_change_language() {
+    for (replacement, args) in [
+        (GOLDEN_ASSETS, vec!["assets", "export", "--images", "2:1"]),
+        (
+            "icons = \"src/new-icons\"\ncomponents = \"jsx\"\n",
+            vec!["assets", "export", "--icons", "1:2"],
+        ),
+        (
+            "icons = \"src/icons\"\ncomponents = \"tsx\"\n",
+            vec!["assets", "export", "--icons", "1:2"],
+        ),
+    ] {
+        let dir = project(GOLDEN_ASSETS, &ICONS);
+        let root = dir.path();
+        figmog(root, &["assets", "export", "--icons", "1:2"]).success();
+        fs::write(
+            root.join("figmog.toml"),
+            format!("[files]\ndefault = \"{KEY}\"\n[assets]\n{replacement}"),
+        )
+        .unwrap();
+        let summary = json_of(&figmog(root, &args).success().get_output().stdout);
+        let stale = summary["stale"].as_array().unwrap();
+        assert!(stale.contains(&json!("src/icons/index.js")), "{summary}");
+        assert!(
+            root.join("src/icons/index.js").exists(),
+            "stale files are reported, not deleted"
+        );
+    }
+}
+
+#[test]
+fn public_image_paths_with_reserved_characters_support_spec_and_reexport() {
+    let dir = project("images = \"public/design images/icônes#?%\"\n", &[]);
+    let root = dir.path();
+    figmog(root, &["assets", "export", "--images", "2:1"]).success();
+    let summary = json_of(
+        &figmog(root, &["assets", "export"])
+            .success()
+            .get_output()
+            .stdout,
+    );
+    assert_eq!(summary["written"], 0, "{summary}");
+    let image = &summary["images"][0];
+    assert!(root.join(image["path"].as_str().unwrap()).exists());
+    assert_eq!(
+        image["url"],
+        "/design%20images/ic%C3%B4nes%23%3F%25/a3979dcc5fa7ded8.png"
+    );
+    figmog(root, &["spec", "2:1", "--no-tailwind"]).success();
 }
 
 #[test]

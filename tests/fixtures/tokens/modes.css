@@ -50,11 +50,11 @@
   --surface: var(--ink-900);
 }
 
-[data-theme="dark"] .brand-globex, [data-theme="dark"].brand-globex {
+:is([data-theme="dark"]) :is(.brand-globex), :is([data-theme="dark"]):is(.brand-globex) {
   --color-action: var(--brand-soft);
 }
 
-[data-theme="dark"] [data-density="compact"], [data-theme="dark"][data-density="compact"] {
+:is([data-theme="dark"]) :is([data-density="compact"]), :is([data-theme="dark"]):is([data-density="compact"]) {
   --space-section: 32px;
 }
 
