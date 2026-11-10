@@ -301,7 +301,10 @@ fn only_changes_to_the_exposed_registry_notify_clients() {
         }
     }
 
-    let mut initial = desktop_tools();
+    let mut initial = vec![
+        json!({"name":"get_a", "description":"Code", "inputSchema":{"type":"object"}}),
+        json!({"name":"get_z", "description":"Code", "inputSchema":{"type":"object"}}),
+    ];
     initial.push(json!({"name":"figmog_status", "description":"hidden A"}));
     let next = Arc::new(Mutex::new(initial.clone()));
     let refreshes = Arc::new(AtomicUsize::new(0));
@@ -321,10 +324,13 @@ fn only_changes_to_the_exposed_registry_notify_clients() {
     let count = refreshes.load(Ordering::Acquire);
     {
         let mut updated = next.lock().unwrap();
-        updated[1]["description"] = json!("hidden B");
+        updated[2]["description"] = json!("hidden B");
         // The proxy exposes name, prefixed description and inputSchema;
         // an unsupported raw field cannot change tools/list either.
         updated[0]["internalMetadata"] = json!("changed");
+        // This key sorts before all exposed keys in the complete JSON,
+        // so sorting raw tools would move get_z ahead of get_a.
+        updated[1]["_meta"] = json!({"changed":true});
         updated.push(json!({"description":"no tool name"}));
     }
     let deadline = Instant::now() + EXPECT;
@@ -345,7 +351,8 @@ fn only_changes_to_the_exposed_registry_notify_clients() {
         exposed["result"]["tools"]
             .as_array()
             .unwrap()
-            .last()
+            .iter()
+            .find(|tool| tool["name"] == "get_a")
             .unwrap()["description"],
         "[via Figma desktop] Updated code tool"
     );

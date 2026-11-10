@@ -32,6 +32,10 @@ type SessionApi = Arc<dyn FigmaApi + Send + Sync>;
 const WORKER_GONE: &str =
     "this file's worker stopped unexpectedly; inspect server stderr and restart figmog serve";
 
+/// Image jobs waiting behind one file's active operation, independent of
+/// how many requesters connect or disconnect while it runs.
+pub(crate) const MAX_QUEUED_IMAGES: usize = 128;
+
 /// Delivers one `figmog_images` result from the file's worker thread back
 /// to whoever asked (NWS-2955: `serve` turns it into a deferred response).
 /// Dropping it uncalled — a discarded queue on shutdown, or a worker that
@@ -300,7 +304,8 @@ pub(crate) struct FileSession {
     polling: bool,
     /// The worker is busy with an image request (not a pull or poll).
     imaging: bool,
-    /// Image requests accepted while another one runs, in arrival order.
+    /// Image requests accepted while another one runs, in arrival order,
+    /// bounded by `MAX_QUEUED_IMAGES` even after callers disconnect.
     image_queue: VecDeque<ImageJob>,
     /// A watch poll came due while an image request held the worker.
     poll_owed: bool,
@@ -1011,7 +1016,8 @@ impl FileSession {
 
     /// Accept one image request; `reply` receives its result later, from
     /// the worker. Never waits on the worker: an idle worker starts it
-    /// now, an image request already running queues it behind (FIFO), and a
+    /// now, an image request already running queues it behind (FIFO, up to
+    /// [`MAX_QUEUED_IMAGES`] queued jobs), and a
     /// running pull or metadata poll refuses it with a prompt busy error
     /// (spec §6), even for a cache hit. A watch poll or retry that comes due
     /// while images run gets the worker before the next queued image; a
@@ -1036,6 +1042,12 @@ impl FileSession {
         }
         if self.reset.is_some() {
             return Err(format!("mirror {}: {RESETTING}", self.key));
+        }
+        if self.image_queue.len() >= MAX_QUEUED_IMAGES {
+            return Err(format!(
+                "mirror {} image queue is full (limit {MAX_QUEUED_IMAGES}); retry figmog_images later",
+                self.key
+            ));
         }
         let job = ImageJob {
             ids: ids.to_vec(),
