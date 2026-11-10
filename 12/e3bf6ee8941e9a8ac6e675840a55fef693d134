@@ -1,0 +1,55 @@
+tests/serve.rs
+  s_d00caf59bef041::t_fa7ada016d8604 3352,3382-3383
+src/owner.rs
+  s_d00caf59bef041::t_6bc2c5ef801f5e 1109-1119,1123,1135-1138,1161-1168,1171,1409-1414,1419-1420
+  s_d00caf59bef041::t_12677b72ece54a 1421
+src/serve/writes.rs
+  s_d00caf59bef041::t_8783a7d3cf118a 277-283
+  s_d00caf59bef041::t_c9ebb5b4eb73e3 89,263-276,284-285
+src/serve/async_tests.rs
+  s_d00caf59bef041::t_a6bcb235ffe92d 51,185,1908
+  s_d00caf59bef041::t_b154c8d744473c 1795-1805,1811-1814,1820-1822,1829,1839-1840,1850,1853-1855,1865-1868,1878-1881,1891-1893
+  s_d00caf59bef041::t_4c3809b8fcd575 1815-1819,1823-1828,1830-1838,1841-1849,1851-1852,1856-1864,1869-1877,1882-1890
+  s_d00caf59bef041::t_85934f9542b7d5 1894-1895
+src/serve.rs
+  s_d00caf59bef041::t_4c3809b8fcd575 2413-2419,2423-2426,2430-2437
+  s_d00caf59bef041::t_8c0ff5087dd90f 1420-1424,1616-1632,1826,1835,1950,1953
+src/serve/async_tests/writes.rs
+  s_d00caf59bef041::t_fa7ada016d8604 123-138,143-145,147-151,155-159
+  s_d00caf59bef041::t_8783a7d3cf118a 139-142,146,152-154
+tests/project_feedback.rs
+  s_d00caf59bef041::t_bf4245674a60f4 113-119,184-187,190-193
+  s_d00caf59bef041::t_4d71f36637e1c0 7-9,11-12,99-112,125-183,188-189,194-199
+  s_d00caf59bef041::t_eb887d3f56d02a 120-124
+  s_d00caf59bef041::t_1494908b86dd3b 200-201
+src/sessions.rs
+  s_d00caf59bef041::t_8c0ff5087dd90f 1607-1614,1664,1674-1685
+docs/SPEC.md
+  s_d00caf59bef041::t_f4aa0041af6d7d 1794-1795
+  s_d00caf59bef041::t_a7957193a6c1b6 520-527,1791-1793
+src/project.rs
+  s_d00caf59bef041::t_f9e6a843705b7a 537-539,542-545
+tests/owner.rs
+  s_d00caf59bef041::t_3038157e6b6b9b 388-468
+src/serve/async_tests/isolation.rs
+  s_d00caf59bef041::t_2abc4121699cf2 545
+  s_d00caf59bef041::t_23f537a3933965 176-180,182-198,214,231,243,247-262,270-275
+  s_d00caf59bef041::t_951d4052c21c4b 181,199-213,218-230,232-242,244-246
+  s_d00caf59bef041::t_4c3809b8fcd575 215-217,263-269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "12e3bf6ee8941e9a8ac6e675840a55fef693d134",
+  "prompts": {},
+  "sessions": {
+    "s_d00caf59bef041": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa7-9721-7ac1-9380-ea52571e7db3",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
