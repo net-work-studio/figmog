@@ -1,0 +1,94 @@
+src/spec/css.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 39-44,46-56,298-299,301,395-435
+  s_9cf6a020dd8111::t_738feef4a8ea40 436
+examples/slice/app/scripts/lib.mjs
+  s_9cf6a020dd8111::t_345ea8e56fec29 141-142,147-154,246-268
+examples/slice/app/scripts/slice.mjs
+  s_9cf6a020dd8111::t_345ea8e56fec29 24,38,75,80,159,161,166,233-234
+examples/slice/evidence/broken/390/manifest.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 6,12,18,28,64,72,108,116,152,195-196,200-201
+src/svg.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 34-35,49-51,615,663-669,671,888-904,966-1055,1100-1108,1110-1121,1124-1128,1134-1163,1167-1170,1173-1177,1181-1184,1187-1198,1214,1218-1223,1245-1248,1251,1258,1266,1271-1274,1583-1765
+  s_9cf6a020dd8111::t_ed514f8ac7106a 1766
+src/assets.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 381-384,463-475,477,535-538,906-929,1184-1280
+  s_9cf6a020dd8111::t_dc3c201405e91e 1281
+src/cli/doctor.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 13,159,163,277-329,549-639
+  s_9cf6a020dd8111::t_e03f694ccf3640 640
+tests/fixtures/assets/export/src/icons/IconLogo.jsx
+  s_9cf6a020dd8111::t_345ea8e56fec29 6
+tests/fixtures/spec/edge.spec.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 2141,2228,2372,2473,2573,2675,2897
+examples/slice/app/test/icons.test.mjs
+  s_9cf6a020dd8111::t_345ea8e56fec29 89-105
+examples/slice/README.md
+  s_9cf6a020dd8111::t_345ea8e56fec29 40-43,57-60,64-65,118-119
+src/cli/assets.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 26,92,94-95,101-106,221-225,451,455,457-472,655-690,699,808-843,862-864,867-868,870-875,907-912
+tests/spec.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 587-642
+examples/slice/evidence/correct/390/manifest.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 6,12,18,28,64,72,108,116,152,200-201
+examples/slice/app/test/provenance.test.mjs
+  s_9cf6a020dd8111::t_345ea8e56fec29 1-96
+examples/slice/figma/card-render-1440.manifest.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 5
+examples/slice/evidence/COMMENT.md
+  s_9cf6a020dd8111::t_345ea8e56fec29 9,11,39-41
+packages/react/test/spec.test.ts
+  s_9cf6a020dd8111::t_345ea8e56fec29 247-282
+examples/slice/evidence/evidence.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 5,14,23,60,64,69-70,81,85,89,93,97,101,106-107,114,118,122,126,130,134,139-140,149,153,157,161,165,169,175,182,186,190,194,198,202,208
+tests/serve.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 726-728
+examples/slice/app/test/slice.test.mjs
+  s_9cf6a020dd8111::t_345ea8e56fec29 25,28,152-159
+  s_9cf6a020dd8111::t_96acfaf229da28 160-161
+examples/slice/figma/card-render-390.manifest.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 5
+docs/SPEC.md
+  s_9cf6a020dd8111::t_345ea8e56fec29 1353-1356,2190,2193-2197,2335-2338,2405-2407,2419-2425,2456,2481-2483,2647-2656,2780-2782,2808-2816,2829-2832,2839-2841,2856-2861,2873-2878,2880-2884
+tests/fixtures/tokens/modes.css
+  s_9cf6a020dd8111::t_345ea8e56fec29 53,57
+src/map.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 619-633,1115-1196
+  s_9cf6a020dd8111::t_bbf081a6685b07 1197
+examples/slice/evidence/correct/1440/manifest.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 6,12,18,28,64,72,108,116,152,200-201
+tests/fixtures/spec/font-families.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 1-42
+examples/slice/evidence/broken/1440/manifest.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 6,12,18,28,64,72,108,116,152,195-196,200-201
+src/tokens.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 232,843,845,964-966,968,1128-1172,1210,1218,1650,2089,2094-2181,2183-2199,2311-2484
+  s_9cf6a020dd8111::t_f1ec64b1df4dc9 2485
+src/spec.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 45,317-320,418,803-810,880-889,991-993,1555,1726-1731,2029-2037,2144,2159,2177-2190,2192,2268,2286,2295-2296,2299,2305-2308,2331,2334-2335,2462-2694
+  s_9cf6a020dd8111::t_a381b728133d9a 2695
+tests/assets.rs
+  s_9cf6a020dd8111::t_345ea8e56fec29 163,247-298,379-415
+  s_9cf6a020dd8111::t_7a9bd013c0544f 416
+examples/slice/figma/card-render.json
+  s_9cf6a020dd8111::t_345ea8e56fec29 6,12,16,21-22
+src/serve/async_tests/isolation.rs
+  s_9cf6a020dd8111::t_b3b16e5352e734 580,747
+tests/fixtures/assets/export/src/icons/IconStar.jsx
+  s_9cf6a020dd8111::t_345ea8e56fec29 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "250ce70a7bce2d6a8a052c6ceacf1e320077f044",
+  "prompts": {},
+  "sessions": {
+    "s_9cf6a020dd8111": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c659-8327-7e80-92e0-5a3276c64bdd",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
