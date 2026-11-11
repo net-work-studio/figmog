@@ -60,6 +60,7 @@ pub struct ReportEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Theme {
     pub collection: String,
+    pub collection_id: String,
     pub light_mode: String,
     pub dark_mode: String,
 }
@@ -85,6 +86,7 @@ struct Var<'a> {
     name: String,
     resolved_type: String,
     collection: String,
+    collection_id: String,
     default_mode: String,
     scopes: Vec<String>,
     web: Option<String>,
@@ -160,6 +162,9 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         let Some(default_mode) = row["default_mode"].as_str() else {
             return Err("the variables read carries no `default_mode` — the figmog serving this mirror is older than this CLI; restart it (kill the pid in owner.json) and retry".into());
         };
+        let Some(collection_id) = row["collection_id"].as_str() else {
+            return Err("the variables read carries no `collection_id` — the figmog serving this mirror is older than this CLI; restart it (kill the pid in owner.json) and retry".into());
+        };
         let text = |k: &str| row[k].as_str().unwrap_or_default().to_string();
         all.insert(
             id.clone(),
@@ -168,6 +173,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
                 name: text("name"),
                 resolved_type: text("resolved_type"),
                 collection: text("collection"),
+                collection_id: collection_id.to_string(),
                 default_mode: default_mode.to_string(),
                 scopes: row["scopes"]
                     .as_array()
@@ -193,7 +199,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
     // theme collection, the dark mode.
     let modes_of = |v: &Var<'_>| -> Vec<String> {
         match &theme {
-            Some(t) if t.collection == v.collection => {
+            Some(t) if t.collection_id == v.collection_id => {
                 vec![t.light_mode.clone(), t.dark_mode.clone()]
             }
             _ => vec![v.default_mode.clone()],
@@ -517,30 +523,55 @@ fn choose_theme(
     all: &BTreeMap<String, Var<'_>>,
     opts: &ExportOptions,
 ) -> Result<Option<Theme>, String> {
-    // Collection name → (mode names, default modes).
-    let mut collections: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
-    for v in all.values() {
-        let c = collections.entry(&v.collection).or_default();
-        c.0.extend(v.values.keys().map(String::as_str));
-        c.0.insert(&v.default_mode);
-        c.1.insert(&v.default_mode);
+    struct Collection<'a> {
+        name: &'a str,
+        modes: BTreeSet<&'a str>,
+        defaults: BTreeSet<&'a str>,
     }
+    // Display names need not be unique; only ids identify collections.
+    let mut collections: BTreeMap<&str, Collection<'_>> = BTreeMap::new();
+    for v in all.values() {
+        let c = collections
+            .entry(&v.collection_id)
+            .or_insert_with(|| Collection {
+                name: &v.collection,
+                modes: BTreeSet::new(),
+                defaults: BTreeSet::new(),
+            });
+        c.modes.extend(v.values.keys().map(String::as_str));
+        c.modes.insert(&v.default_mode);
+        c.defaults.insert(&v.default_mode);
+    }
+    let names: BTreeSet<&str> = collections.values().map(|c| c.name).collect();
     let like = |mode: &str, word: &str| mode.to_ascii_lowercase().contains(word);
-    let collection = match &opts.collection {
+    let collection_id = match &opts.collection {
         Some(name) => {
-            if !collections.contains_key(name.as_str()) {
-                return Err(format!(
-                    "no variable collection named {name:?} (collections: {})",
-                    quoted(collections.keys())
-                ));
+            let matches: Vec<&str> = collections
+                .iter()
+                .filter(|(_, collection)| collection.name == name)
+                .map(|(id, _)| *id)
+                .collect();
+            match matches.as_slice() {
+                [one] => *one,
+                [] => {
+                    return Err(format!(
+                        "no variable collection named {name:?} (collections: {})",
+                        quoted(names.iter())
+                    ));
+                }
+                many => {
+                    return Err(format!(
+                        "several variable collections are named {name:?} (ids: {}) — rename a collection before selecting it with --collection",
+                        quoted(many.iter())
+                    ));
+                }
             }
-            name.as_str()
         }
         None => {
             let with_dark: Vec<&str> = collections
                 .iter()
-                .filter(|(_, (modes, _))| modes.iter().any(|m| like(m, "dark")))
-                .map(|(name, _)| *name)
+                .filter(|(_, collection)| collection.modes.iter().any(|m| like(m, "dark")))
+                .map(|(id, _)| *id)
                 .collect();
             match with_dark.as_slice() {
                 [one] => *one,
@@ -548,19 +579,22 @@ fn choose_theme(
                 [] => {
                     return Err(format!(
                         "no collection has a mode named like \"dark\" — pass --collection (collections: {})",
-                        quoted(collections.keys())
+                        quoted(names.iter())
                     ));
                 }
                 many => {
                     return Err(format!(
-                        "several collections have a mode named like \"dark\" ({}) — pass --collection",
+                        "several collections have a mode named like \"dark\" (ids: {}) — pass --collection with a unique collection name",
                         quoted(many.iter())
                     ));
                 }
             }
         }
     };
-    let (modes, defaults) = &collections[collection];
+    let selected = &collections[collection_id];
+    let collection = selected.name;
+    let modes = &selected.modes;
+    let defaults = &selected.defaults;
     let pick = |flag: &Option<String>, word: &str, what: &str| -> Result<Option<String>, String> {
         if let Some(m) = flag {
             if !modes.contains(m.as_str()) {
@@ -605,6 +639,7 @@ fn choose_theme(
     }
     Ok(Some(Theme {
         collection: collection.to_string(),
+        collection_id: collection_id.to_string(),
         light_mode: light,
         dark_mode: dark,
     }))
@@ -722,7 +757,7 @@ mod tests {
     ) -> Value {
         json!({
             "variable_id": id, "source": "imported", "name": name,
-            "resolved_type": ty, "collection": "c", "default_mode": "light",
+            "resolved_type": ty, "collection": "c", "collection_id": "C:c", "default_mode": "light",
             "scopes": scopes, "values_by_mode": values,
             "code_syntax": web.map(|w| json!({"WEB": w})),
         })
@@ -818,9 +853,11 @@ mod tests {
         );
         let mut b = a.clone();
         a["collection"] = json!("one");
+        a["collection_id"] = json!("C:one");
         b["variable_id"] = json!("V:2");
         b["name"] = json!("b");
         b["collection"] = json!("two");
+        b["collection_id"] = json!("C:two");
         let v = snap(vec![a, b]);
         let err = export_css(&v, &ExportOptions::default()).unwrap_err();
         assert!(err.contains("pass --collection"), "{err}");
@@ -927,6 +964,7 @@ mod tests {
         let sem = |id: &str, name: &str, to: &str| {
             let mut r = row(id, name, "COLOR", alias(to), json!([]), None);
             r["collection"] = json!("semantic");
+            r["collection_id"] = json!("C:semantic");
             r["default_mode"] = json!("default");
             r
         };
@@ -951,6 +989,7 @@ mod tests {
                     None,
                 );
                 r["collection"] = json!("semantic");
+                r["collection_id"] = json!("C:semantic");
                 r["default_mode"] = json!("default");
                 r
             },
@@ -963,6 +1002,85 @@ mod tests {
             ),
             "{}",
             out.css
+        );
+    }
+
+    #[test]
+    fn same_named_collections_keep_their_own_modes_and_explicit_names_are_ambiguous() {
+        let mut themed = row(
+            "V:theme",
+            "themed",
+            "FLOAT",
+            json!({"Light": 16, "Dark": 24}),
+            json!(["GAP"]),
+            None,
+        );
+        themed["collection"] = json!("Same");
+        themed["collection_id"] = json!("C:theme");
+        themed["default_mode"] = json!("Light");
+        let mut other = row(
+            "V:other",
+            "other",
+            "FLOAT",
+            json!({"Value": 8}),
+            json!(["GAP"]),
+            None,
+        );
+        other["collection"] = json!("Same");
+        other["collection_id"] = json!("C:other");
+        other["default_mode"] = json!("Value");
+        let vars = snap(vec![themed, other]);
+        let out = export_css(&vars, &ExportOptions::default()).unwrap();
+        assert_eq!(out.tokens, 2);
+        assert!(out.report.is_empty(), "{:?}", out.report);
+        assert_eq!(out.theme.as_ref().unwrap().collection_id, "C:theme");
+        assert!(out.css.contains("  --other: 8px;"), "{}", out.css);
+        assert!(out.css.contains("  --themed: 16px;"), "{}", out.css);
+        let dark = out
+            .css
+            .split("[data-theme=\"dark\"] {\n")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(dark.contains("  --themed: 24px;"), "{dark}");
+        assert!(!dark.contains("--other"), "{dark}");
+        let err = export_css(
+            &vars,
+            &ExportOptions {
+                collection: Some("Same".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("several variable collections are named \"Same\""),
+            "{err}"
+        );
+        assert!(err.contains("C:other") && err.contains("C:theme"), "{err}");
+        let mut both_dark = vars.clone();
+        both_dark["variables"][1]["values_by_mode"]["Dark"] = json!(12);
+        let err = export_css(&both_dark, &ExportOptions::default()).unwrap_err();
+        assert!(err.contains("several collections"), "{err}");
+        assert!(err.contains("C:other") && err.contains("C:theme"), "{err}");
+    }
+
+    #[test]
+    fn old_variables_reads_without_collection_identity_request_a_restart() {
+        let mut variable = row(
+            "V:1",
+            "gap",
+            "FLOAT",
+            json!({"light": 8}),
+            json!(["GAP"]),
+            None,
+        );
+        variable.as_object_mut().unwrap().remove("collection_id");
+        let err = export_css(&snap(vec![variable]), &ExportOptions::default()).unwrap_err();
+        assert!(
+            err.contains("no `collection_id`") && err.contains("restart"),
+            "{err}"
         );
     }
 

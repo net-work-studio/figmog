@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import pixelmatch from "pixelmatch";
 import type { CaptureManifest } from "./capture.js";
@@ -162,16 +162,50 @@ export interface CompareManifest {
   viewport: { height: number; width: number } | null;
 }
 
-async function loadCaptureManifest(pngPath: string): Promise<CaptureManifest | null> {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+async function loadCaptureManifest(pngPath: string, bytes: Uint8Array, image: Rgba): Promise<CaptureManifest | null> {
   const stem = basename(pngPath).replace(/\.png$/i, "");
+  const path = join(dirname(pngPath), `${stem}.manifest.json`);
+  let text: string;
   try {
-    return JSON.parse(await readFile(join(dirname(pngPath), `${stem}.manifest.json`), "utf8")) as CaptureManifest;
+    text = await readFile(path, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return null;
     }
     throw error;
   }
+  const invalid = (reason: string): never => {
+    throw new Error(`invalid capture sidecar ${path}: ${reason}`);
+  };
+  let capture: unknown;
+  try {
+    capture = JSON.parse(text) as unknown;
+  } catch {
+    return invalid("invalid JSON");
+  }
+  if (!isRecord(capture) || capture["kind"] !== "figmog-shot/capture" || capture["version"] !== 1) {
+    return invalid("expected figmog-shot/capture version 1");
+  }
+  const recorded = capture["image"];
+  if (!isRecord(recorded) || recorded["sha256"] !== sha256(bytes)) {
+    return invalid("image SHA-256 does not match the PNG");
+  }
+  if (recorded["width"] !== image.width || recorded["height"] !== image.height) {
+    return invalid("image dimensions do not match the PNG");
+  }
+  const viewport = capture["viewport"];
+  if (!isRecord(viewport)) return invalid("expected a viewport with positive integer dimensions");
+  const width = viewport["width"];
+  const height = viewport["height"];
+  if (typeof width !== "number" || !Number.isInteger(width) || width <= 0 ||
+      typeof height !== "number" || !Number.isInteger(height) || height <= 0) {
+    return invalid("expected a viewport with positive integer dimensions");
+  }
+  return capture as unknown as CaptureManifest;
 }
 
 function entry(file: string, bytes: Uint8Array, image: Rgba): ImageEntry {
@@ -187,9 +221,9 @@ function entry(file: string, bytes: Uint8Array, image: Rgba): ImageEntry {
 export async function compareToDir(options: CompareOptions): Promise<{ manifest: CompareManifest; manifestPath: string }> {
   const [figma, before, after] = await Promise.all([readPng(options.figma), readPng(options.before), readPng(options.after)]);
   const [figmaCapture, beforeCapture, afterCapture] = await Promise.all([
-    loadCaptureManifest(options.figma),
-    loadCaptureManifest(options.before),
-    loadCaptureManifest(options.after),
+    loadCaptureManifest(options.figma, figma.bytes, figma.image),
+    loadCaptureManifest(options.before, before.bytes, before.image),
+    loadCaptureManifest(options.after, after.bytes, after.image),
   ]);
   const diffBefore = diffImages(figma.image, before.image);
   const diffAfter = diffImages(figma.image, after.image);
@@ -197,9 +231,9 @@ export async function compareToDir(options: CompareOptions): Promise<{ manifest:
 
   await mkdir(options.outDir, { recursive: true });
   await Promise.all([
-    copyFile(options.figma, join(options.outDir, "figma.png")),
-    copyFile(options.before, join(options.outDir, "before.png")),
-    copyFile(options.after, join(options.outDir, "after.png")),
+    writeFile(join(options.outDir, "figma.png"), figma.bytes),
+    writeFile(join(options.outDir, "before.png"), before.bytes),
+    writeFile(join(options.outDir, "after.png"), after.bytes),
   ]);
   const diffBeforeBytes = await writePng(join(options.outDir, "diff-before.png"), diffBefore.image);
   const diffAfterBytes = await writePng(join(options.outDir, "diff-after.png"), diffAfter.image);

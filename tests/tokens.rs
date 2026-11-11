@@ -57,7 +57,7 @@ fn fixture_exports_byte_identically_and_matches_the_golden_file() {
     assert_eq!(summary["tokens"], 14);
     assert_eq!(
         summary["theme"],
-        serde_json::json!({"collection": "Theme", "light_mode": "Light", "dark_mode": "Dark"})
+        serde_json::json!({"collection": "Theme", "collection_id": "VariableCollectionId:2:0", "light_mode": "Light", "dark_mode": "Dark"})
     );
     let reported: Vec<&str> = summary["report"]
         .as_array()
@@ -159,5 +159,53 @@ fn explicit_modes_are_validated() {
     assert!(
         dark.contains("  --color-brand: var(--ocean-500);\n"),
         "{css}"
+    );
+}
+
+#[test]
+fn duplicate_collection_names_remain_distinct_after_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("duplicate-collections.json");
+    let export = serde_json::json!({
+        "variableCollections": {
+            "C:theme": {"name": "Same", "defaultModeId": "M:light", "modes": [
+                {"modeId": "M:light", "name": "Light"}, {"modeId": "M:dark", "name": "Dark"}]},
+            "C:other": {"name": "Same", "defaultModeId": "M:value", "modes": [
+                {"modeId": "M:value", "name": "Value"}]}
+        },
+        "variables": {
+            "V:theme": {"name": "themed", "resolvedType": "FLOAT", "variableCollectionId": "C:theme",
+                "valuesByMode": {"M:light": 16, "M:dark": 24}, "scopes": ["WIDTH_HEIGHT", "GAP"]},
+            "V:other": {"name": "other", "resolvedType": "FLOAT", "variableCollectionId": "C:other",
+                "valuesByMode": {"M:value": 8}, "scopes": ["GAP"]}
+        }
+    });
+    std::fs::write(&path, export.to_string()).unwrap();
+    let (_store, db) = imported(&path);
+    let vars = common::command()
+        .args(["--db", &db, "vars", "--snapshot"])
+        .assert()
+        .success();
+    let vars: serde_json::Value = serde_json::from_slice(&vars.get_output().stdout).unwrap();
+    let themed = vars["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["variable_id"] == "V:theme")
+        .unwrap();
+    assert_eq!(themed["collection"], "Same");
+    assert_eq!(themed["collection_id"], "C:theme");
+    assert_eq!(themed["scopes"], serde_json::json!(["GAP", "WIDTH_HEIGHT"]));
+    let css = String::from_utf8(export_stdout(&db)).unwrap();
+    assert!(css.contains("  --other: 8px;"), "{css}");
+    assert!(css.contains("  --themed: 16px;"), "{css}");
+    let error = common::command()
+        .args(["--db", &db, "tokens", "export", "--collection", "Same"])
+        .assert()
+        .failure()
+        .code(1);
+    assert!(
+        String::from_utf8_lossy(&error.get_output().stderr)
+            .contains("several variable collections are named")
     );
 }

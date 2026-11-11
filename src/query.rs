@@ -910,6 +910,9 @@ pub fn vars<R: Readable>(
                 values_by_mode.insert(mode_name, val);
             }
             let code = code_of(vid);
+            let mut scopes = var.scopes.clone();
+            scopes.sort();
+            scopes.dedup();
             let mut row = OwnedValue(json!({
                 "variable_id": vid,
                 "source": "imported",
@@ -922,6 +925,7 @@ pub fn vars<R: Readable>(
                 "name": var.name,
                 "resolved_type": var.resolved_type,
                 "collection": collection.as_ref().map(|c| c.name.clone()),
+                "collection_id": var.collection_id,
                 // The collection's default mode, by name (mode id when
                 // the collection doesn't name it), and the variable's
                 // Figma scopes — what `figmog tokens export` needs to
@@ -933,7 +937,7 @@ pub fn vars<R: Readable>(
                         .map(|(_, name)| name.clone())
                         .unwrap_or_else(|| c.default_mode_id.clone())
                 }),
-                "scopes": var.scopes,
+                "scopes": scopes,
                 "sites": sites,
                 "observed": observed,
             }));

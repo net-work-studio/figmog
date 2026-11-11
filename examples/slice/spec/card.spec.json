@@ -329,6 +329,7 @@
     "state": "current",
     "theme": {
       "collection": "Theme",
+      "collection_id": "VariableCollectionId:2:0",
       "dark_mode": "Dark",
       "light_mode": "Light"
     },

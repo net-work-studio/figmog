@@ -1309,8 +1309,9 @@ retains the full lifecycle details.
 or imported) over inference whenever one exists for a given variable id.
 Authoritative rows also carry `code_syntax` (platform → name object),
 `hidden_from_publishing` and `remote` from the snapshot row — null for a
-legacy snapshot — plus the variable's `scopes` and its collection's
-`default_mode` (by name, the mode id when unnamed; NWS-2967). Without
+legacy snapshot — plus the variable's sorted, deduplicated `scopes`, its
+existing `collection_id`, and its collection's `default_mode` (by name,
+the mode id when unnamed; NWS-2967). Without
 `--snapshot`/`snapshot: true` the result stays the plain row array; with
 it, `{snapshot, variables}`.
 
@@ -1325,7 +1326,8 @@ existing `figmog_vars {snapshot: true}` read (`ReadCommand::Vars`), so it
 is socket-routed to a running serve/background owner or opens the store
 directly exactly like `figmog vars --snapshot` (§10 "Socket-first
 routing"), and renders that JSON locally. A serving binary older than the
-`default_mode` field is reported as an error asking to restart it.
+`default_mode` or `collection_id` fields is reported as an error asking
+to restart it.
 
 **Snapshot.** Only state `current` exports; `none`, `legacy` (no
 provenance) and `empty` are exit-1 errors. Only authoritative rows are
@@ -1351,8 +1353,10 @@ snapshot) is skipped and reported.
 4. `@theme { … }` and `@theme inline { … }` — the Tailwind v4 theme
    (below). Empty blocks are omitted.
 
-**Theme collection and modes.** `--collection` names it; otherwise it is
-the one collection with a mode whose name contains "dark"
+**Theme collection and modes.** Collections are grouped and tested for
+theme membership by ID. `--collection` selects a display name and rejects
+that name when more than one collection has it. Without `--collection`,
+the theme is the one collection with a mode whose name contains "dark"
 (ASCII-case-insensitive) — none ⇒ no dark block (an error if
 `--light-mode`/`--dark-mode` was given), several ⇒ an error asking for
 `--collection`. The dark mode is `--dark-mode`, else the collection's one
@@ -1996,7 +2000,8 @@ bare id, a `12-34` id or a Figma URL (§12); an unknown id is the standard
 A spec node is `{id, name, type, layout?, values, children}` with
 `children` in child-index order. `tokens_snapshot` is the §9 snapshot
 summary the names refer to, plus the theme the token export picks
-(`{collection, light_mode, dark_mode}` or null) and `css_unavailable`:
+(`{collection, collection_id, light_mode, dark_mode}` or null) and
+`css_unavailable`:
 null, or the token export's error (no `current` snapshot, a name
 collision, an ambiguous theme), in which case every `css` is null.
 
@@ -2025,7 +2030,8 @@ collision, an ambiguous theme), in which case every `css` is null.
 **Values:** `fill` and `stroke` (arrays, one entry per visible `SOLID`
 paint; the raw value is `#rrggbb`, or `#rrggbbaa` below full alpha, the
 paint's `opacity` folded into alpha — the token export's color form),
-`stroke_weight` (with visible strokes), `radius` (`{top_left, top_right,
+`stroke_weight` (with visible uniform strokes, defaulting to 1 when
+`strokeWeight` is omitted), `radius` (`{top_left, top_right,
 bottom_right, bottom_left}` from `rectangleCornerRadii`, else
 `cornerRadius`; absent when the node has neither and no corner binding),
 and on TEXT nodes `typography`: `font_family`, `font_size`,

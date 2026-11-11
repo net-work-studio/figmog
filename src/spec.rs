@@ -33,7 +33,7 @@ use crate::tokens::{ExportOptions, Theme, color, export_css};
 struct Var<'a> {
     name: String,
     resolved_type: String,
-    collection: String,
+    collection_id: String,
     default_mode: Option<String>,
     scopes: Vec<String>,
     /// Mode name → raw value or alias.
@@ -165,7 +165,7 @@ impl<'a> Tokens<'a> {
                 Var {
                     name: text("name"),
                     resolved_type: text("resolved_type"),
-                    collection: text("collection"),
+                    collection_id: text("collection_id"),
                     default_mode: row["default_mode"].as_str().map(str::to_string),
                     scopes: row["scopes"]
                         .as_array()
@@ -261,7 +261,7 @@ fn root_value(
 ) -> Option<Lit> {
     let v = all.get(id)?;
     let mode = match theme {
-        Some(t) if t.collection == v.collection => Some(&t.light_mode),
+        Some(t) if t.collection_id == v.collection_id => Some(&t.light_mode),
         _ => v.default_mode.as_ref(),
     }?;
     let raw = v.values.get(mode)?;
@@ -575,10 +575,14 @@ impl Cx<'_, '_> {
             values.insert("stroke".into(), OwnedValue(Value::Array(strokes)));
             if n.get("individualStrokeWeights").is_some() {
                 self.unsupported(&id, "individualStrokeWeights: stroke weight not specified");
-            } else if let Some(raw) = n.get("strokeWeight")
-                && let Some(e) = self.number(n, &id, "strokeWeight", copy_value(raw), STROKE_WEIGHT)
-            {
-                values.insert("stroke_weight".into(), e);
+            } else {
+                let raw = n
+                    .get("strokeWeight")
+                    .map(copy_value)
+                    .unwrap_or(OwnedValue(json!(1)));
+                if let Some(e) = self.number(n, &id, "strokeWeight", raw, STROKE_WEIGHT) {
+                    values.insert("stroke_weight".into(), e);
+                }
             }
         }
         if let Some(radius) = self.radius(n, &id) {
@@ -874,6 +878,76 @@ mod tests {
         let spec = build(&tree, &vars);
         assert_eq!(spec["node"]["values"]["fill"][0]["variable_id"], "V:3");
         assert_eq!(spec["unsupported"], json!([]));
+    }
+
+    #[test]
+    fn omitted_stroke_weight_uses_one_and_keeps_binding_or_matches() {
+        let tree = json!({"id": "1:1", "name": "Box", "type": "RECTANGLE",
+            "strokes": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0}}],
+            "boundVariables": {"strokeWeight": {"type": "VARIABLE_ALIAS", "id": "V:weight"}},
+            "children": []});
+        let vars = json!({"snapshot": {"state": "current"}, "variables": [{
+            "variable_id": "V:weight", "name": "stroke/weight", "source": "imported",
+            "resolved_type": "FLOAT", "collection": "Stroke", "collection_id": "C:stroke",
+            "default_mode": "Value", "scopes": ["STROKE_FLOAT"], "values_by_mode": {"Value": 1}
+        }]});
+        let spec = build(&tree, &vars);
+        assert_eq!(
+            spec["node"]["values"]["stroke_weight"],
+            json!({
+            "token": "stroke/weight", "variable_id": "V:weight", "css": "--stroke-weight", "raw": 1})
+        );
+        assert_eq!(spec["unsupported"], json!([]));
+        let mut unbound = tree.clone();
+        unbound.as_object_mut().unwrap().remove("boundVariables");
+        let spec = build(&unbound, &vars);
+        assert_eq!(
+            spec["node"]["values"]["stroke_weight"],
+            json!({"untokenized": true, "raw": 1,
+            "matches": [{"token": "stroke/weight", "variable_id": "V:weight", "css": "--stroke-weight"}]})
+        );
+        let mut explicit = tree.clone();
+        explicit["strokeWeight"] = json!(3);
+        assert_eq!(
+            build(&explicit, &vars)["node"]["values"]["stroke_weight"]["raw"],
+            3
+        );
+        let mut individual = tree;
+        individual["individualStrokeWeights"] =
+            json!({"top": 2, "right": 1, "bottom": 1, "left": 1});
+        let spec = build(&individual, &vars);
+        assert!(spec["node"]["values"].get("stroke_weight").is_none());
+        assert_eq!(
+            spec["unsupported"],
+            json!([{"id": "1:1", "reason": "individualStrokeWeights: stroke weight not specified"}])
+        );
+        unbound["strokes"][0]["visible"] = json!(false);
+        assert!(
+            build(&unbound, &vars)["node"]["values"]
+                .get("stroke_weight")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn matching_uses_collection_identity_when_display_names_repeat() {
+        let tree = json!({"id": "1:1", "name": "Card", "type": "FRAME", "layoutMode": "VERTICAL",
+            "itemSpacing": 8, "children": []});
+        let vars = json!({"snapshot": {"state": "current"}, "variables": [
+            {"variable_id": "V:theme", "name": "theme-gap", "source": "imported", "resolved_type": "FLOAT",
+                "collection": "Same", "collection_id": "C:theme", "default_mode": "Light", "scopes": ["GAP"],
+                "values_by_mode": {"Light": 16, "Dark": 24}},
+            {"variable_id": "V:other", "name": "other-gap", "source": "imported", "resolved_type": "FLOAT",
+                "collection": "Same", "collection_id": "C:other", "default_mode": "Value", "scopes": ["GAP"],
+                "values_by_mode": {"Light": 99, "Value": 8}}
+        ]});
+        let spec = build(&tree, &vars);
+        assert_eq!(spec["tokens_snapshot"]["theme"]["collection_id"], "C:theme");
+        assert_eq!(
+            spec["node"]["layout"]["gap"]["matches"],
+            json!([
+            {"token": "other-gap", "variable_id": "V:other", "css": "--other-gap"}])
+        );
     }
 
     #[test]

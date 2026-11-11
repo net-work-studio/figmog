@@ -93,6 +93,10 @@ design system lacks generates nothing. Tokens the export emits unitless and
 without a theme entry (font sizes, weight, line height, stroke width) are
 used through their CSS variables, e.g. `text-[length:calc(var(--font-size-title)*1px)]`.
 
+Tailwind's automatic source discovery is disabled. It scans only `src/` and
+`index.html`, which the build identity hashes and the temporary app copies.
+Files outside that scope and previous `dist/` output cannot add utilities.
+
 Values the spec flags `untokenized` (horizontal padding 24, width 320, title
 line height 28, body fill and weight, badge size and radius, letter spacing)
 have no token, so they are written as arbitrary values and marked

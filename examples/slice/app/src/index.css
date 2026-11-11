@@ -7,5 +7,9 @@
  */
 @layer theme, base, components, utilities;
 @import "tailwindcss/preflight.css" layer(base);
-@import "tailwindcss/utilities.css" layer(utilities);
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
 @import "./tokens.css";
+
+/* These sources are copied and hashed by the slice's build identity. */
+@source "./";
+@source "../index.html";

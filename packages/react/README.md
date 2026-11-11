@@ -139,6 +139,11 @@ relative to the output directory, never absolute paths.
   capture manifest), `legend`, `score`, `settings`, and `viewport` (shared
   viewport of the inputs' captures, or `null` when unknown or mixed).
 
+Comparison checks each capture sidecar's kind, version, image digest and
+dimensions against the loaded PNG before using its metadata. Stale or invalid
+sidecars fail with an error naming the sidecar. PNGs without a sidecar remain
+valid inputs and carry no capture metadata.
+
 ## Fixtures
 
 Everything under `test/fixtures/` is synthetic. The tests produce the Figma
