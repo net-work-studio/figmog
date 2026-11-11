@@ -1,0 +1,37 @@
+docs/SPEC.md
+  s_9cf6a020dd8111::t_769d265b01ea68 2958-2959,3000-3003
+packages/react/test/mark.test.ts
+  s_9cf6a020dd8111::t_a46e5321c6bb9e 31-83
+packages/react/test/plugin.test.ts
+  s_9cf6a020dd8111::t_d821499c9fcebf 427,431,433-459,462,464-465,467-469,471-478
+  s_9cf6a020dd8111::t_e1240085847b0c 428-430,432,460-461,463,466,470
+  s_9cf6a020dd8111::t_8dcbd61a769b7c 479-515,517-539
+  s_9cf6a020dd8111::t_769d265b01ea68 516
+packages/react/src/vite.ts
+  s_9cf6a020dd8111::t_e1240085847b0c 9,145
+packages/react/src/mark.ts
+  s_9cf6a020dd8111::t_4292061f52c46a 91-114,116,157,259
+packages/react/README.md
+  s_9cf6a020dd8111::t_769d265b01ea68 93-94
+packages/react/src/bridge.ts
+  s_9cf6a020dd8111::t_132e9ff120806c 257-259
+  s_9cf6a020dd8111::t_e1240085847b0c 19,231-236,238-256,260-265
+  s_9cf6a020dd8111::t_8dcbd61a769b7c 237
+  s_9cf6a020dd8111::t_785263a5193182 266-267
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "064e364ce93d78cf6f5163b1560a40bfd691c827",
+  "prompts": {},
+  "sessions": {
+    "s_9cf6a020dd8111": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c659-8327-7e80-92e0-5a3276c64bdd",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
