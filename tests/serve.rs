@@ -2576,11 +2576,11 @@ fn socket_status_targets_current_mirror_not_servers_own_default() {
 }
 
 /// C1 (reproduced by review, now fixed): the real quick-start shape — zero
-/// startup files (`figmog serve` with no file argument, exactly what
-/// `claude mcp add figmog -- figmog serve` runs), relying entirely on
-/// auto-open. Before the fix, a socket-routed `figmog status` with no
-/// `file` argument hit `SessionManager::resolve(None, ..)` against a
-/// server with *zero* sessions and no `default_key` — a hard "no default
+/// startup files or current pointer, relying entirely on auto-open after
+/// a CLI selects a current file. Before the fix, a socket-routed
+/// `figmog status` with no `file` argument hit
+/// `SessionManager::resolve(None, ..)` against a server with *zero*
+/// sessions and no `default_key` — a hard "no default
 /// mirrored file" error, even though a mirror was already pulled and
 /// sitting on disk. The fix routes the injected `.figmog/current` key
 /// through the explicit-`file` path, which auto-opens it — the store is
@@ -2589,12 +2589,17 @@ fn socket_status_targets_current_mirror_not_servers_own_default() {
 fn socket_status_targets_the_current_mirror_with_zero_startup_files() {
     const KEY: &str = "figmogsockzerofilesg1";
     let dir = default_root_fixture(KEY, common::fixture_v1());
+    // A current pointer present at startup is now a startup selection.
+    // Publish it afterward to exercise the CLI's independent routing.
+    let current = dir.path().join(".figmog/current");
+    std::fs::remove_file(&current).unwrap();
     let (mut guard, mut stdin, rx) = spawn_default_root_serve_zero_files(dir.path(), &[]);
     handshake(&mut stdin, &rx);
 
     // Nothing mirrored yet from serve's own point of view.
     let resp = call(&mut stdin, &rx, 2, "figmog_files", json!({}));
     assert_eq!(result_json(&resp), json!([]));
+    std::fs::write(&current, KEY).unwrap();
 
     let out = common::command()
         .arg("status")
@@ -3313,6 +3318,109 @@ fn every_local_read_matches_across_direct_socket_and_mcp() {
 }
 
 // ---- NWS-2963: writers through a running serve ----
+
+#[test]
+fn no_watch_relay_attaches_the_selected_project_default_at_startup() {
+    const KEY: &str = "SyntheticStartupDefault0001";
+    for configured in [false, true] {
+        let dir = default_root_fixture(KEY, common::fixture_v1());
+        if configured {
+            std::fs::remove_file(dir.path().join(".figmog/current")).unwrap();
+            std::fs::write(
+                dir.path().join("figmog.toml"),
+                format!("[files]\ndefault = \"{KEY}\"\n"),
+            )
+            .unwrap();
+        }
+        let (mut guard, mut stdin, rx) = spawn_default_root_serve_zero_files(dir.path(), &[]);
+        handshake(&mut stdin, &rx);
+        let files = result_json(&call(&mut stdin, &rx, 2, "figmog_files", json!({})));
+        assert_eq!(
+            files.as_array().unwrap().len(),
+            1,
+            "configured={configured}: {files}"
+        );
+        assert_eq!(files[0]["key"], KEY);
+        assert_eq!(files[0]["version"], "100");
+        let status = result_json(&call(&mut stdin, &rx, 3, "figmog_status", json!({})));
+        assert_eq!(status["version"], "100");
+        assert!(status["pull"]["job"].is_null(), "{status}");
+        drop(stdin);
+        assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+        wait_for_owner_exit(&dir.path().join(".figmog"));
+    }
+}
+
+#[test]
+fn relay_rejected_arguments_preserve_sole_reference_routing() {
+    let dir = default_root_fixture(KEY_A, common::fixture_v1());
+    std::fs::remove_file(dir.path().join(".figmog/current")).unwrap();
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve_zero_files(dir.path(), &[]);
+    handshake(&mut stdin, &rx);
+    let rejected = call(&mut stdin, &rx, 2, "figmog_node", json!({}));
+    assert_eq!(rejected["result"]["isError"], true, "{rejected}");
+    assert!(
+        rejected["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("missing required field: id"),
+        "{rejected}"
+    );
+    let first = call(
+        &mut stdin,
+        &rx,
+        3,
+        "figmog_node",
+        json!({"file": KEY_A, "id": "1:1"}),
+    );
+    assert_eq!(result_json(&first)["name"], "Hero");
+    let url_b = format!("https://www.figma.com/design/{KEY_B}/Synthetic?node-id=1-1");
+    for (name, args, field) in [
+        ("figmog_nonexistent", json!({"file": KEY_B}), "unknown tool"),
+        ("figmog_node", json!({"file": KEY_B}), "id"),
+        (
+            "figmog_subtree",
+            json!({"id": url_b, "depth": "invalid"}),
+            "depth",
+        ),
+        (
+            "figmog_open",
+            json!({"file": KEY_B, "geometry": "invalid"}),
+            "geometry",
+        ),
+        ("figmog_images", json!({"file": KEY_B, "ids": [1]}), "ids"),
+        (
+            "figmog_images",
+            json!({"file": KEY_B, "ids": ["1:1"], "format": 3}),
+            "format",
+        ),
+        (
+            "figmog_images",
+            json!({"file": KEY_B, "ids": ["1:1"], "scale": "invalid"}),
+            "scale",
+        ),
+    ] {
+        let rejected = call(&mut stdin, &rx, 4, name, args);
+        assert_eq!(rejected["result"]["isError"], true, "{rejected}");
+        assert!(
+            rejected["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(field),
+            "{rejected}"
+        );
+        let node = call(&mut stdin, &rx, 5, "figmog_node", json!({"id": "1:1"}));
+        assert_eq!(node["result"]["isError"], false, "{node}");
+        assert_eq!(result_json(&node)["name"], "Hero");
+        let files = result_json(&call(&mut stdin, &rx, 6, "figmog_files", json!({})));
+        assert_eq!(files.as_array().unwrap().len(), 1, "{files}");
+        assert_eq!(files[0]["key"], KEY_A);
+        assert!(!dir.path().join(".figmog").join(KEY_B).exists());
+    }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    wait_for_owner_exit(&dir.path().join(".figmog"));
+}
 
 #[test]
 fn operation_receipts_route_without_a_current_file() {

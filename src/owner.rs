@@ -35,6 +35,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -657,23 +658,178 @@ pub(crate) enum Probe {
     Closing,
 }
 
+/// Cancellation for one relay reconnect. The retained socket also covers
+/// a completed handshake waiting in the relay's event queue, so teardown
+/// can close it before its result is installed.
+#[derive(Default)]
+pub(crate) struct ConnectCancel {
+    cancelled: AtomicBool,
+    socket: Mutex<Option<UnixStream>>,
+}
+
+impl ConnectCancel {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(socket) = self.socket.lock().unwrap().take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.is_cancelled() {
+            Err("owner connection cancelled".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn track(&self, socket: &UnixStream) -> Result<(), String> {
+        let mut tracked = self.socket.lock().unwrap();
+        self.check()?;
+        *tracked = Some(socket.try_clone().map_err(|error| error.to_string())?);
+        Ok(())
+    }
+
+    pub(crate) fn release(&self) {
+        self.socket.lock().unwrap().take();
+    }
+}
+
 /// Look for `paths`' owner and handshake with it. `Err` is final: the
 /// owner refused this client (or is a different figmog build).
 pub(crate) fn probe(
     paths: &OwnerPaths,
     relay: Option<(&Settings, &[String])>,
 ) -> Result<Probe, String> {
+    probe_cancellable(paths, relay, None)
+}
+
+fn probe_cancellable(
+    paths: &OwnerPaths,
+    relay: Option<(&Settings, &[String])>,
+    cancel: Option<&ConnectCancel>,
+) -> Result<Probe, String> {
+    if let Some(cancel) = cancel {
+        cancel.check()?;
+    }
     let Some(discovery) = read_discovery(paths) else {
         return Ok(Probe::Absent);
     };
     if !validate_discovery_socket(paths, &discovery.socket)? {
         return Ok(Probe::Absent);
     }
-    let Ok(stream) = UnixStream::connect(&discovery.socket) else {
-        return Ok(Probe::Absent);
+    let stream = if let Some(cancel) = cancel {
+        let Some(stream) = connect_socket_cancelled(&discovery.socket, cancel)? else {
+            cancel.release();
+            return Ok(Probe::Absent);
+        };
+        stream
+    } else {
+        let Ok(stream) = UnixStream::connect(&discovery.socket) else {
+            return Ok(Probe::Absent);
+        };
+        stream
     };
     check_peer(&stream)?;
-    probe_connected(paths, relay, &discovery, stream)
+    let result = probe_connected(paths, relay, &discovery, stream);
+    if let Some(cancel) = cancel {
+        cancel.check()?;
+        if !matches!(&result, Ok(Probe::Ready(_))) {
+            cancel.release();
+        }
+    }
+    result
+}
+
+/// A full AF_UNIX listener backlog may block `UnixStream::connect` too.
+/// Create and track the socket first, and keep connect nonblocking until
+/// it has completed. All waits can then observe relay cancellation.
+fn connect_socket_cancelled(
+    path: &Path,
+    cancel: &ConnectCancel,
+) -> Result<Option<UnixStream>, String> {
+    use std::os::fd::FromRawFd;
+    cancel.check()?;
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: socket creates an owned fd, transferred immediately below.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: fd is a new, owned Unix socket.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    // SAFETY: fcntl operates on this live fd; retain no inherited handles.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let enabled: libc::c_int = 1;
+        // SAFETY: the option points to an initialized int of the stated size.
+        if unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw const enabled).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        } == -1
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    cancel.track(&stream)?;
+    // SAFETY: sockaddr_un is a plain C structure; zero fills the path terminator.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err("invalid owner socket path".into());
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (destination, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *destination = *byte as libc::c_char;
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = length as u8;
+    }
+    let deadline = std::time::Instant::now() + HELLO_TIMEOUT;
+    loop {
+        cancel.check()?;
+        // SAFETY: address and its initialized pathname live through the call.
+        let connected =
+            unsafe { libc::connect(fd, (&raw const address).cast(), length as libc::socklen_t) };
+        let error = std::io::Error::last_os_error();
+        if connected == 0 || error.raw_os_error() == Some(libc::EISCONN) {
+            stream
+                .set_nonblocking(false)
+                .map_err(|error| error.to_string())?;
+            cancel.check()?;
+            return Ok(Some(stream));
+        }
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINPROGRESS | libc::EALREADY | libc::EAGAIN | libc::EINTR)
+        ) {
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Handshake on a connection whose address and peer have been validated.
@@ -836,12 +992,24 @@ pub(crate) fn launch(
     cwd: &Path,
     args: &[String],
 ) -> Result<std::sync::mpsc::Receiver<std::process::ExitStatus>, String> {
+    launch_cancellable(paths, cwd, args, None)
+}
+
+fn launch_cancellable(
+    paths: &OwnerPaths,
+    cwd: &Path,
+    args: &[String],
+    cancel: Option<&ConnectCancel>,
+) -> Result<std::sync::mpsc::Receiver<std::process::ExitStatus>, String> {
+    if let Some(cancel) = cancel {
+        cancel.check()?;
+    }
     #[cfg(target_os = "macos")]
     if let Some(addchdir) = macos_spawn::addchdir() {
-        return macos_spawn::launch(paths, cwd, args, addchdir)
+        return macos_spawn::launch(paths, cwd, args, addchdir, cancel)
             .map_err(|e| format!("starting the background figmog: {e}"));
     }
-    launch_command(paths, cwd, args)
+    launch_command(paths, cwd, args, cancel)
 }
 
 // Linux uses close_range(CLOEXEC); older platforms without an atomic
@@ -850,6 +1018,7 @@ fn launch_command(
     paths: &OwnerPaths,
     cwd: &Path,
     args: &[String],
+    cancel: Option<&ConnectCancel>,
 ) -> Result<std::sync::mpsc::Receiver<std::process::ExitStatus>, String> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -893,6 +1062,9 @@ fn launch_command(
             }
             Ok(())
         });
+    }
+    if let Some(cancel) = cancel {
+        cancel.check()?;
     }
     let mut child = command
         .spawn()
@@ -998,6 +1170,7 @@ mod macos_spawn {
         cwd: &Path,
         args: &[String],
         addchdir: AddChdir,
+        cancel: Option<&ConnectCancel>,
     ) -> io::Result<std::sync::mpsc::Receiver<std::process::ExitStatus>> {
         let exe = std::env::current_exe()?;
         let exe = cstring(exe.as_os_str().as_bytes())?;
@@ -1090,6 +1263,9 @@ mod macos_spawn {
                 log.as_raw_fd(),
             ))?;
             check(addchdir(&raw mut spawn.actions, cwd.as_ptr()))?;
+            if let Some(cancel) = cancel {
+                cancel.check().map_err(io::Error::other)?;
+            }
             check(libc::posix_spawn(
                 &raw mut pid,
                 exe.as_ptr(),
@@ -1134,6 +1310,18 @@ pub(crate) fn connect_or_launch(
     connect_or_launch_with_timeout(paths, cwd, settings, attach, START_TIMEOUT)
 }
 
+/// A runtime relay reconnect. Cancellation closes a HELLO in progress and
+/// prevents another launch after an interrupted probe or preparation.
+pub(crate) fn connect_or_launch_cancelled(
+    paths: &OwnerPaths,
+    cwd: &Path,
+    settings: &Settings,
+    attach: &[String],
+    cancel: &ConnectCancel,
+) -> Result<OwnerConn, String> {
+    connect_or_launch_inner(paths, cwd, settings, attach, START_TIMEOUT, Some(cancel))
+}
+
 fn connect_or_launch_with_timeout(
     paths: &OwnerPaths,
     cwd: &Path,
@@ -1141,12 +1329,26 @@ fn connect_or_launch_with_timeout(
     attach: &[String],
     timeout: Duration,
 ) -> Result<OwnerConn, String> {
+    connect_or_launch_inner(paths, cwd, settings, attach, timeout, None)
+}
+
+fn connect_or_launch_inner(
+    paths: &OwnerPaths,
+    cwd: &Path,
+    settings: &Settings,
+    attach: &[String],
+    timeout: Duration,
+    cancel: Option<&ConnectCancel>,
+) -> Result<OwnerConn, String> {
     let deadline = std::time::Instant::now() + timeout;
     let mut launched: Option<std::sync::mpsc::Receiver<std::process::ExitStatus>> = None;
     let mut delay = Duration::from_millis(25);
     loop {
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
         let mut unreachable_lock_holder = false;
-        match probe(paths, Some((settings, attach)))? {
+        match probe_cancellable(paths, Some((settings, attach)), cancel)? {
             Probe::Ready(conn) => return Ok(conn),
             Probe::Absent if launched.is_none() => {
                 // Do not spawn a losing process every time an owner holds
@@ -1154,7 +1356,12 @@ fn connect_or_launch_with_timeout(
                 match OwnerLock::try_acquire(paths)? {
                     Some(lock) => {
                         drop(lock);
-                        launched = Some(launch(paths, cwd, &settings.args())?);
+                        launched = Some(match cancel {
+                            Some(cancel) => {
+                                launch_cancellable(paths, cwd, &settings.args(), Some(cancel))?
+                            }
+                            None => launch(paths, cwd, &settings.args())?,
+                        });
                     }
                     None => {
                         // Desktop initialization happens before discovery
@@ -1205,6 +1412,130 @@ fn connect_or_launch_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelling_a_reconnect_interrupts_an_unanswered_hello() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let _lock = OwnerLock::try_acquire(&paths).unwrap().unwrap();
+        let listener = bind_socket(&paths.socket()).unwrap();
+        write_discovery(
+            &paths,
+            &Discovery {
+                socket: paths.socket(),
+                pid: 42,
+                generation: "unanswered-hello".into(),
+                version: version().into(),
+                protocol: PROTOCOL,
+            },
+        )
+        .unwrap();
+        let cancel = std::sync::Arc::new(ConnectCancel::default());
+        let (done, result) = std::sync::mpsc::channel();
+        let worker_cancel = cancel.clone();
+        let worker_paths = paths.clone();
+        let cwd = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let result = connect_or_launch_cancelled(
+                &worker_paths,
+                &cwd,
+                &Settings {
+                    watch: false,
+                    interval: 10,
+                    upstream: None,
+                },
+                &[],
+                &worker_cancel,
+            );
+            done.send(result.map(|_| ())).unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        assert!(hello.contains(HELLO), "{hello}");
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+        assert!(
+            !paths.log().exists(),
+            "cancellation must not launch a replacement"
+        );
+        drop(listener);
+        std::fs::remove_file(paths.socket()).unwrap();
+    }
+
+    #[test]
+    fn an_already_cancelled_attempt_cannot_launch_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let cancel = ConnectCancel::default();
+        cancel.cancel();
+        assert!(
+            connect_or_launch_cancelled(
+                &paths,
+                dir.path(),
+                &Settings {
+                    watch: false,
+                    interval: 10,
+                    upstream: None
+                },
+                &[],
+                &cancel,
+            )
+            .is_err()
+        );
+        assert!(!paths.log().exists());
+        assert!(!paths.discovery().exists());
+    }
+
+    #[test]
+    fn cancelling_connect_does_not_wait_for_a_full_unix_socket_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let listener = bind_socket(&paths.socket()).unwrap();
+        // SAFETY: listener is a live AF_UNIX listening socket. A small
+        // backlog lets this test fill it without depending on OS defaults.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let mut queued = Vec::new();
+        let mut filled = false;
+        for _ in 0..32 {
+            let cancel = std::sync::Arc::new(ConnectCancel::default());
+            let timer_cancel = cancel.clone();
+            let timer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                timer_cancel.cancel();
+            });
+            match connect_socket_cancelled(&paths.socket(), &cancel) {
+                Ok(Some(stream)) => {
+                    cancel.release();
+                    queued.push(stream);
+                }
+                // Some Unix kernels reject a full nonblocking backlog
+                // immediately instead of leaving the connect pending.
+                Err(_) | Ok(None) => filled = true,
+            }
+            timer.join().unwrap();
+            if filled {
+                break;
+            }
+        }
+        assert!(filled, "the listener's unaccepted queue must fill");
+        assert!(!queued.is_empty());
+        drop(queued);
+        drop(listener);
+        std::fs::remove_file(paths.socket()).unwrap();
+    }
 
     #[test]
     fn socket_addresses_are_short_stable_and_per_project() {
@@ -1531,8 +1862,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let paths = OwnerPaths::ensure(dir.path()).unwrap();
-        let error =
-            macos_spawn::launch(&paths, &dir.path().join("missing"), &[], addchdir).unwrap_err();
+        let error = macos_spawn::launch(&paths, &dir.path().join("missing"), &[], addchdir, None)
+            .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
     }
 

@@ -11,7 +11,9 @@
 //! 1. refuse if `D` already exists (never overwrite a mirror);
 //! 2. lock `L/db` (figmog's anchor *and* fjall's own writer lock, so a
 //!    running serve — even an older binary — makes this fail cleanly), then
-//!    close the store but keep the anchor;
+//!    close/quiesce the store, then retain the anchor and an exclusive lock
+//!    on fjall's `db/lock` file (a competing opener winning that transition
+//!    makes migration fail before copying);
 //! 3. remove any `S` left by an interrupted run (safe: the migration lock
 //!    excludes a live one), copy `L` into `S` (the lock anchor itself is not
 //!    copied), lock `S/db` with a fresh anchor and write the
@@ -19,8 +21,8 @@
 //! 4. rename `S` to `D` — the held anchor moves with it, so `D` is owned
 //!    from the moment it appears;
 //! 5. rename `L` to its tombstone `T` = `<checkout>/.figmog/.<key>.deleting`
-//!    (same directory, so atomic; `L`'s anchor is still held and its fjall
-//!    writer lock was checked in 2), remove `T` recursively, then the
+//!    (same directory, so atomic; both writer exclusions remain held),
+//!    remove `T` recursively, then the
 //!    marker.
 //!
 //! Interrupted states and what a rerun does: a crash in 3 leaves `L`
@@ -47,8 +49,9 @@ use serde_json::{Value, json};
 use crate::ident::is_file_key;
 use crate::project::{Layout, MIGRATED_MARKER};
 
+#[cfg(test)]
 use super::open_store_checked;
-use super::store_lock::{LOCK_NAME, MigrationLock, StoreOwner};
+use super::store_lock::{LOCK_NAME, MigrationLock, MigrationOwner, StoreOwner};
 
 /// One moved (or finished) mirror.
 #[derive(Debug, PartialEq, Eq)]
@@ -157,47 +160,96 @@ fn migration_lock_path(layout: &Layout, key: &str) -> PathBuf {
     layout.mirror_root.join(format!("{key}.migrate.lock"))
 }
 
-/// Lock a store for migration the way a fresh migration locks its source:
-/// figmog's anchor *and* fjall's own writer lock (an older binary's serve
-/// holds only the latter), then close the database but keep the anchor.
-fn lock_store(db: &Path) -> Result<StoreOwner, String> {
-    Ok(open_store_checked(db, |path| crate::open_store!(path))?.into_owner())
+/// Recover and close a store, retaining figmog's anchor and then taking
+/// fjall's raw writer lock without reopening background workers. A raw
+/// opener that wins this transition makes the lock attempt fail safely.
+fn lock_store(db: &Path) -> Result<MigrationOwner, String> {
+    lock_store_after_close(db, || Ok(()))
 }
 
-/// Lock an old store a migration already published elsewhere, before
-/// retiring it: figmog's anchor (never creating the directory) and fjall's
-/// own writer lock. Unlike [`lock_store`], a store that fails to open for
-/// any reason other than lock contention — one an older binary's
-/// interrupted cleanup left half deleted — is not an error: nothing can be
-/// writing it, and it is only going to be removed. `None` if it is gone.
-fn lock_leftover(db: &Path) -> Result<Option<StoreOwner>, String> {
-    let Some(owner) = StoreOwner::acquire_existing(db)? else {
-        return Ok(None);
+fn lock_store_after_close(
+    db: &Path,
+    closed: impl FnOnce() -> Result<(), String>,
+) -> Result<MigrationOwner, String> {
+    let owner = StoreOwner::acquire_existing(db)?
+        .ok_or_else(|| format!("store moved while migration started: {}", db.display()))?;
+    let owner = super::open_store_owned(owner, |path| crate::open_store!(path))?.into_owner();
+    closed()?;
+    MigrationOwner::acquire(owner, false)
+}
+
+/// Take both writer exclusions for cleanup without opening or repairing
+/// potentially torn data. If deletion already removed `db` or `db/lock`,
+/// recreate only that lock barrier inside the existing tree: raw fjall
+/// create-new openers must also be excluded before the tree is retired.
+/// Never recreate an absent tree or its ancestors.
+fn lock_leftover(db: &Path) -> Result<Option<MigrationOwner>, String> {
+    let owner = match StoreOwner::acquire_existing(db)? {
+        Some(owner) => owner,
+        None => {
+            let parent = db.parent().ok_or("store has no parent directory")?;
+            let Some(parent) = crate::private_dir::existing(parent)? else {
+                return Ok(None);
+            };
+            let db = parent.join("db");
+            match fs::DirBuilder::new().mode(0o700).create(&db) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(format!("preparing cleanup lock {}: {error}", db.display()));
+                }
+            }
+            StoreOwner::acquire_existing(&db)?
+                .ok_or_else(|| format!("store moved while cleanup started: {}", db.display()))?
+        }
     };
-    if super::writer_locked(&owner) {
-        return Err(super::STORE_LOCKED_MSG.to_string());
-    }
-    Ok(Some(owner))
+    MigrationOwner::acquire(owner, true).map(Some)
 }
 
 /// Step 5: atomically move the (locked, checked) old store `legacy` to its
 /// tombstone — replacing a stale one — then remove the tombstone.
-fn retire(legacy: &Path) -> Result<(), String> {
+fn retire(legacy: &Path, owner: &MigrationOwner) -> Result<(), String> {
+    retire_with_hook(legacy, owner, || Ok(()))
+}
+
+fn retire_with_hook(
+    legacy: &Path,
+    owner: &MigrationOwner,
+    renamed: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let tomb = tombstone(legacy);
     remove_tombstone(&tomb)?;
+    owner.validate_at(&legacy.join("db"))?;
     fs::rename(legacy, &tomb).map_err(|e| format!("renaming {}: {e}", legacy.display()))?;
     if let Some(parent) = legacy.parent() {
         sync_path(parent)?;
     }
-    remove_tombstone(&tomb)
+    renamed()?;
+    // The original inode is now under T. Never revisit L: an older binary
+    // may create a new independent store there after the rename.
+    owner.validate_at(&tomb.join("db"))?;
+    remove_tree(&tomb)
 }
 
-/// Remove a tombstone (never opened as a store), if there is one.
+/// Remove a leftover tree while excluding raw fjall openers. It is never
+/// opened as a database, so partially deleted trees remain recoverable.
 fn remove_tombstone(tomb: &Path) -> Result<(), String> {
     if exists(tomb) {
-        fs::remove_dir_all(tomb).map_err(|e| format!("removing {}: {e}", tomb.display()))?;
+        let owner = if fs::symlink_metadata(tomb).is_ok_and(|metadata| metadata.is_dir()) {
+            lock_leftover(&tomb.join("db"))?
+        } else {
+            None
+        };
+        if let Some(owner) = &owner {
+            owner.validate_at(&tomb.join("db"))?;
+        }
+        remove_tree(tomb)?;
     }
     Ok(())
+}
+
+fn remove_tree(tree: &Path) -> Result<(), String> {
+    fs::remove_dir_all(tree).map_err(|error| format!("removing {}: {error}", tree.display()))
 }
 
 /// The source path a [`MIGRATED_MARKER`] records (raw path bytes).
@@ -216,7 +268,23 @@ fn same_path(left: &Path, right: &Path) -> bool {
         )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigrationEvent {
+    SourceClosed,
+    BeforeCopy,
+    BeforePublish,
+    BeforeRetire,
+}
+
 pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, String> {
+    migrate_key_with_hook(layout, key, |_| Ok(()))
+}
+
+fn migrate_key_with_hook(
+    layout: &Layout,
+    key: &str,
+    mut admitted: impl FnMut(MigrationEvent) -> Result<(), String>,
+) -> Result<Option<Moved>, String> {
     if !is_file_key(key) {
         return Err(format!("not a Figma file key: {key}"));
     }
@@ -271,11 +339,17 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
         }
         // Finish under both stores' anchors and fjall writer locks, checked
         // on the old store before it moves to its tombstone.
-        let _dest_owner = lock_store(&dest.join("db"))?;
+        let dest_owner = lock_store(&dest.join("db"))?;
         if ours {
-            let _legacy_owner = lock_leftover(&legacy.join("db"))?;
+            let legacy_owner = lock_leftover(&legacy.join("db"))?;
             if exists(&legacy) {
-                retire(&legacy)?;
+                admitted(MigrationEvent::BeforeRetire)?;
+                let owner = legacy_owner
+                    .as_ref()
+                    .ok_or("legacy store changed before cleanup")?;
+                owner.validate_at(&legacy.join("db"))?;
+                dest_owner.validate_at(&dest.join("db"))?;
+                retire(&legacy, owner)?;
             }
         }
         // A tombstone is past the point of no return, whichever checkout
@@ -295,7 +369,7 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
         // Nothing to move; under the migration lock, a staging dir or a
         // tombstone is debris from an interrupted run.
         if exists(&staging) {
-            fs::remove_dir_all(&staging).map_err(|e| io("removing", &staging, e))?;
+            remove_tombstone(&staging)?;
         }
         remove_tombstone(&tombstone(&legacy))?;
         return Ok(None);
@@ -308,14 +382,18 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
         ));
     }
 
-    let source = lock_store(&legacy.join("db"))?;
+    let source = lock_store_after_close(&legacy.join("db"), || {
+        admitted(MigrationEvent::SourceClosed)
+    })?;
     // No other migration of this key can be running: any staging dir is
     // left by an interrupted one.
     if exists(&staging) {
-        fs::remove_dir_all(&staging).map_err(|e| io("removing", &staging, e))?;
+        remove_tombstone(&staging)?;
     }
+    admitted(MigrationEvent::BeforeCopy)?;
+    source.validate_at(&legacy.join("db"))?;
     copy_tree(&legacy, &staging)?;
-    let staged = StoreOwner::acquire(&staging.join("db"))?;
+    let staged = MigrationOwner::acquire(StoreOwner::acquire(&staging.join("db"))?, false)?;
     let staged_marker = staging.join(MIGRATED_MARKER);
     {
         use std::os::unix::ffi::OsStrExt;
@@ -324,6 +402,9 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
     }
     sync_path(&staged_marker)?;
     sync_path(&staging)?;
+    admitted(MigrationEvent::BeforePublish)?;
+    source.validate_at(&legacy.join("db"))?;
+    staged.validate_at(&staging.join("db"))?;
     if exists(&dest) {
         return Err(format!(
             "refusing to migrate {key}: {} appeared during the copy",
@@ -332,7 +413,9 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
     }
     fs::rename(&staging, &dest).map_err(|e| io("renaming into", &dest, e))?;
     sync_path(&layout.mirror_root)?;
-    retire(&legacy)?;
+    admitted(MigrationEvent::BeforeRetire)?;
+    staged.validate_at(&dest.join("db"))?;
+    retire(&legacy, &source)?;
     drop(source);
     fs::remove_file(&marker).map_err(|e| io("removing", &marker, e))?;
     drop(staged);
@@ -568,6 +651,180 @@ mod tests {
         assert!(migrate_key(&layout, KEY).unwrap().unwrap().resumed);
         assert!(!legacy_db.exists());
         assert!(!dest.join(MIGRATED_MARKER).exists());
+    }
+
+    fn raw_opener_is_refused(db: &Path) -> bool {
+        match std::panic::catch_unwind(|| crate::open_store!(db)) {
+            Ok(store) => {
+                drop(store);
+                false
+            }
+            Err(payload) => super::super::panic_message(&*payload).contains("Locked"),
+        }
+    }
+
+    fn check_late_raw_openers(resumed: bool) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let legacy_db = legacy_store(&layout);
+        let dest_db = layout.shared_dir(KEY).join("db");
+        if resumed {
+            interrupted_after_rename(&layout);
+        }
+        let (events, phases) = mpsc::channel();
+        let (resume, proceed) = mpsc::channel();
+        let migration = std::thread::spawn(move || {
+            migrate_key_with_hook(&layout, KEY, |phase| {
+                events.send(phase).map_err(|error| error.to_string())?;
+                proceed
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(|error| error.to_string())
+            })
+        });
+        let mut excluded = Vec::new();
+        loop {
+            let phase = phases.recv_timeout(Duration::from_secs(30)).unwrap();
+            if phase != MigrationEvent::SourceClosed {
+                excluded.push((phase, legacy_db.clone(), raw_opener_is_refused(&legacy_db)));
+                if phase == MigrationEvent::BeforeRetire {
+                    excluded.push((phase, dest_db.clone(), raw_opener_is_refused(&dest_db)));
+                }
+            }
+            resume.send(()).unwrap();
+            if phase == MigrationEvent::BeforeRetire {
+                break;
+            }
+        }
+        assert!(migration.join().unwrap().unwrap().is_some());
+        assert!(
+            excluded.iter().all(|(_, _, refused)| *refused),
+            "an older-style raw opener entered after migration admission: {excluded:?}"
+        );
+        assert!(!legacy_db.exists());
+        assert!(dest_db.exists());
+    }
+
+    #[test]
+    fn migration_excludes_late_raw_openers_during_copy_and_retirement() {
+        check_late_raw_openers(false);
+    }
+
+    #[test]
+    fn resumed_cleanup_excludes_late_raw_openers_before_retirement() {
+        check_late_raw_openers(true);
+    }
+
+    #[test]
+    fn an_older_writer_winning_the_close_to_lock_transition_stops_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let legacy_db = legacy_store(&layout);
+        let mut older = None;
+        let error = migrate_key_with_hook(&layout, KEY, |phase| {
+            if phase == MigrationEvent::SourceClosed {
+                let mut store = crate::open_store!(&legacy_db);
+                crate::store::upsert_mirror_config(&mut store, true);
+                older = Some(store);
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error, super::super::STORE_LOCKED_MSG);
+        assert!(!staging_dir(&layout, KEY).exists());
+        assert!(!layout.shared_dir(KEY).exists());
+        assert!(legacy_db.join("sentinel").exists());
+        drop(older);
+        migrate_key(&layout, KEY).unwrap().unwrap();
+        let store = crate::open_store!(layout.shared_dir(KEY).join("db"));
+        assert!(store.rtx(|(.., config, _, _, _)| crate::store::read_geometry(&config)));
+    }
+
+    #[test]
+    fn a_source_replaced_after_copy_is_not_published_or_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let legacy_db = legacy_store(&layout);
+        let legacy = layout.legacy_dir(KEY);
+        let original = dir.path().join("original");
+        let error = migrate_key_with_hook(&layout, KEY, |phase| {
+            if phase == MigrationEvent::BeforePublish {
+                fs::rename(&legacy, &original).unwrap();
+                fs::create_dir_all(&legacy_db).unwrap();
+                fs::write(legacy_db.join("replacement"), "keep").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("store ownership changed"), "{error}");
+        assert!(!layout.shared_dir(KEY).exists());
+        assert!(original.join("db/sentinel").exists());
+        assert_eq!(
+            fs::read_to_string(legacy_db.join("replacement")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn retirement_never_removes_an_older_openers_new_legacy_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let legacy_db = legacy_store(&layout);
+        let legacy = layout.legacy_dir(KEY);
+        let held = lock_store(&legacy_db).unwrap();
+        let mut recreated = None;
+        retire_with_hook(&legacy, &held, || {
+            let mut store = crate::open_store!(&legacy_db);
+            crate::store::upsert_mirror_config(&mut store, true);
+            recreated = Some(store);
+            Ok(())
+        })
+        .unwrap();
+        drop(recreated);
+        assert!(!tombstone(&legacy).exists());
+        let store = crate::open_store!(&legacy_db);
+        assert!(store.rtx(|(.., config, _, _, _)| crate::store::read_geometry(&config)));
+    }
+
+    #[test]
+    fn leftover_staging_and_tombstone_cleanup_exclude_raw_openers() {
+        for tomb in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = layout(dir.path());
+            crate::private_dir::ensure(&layout.local_root).unwrap();
+            let leftover = if tomb {
+                tombstone(&layout.legacy_dir(KEY))
+            } else {
+                staging_dir(&layout, KEY)
+            };
+            let db = leftover.join("db");
+            drop(open_store_checked(&db, |path| crate::open_store!(path)).unwrap());
+            fs::write(db.join("sentinel"), "keep").unwrap();
+            let older = crate::open_store!(&db);
+            assert_eq!(
+                migrate_key(&layout, KEY).unwrap_err(),
+                super::super::STORE_LOCKED_MSG
+            );
+            assert_eq!(fs::read_to_string(db.join("sentinel")).unwrap(), "keep");
+            drop(older);
+            assert_eq!(migrate_key(&layout, KEY).unwrap(), None);
+            assert!(!leftover.exists());
+        }
+    }
+
+    #[test]
+    fn resumed_cleanup_handles_a_source_whose_database_directory_is_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let legacy_db = legacy_store(&layout);
+        let dest = interrupted_after_rename(&layout);
+        fs::remove_dir_all(&legacy_db).unwrap();
+        assert!(migrate_key(&layout, KEY).unwrap().unwrap().resumed);
+        assert!(!layout.legacy_dir(KEY).exists());
+        assert!(!dest.join(MIGRATED_MARKER).exists());
+        assert!(dest.join("db/sentinel").exists());
     }
 
     /// Delete roughly half of a store directory's entries (every other one,

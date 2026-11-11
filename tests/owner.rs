@@ -396,6 +396,135 @@ fn an_unread_relay_stdout_cannot_extend_the_eof_shutdown_budget() {
     wait_owner_gone(repo.path());
 }
 
+/// A rejected request followed by EOF must not wait for a replacement's
+/// full sixty-second handshake budget.
+#[test]
+fn eof_during_a_rejected_requests_reconnect_keeps_the_drain_budget() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo();
+    let root = repo.path().join(".git/figmog");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(root.join("owner.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let runtime = tempfile::Builder::new()
+        .prefix("fr-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let address_dir = runtime.path().join("figmog");
+    std::fs::create_dir(&address_dir).unwrap();
+    std::fs::set_permissions(&address_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hash = root
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let socket = address_dir.join(format!("{hash:016x}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let record = json!({"generation":"drain-test", "pid":std::process::id(),
+        "project":root, "protocol":1, "socket":socket, "version":env!("CARGO_PKG_VERSION")});
+    std::fs::write(root.join("owner.json"), record.to_string()).unwrap();
+    let (ready, initialized) = mpsc::channel();
+    let (hello, reconnecting) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let accept = || {
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                        break stream;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "relay never connected");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        };
+        let stream = accept();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        let first: Value = serde_json::from_str(&first).unwrap();
+        let mut writer = stream;
+        let response = json!({"jsonrpc":"2.0", "id":first["id"], "result":{
+            "attach_errors":{}, "generation":"drain-test", "pid":std::process::id(),
+            "project":record["project"], "protocol":1, "version":env!("CARGO_PKG_VERSION"),
+            "settings":{"watch":false,"interval":10,"upstream":null}}});
+        writeln!(writer, "{response}").unwrap();
+        ready.send(()).unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "tools/list");
+        writeln!(
+            writer,
+            "{}",
+            json!({"jsonrpc":"2.0", "id":request["id"],
+            "error":{"code":-32001,"message":"not accepted: closing"}})
+        )
+        .unwrap();
+        drop(reader);
+        drop(writer);
+        let stream = accept();
+        let mut reader = BufReader::new(stream);
+        let mut frame = String::new();
+        reader.read_line(&mut frame).unwrap();
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["method"], "figmog/hello");
+        hello.send(()).unwrap();
+        // Never answer the replacement HELLO. The relay must cancel it.
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+    });
+    let mut relay = spawn_relay(
+        relay_command(repo.path(), &["--no-watch", "--no-upstream"])
+            .env("XDG_RUNTIME_DIR", runtime.path()),
+    );
+    initialized.recv_timeout(TIMEOUT).unwrap();
+    relay.send(&json!({"jsonrpc":"2.0", "id":7, "method":"tools/list"}));
+    drop(relay.stdin.take());
+    reconnecting.recv_timeout(TIMEOUT).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = relay.child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = relay.child.kill();
+            let _ = relay.child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    peer.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
+    std::fs::remove_file(root.join("owner.json")).unwrap();
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "relay exceeded EOF drain: {}",
+        relay.stderr_text()
+    );
+    assert!(
+        owners_in(repo.path()).is_empty(),
+        "cancelled reconnect must not launch a later owner"
+    );
+}
+
 /// Pull a synthetic fixture into `cwd`'s project as `key` (direct: no owner
 /// is running), landing in the shared mirror root.
 fn seed(cwd: &Path, key: &str, fixture: &Value) {

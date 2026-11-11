@@ -1192,23 +1192,6 @@ fn open_store_owned<T>(
     Ok(OwnedStore::new(store, owner))
 }
 
-/// Whether fjall's own writer lock on the store at `owner.path` is held by
-/// someone else (an older binary's serve holds only that one): the store
-/// is opened and closed at once with its panics caught, like
-/// [`open_store_checked`] — the same `"Locked"` payload match (see the
-/// pin-bump checklist in `AGENTS.md`). Any other failure — a store left
-/// damaged, such as one an interrupted `figmog migrate` half deleted
-/// (NWS-2964) — is not lock contention and reads as `false`, never as an
-/// exit.
-fn writer_locked(owner: &StoreOwner) -> bool {
-    let path = owner.path.clone();
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(|| drop(crate::open_store!(&path)));
-    std::panic::set_hook(prev_hook);
-    result.is_err_and(|payload| panic_message(&*payload).contains("Locked"))
-}
-
 /// Best-effort text for a caught panic's payload: `&str`/`String` cover
 /// every panic this codebase (and fold) actually raises (`panic!`,
 /// `.expect(...)`, `.unwrap()`), falling back to `"unknown panic"` for
