@@ -1,0 +1,23 @@
+tests/cli.rs
+  s_9cf6a020dd8111::t_66e01fe6b63313 798,800
+packages/react/test/plugin.test.ts
+  s_9cf6a020dd8111::t_ef6c18a7b72874 6,13-14,393-394,402-407,409-424
+  s_9cf6a020dd8111::t_454ace24dc29d9 361,371-376,395-401,408
+  s_9cf6a020dd8111::t_016e0cbe9a1893 425-426
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7ca4e8c686cb4b858f625e470a97a0d296618aaa",
+  "prompts": {},
+  "sessions": {
+    "s_9cf6a020dd8111": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c659-8327-7e80-92e0-5a3276c64bdd",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
