@@ -220,8 +220,8 @@ struct PendingWrite {
     waiters: Waiters,
 }
 
-/// Writes a store reset carries from the closed session to its reopened
-/// one: the prepared fresh pull it was reset for, and writes still queued.
+/// Accepted work and watch scheduling a store reset carries from the
+/// closed session to its reopened one.
 pub(crate) struct Carry {
     fresh: Option<(Prepared, Waiters)>,
     writes: VecDeque<PendingWrite>,
@@ -229,6 +229,14 @@ pub(crate) struct Carry {
     job: Option<Job>,
     queued: Option<Job>,
     next_job: u64,
+    poll_owed: bool,
+    backoff: Duration,
+    retry_at: Instant,
+    next_poll: Instant,
+    poll_retry_at: Option<Instant>,
+    watch_retry_at: Option<Instant>,
+    expedited_poll: bool,
+    interval: Duration,
 }
 
 impl Carry {
@@ -911,6 +919,14 @@ impl FileSession {
             job: self.job.take(),
             queued: self.queued.take(),
             next_job: self.next_job,
+            poll_owed: self.poll_owed,
+            backoff: self.backoff,
+            retry_at: self.retry_at,
+            next_poll: self.next_poll,
+            poll_retry_at: self.poll_retry_at,
+            watch_retry_at: self.watch_retry_at,
+            expedited_poll: self.expedited_poll,
+            interval: self.interval,
         }
     }
 
@@ -922,6 +938,14 @@ impl FileSession {
         self.job = carry.job;
         self.queued = carry.queued;
         self.next_job = carry.next_job;
+        self.poll_owed = carry.poll_owed;
+        self.backoff = carry.backoff;
+        self.retry_at = carry.retry_at;
+        self.next_poll = carry.next_poll;
+        self.poll_retry_at = carry.poll_retry_at;
+        self.watch_retry_at = carry.watch_retry_at;
+        self.expedited_poll = carry.expedited_poll;
+        self.interval = carry.interval;
         match carry.fresh {
             Some((prepared, waiters)) => {
                 self.fresh_applying = true;

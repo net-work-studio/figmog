@@ -3315,6 +3315,51 @@ fn every_local_read_matches_across_direct_socket_and_mcp() {
 // ---- NWS-2963: writers through a running serve ----
 
 #[test]
+fn operation_receipts_route_without_a_current_file() {
+    const KEY: &str = "SyntheticReceiptRouting0001";
+    let dir = tempfile::tempdir().unwrap();
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve_zero_files(dir.path(), &[]);
+    handshake(&mut stdin, &rx);
+    // The hidden write completes on the owner without the pull CLI's
+    // current-pointer publication, as when its requester disconnects.
+    let arguments = json!({
+        "file": KEY,
+        "db": dir.path().join(".figmog").join(KEY).join("db"),
+        "from_file": common::fixture_v1(),
+    })
+    .to_string();
+    let write = run_cli(
+        dir.path(),
+        &["call", "figmog_internal_pull", "--args", &arguments],
+    );
+    assert_eq!(write.0, Some(0), "{write:?}");
+    let write: Value = serde_json::from_slice(&write.1).unwrap();
+    let operation = write["operation"].as_str().unwrap();
+    let current = dir.path().join(".figmog/current");
+    assert!(!current.exists());
+    let query = json!({"id": operation}).to_string();
+    for invalid_current in [false, true] {
+        if invalid_current {
+            // Management requests must not consult even a malformed
+            // current pointer during default-file injection.
+            std::fs::write(&current, "../invalid").unwrap();
+        }
+        let receipt = run_cli(
+            dir.path(),
+            &["call", "figmog_internal_operation", "--args", &query],
+        );
+        assert_eq!(receipt.0, Some(0), "{receipt:?}");
+        let receipt: Value = serde_json::from_slice(&receipt.1).unwrap();
+        assert_eq!(receipt["id"], operation);
+        assert_eq!(receipt["state"], "succeeded");
+        assert_eq!(receipt["result"], write["result"]);
+    }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    wait_for_owner_exit(&dir.path().join(".figmog"));
+}
+
+#[test]
 fn invalid_saved_pulls_do_not_admit_a_new_routed_mirror() {
     const KEY: &str = "SyntheticInvalidSaved0001";
     let dir = tempfile::tempdir().unwrap();

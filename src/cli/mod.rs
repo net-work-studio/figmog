@@ -666,7 +666,11 @@ fn requested_file(args: &Value) -> Result<Option<String>, String> {
 /// Management tools don't target an existing mirror, and desktop tools
 /// use the desktop's own context rather than local mirror routing.
 pub(crate) fn is_per_file_local_tool(tool: &str) -> bool {
-    crate::proxy::is_local_tool(tool) && !matches!(tool, "figmog_open" | "figmog_files")
+    crate::proxy::is_local_tool(tool)
+        && !matches!(
+            tool,
+            "figmog_open" | "figmog_files" | crate::serve::writes::OPERATION
+        )
 }
 
 /// For per-file local tools, inject the project default's key
@@ -689,9 +693,9 @@ pub(crate) fn is_per_file_local_tool(tool: &str) -> bool {
 /// in-process serve keeps its own-default behavior, while the shared
 /// background owner is not asked at all ([`route_for`]).
 ///
-/// Never applied to desktop tools or `figmog_files`, which have no mirror
-/// routing, nor to `figmog_open`: its own `file` argument names the file
-/// *to open*, not a routing hint — it's required, and direct mode's own
+/// Never applied to desktop tools, `figmog_files`, or operation receipt
+/// queries, which have no mirror routing, nor to `figmog_open`: its own
+/// `file` argument names the file *to open*, not a routing hint — it's required, and direct mode's own
 /// dispatch correctly rejects an omitted one; silently defaulting it here
 /// would let `figmog call figmog_open`
 /// (no `--args`) succeed over the socket while the exact same invocation

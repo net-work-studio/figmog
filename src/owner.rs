@@ -97,7 +97,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// Use the session's private runtime directory when it is safe and short
-/// enough for a Unix socket. Invalid/missing XDG directories use /tmp.
+/// enough for a Unix socket and representable in discovery's UTF-8 JSON
+/// path. Invalid/missing XDG directories use /tmp.
 pub(crate) fn runtime_dir() -> PathBuf {
     runtime_dir_for(std::env::var_os("XDG_RUNTIME_DIR").as_deref())
 }
@@ -107,6 +108,7 @@ fn runtime_dir_for(xdg: Option<&std::ffi::OsStr>) -> PathBuf {
         let root = Path::new(xdg);
         let candidate = root.join("figmog");
         if root.is_absolute()
+            && candidate.to_str().is_some()
             && candidate.join("0000000000000000.sock").as_os_str().len() < 104
             && std::fs::symlink_metadata(root)
                 .is_ok_and(|m| m.is_dir() && m.uid() == euid() && m.mode() & 0o777 == 0o700)
@@ -1219,6 +1221,8 @@ mod tests {
 
     #[test]
     fn xdg_runtime_requires_private_real_short_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("run");
         std::fs::create_dir(&root).unwrap();
@@ -1242,6 +1246,58 @@ mod tests {
             runtime_dir_for(Some(long.as_os_str())),
             runtime_dir_for(None)
         );
+        let non_utf8 = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"run-\xff".to_vec()));
+        assert_eq!(
+            runtime_dir_for(Some(non_utf8.as_os_str())),
+            runtime_dir_for(None)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_runtime_directory_keeps_owner_discovery_reachable() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("figmog-runtime-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let runtime = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"run-\xff".to_vec()));
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(runtime.to_str().is_none());
+        let paths = OwnerPaths::ensure(&dir.path().join("project")).unwrap();
+        let selected = runtime_dir_for(Some(runtime.as_os_str()));
+        let socket = selected.join(socket_name(&paths.project));
+        let listener = bind_socket(&socket).unwrap();
+        let discovery = Discovery {
+            socket: socket.clone(),
+            pid: 42,
+            generation: "non-utf8-runtime".into(),
+            version: version().into(),
+            protocol: PROTOCOL,
+        };
+        write_discovery(&paths, &discovery).unwrap();
+        let restored = read_discovery(&paths).unwrap();
+        let validated = validate_discovery_socket(&paths, &restored.socket).unwrap();
+        let connected = UnixStream::connect(&restored.socket).is_ok();
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+
+        assert_eq!(restored, discovery);
+        assert!(
+            validated,
+            "the published socket must pass discovery validation"
+        );
+        assert!(
+            connected,
+            "the published socket must reach the bound listener"
+        );
+        assert_eq!(selected, runtime_dir_for(None));
     }
 
     #[test]

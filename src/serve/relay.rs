@@ -50,6 +50,8 @@ const OWNER_ID: &str = "figmog-relay-";
 enum Msg {
     Stdin(String),
     StdinEof,
+    /// The agent closed its output stream.
+    StdoutGone,
     /// A frame from the owner connection of this epoch.
     Owner(u64, String),
     /// The owner connection of this epoch ended.
@@ -82,6 +84,8 @@ struct Relay {
     /// The agent's `initialize`, replayed on reconnect.
     initialize: Option<String>,
     writer: Option<UnixStream>,
+    /// Agent output never blocks the relay's request and shutdown loop.
+    stdout: Option<super::output::StdioWriter>,
     epoch: u64,
     pending: BTreeMap<String, Sent>,
     tx: mpsc::Sender<Msg>,
@@ -124,6 +128,14 @@ pub(crate) fn run_relay(
     }
     let paths = OwnerPaths::ensure(&layout.mirror_root)?;
     let (tx, rx) = mpsc::channel();
+    let output_tx = tx.clone();
+    let stdout = super::output::StdioWriter::spawn(move |frame| {
+        let written = write_agent(frame);
+        if !written {
+            let _ = output_tx.send(Msg::StdoutGone);
+        }
+        written
+    });
     let mut relay = Relay {
         layout,
         paths,
@@ -133,6 +145,7 @@ pub(crate) fn run_relay(
         referenced: BTreeSet::new(),
         initialize: None,
         writer: None,
+        stdout: Some(stdout),
         epoch: 0,
         pending: BTreeMap::new(),
         tx: tx.clone(),
@@ -164,7 +177,16 @@ pub(crate) fn run_relay(
         }
         let _ = tx.send(Msg::StdinEof);
     });
-    relay.run(&rx);
+    let deadline = relay
+        .run(&rx)
+        .unwrap_or_else(|| Instant::now() + super::EXIT_DRAIN);
+    // The reader holds another descriptor for this connection. Shut down
+    // both halves before waiting on the agent's output, so an unread pipe
+    // cannot keep the owner attached for the rest of the drain budget.
+    if let Some(writer) = relay.writer.take() {
+        let _ = writer.shutdown(std::net::Shutdown::Both);
+    }
+    relay.stdout.take().unwrap().finish(deadline);
     Ok(())
 }
 
@@ -182,8 +204,8 @@ fn shared_store(layout: &Layout, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// One frame to stdout. `false`: the agent is gone.
-fn to_agent(frame: &str) -> bool {
+/// One frame to stdout, called only by the output worker.
+fn write_agent(frame: &str) -> bool {
     let mut stdout = std::io::stdout();
     writeln!(stdout, "{frame}").is_ok() && stdout.flush().is_ok()
 }
@@ -207,6 +229,12 @@ fn local_error(id: OwnedValue, method: &str, message: &str) -> OwnedValue {
 }
 
 impl Relay {
+    fn to_agent(&self, frame: &str) -> bool {
+        self.stdout
+            .as_ref()
+            .is_some_and(|stdout| stdout.send(frame.to_owned()))
+    }
+
     /// Connect (launching an owner if needed), handshake with the startup
     /// files, start this connection's reader, and replay `initialize`.
     fn connect(&mut self) -> Result<owner::OwnerInfo, String> {
@@ -329,7 +357,7 @@ impl Relay {
     fn send(&mut self, owner_id: String, mut sent: Sent) -> bool {
         if let Err(error) = self.ensure_connected() {
             return match sent.agent_id {
-                Some(id) => to_agent(
+                Some(id) => self.to_agent(
                     &crate::deep_json::to_string(&local_error(id, &sent.method, &error).0)
                         .expect("Value serializes"),
                 ),
@@ -345,25 +373,26 @@ impl Relay {
         true
     }
 
-    fn run(&mut self, rx: &mpsc::Receiver<Msg>) {
+    /// Return the EOF deadline so final stdout flushing shares its budget.
+    fn run(&mut self, rx: &mpsc::Receiver<Msg>) -> Option<Instant> {
         let mut drain_until: Option<Instant> = None;
         loop {
             if let Some(deadline) = drain_until
                 && (!self.pending.values().any(|sent| sent.agent_id.is_some())
                     || Instant::now() >= deadline)
             {
-                return;
+                return drain_until;
             }
             let msg = match drain_until {
                 Some(deadline) => {
                     match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                         Ok(msg) => msg,
-                        Err(_) => return,
+                        Err(_) => return drain_until,
                     }
                 }
                 None => match rx.recv() {
                     Ok(msg) => msg,
-                    Err(_) => return,
+                    Err(_) => return drain_until,
                 },
             };
             let alive = match msg {
@@ -374,11 +403,12 @@ impl Relay {
                     drain_until = Some(Instant::now() + super::EXIT_DRAIN);
                     true
                 }
+                Msg::StdoutGone => false,
                 Msg::Owner(epoch, line) => self.on_owner(epoch, &line),
                 Msg::OwnerGone(epoch) => self.owner_gone(epoch, drain_until.is_none()),
             };
             if !alive {
-                return;
+                return drain_until;
             }
         }
     }
@@ -390,7 +420,7 @@ impl Relay {
             // Parse failures have no request id to track in `pending`.
             // Answer here so an immediately queued stdin EOF cannot drop
             // the response while it is still on its way from the owner.
-            return to_agent(
+            return self.to_agent(
                 &json!({
                     "jsonrpc": "2.0",
                     "id": null,
@@ -419,7 +449,7 @@ impl Relay {
         if method == "tools/call"
             && let Err(message) = self.route(&mut frame.0)
         {
-            return to_agent(
+            return self.to_agent(
                 &crate::deep_json::to_string(&local_error(id, &method, &message).0)
                     .expect("Value serializes"),
             );
@@ -499,15 +529,15 @@ impl Relay {
         if frame.get("method").is_some() {
             // Notifications from the current connection only (a replaced
             // connection's would be duplicates or stale).
-            return epoch != self.epoch || to_agent(line);
+            return epoch != self.epoch || self.to_agent(line);
         }
         let Some(owner_id) = frame["id"].as_str().map(str::to_string) else {
             // An answer to no request of ours (a frame the owner could not
             // parse): the agent's, as is.
-            return to_agent(line);
+            return self.to_agent(line);
         };
         let Some(mut sent) = self.pending.remove(&owner_id) else {
-            return to_agent(line);
+            return self.to_agent(line);
         };
         if sent.agent_id.is_none() {
             // The relay's own request (its replayed `initialize`).
@@ -527,7 +557,7 @@ impl Relay {
             return self.send(owner_id, resent);
         }
         frame.insert("id".into(), sent.agent_id.take().expect("checked above"));
-        to_agent(&crate::deep_json::to_string(&frame.0).expect("Value serializes"))
+        self.to_agent(&crate::deep_json::to_string(&frame.0).expect("Value serializes"))
     }
 
     /// The owner connection of `epoch` ended: answer what it owed, then
@@ -554,7 +584,7 @@ impl Relay {
                 "outcome unknown: the background figmog exited before answering; check \
                  figmog_status or figmog_files before retrying",
             );
-            if !to_agent(&crate::deep_json::to_string(&answer.0).expect("Value serializes")) {
+            if !self.to_agent(&crate::deep_json::to_string(&answer.0).expect("Value serializes")) {
                 return false;
             }
         }
@@ -593,6 +623,7 @@ mod tests {
             referenced: BTreeSet::new(),
             initialize: None,
             writer: Some(writer),
+            stdout: Some(super::super::output::StdioWriter::spawn(|_| true)),
             epoch: 1,
             pending: BTreeMap::new(),
             tx,
@@ -614,6 +645,40 @@ mod tests {
             std::io::ErrorKind::WouldBlock
         );
         assert!(relay.pending.is_empty());
+    }
+
+    #[test]
+    fn stalled_agent_output_does_not_block_eof_or_extend_the_flush_deadline() {
+        use std::time::Duration;
+
+        let (_dir, mut relay, _reader) = configured_relay();
+        let (entered, writing) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        relay.stdout.take().unwrap().finish(Instant::now());
+        relay.stdout = Some(super::super::output::StdioWriter::spawn(move |_| {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+            done.send(()).unwrap();
+            true
+        }));
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Stdin("{\n".into())).unwrap();
+        tx.send(Msg::StdinEof).unwrap();
+        let started = Instant::now();
+        let deadline = relay.run(&rx).expect("EOF establishes the drain deadline");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(deadline > started);
+        writing.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        relay
+            .stdout
+            .take()
+            .unwrap()
+            .finish(started + Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]

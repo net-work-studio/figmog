@@ -340,6 +340,62 @@ fn a_one_shot_malformed_frame_receives_a_parse_error_before_relay_exit() {
     wait_owner_gone(repo.path());
 }
 
+/// A client that keeps stdout open without reading cannot prevent EOF
+/// shutdown. The production drain budget is fifteen seconds.
+#[test]
+fn an_unread_relay_stdout_cannot_extend_the_eof_shutdown_budget() {
+    struct UnreadRelay(Child);
+    impl Drop for UnreadRelay {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let repo = repo();
+    let child = relay_command(repo.path(), &["--no-watch", "--no-upstream"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut relay = UnreadRelay(child);
+    let mut stdout = relay.0.stdout.take().unwrap();
+    let mut stdin = relay.0.stdin.take().unwrap();
+    // Each tools/list answer is much larger than its request. The total
+    // responses exceed the OS pipe capacity while these requests fit the
+    // input pipe, which the relay's reader also drains independently.
+    for id in 0..128 {
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0", "id":id, "method":"tools/list"})
+        )
+        .unwrap();
+    }
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = relay.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "relay stayed blocked on unread stdout beyond its EOF drain budget"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status}");
+    let mut output = String::new();
+    stdout.read_to_string(&mut output).unwrap();
+    assert!(!output.is_empty(), "no response reached the stdout pipe");
+    assert!(
+        output.lines().count() < 128,
+        "the response burst must exceed the unread pipe's capacity"
+    );
+    wait_owner_gone(repo.path());
+}
+
 /// Pull a synthetic fixture into `cwd`'s project as `key` (direct: no owner
 /// is running), landing in the shared mirror root.
 fn seed(cwd: &Path, key: &str, fixture: &Value) {

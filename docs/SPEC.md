@@ -633,7 +633,9 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   `figmog_internal_operation {id}` (any connection) returns `{"id",
   "state": "succeeded", "result"}`, `{"id", "state": "failed", "error"}`,
   `{"id", "state": "running"}`, or an unknown-operation error (another
-  process's id, or expired). Receipts and ids are in memory only.
+  process's id, or expired). This is a process-scoped management query:
+  its ID is sufficient even when the checkout has no default or current
+  file. Receipts and ids are in memory only.
 - *Ordering and coalescing.* Writes run on the file's worker (still its
   only writer) in arrival order, ahead of queued watch/sync jobs, and,
   like a direct pull, without waiting out a failed pull's backoff. Two
@@ -648,7 +650,9 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   store, reads queue no implicit first pull. A successful routed pull
   updates `last_success` (`"job_id": null`, plus `"operation"`) and clears
   the failed-pull watch deferral while preserving independent metadata
-  Retry-After and ordinary cadence; it is not a lifecycle job.
+  Retry-After and ordinary cadence, including across a fresh store reopen.
+  Pending expedited observations and owed polls also survive the reopen.
+  A routed pull is not a lifecycle job.
 - *Validation first.* `from_file` (a parsed `GET /v1/files/:key`
   response) and `content` (an export's exact text; the snapshot digest is
   over it) are checked — parse, flatten, variable entries — before any
@@ -970,8 +974,9 @@ lock file that disappears or is replaced makes its holder shut down (see
 **Socket.** `<runtime directory>/<16 hex>.sock`, the hex a 64-bit FNV-1a
 hash of the project identity. A valid user-owned mode-0700
 `$XDG_RUNTIME_DIR` is preferred, with a private `figmog` child; otherwise
-`/tmp/figmog-<uid>` is used. Paths that would reach macOS's 104-byte limit
-fall back to the short `/tmp` address. Directories and sockets are checked
+`/tmp/figmog-<uid>` is used. Non-UTF-8 paths and paths that would reach
+macOS's 104-byte limit fall back to the short `/tmp` address, so discovery
+can represent the exact socket path in JSON. Directories and sockets are checked
 for ownership, modes and symlinks before connecting, and the connected
 peer must have the current uid. Discovery must name the expected socket.
 An unsafe or pre-planted runtime directory produces an actionable error;
@@ -1072,6 +1077,12 @@ and reconnects at once. On every new connection the relay repeats the
 handshake (with its startup files) and the agent's `initialize` (under a
 relay-internal id whose answer it swallows), so notifications keep
 flowing.
+
+**Agent output and EOF.** Relay responses use a dedicated stdout writer,
+so a client that stops reading cannot block the event loop from receiving
+stdin EOF. Pending replies and the final output flush share the 15-second
+exit-drain deadline. The owner connection closes before that final flush,
+so blocked output cannot keep the owner attached.
 
 **Notifications.** Notifications from the owner — `tools/list_changed`
 from desktop re-detection (§8) — are forwarded verbatim to the relay's
