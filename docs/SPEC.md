@@ -2955,7 +2955,8 @@ it in the mirror, `data-figmog-node="<node id>"`, on its root element. The
 transform runs before JSX compilation (`enforce: "pre"`), parses the module
 with Vite's own parser, and finds the export (function declaration, arrow
 or function expression, `export { Local as Name }`, `export default
-function Name`, `memo(...)`/`forwardRef(...)` wrappers) and every value its
+function Name`, `memo(...)`/`forwardRef(...)` wrappers, including local
+identifiers passed to them) and every value its
 own body returns. It marks only when **every** return is a DOM element
 (lowercase JSX tag), `null`, or a conditional of those; a fragment, a
 component element (`<Card>` — its props may not reach the DOM), an array or
@@ -2996,7 +2997,10 @@ anything is forwarded:
   no other origin can read one. With the bridge enabled, cross-origin
   requests for dev pages and assets are refused before HTML rendering,
   removing any CORS headers Vite already added. Another localhost origin
-  cannot read the HTML's injected session token.
+  cannot read the HTML's injected session token. Successful HTML responses
+  remove CORS permissions and send `Cache-Control: no-store` when headers
+  are committed, including headers supplied by later middleware. A cached
+  dev-page response cannot expose its token to another origin.
 - **Allowlist.** The 18 local reads (§6 "Read adapters") plus
   `figmog_images` (renders; `refresh: true` refused). Not `figmog_open`,
   `figmog_sync`, `figmog_files`, the internal write tools, `tools/list`

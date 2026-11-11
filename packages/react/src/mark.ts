@@ -88,19 +88,33 @@ function unwrap(node: Node): Node {
 }
 
 /** The component function behind an exported value, or `null`. */
-function componentFunction(value: Node): Node | null {
-  const node = unwrap(value);
-  if (FUNCTIONS.has(node.type)) return node;
-  if (node.type === "CallExpression") {
-    const callee = child(node, "callee");
-    const calleeName =
-      callee?.type === "MemberExpression" ? name(child(callee, "property")) : name(callee);
-    const first = list(node, "arguments")[0];
-    if (calleeName !== null && COMPONENT_WRAPPERS.has(calleeName) && first !== undefined) {
-      return componentFunction(first);
+function componentFunction(value: Node, locals: ReadonlyMap<string, Node>): Node | null {
+  const seen = new Set<Node>();
+  let current = value;
+  while (true) {
+    const node = unwrap(current);
+    if (seen.has(node)) return null;
+    seen.add(node);
+    if (FUNCTIONS.has(node.type)) return node;
+    if (node.type === "Identifier") {
+      const id = name(node);
+      const local = id === null ? undefined : locals.get(id);
+      if (local === undefined) return null;
+      current = local;
+      continue;
     }
+    if (node.type === "CallExpression") {
+      const callee = child(node, "callee");
+      const calleeName =
+        callee?.type === "MemberExpression" ? name(child(callee, "property")) : name(callee);
+      const first = list(node, "arguments")[0];
+      if (calleeName !== null && COMPONENT_WRAPPERS.has(calleeName) && first !== undefined) {
+        current = first;
+        continue;
+      }
+    }
+    return null;
   }
-  return null;
 }
 
 /** Top-level bindings and exports of a module. */
@@ -140,6 +154,7 @@ function bindings(program: Node): { locals: Map<string, Node>; exports: Map<stri
       // `export default function PricingCard() {}`: matched by its own name.
       const declaration = child(statement, "declaration");
       if (declaration !== null && declaration.type === "FunctionDeclaration") {
+        declare(declaration, false);
         const id = name(child(declaration, "id"));
         if (id !== null && !exports.has(id)) exports.set(id, declaration);
       }
@@ -241,7 +256,7 @@ export function markModule(code: string, filename: string, specs: readonly MarkS
   const candidates = [...specs].sort((a, b) => a.exportName.localeCompare(b.exportName)).map((spec) => {
     const exported = exports.get(spec.exportName);
     const value = typeof exported === "string" ? locals.get(exported) : exported;
-    const fn = value === undefined ? null : componentFunction(value);
+    const fn = value === undefined ? null : componentFunction(value, locals);
     const elements: Node[] = [];
     let reason = value === undefined ? "no such export" : fn === null ? "not a function component" : null;
     if (fn !== null) {

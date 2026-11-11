@@ -90,7 +90,8 @@ so it is not a boundary on its own):
 - `Origin` must be the dev page's own origin — another local dev server's
   page is refused, and the CORS headers Vite adds for localhost origins are
   removed from every answer; cross-origin dev-page requests are also refused
-  before the HTML can expose its session token;
+  before the HTML can expose its session token. Successful HTML responses
+  also strip CORS permissions and send `Cache-Control: no-store`;
 - read tools and `figmog_images` only — no `figmog_sync`/`figmog_open`,
   `figmog_files`, internal write tools or desktop-proxy tools;
 - only this project's Figma files (figmog.toml `[files]`);

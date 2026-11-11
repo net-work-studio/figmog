@@ -6,7 +6,7 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { TLSSocket } from "node:tls";
 import type { Logger, Plugin, ResolvedConfig } from "vite";
-import { BRIDGE_GLOBAL, BRIDGE_PATH, handleBridgeRequest, isBridgeUrl, removeCorsHeaders } from "./bridge.js";
+import { BRIDGE_GLOBAL, BRIDGE_PATH, handleBridgeRequest, isBridgeUrl, protectHtmlResponse, removeCorsHeaders } from "./bridge.js";
 import { figmogBinary, message, readMapTargets, readSettings, type ProjectSettings } from "./figmog.js";
 import { markModule, type MarkSpec } from "./mark.js";
 import { FigmogRelay } from "./relay.js";
@@ -142,6 +142,7 @@ export function figmog(options: FigmogPluginOptions = {}): Plugin {
             response.end("the figmog dev server only answers its own origin");
             return;
           }
+          protectHtmlResponse(response);
           next();
           return;
         }

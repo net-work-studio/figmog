@@ -28,6 +28,59 @@ describe("markModule", () => {
     }
   });
 
+  test("resolves local component functions inside memo and forwardRef wrappers", () => {
+    const cases = [
+      ...["memo", "forwardRef", "React.memo", "React.forwardRef"].map((wrapper) =>
+        `function Inner() { return <div/>; } export const Card = ${wrapper}(Inner);`,
+      ),
+      "const Inner = () => <div/>; const Alias = Inner; export const Card = React.memo(React.forwardRef(Alias));",
+      "const Inner = () => <div/>; const Wrapped = forwardRef(Inner); export const Card = memo(Wrapped);",
+      "export const Card = memo(Inner); function Inner() { return <div/>; }",
+      "export default function Inner() { return <div/>; } export const Card = memo(Inner);",
+      "function Inner() { return <div/>; } const Alias = Inner; export const Card = memo((Alias as typeof Inner)!);",
+    ];
+    for (const code of cases) {
+      const outcome = mark(code);
+      assert.deepEqual(outcome.skipped, [], code);
+      assert.deepEqual(outcome.marked, ["Card"], code);
+      assert.ok(outcome.code?.includes(`<div${ATTRS}/>`), `${code}\n=> ${outcome.code}`);
+    }
+  });
+
+  test("skips every mapping that resolves through wrappers to the same component", () => {
+    const cases = [
+      "export function Card() { return <div/>; } export const Wrapped = memo(Card);",
+      "export const Card = () => <div/>; export const Wrapped = React.forwardRef(Card);",
+      "const Inner = () => <div/>; export const Card = memo(Inner); export const Wrapped = forwardRef(Inner);",
+      "export default function Card() { return <div/>; } export const Wrapped = React.memo(Card);",
+    ];
+    const specs = [SPEC, { exportName: "Wrapped", figma: "component:wrapped", node: "2:1" }];
+    for (const code of cases) {
+      const outcome = mark(code, specs);
+      assert.equal(outcome.code, null, code);
+      assert.deepEqual(outcome.marked, [], code);
+      assert.deepEqual(outcome.skipped.map(({ exportName }) => exportName), ["Card", "Wrapped"], code);
+      for (const { reason } of outcome.skipped) assert.match(reason, /several .* entries resolve to this component/);
+      assert.deepEqual(mark(code, [...specs].reverse()), outcome);
+    }
+  });
+
+  test("skips missing, imported and cyclic wrapper arguments without following them forever", () => {
+    const cases = [
+      "export const Card = memo(Missing);",
+      'import Inner from "./Inner.js"; export const Card = React.forwardRef(Inner);',
+      "export const Card = memo(Card);",
+      "const A = B; const B = A; export const Card = forwardRef(A);",
+      "const A = memo(B); const B = forwardRef(A); export const Card = memo(A);",
+    ];
+    for (const code of cases) {
+      const outcome = mark(code);
+      assert.equal(outcome.code, null, code);
+      assert.deepEqual(outcome.marked, [], code);
+      assert.deepEqual(outcome.skipped, [{ exportName: "Card", reason: "not a function component" }], code);
+    }
+  });
+
   test("caller markers in spread props override automatic defaults", async () => {
     const outcome = mark("export const Card = props => <div {...props}/>;", [SPEC], "Card.jsx");
     assert.deepEqual(outcome.marked, ["Card"]);

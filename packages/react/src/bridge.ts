@@ -16,7 +16,7 @@
 // The Figma token never leaves figmog: the bridge forwards tool calls and
 // returns their results, nothing else.
 import { timingSafeEqual } from "node:crypto";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import type { IncomingMessage, OutgoingHttpHeader, OutgoingHttpHeaders, ServerResponse } from "node:http";
 import type { TLSSocket } from "node:tls";
 import { isObject } from "./figmog.js";
 
@@ -226,6 +226,43 @@ const CORS_HEADERS = [
 /** Removes any CORS permission Vite already added to a private response. */
 export function removeCorsHeaders(response: ServerResponse): void {
   for (const header of CORS_HEADERS) response.removeHeader(header);
+}
+
+type ResponseHeaders = OutgoingHttpHeaders | OutgoingHttpHeader[];
+
+/** Protect HTML credentials when headers are committed, after Vite's own headers. */
+export function protectHtmlResponse(response: ServerResponse): void {
+  const writeHead = response.writeHead.bind(response);
+  response.writeHead = (status: number, reasonOrHeaders?: string | ResponseHeaders, headers?: ResponseHeaders) => {
+    let outgoing = typeof reasonOrHeaders === "string" || reasonOrHeaders === undefined ? headers : reasonOrHeaders;
+    const entries: [string, OutgoingHttpHeader | undefined][] = [];
+    if (Array.isArray(outgoing)) {
+      for (let i = 0; i < outgoing.length; i += 2) entries.push([String(outgoing[i]), outgoing[i + 1]]);
+    } else {
+      entries.push(...Object.entries(outgoing ?? {}));
+    }
+    const contentType = entries.findLast(([name]) => name.toLowerCase() === "content-type")?.[1]
+      ?? response.getHeader("content-type");
+    if ([contentType].flat().some((value) => typeof value === "string" && /^\s*text\/html(?:\s*;|\s*$)/i.test(value))) {
+      const keep = (name: string): boolean => {
+        const key = name.toLowerCase();
+        return key !== "cache-control" && !key.startsWith("access-control-");
+      };
+      for (const name of response.getHeaderNames()) {
+        if (!keep(name)) response.removeHeader(name);
+      }
+      response.setHeader("cache-control", "no-store");
+      // Raw header arrays alternate names and values. Keep each pair together,
+      // preserving unrelated duplicate headers such as Set-Cookie.
+      const supplied = outgoing;
+      outgoing = Array.isArray(supplied)
+        ? supplied.filter((_, i) => keep(String(supplied[i - i % 2])))
+        : Object.fromEntries(entries.filter(([name]) => keep(name)));
+    }
+    return typeof reasonOrHeaders === "string"
+      ? writeHead(status, reasonOrHeaders, outgoing)
+      : writeHead(status, outgoing);
+  };
 }
 
 function send(response: ServerResponse, status: number, body: unknown): void {

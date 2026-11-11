@@ -424,6 +424,119 @@ describe("bridge", () => {
     );
   });
 
+  test("cached dev HTML cannot expose its token to another localhost origin", async (t) => {
+    const root = join(work, "cache-html");
+    await mkdir(root);
+    await writeFile(join(root, "index.html"), "<!doctype html><title>Synthetic cache fixture</title>");
+    const isolated = await createServer(config({ attributes: false }, {
+      root,
+      server: { cors: true, host: "127.0.0.1", port: 0 },
+    }));
+    t.after(() => isolated.close());
+    await isolated.listen();
+    const isolatedPort = (isolated.httpServer?.address() as AddressInfo).port;
+    const origin = `http://127.0.0.1:${isolatedPort}`;
+    const other = await serveFixtures();
+    t.after(other.close);
+    const executablePath = process.env["FIGMOG_SHOT_CHROMIUM"];
+    const browser = await chromium.launch({
+      headless: true,
+      ...(executablePath === undefined || executablePath === "" ? {} : { executablePath }),
+    });
+    try {
+      const tab = await browser.newPage();
+      await tab.goto(`${origin}/`);
+      const seeded = await tab.evaluate(async () => {
+        const response = await fetch("/");
+        return {
+          body: await response.text(),
+          cacheControl: response.headers.get("cache-control"),
+          cors: response.headers.get("access-control-allow-origin"),
+          status: response.status,
+        };
+      });
+      assert.equal(seeded.status, 200);
+      assert.match(seeded.body, /window\.__FIGMOG_BRIDGE__/);
+      const pageToken = /"token":"([A-Za-z0-9_-]{43})"/.exec(seeded.body)?.[1];
+      assert.ok(pageToken);
+      await tab.goto(`${other.origin}/card.html`);
+      const leaked = await tab.evaluate(async ({ url, token }) => {
+        try {
+          const response = await fetch(url, { cache: "force-cache" });
+          return { exposesToken: (await response.text()).includes(token), status: response.status };
+        } catch {
+          return null;
+        }
+      }, { token: pageToken, url: `${origin}/` });
+      assert.equal(leaked, null, "another localhost origin must not read cached token-bearing HTML");
+      assert.equal(seeded.cors, null);
+      assert.equal(seeded.cacheControl, "no-store");
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("HTML protection survives later middleware headers without changing other responses", async () => {
+    for (const bridge of [true, false]) {
+      const base = config({ attributes: false, bridge }, { server: { cors: true, host: "127.0.0.1", port: 0 } });
+      const isolated = await createServer({
+        ...base,
+        plugins: [...(base.plugins ?? []), {
+          name: "synthetic-late-html",
+          configureServer(dev: ViteDevServer) {
+            dev.middlewares.use((request, response, next) => {
+              const style = request.url ?? "";
+              if (!["/implicit", "/object", "/array", "/no-reason", "/plain"].includes(style)) return next();
+              const headers = {
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=600",
+                "Content-Type": style === "/plain" ? "text/plain" : "text/html; charset=utf-8",
+                "Set-Cookie": ["first=1", "second=2"],
+              };
+              if (style === "/plain") {
+                response.writeHead(200, headers).end("Synthetic plain fixture");
+                return;
+              }
+              void dev.transformIndexHtml("/index.html", "<!doctype html><title>Synthetic headers fixture</title>").then(
+                (html) => {
+                  if (style === "/implicit") {
+                    for (const [name, value] of Object.entries(headers)) response.setHeader(name, value);
+                  } else if (style === "/array") {
+                    response.writeHead(200, [
+                      "Content-Type", headers["Content-Type"], "Set-Cookie", "first=1", "Set-Cookie", "second=2",
+                      "ACCESS-CONTROL-ALLOW-ORIGIN", "*", "cAcHe-CoNtRoL", headers["Cache-Control"],
+                    ]);
+                  } else if (style === "/no-reason") {
+                    response.writeHead(200, undefined, headers);
+                  } else {
+                    response.writeHead(200, "Synthetic OK", headers);
+                  }
+                  response.end(html);
+                },
+              ).catch(next);
+            });
+          },
+        }],
+      });
+      try {
+        await isolated.listen();
+        const isolatedPort = (isolated.httpServer?.address() as AddressInfo).port;
+        for (const style of ["implicit", "object", "array", "no-reason", "plain"]) {
+          const response = await fetch(`http://127.0.0.1:${isolatedPort}/${style}`);
+          const body = await response.text();
+          const privateHtml = bridge && style !== "plain";
+          assert.equal(response.status, 200, body);
+          assert.equal(response.headers.get("access-control-allow-origin"), privateHtml ? null : "*");
+          assert.equal(response.headers.get("cache-control"), privateHtml ? "no-store" : "public, max-age=600");
+          assert.deepEqual(response.headers.getSetCookie(), ["first=1", "second=2"]);
+          assert.equal(body.includes("window.__FIGMOG_BRIDGE__"), privateHtml);
+        }
+      } finally {
+        await isolated.close();
+      }
+    }
+  });
+
   test("refuses peers that are not this machine, even with forged headers", async (t) => {
     assert.ok(isLoopbackAddress("127.0.0.1") && isLoopbackAddress("::1") && isLoopbackAddress("::ffff:127.0.0.1"));
     assert.ok(!isLoopbackAddress("10.0.0.2") && !isLoopbackAddress("::ffff:192.168.1.2") && !isLoopbackAddress(undefined));
