@@ -1,0 +1,42 @@
+[
+  {
+    "css": "\"Foo_Bar\"",
+    "family": "Foo_Bar",
+    "tailwind": "[font-family:\"Foo\\_Bar\"]"
+  },
+  {
+    "css": "\"O'Reilly\"",
+    "family": "O'Reilly",
+    "tailwind": "[font-family:\"O'Reilly\"]"
+  },
+  {
+    "css": "\"Space Family\"",
+    "family": "Space Family",
+    "tailwind": "[font-family:\"Space_Family\"]"
+  },
+  {
+    "css": "\"\\\"Quoted\\\" Family\"",
+    "family": "\"Quoted\" Family",
+    "tailwind": "[font-family:\"\\\"Quoted\\\"_Family\"]"
+  },
+  {
+    "css": "\"Back\\\\Slash_Pro\"",
+    "family": "Back\\Slash_Pro",
+    "tailwind": "[font-family:\"Back\\\\Slash\\_Pro\"]"
+  },
+  {
+    "css": "\"Fancy (Alt)_Face\"",
+    "family": "Fancy (Alt)_Face",
+    "tailwind": "[font-family:\"Fancy_(Alt)\\_Face\"]"
+  },
+  {
+    "css": "\"Foo[Bar]_Alt\"",
+    "family": "Foo[Bar]_Alt",
+    "tailwind": "[font-family:\"Foo[Bar]\\_Alt\"]"
+  },
+  {
+    "css": "\"Ångström_Face\"",
+    "family": "Ångström_Face",
+    "tailwind": "[font-family:\"Ångström\\_Face\"]"
+  }
+]

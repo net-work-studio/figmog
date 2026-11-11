@@ -1350,9 +1350,10 @@ variable missing a needed mode's value.
   matches (its root mode when none does) — so collections sharing a
   selector (every dark mode on `[data-theme="dark"]` by default) switch
   together and a loop closing only when one is Light and the other Dark
-  is no cycle; two modes of one collection never apply at once (a
-  variable has one value per combination; more than 12 selectors ⇒ every
-  member is skipped unchecked). A member of a cycle is skipped and
+  is no cycle. Two modes of one collection never apply at once, so a
+  variable has one value per combination. The limit counts legal contexts,
+  including shared-selector coupling. Components with more than 4096
+  legal mode combinations are skipped unchecked. A member of a cycle is skipped and
   reported with the cycle and either `in every mode` or `only in some
   modes (first: "Theme" mode "Dark")`; a loop no combination closes is no
   cycle;
@@ -2186,10 +2187,14 @@ The store is never opened (a running serve may hold it). The dev
 server's `localhost` / `*.localhost` host goes straight to `127.0.0.1` and
 `::1` without a resolver, an IP literal as is; any other name is resolved
 on a detached thread abandoned after 2 s (a `warn`). Network checks
-are bounded — 10 s per Figma request, the desktop client's 2 s connect
+are bounded — 10 s per complete Figma check, the desktop client's 2 s connect
 and 10 s request timeouts, 2 s per dev-server address — and a network
 failure is a `warn` ("could not reach Figma"), so an offline machine gets
-a complete report quickly. Figma checks use serve's API client (debug
+a complete report quickly. Each Figma check runs on a worker under one
+absolute deadline, including client creation, DNS resolution and HTTP.
+The HTTP client receives only the remaining budget. Doctor abandons a
+worker that exceeds the deadline, discards its late result and continues
+with a warning. Figma checks use serve's API client (debug
 builds honor `FIGMOG_API_BASE`, for tests). The token is never printed.
 Exit 0 unless a check failed; then the report is still printed and
 `{"error": "doctor: failed checks: <names>"}` goes to stderr, exit 1.
@@ -2327,8 +2332,10 @@ positioned nodes, and the root when it carries `layoutSizing*`):
 
 `fill` and `stroke` (arrays, one entry per visible `SOLID` paint; the raw
 value is `#rrggbb`, or `#rrggbbaa` below full alpha, the paint's `opacity`
-folded into alpha — the token export's color form), `stroke_weight` (with
-visible strokes), `radius` (`{top_left, top_right, bottom_right,
+folded into alpha — the token export's color form; a bound paint with
+opacity below 1 also carries `paint_opacity`, combined with the token
+through CSS `color-mix` so the token's own alpha survives), `stroke_weight`
+(with visible strokes), `radius` (`{top_left, top_right, bottom_right,
 bottom_left}` from `rectangleCornerRadii`, else `cornerRadius`; absent
 when the node has neither and no corner binding), `opacity` (a layer
 opacity below 1, or bound; matched against tokens as 0–100, Figma's
@@ -2395,6 +2402,9 @@ style and the runs' overrides name every variable in them.
   (offsets in UTF-16 code units, as Figma's; `style` the override id, 0
   the base style), plus for an override its `typography` and `fill`
   entries (only the properties the override sets), `css` and `tailwind`.
+  Explicit normal styles reset inherited italics, text case and letter
+  spacing. Mixed text applies decorations on each run, including base
+  runs, so an override can remove them.
 - `content.assets`: `{kind: "image", node_id, paint, image_ref,
   scale_mode}` per visible `IMAGE` fill; `{kind: "vector", node_id,
   format: "svg"}` for a node CSS can't draw (`VECTOR`,
@@ -2406,14 +2416,13 @@ style and the runs' overrides name every variable in them.
   an exported image fill's entry also carries the file's `path` and
   `url` (null outside `public/`), and its `unsupported` reason says it
   was exported (its scaling and cropping still have no CSS); a node that
-  is an exported icon — for an instance by its main component's key
-  (keys are the same in every file using a library component), else by
-  node id, but only when the manifest's icon was exported from the file
-  this spec describes (node ids are file-local and repeat across files;
-  the CLI and the relay tell the manifest which file the call targets,
-  as its `for_file`) — gets `{kind: "icon", node_id,
-  component, path, svg, jsx: "<IconX />"}` (instead of the `vector`
-  entry, for a vector node). Without a manifest the output is unchanged.
+  is an exported icon gets `{kind: "icon", node_id, component, path,
+  svg, jsx: "<IconX />"}` (instead of the `vector` entry, for a vector
+  node). Lookup tries the node's own id first, then for an instance its
+  main component's key, then its main component's id. Keys work across
+  files; node ids match only within the exported file (the CLI and relay
+  supply the spec's file as `for_file`). Without a manifest the output
+  is unchanged.
 - `instance` (INSTANCE nodes): `{component_id, component: {name, key,
   remote} | null, component_set: {id, name, key} | null, variant: {name:
   value} (VARIANT properties), properties: {name: {type, value, token?}}
@@ -2444,6 +2453,7 @@ Per node, from the parent's layout and its own:
 | fill | one visible solid paint → `background-color` (`color` on TEXT) |
 | stroke | one visible solid paint with `strokeAlign`: `outline-*` (Figma strokes take no layout space), `outline-offset` −weight (INSIDE) or −weight/2 (CENTER); a `border-*` for INSIDE with `strokesIncludedInLayout` |
 | radius | `border-radius`, or the corner longhands |
+| full `ELLIPSE` | `border-radius: 50%`; partial arcs and donuts are vector assets |
 | one drop/inner shadow | `box-shadow` (`inset`); a TEXT drop shadow → `text-shadow`. Two or more shadows are unsupported: CSS lists them top-most first and Figma's effect order is unverified |
 | opacity | `opacity` |
 | typography | `font-family` (quoted), `font-size`, `font-weight`, `line-height` (`normal` for auto), `letter-spacing`, `font-style: italic`, `text-align`, `text-transform` / `font-variant-caps`, `text-decoration-line` |
@@ -2468,6 +2478,9 @@ theme utility (`--color-surface` → `bg-surface`, `--spacing-4` →
 `gap-4`, `p-4`, `--radius-md` → `rounded-md`); any other bound value the
 arbitrary property `[font-size:var(--font-size-title)]`; an unbound value
 an arbitrary value (`gap-[8px]`, `bg-[#1a1a1f]`) — never a theme utility.
+Arbitrary values preserve CSS string delimiters and escapes. Literal
+underscores are escaped before spaces become underscores, so a font such
+as `Foo_Bar` or `O'Reilly` keeps the same name after Tailwind compilation.
 `pt-X pb-X` / `pl-X pr-X` collapse to `py-X` / `px-X`. `box-sizing:
 border-box` has no class (Tailwind's preflight sets it).
 
@@ -2631,12 +2644,16 @@ instance it can't express:
 
 - `unmapped_properties`: an instance property the map has no prop for; a
   value not listed in `values`; an instance swap to a component with no
-  entry; a property bound to a variable (the map would pass a literal);
-  an ambiguous suffix match.
-- A **`component` entry** names one variant, so its identity already
-  expresses every VARIANT property (`Tier=Pro` needs no prop); a
-  `component_set` entry has to map them. Other properties need a prop
-  either way.
+  entry, or whose entry identifies only a component set without the
+  authoritative variant properties needed to select its props; a swap
+  target with explicit prop mappings whose property values are unavailable,
+  including a component-specific entry; a property bound to a variable
+  (the map would pass a literal); an ambiguous suffix match.
+- A **`component` entry** names one variant, so its identity covers a
+  VARIANT property with no explicit mapping (`Tier=Pro` needs no prop).
+  Explicit mappings still require the instance's property values. A
+  `component_set` entry has to map variant properties. Other properties
+  need a prop either way.
 - `unmapped_overrides` (`reason` says which kind):
   - `override` — every `overrides[].overriddenFields` entry, on the
     instance and on every nested instance, that a mapped property doesn't
@@ -2760,7 +2777,9 @@ sanitizer), `src/cli/assets.rs` (reads, fetches and writes).
   icons by component name, images by imageRef, no timestamps or file
   version (a re-export after unrelated edits is byte-identical). `url` is
   the root-relative URL when the images folder is `public` or under
-  `public/` (the Vite / Next.js static folder), else null. `sources`
+  `public/` (the Vite / Next.js static folder), else null. URL path
+  segments are percent-encoded; filesystem paths keep their original
+  spelling. `sources`
   records the file and the roots, so a plain `figmog assets export`
   repeats the last export — and refuses when the project's file is no
   longer the recorded one (the roots are that file's node ids; pass
@@ -2786,11 +2805,15 @@ data); node ids reach a comment only after a strict character check
 (`[A-Za-z0-9:;-]`, ≤ 128); imageRefs must be ASCII alphanumeric; file
 names are the validated component name or the content hash (SHA-256 via
 `ring`, already compiled in through rustls). Every write target is
-checked before anything is written: inside the project, no symlink
-anywhere on its path below the project root (the file or any directory;
-`--force` doesn't change this), a regular file, and no directory on the
-way spelled differently on disk (a case-insensitive filesystem: refused,
-naming the spelling on disk). Missing directories are created one at a
+checked before anything is written. Path comparisons normalize relative
+components, including `.`. The manifest must not sit inside an output
+directory or occupy one of its ancestors. The complete planned output
+graph rejects duplicate destinations and file/directory conflicts before
+any write, including with `--force`. Every target must stay inside the
+project. Symlinks anywhere below the project root are refused, including
+with `--force`. An existing target must be a regular file. Directory
+spellings must match the names on disk; case aliases produce an error
+that names the existing spelling. Missing directories are created one at a
 time, each checked (never `create_dir_all` through a link). Each file is
 written atomically: a new temporary file in the same directory (created
 exclusively, `O_NOFOLLOW`), then renamed over the target. A target that
@@ -2803,14 +2826,19 @@ by \`figmog assets export\`…`, `<!-- … -->` for SVG, a leading
 content-hash name says — or with `--force`. One refusal and nothing is
 written. A file whose bytes are already right is not rewritten, so
 re-exporting an unchanged file changes no files (not even mtimes).
+The stale inventory includes barrels inferred from previous icon paths
+and languages. Abandoned barrels are reported, including an images-only
+export's old barrel; stale files are never deleted automatically. On a
+case-sensitive filesystem, an old case-only spelling is reported too.
 
 **SVG sanitizing** (`src/svg.rs`, no XML dependency): a strict,
 non-validating reader — elements, quoted attributes, text, CDATA,
 comments and PIs; the five predefined entities and numeric references
 only; any `<!DOCTYPE`/`<!ENTITY>` rejects the document (no entity
 expansion); size (4 MiB), depth (64), element (20 000) and attribute (64)
-caps; malformed markup is an error. Then an allowlist: only SVG's shape,
-paint-server, clip/mask, text and common filter-primitive elements
+caps; malformed markup and duplicate ids are errors. Duplicate ids are
+rejected before pruning or reference checks. Then an allowlist: only
+SVG's shape, paint-server, clip/mask, text and common filter-primitive elements
 survive (everything else — `script`, `style`, `foreignObject`, `a`,
 animations, `feImage`, prefixed names — is dropped with its content);
 only allowlisted presentation/geometry attributes survive (no `on*`,
@@ -2825,10 +2853,12 @@ local `#id` (or, on `<image>`, a base64 raster `data:` URI) — and a
 `url(#id)`, and a reference to an undefined id is dropped; `style` keeps
 only `mask-type`, `mix-blend-mode` and `isolation` keywords. Every
 removal is reported per icon (`removed` in the command's output). Light
-optimization only: comments, PIs, whitespace, empty `<defs>`/`<g>`,
-unreferenced ids and attribute-less `<g>` wrappers go; geometry is
-verbatim. Limitations: no `<style>` sheets (CSS-styled SVGs lose those
-styles), no `<symbol>`/`<marker>`/`<switch>`; meant for Figma's own SVG
+optimization only: comments, PIs, whitespace outside text-bearing
+contexts, empty `<defs>`/`<g>`, unreferenced ids and attribute-less `<g>` wrappers go; geometry is
+verbatim. Text whitespace is retained, and text subtrees serialize
+without inserted indentation or newlines, including inherited
+`xml:space="preserve"`. Limitations: no `<style>` sheets (CSS-styled SVGs
+lose those styles), no `<symbol>`/`<marker>`/`<switch>`; meant for Figma's own SVG
 export shape.
 
 **Fidelity.** An icon is single-color when exactly one flat paint color
@@ -2840,11 +2870,18 @@ no gradient, pattern, filter, image or `color` attribute (which would
 pin `currentColor`). With `current_color = true` that color becomes
 `currentColor` (an implicit black fill is written out as
 `fill="currentColor"`), so Tailwind text colors apply; multicolor
-icons and logos always keep their colors (`colors` in the manifest). Ids
+icons and logos always keep their colors (`colors` in the manifest).
+Embedded color alpha is combined with effective paint opacity. Conversion
+is declined when alpha cannot be represented safely, including when
+moving embedded alpha or materializing an implicit fill on referenced
+geometry could override use-site paints or opacity. Mask/clip geometry
+must also keep its inherited paints. Ids
 are renumbered in document order: the `.svg` file prefixes them with the
-component name; the component with React's `useId()` (reduced to
-`[A-Za-z0-9_-]`, prefixed `figmog`), so two instances on one page never
-share a gradient, mask, clip-path or filter id. Components need React 18+
+component name; the component losslessly encodes every UTF-16 code unit
+of React's `useId()` as four hexadecimal digits, prefixed with `figmog`.
+This preserves React's ID distinctions across instances and independent
+roots with distinct `identifierPrefix` values. Instances then keep their
+gradient, mask, clip-path and filter references separate. Components need React 18+
 (for `useId`) and the automatic JSX runtime, nothing else; they are
 `aria-hidden` unless given `aria-label`/`aria-labelledby`, and spread
 their props last (`className`, `width`, … override).

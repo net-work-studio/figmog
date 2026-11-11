@@ -3,19 +3,19 @@
     "composite": {
       "file": "composite.png",
       "height": 158,
-      "sha256": "77f5813c194d0d9da9e6136b9073dd5b0f30114fef83081c6315ff50156309dd",
+      "sha256": "cc35c30963cfc738ad10ad47a42707882d5e23f9dba3793351091f2b0b30b937",
       "width": 1360
     },
     "diffAfter": {
       "file": "diff-after.png",
       "height": 100,
-      "sha256": "b2ab3eece943c9ef52c00f14d531c356b983fff021cf75c076f28cfbb758128a",
+      "sha256": "02026dda398b955169d34f4107fe696b116d63287d695524fa770eb77f87a4ab",
       "width": 320
     },
     "diffBefore": {
       "file": "diff-before.png",
       "height": 100,
-      "sha256": "277783c45936bb29ed7af16cd5b8a25f6ec83fcbc2d523f2f38adf2dccc0576c",
+      "sha256": "f802f123031bb689d1b85f6450c41418f57bef29256feeb484f33c17624eb014",
       "width": 320
     }
   },
@@ -25,7 +25,7 @@
         "image": {
           "file": "broken.png",
           "height": 84,
-          "sha256": "883bc611054fb32d1aa8d49ed132374828a5f1ac35f8c95745c2f253e27fbfb4",
+          "sha256": "e2d1068bd7ddd77fe0a9fa7b0a674976648b71d2fa2c216dfcf56565eb120a25",
           "width": 320
         },
         "kind": "figmog-shot/capture",
@@ -61,7 +61,7 @@
       },
       "file": "after.png",
       "height": 84,
-      "sha256": "883bc611054fb32d1aa8d49ed132374828a5f1ac35f8c95745c2f253e27fbfb4",
+      "sha256": "e2d1068bd7ddd77fe0a9fa7b0a674976648b71d2fa2c216dfcf56565eb120a25",
       "width": 320
     },
     "before": {
@@ -69,7 +69,7 @@
         "image": {
           "file": "before.png",
           "height": 48,
-          "sha256": "6f4d2e9a9ab6e36e8b655c080b549f684e82cbf077fd8bf96e779dc20d52c722",
+          "sha256": "1228017d6668afb3fad38ceec4b711d15e3acaf1f18acf308041bd51e9a02184",
           "width": 310
         },
         "kind": "figmog-shot/capture",
@@ -105,7 +105,7 @@
       },
       "file": "before.png",
       "height": 48,
-      "sha256": "6f4d2e9a9ab6e36e8b655c080b549f684e82cbf077fd8bf96e779dc20d52c722",
+      "sha256": "1228017d6668afb3fad38ceec4b711d15e3acaf1f18acf308041bd51e9a02184",
       "width": 310
     },
     "figma": {
@@ -113,7 +113,7 @@
         "image": {
           "file": "card-render-390.png",
           "height": 100,
-          "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf",
+          "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad",
           "width": 320
         },
         "kind": "figmog-shot/capture",
@@ -149,7 +149,7 @@
       },
       "file": "figma.png",
       "height": 100,
-      "sha256": "fa09708c740a32ccb017ac2b84d2df462c531aae0de8986a3cff5abadc47cfcf",
+      "sha256": "0bef1950cd9cfd3e4d467ff57ea8d03ebc983afeba1aab4c0e2084065dd9acad",
       "width": 320
     }
   },
@@ -192,13 +192,13 @@
   "score": {
     "advisory": true,
     "after": {
-      "mismatched": 7923,
-      "score": 75.24,
+      "mismatched": 8376,
+      "score": 73.83,
       "total": 32000
     },
     "before": {
-      "mismatched": 18875,
-      "score": 41.02,
+      "mismatched": 19210,
+      "score": 39.97,
       "total": 32000
     },
     "formula": "score = round2(100 * (1 - mismatched / (W * H))), where W x H is the larger width x the larger height of the two images, mismatched counts pixels pixelmatch (threshold 0.1, anti-aliasing ignored) finds different inside the area both images cover, plus every pixel only one image covers (or neither does); round2 rounds to two decimals; 100 means pixel-identical. Advisory only."

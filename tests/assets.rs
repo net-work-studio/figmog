@@ -160,8 +160,7 @@ fn assert_golden(files: &BTreeMap<String, Vec<u8>>) {
     );
     for (rel, bytes) in files {
         assert_eq!(
-            String::from_utf8_lossy(bytes),
-            String::from_utf8_lossy(&expected[rel]),
+            bytes, &expected[rel],
             "tests/fixtures/assets/export/{rel} is stale — rerun with FIGMOG_BLESS=1 if the change is intended"
         );
     }
@@ -246,6 +245,58 @@ fn synthetic_icon_set_exports_to_react_components_and_reexport_changes_nothing()
 }
 
 #[test]
+fn abandoned_barrels_are_reported_when_icons_are_removed_moved_or_change_language() {
+    for (replacement, args) in [
+        (GOLDEN_ASSETS, vec!["assets", "export", "--images", "2:1"]),
+        (
+            "icons = \"src/new-icons\"\ncomponents = \"jsx\"\n",
+            vec!["assets", "export", "--icons", "1:2"],
+        ),
+        (
+            "icons = \"src/icons\"\ncomponents = \"tsx\"\n",
+            vec!["assets", "export", "--icons", "1:2"],
+        ),
+    ] {
+        let dir = project(GOLDEN_ASSETS, &ICONS);
+        let root = dir.path();
+        figmog(root, &["assets", "export", "--icons", "1:2"]).success();
+        fs::write(
+            root.join("figmog.toml"),
+            format!("[files]\ndefault = \"{KEY}\"\n[assets]\n{replacement}"),
+        )
+        .unwrap();
+        let summary = json_of(&figmog(root, &args).success().get_output().stdout);
+        let stale = summary["stale"].as_array().unwrap();
+        assert!(stale.contains(&json!("src/icons/index.js")), "{summary}");
+        assert!(
+            root.join("src/icons/index.js").exists(),
+            "stale files are reported, not deleted"
+        );
+    }
+}
+
+#[test]
+fn public_image_paths_with_reserved_characters_support_spec_and_reexport() {
+    let dir = project("images = \"public/design images/icônes#?%\"\n", &[]);
+    let root = dir.path();
+    figmog(root, &["assets", "export", "--images", "2:1"]).success();
+    let summary = json_of(
+        &figmog(root, &["assets", "export"])
+            .success()
+            .get_output()
+            .stdout,
+    );
+    assert_eq!(summary["written"], 0, "{summary}");
+    let image = &summary["images"][0];
+    assert!(root.join(image["path"].as_str().unwrap()).exists());
+    assert_eq!(
+        image["url"],
+        "/design%20images/ic%C3%B4nes%23%3F%25/a3979dcc5fa7ded8.png"
+    );
+    figmog(root, &["spec", "2:1", "--no-tailwind"]).success();
+}
+
+#[test]
 fn spec_references_the_manifest_instead_of_raw_ids() {
     let dir = project(GOLDEN_ASSETS, &ICONS);
     let root = dir.path();
@@ -323,6 +374,44 @@ fn spec_references_the_manifest_instead_of_raw_ids() {
         stderr.contains("figmog.assets.json: icons[0].component: not a component name"),
         "{stderr}"
     );
+}
+
+#[test]
+fn aliased_or_ancestral_manifest_paths_fail_before_creating_any_outputs() {
+    for settings in [
+        "manifest = \"src/./icons/index.ts\"\n",
+        "manifest = \"./src/icons/index.ts\"\nicons = \"src/./icons\"\n",
+        "manifest = \"src\"\n",
+        "manifest = \"public\"\n",
+    ] {
+        let dir = project(settings, &ICONS);
+        let output = figmog(
+            dir.path(),
+            &["assets", "export", "--icons", "1:1", "--images", "2:1"],
+        )
+        .failure()
+        .code(1);
+        let error = String::from_utf8_lossy(&output.get_output().stderr);
+        assert!(error.contains("[assets] manifest"), "{error}");
+        assert!(tree(dir.path()).is_empty(), "{settings}");
+        assert!(!dir.path().join("src").exists());
+        assert!(!dir.path().join("public").exists());
+    }
+}
+
+#[test]
+fn planned_file_directory_conflicts_fail_before_any_asset_is_written() {
+    let dir = project("images = \"src/icons/index.ts\"\n", &ICONS);
+    let output = figmog(
+        dir.path(),
+        &["assets", "export", "--icons", "1:1", "--images", "2:1"],
+    )
+    .failure()
+    .code(1);
+    let error = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(error.contains("planned asset"), "{error}");
+    assert!(tree(dir.path()).is_empty());
+    assert!(!dir.path().join("src").exists());
 }
 
 #[test]

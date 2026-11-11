@@ -577,7 +577,7 @@ fn pending_requests_are_bounded_per_connection_and_closed_connections_are_skippe
     let server = Server::start(manager_of(dir.path(), vec![a]), offload);
     let mut busy = server.connect(1);
     let mut closing = server.connect(2);
-    // macOS rejects changing SO_RCVTIMEO after the peer has closed.
+    // Set the timeout before peer shutdown. macOS rejects later timeout changes.
     closing
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -744,7 +744,7 @@ fn shutdown_is_bounded_by_the_exit_deadline_despite_a_stalled_read() {
     offload.exit_drain = drain;
     let server = Server::start(manager_of(dir.path(), vec![a]), offload);
     let mut client = server.connect(1);
-    // Set this while the peer is live; macOS rejects it after shutdown.
+    // Set the timeout before peer shutdown. macOS rejects later timeout changes.
     client
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(200)))

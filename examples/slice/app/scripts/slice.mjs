@@ -21,7 +21,7 @@ import {
   EVIDENCE_DIR,
   evidenceLink,
   FIGMA_FILE,
-  gitIdentity,
+  generateInputs,
   mirror,
   REPO,
   repoPath,
@@ -35,6 +35,7 @@ import {
   standinPng,
   TOKENS_CSS,
   treeDigest,
+  validateStandin,
   variantTree,
   VIEWPORTS,
   withBuild,
@@ -71,11 +72,12 @@ async function standin() {
   }
   const record = {
     caveat: STANDIN_CAVEAT,
-    file: { name: status.name, path: repoPath(FIGMA_FILE), version: status.version },
+    file: { ...(await digestFile(FIGMA_FILE)), name: status.name, version: status.version },
     images,
     kind: "figma-render-stand-in",
     node: CARD_NODE,
     source: repoPath(join(STANDIN_DIR, "standin", "index.html")),
+    sourceSha256: sha256(await readFile(join(STANDIN_DIR, "standin", "index.html"))),
   };
   await writeFile(STANDIN_RECORD, stableJson(record));
   process.stdout.write(`${repoPath(STANDIN_RECORD)}\n`);
@@ -150,25 +152,18 @@ function comment(evidence, linkBase) {
 /** The default command: the whole slice, writing the token CSS, spec and evidence/. */
 async function run(linkBase) {
   const { compareToDir, stableJson } = await shot();
-  const identity = gitIdentity();
 
   // 1. Tokens and spec, from the synthetic file and the committed snapshot.
   const m = await mirror();
   let status;
+  let identity;
   try {
-    status = m.status();
-    m.exportTokens(TOKENS_CSS);
-    await writeFile(SPEC_JSON, m.spec());
+    ({ status, identity } = await generateInputs(m));
   } finally {
     await m.cleanup();
   }
   const standinRecord = JSON.parse(await readFile(STANDIN_RECORD, "utf8"));
-  if (standinRecord.file.version !== status.version) {
-    throw new Error(
-      `the Figma render stand-in is for version ${standinRecord.file.version} but the mirror is at ${status.version}: ` +
-        "re-render it with `node scripts/slice.mjs standin`",
-    );
-  }
+  await validateStandin(standinRecord, status);
 
   // 2. Builds and captures: before (baseline card), after (the app as is), broken.
   const work = await mkdtemp(join(tmpdir(), "figmog-slice-shots-"));
@@ -235,6 +230,8 @@ async function run(linkBase) {
           images: standinRecord.images,
           kind: standinRecord.kind,
           record: repoPath(STANDIN_RECORD),
+          source: standinRecord.source,
+          sourceSha256: standinRecord.sourceSha256,
           version: standinRecord.file.version,
         },
       },

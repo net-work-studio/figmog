@@ -23,7 +23,7 @@
 //! this one no longer produces are reported as `stale`, never deleted.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -89,11 +89,18 @@ pub(super) fn run(
         .ok_or("assets export writes into the project and does not take --db")?;
     let settings = layout.settings().assets;
     let root = &layout.project_root;
+    let manifest = normalized_path(&settings.manifest)?;
     for (key, dir) in [("icons", &settings.icons), ("images", &settings.images)] {
-        let dir = dir.trim_end_matches('/');
-        if settings.manifest == dir || settings.manifest.starts_with(&format!("{dir}/")) {
+        let output = normalized_path(dir)?;
+        if manifest.starts_with(&output) {
             return Err(format!(
                 "[assets] manifest ({}) must not be inside the {key} folder ({dir}): figmog writes that folder's files itself",
+                settings.manifest
+            ));
+        }
+        if output.starts_with(&manifest) {
+            return Err(format!(
+                "[assets] manifest ({}) must not contain the {key} folder ({dir}): the manifest is a file, not a directory",
                 settings.manifest
             ));
         }
@@ -211,15 +218,11 @@ pub(super) fn run(
     } else {
         BTreeMap::new()
     };
-    let stale = stale(
-        previous.iter().flat_map(|p| {
-            p.icons
-                .iter()
-                .flat_map(|i| [i.path.as_str(), i.svg.as_str()])
-                .chain(p.images.iter().map(|i| i.path.as_str()))
-        }),
-        &plan.files,
-    );
+    let previous_paths: BTreeSet<String> = previous
+        .iter()
+        .flat_map(AssetIndex::generated_paths)
+        .collect();
+    let stale = stale(root, previous_paths.iter().map(String::as_str), &plan.files);
     let written = statuses.values().filter(|s| **s == "written").count();
     let files: Vec<Value> = statuses
         .iter()
@@ -445,12 +448,28 @@ fn fetch_routed(
 /// path that differs from a new one only in case (a renamed icon on a
 /// case-insensitive filesystem is the same, live file).
 fn stale<'a>(
+    root: &Path,
     previous: impl Iterator<Item = &'a str>,
     files: &BTreeMap<String, (Kind, Vec<u8>)>,
 ) -> Vec<&'a str> {
-    let live: BTreeSet<String> = files.keys().map(|p| p.to_lowercase()).collect();
+    let live_casefolded: BTreeSet<String> = files.keys().map(|p| p.to_lowercase()).collect();
     previous
-        .filter(|p| !live.contains(&p.to_lowercase()))
+        .filter(|p| {
+            if files.contains_key(*p) {
+                return false;
+            }
+            if !live_casefolded.contains(&p.to_lowercase()) {
+                return true;
+            }
+            // A differently spelled old path is live only if looking it
+            // up actually aliases a new filename on this filesystem.
+            let alias = check_target(root, p).ok().and_then(|e| e.alias);
+            let actual = alias.map(|name| match p.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/{name}"),
+                None => name,
+            });
+            !actual.is_some_and(|actual| files.contains_key(&actual))
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -633,6 +652,42 @@ fn ensure_dirs(root: &Path, rel_dir: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// A checked path's lexical destination. Keep the configured spelling in
+/// reports and manifests, but compare the components the writer will use.
+fn normalized_path(path: &str) -> Result<PathBuf, String> {
+    check_project_path(path).map_err(|e| format!("{path}: {e}"))?;
+    Ok(Path::new(path)
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .collect())
+}
+
+/// Validate the entire planned file/directory graph before looking at or
+/// writing targets. Existing-file checks cannot see directories introduced
+/// by another planned output.
+fn check_planned_paths(plan: &Plan) -> Result<(), String> {
+    let mut destinations = BTreeMap::new();
+    for path in plan.files.keys() {
+        let destination = normalized_path(path)?;
+        if let Some(previous) = destinations.insert(destination.clone(), path) {
+            return Err(format!(
+                "planned asset paths {previous:?} and {path:?} name the same file ({})",
+                destination.display()
+            ));
+        }
+    }
+    for (destination, path) in &destinations {
+        for parent in destination.ancestors().skip(1) {
+            if let Some(file) = destinations.get(parent) {
+                return Err(format!(
+                    "planned asset file {file:?} must be a directory for {path:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Check every planned file, then write the ones whose bytes (or
 /// on-disk spelling) differ. Returns each path's status (`written` /
 /// `unchanged`).
@@ -641,6 +696,7 @@ fn write_files(
     plan: &Plan,
     force: bool,
 ) -> Result<BTreeMap<String, &'static str>, String> {
+    check_planned_paths(plan)?;
     let mut statuses = BTreeMap::new();
     let mut aliases = BTreeMap::new();
     for (rel, (kind, bytes)) in &plan.files {
@@ -749,6 +805,42 @@ mod tests {
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
     }
 
+    #[test]
+    fn rejects_planned_output_collisions_before_writing() {
+        for paths in [
+            ["src/./icons/index.ts", "src/icons/index.ts"],
+            ["./src/icons/index.ts", "src//icons/index.ts"],
+            ["src", "src/icons/IconA.tsx"],
+            ["src/./icons/svg", "src/icons/svg/IconA.svg"],
+        ] {
+            for force in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let files = paths
+                    .into_iter()
+                    .map(|path| {
+                        (
+                            path.to_string(),
+                            (Kind::Generated, assets::js_header().into_bytes()),
+                        )
+                    })
+                    .collect();
+                let plan = Plan {
+                    files,
+                    icons: vec![],
+                    images: vec![],
+                    skipped: vec![],
+                };
+                let error = write_files(dir.path(), &plan, force).unwrap_err();
+                assert!(error.contains("planned asset"), "{error}");
+                assert_eq!(
+                    std::fs::read_dir(dir.path()).unwrap().count(),
+                    0,
+                    "{paths:?}"
+                );
+            }
+        }
+    }
+
     /// Case-insensitive filesystems, simulated: a lookup of `IconStar.tsx`
     /// that finds `Iconstar.tsx` is an alias, never an exact match.
     #[test]
@@ -767,16 +859,20 @@ mod tests {
     }
 
     #[test]
-    fn a_case_alias_of_a_live_file_is_not_stale() {
-        let mut files = BTreeMap::new();
-        files.insert(
+    fn case_differences_are_not_assumed_to_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [(
             "src/icons/IconStar.tsx".to_string(),
             (Kind::Generated, vec![]),
-        );
-        let previous = ["src/icons/Iconstar.tsx", "src/icons/IconGone.tsx"];
+        )]
+        .into();
         assert_eq!(
-            stale(previous.into_iter(), &files),
-            ["src/icons/IconGone.tsx"]
+            stale(
+                dir.path(),
+                ["src/icons/Iconstar.tsx", "src/icons/IconGone.tsx"].into_iter(),
+                &files
+            ),
+            ["src/icons/IconGone.tsx", "src/icons/Iconstar.tsx"]
         );
     }
 
@@ -808,6 +904,12 @@ mod tests {
         // is left for `stale`); case-insensitive: only the new spelling.
         assert!(names.contains(&"IconStar.tsx".to_string()), "{names:?}");
         assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+        let stale_paths = stale(root, ["icons/Iconstar.tsx"].into_iter(), &plan.files);
+        if names.contains(&"Iconstar.tsx".to_string()) {
+            assert_eq!(stale_paths, ["icons/Iconstar.tsx"]);
+        } else {
+            assert!(stale_paths.is_empty(), "{stale_paths:?}");
+        }
         assert_eq!(std::fs::read(root.join("icons/IconStar.tsx")).unwrap(), new);
         // Unchanged bytes: nothing written.
         assert_eq!(

@@ -378,11 +378,10 @@ pub(crate) fn react_component(
     out.push('\n');
     out.push_str(&format!("export function {name}({props}) {{\n"));
     if ids {
-        // `useId` is unique per rendered instance; its punctuation varies
-        // across React versions and isn't id/url()-safe, so it is reduced
-        // to letters, digits, `_` and `-` (still unique: the punctuation
-        // only delimits).
-        out.push_str("  const uid = `figmog${useId().replace(/[^A-Za-z0-9_-]/g, \"\")}`;\n");
+        // Encode every UTF-16 code unit at a fixed width. Removing punctuation
+        // loses uniqueness across roots whose identifierPrefix differs by it;
+        // code-unit encoding also distinguishes arbitrary Unicode prefixes.
+        out.push_str("  const uid = `figmog${useId().split(\"\").map((c) => c.charCodeAt(0).toString(16).padStart(4, \"0\")).join(\"\")}`;\n");
     }
     out.push_str("  return (\n");
     out.push_str(&svg.to_jsx(
@@ -461,11 +460,21 @@ fn join(dir: &str, file: &str) -> String {
 /// (the Vite / Next.js static folder, served from `/`).
 fn public_url(dir: &str, file: &str) -> Option<String> {
     let dir = dir.trim_end_matches('/');
-    if dir == "public" {
-        return Some(format!("/{file}"));
+    let relative = if dir == "public" {
+        file.to_string()
+    } else {
+        format!("{}/{file}", dir.strip_prefix("public/")?)
+    };
+    let mut url = String::from("/");
+    for byte in relative.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            url.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(url, "%{byte:02X}").expect("writing a string");
+        }
     }
-    dir.strip_prefix("public/")
-        .map(|rest| format!("/{rest}/{file}"))
+    Some(url)
 }
 
 fn skip(kind: &str, subject: (&str, &str), reason: String) -> Value {
@@ -523,10 +532,10 @@ pub(crate) fn plan(
             }
         };
         let single = svg.single_color();
-        let converted = settings.current_color && single.is_some();
-        if let Some(color) = single.as_deref().filter(|_| converted) {
-            svg.use_current_color(color);
-        }
+        let converted = settings.current_color
+            && single
+                .as_deref()
+                .is_some_and(|color| svg.use_current_color(color));
         ready.push(Ready {
             source: icon.source,
             name,
@@ -894,6 +903,30 @@ impl AssetIndex {
         Ok(index)
     }
 
+    /// Files a previous export generated, including the barrel implied
+    /// by each icon component's directory and language. Deriving barrels
+    /// also covers manifests written before they were inventoried.
+    pub(crate) fn generated_paths(&self) -> BTreeSet<String> {
+        let mut paths = BTreeSet::new();
+        for icon in &self.icons {
+            paths.insert(icon.path.clone());
+            paths.insert(icon.svg.clone());
+            let index = if icon.path.ends_with(".tsx") {
+                "index.ts"
+            } else if icon.path.ends_with(".jsx") {
+                "index.js"
+            } else {
+                continue;
+            };
+            paths.insert(match icon.path.rsplit_once('/') {
+                Some((dir, _)) => join(dir, index),
+                None => index.to_string(),
+            });
+        }
+        paths.extend(self.images.iter().map(|i| i.path.clone()));
+        paths
+    }
+
     /// This index for a spec of file `target` (none: unknown — no icon is
     /// then matched by node id).
     pub(crate) fn for_file(mut self, target: Option<&str>) -> AssetIndex {
@@ -1146,6 +1179,104 @@ mod tests {
         assert_eq!(p.icons[0]["current_color"], false);
         assert_eq!(p.icons[1]["current_color"], true);
         assert!(p.files.contains_key("src/icons/index.js"));
+    }
+
+    #[test]
+    fn current_color_report_reflects_conservative_conversion_declines() {
+        let mut settings = settings();
+        settings.current_color = true;
+        for (svg, converted) in [
+            (
+                r##"<svg><defs><rect id="a" width="10" height="10"/></defs><use href="#a" fill="none"/></svg>"##,
+                false,
+            ),
+            (
+                r##"<svg><rect fill="#ff000080" width="10" height="10"/></svg>"##,
+                true,
+            ),
+            (
+                r##"<svg fill="#ff000080"><rect width="10" height="10"/></svg>"##,
+                false,
+            ),
+            (
+                r##"<svg fill="white"><mask id="m"><rect width="10" height="10"/></mask><rect width="10" height="10" mask="url(#m)"/></svg>"##,
+                false,
+            ),
+            (
+                r##"<svg fill="none"><defs><rect id="a" fill="#ff000080" width="10" height="10"/></defs><use href="#a" fill-opacity="0"/><use href="#a" fill-opacity="0.25"/></svg>"##,
+                false,
+            ),
+            (
+                r##"<svg fill="none"><defs><rect id="a" stroke="#ff000080" width="10" height="10"/></defs><use href="#a" stroke-opacity="0"/><use href="#a" stroke-opacity="0.75"/></svg>"##,
+                false,
+            ),
+        ] {
+            let plan = plan(
+                &settings,
+                vec![icon("1:1", "paint", svg)],
+                vec![],
+                &Sources::default(),
+                &Inventory::default(),
+            );
+            assert_eq!(plan.icons[0]["current_color"], converted);
+            let manifest: Value =
+                serde_json::from_slice(&plan.files["figmog.assets.json"].1).unwrap();
+            assert_eq!(manifest["icons"][0]["current_color"], converted);
+            let output = String::from_utf8_lossy(&plan.files["src/icons/IconPaint.tsx"].1);
+            assert_eq!(output.contains("currentColor"), converted);
+        }
+    }
+
+    #[test]
+    fn public_image_urls_encode_path_segments_and_round_trip() {
+        for (dir, encoded) in [
+            ("public/design images", "/design%20images"),
+            ("public/icônes", "/ic%C3%B4nes"),
+            ("public/a#b/c?d/100%", "/a%23b/c%3Fd/100%25"),
+            ("public", ""),
+        ] {
+            let mut s = settings();
+            s.images = dir.into();
+            let p = plan(
+                &s,
+                Vec::new(),
+                vec![ImageInput {
+                    image_ref: "aa".into(),
+                    nodes: BTreeSet::new(),
+                    bytes: Ok(b"GIF89a".to_vec()),
+                }],
+                &Sources::default(),
+                &Inventory::default(),
+            );
+            let manifest: Value = serde_json::from_slice(&p.files["figmog.assets.json"].1).unwrap();
+            let index = AssetIndex::from_json(&manifest, "manifest").unwrap();
+            let image = &index.images[0];
+            let filename = image.path.rsplit('/').next().unwrap();
+            assert_eq!(image.path, format!("{dir}/{filename}"));
+            assert_eq!(
+                image.url.as_deref(),
+                Some(format!("{encoded}/{filename}").as_str())
+            );
+            assert!(p.files.contains_key(&image.path));
+            assert_eq!(
+                AssetIndex::from_json(&index.to_json(), "normalized").unwrap(),
+                index
+            );
+        }
+        assert_eq!(public_url("src/images", "x.png"), None);
+    }
+
+    #[test]
+    fn previous_inventory_includes_barrels_from_each_directory_and_language() {
+        let index = AssetIndex::from_json(&json!({"icons": [
+            {"node_id": "1:1", "component": "IconA", "path": "old/IconA.tsx", "svg": "old/svg/IconA.svg"},
+            {"node_id": "1:2", "component": "IconB", "path": "other/IconB.jsx", "svg": "other/svg/IconB.svg"},
+            {"node_id": "1:3", "component": "IconC", "path": "old/IconC.tsx", "svg": "old/svg/IconC.svg"}
+        ]}), "manifest").unwrap();
+        let paths = index.generated_paths();
+        assert_eq!(paths.len(), 8);
+        assert!(paths.contains("old/index.ts"));
+        assert!(paths.contains("other/index.js"));
     }
 
     #[test]

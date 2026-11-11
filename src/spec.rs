@@ -42,7 +42,7 @@ use css::{Css, CssVal, num, px};
 struct Var {
     name: String,
     resolved_type: String,
-    collection: String,
+    collection_key: String,
     default_mode: Option<String>,
     scopes: Vec<String>,
     /// Mode name → raw value or alias.
@@ -314,7 +314,10 @@ impl Tokens {
                 Var {
                     name: text("name"),
                     resolved_type: text("resolved_type"),
-                    collection: text("collection"),
+                    collection_key: row["collection_id"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| text("collection")),
                     default_mode: row["default_mode"].as_str().map(str::to_string),
                     scopes: row["scopes"]
                         .as_array()
@@ -412,7 +415,7 @@ fn root_value(
     depth: usize,
 ) -> Option<Lit> {
     let v = all.get(id)?;
-    let mode = roots.get(&v.collection).or(v.default_mode.as_ref())?;
+    let mode = roots.get(&v.collection_key).or(v.default_mode.as_ref())?;
     let raw = v.values.get(mode)?;
     if raw["type"] == "VARIABLE_ALIAS" {
         return (depth < 32)
@@ -797,6 +800,14 @@ impl Cx<'_> {
             };
             let unit = self.tokens.units.get(var).copied();
             return match (want, unit) {
+                (Want::Color, _) if e["paint_opacity"].as_f64().is_some() => {
+                    let opacity = e["paint_opacity"].as_f64().expect("checked above");
+                    Some(CssVal::lit(format!(
+                        "color-mix(in srgb, {} {}%, transparent)",
+                        plain.value,
+                        num(opacity * 100.0)
+                    )))
+                }
                 (Want::Color | Want::Family, _) | (_, None) => Some(plain),
                 (Want::Px | Want::PxNonZero, Some(Some("px")))
                 | (Want::Opacity, Some(Some("%")))
@@ -866,7 +877,16 @@ impl Cx<'_> {
         let mut layout = Map::new();
         let mut values = Map::new();
         let mut content = Map::new();
-        let vector = VECTOR_LIKE.contains(&node_type.as_str());
+        let ellipse = node_type == "ELLIPSE";
+        let full_ellipse = ellipse
+            && n.get("arcData").is_none_or(|arc| {
+                arc["innerRadius"].as_f64().unwrap_or(0.0) == 0.0
+                    && (arc["endingAngle"].as_f64().unwrap_or(std::f64::consts::TAU)
+                        - arc["startingAngle"].as_f64().unwrap_or(0.0))
+                    .abs()
+                        >= std::f64::consts::TAU - 1e-6
+            });
+        let vector = VECTOR_LIKE.contains(&node_type.as_str()) || (ellipse && !full_ellipse);
 
         // Own layout.
         let kids: &[Value] = if vector {
@@ -967,6 +987,9 @@ impl Cx<'_> {
         self.strokes(n, &id, &node_type, vector, &mut values, &mut css);
         if let Some(radius) = self.radius(n, &id, (!vector).then_some(&mut css)) {
             values.insert("radius".into(), radius);
+        }
+        if full_ellipse {
+            css.lit("border-radius", "50%");
         }
         let effects = self.effects(n, &id, node_type == "TEXT", vector, &mut css);
         if !effects.is_empty() {
@@ -1529,8 +1552,7 @@ impl Cx<'_> {
             // CSS offsets from the padding box: inside the parent's border.
             let inset = |v: f64| match &up.border {
                 None => px(v),
-                Some(b) if b.is_var() => format!("calc({} - {})", px(v), b.value),
-                Some(b) => px(v - b.value.trim_end_matches("px").parse::<f64>().unwrap_or(0.0)),
+                Some(b) => b.inset(v),
             };
             match constraint {
                 "LEFT" | "TOP" | "MIN" => {
@@ -1701,7 +1723,12 @@ impl Cx<'_> {
                 continue;
             };
             let lit = Lit::Color(hex.clone());
-            out.push(self.tokens.entry(binding, json!(hex), Some(&lit), prop));
+            let mut entry = self.tokens.entry(binding, json!(hex), Some(&lit), prop);
+            let opacity = paint["opacity"].as_f64().unwrap_or(1.0);
+            if entry.get("variable_id").is_some() && opacity != 1.0 {
+                entry["paint_opacity"] = json!(opacity.clamp(0.0, 1.0));
+            }
+            out.push(entry);
         }
         if let Some((property, css)) = css {
             match (visible, out.as_slice()) {
@@ -1999,7 +2026,15 @@ impl Cx<'_> {
         let runs = self.runs(n, id);
         let mixed = runs.is_some();
         let typography = self.typography(n, id, mixed);
-        self.type_css(id, &n["style"], &typography, css);
+        let mut base_style = n["style"].clone();
+        if mixed {
+            // Decorations propagate through descendants and cannot be cancelled
+            // by a span, so mixed text applies them to each run instead.
+            if let Some(style) = base_style.as_object_mut() {
+                style.remove("textDecoration");
+            }
+        }
+        self.type_css(id, &base_style, &typography, css, false);
         if !typography.is_empty() {
             values.insert("typography".into(), Value::Object(typography));
         }
@@ -2106,6 +2141,7 @@ impl Cx<'_> {
             run.insert("end".into(), json!(end));
             run.insert("text".into(), json!(text));
             run.insert("style".into(), json!(style));
+            let mut run_css = Css::default();
             if style != 0 {
                 let Some(o) = n["styleOverrideTable"].get(style.to_string()) else {
                     self.unsupported(
@@ -2120,8 +2156,7 @@ impl Cx<'_> {
                 self.style_base = base.clone();
                 let typography = self.typography(&pseudo, id, true);
                 self.style_base = "/style".into();
-                let mut run_css = Css::default();
-                self.type_css(id, o, &typography, &mut run_css);
+                self.type_css(id, o, &typography, &mut run_css, true);
                 if !typography.is_empty() {
                     run.insert("typography".into(), Value::Object(typography));
                 }
@@ -2139,12 +2174,22 @@ impl Cx<'_> {
                 if !fills.is_empty() {
                     run.insert("fill".into(), Value::Array(fills));
                 }
-                if !run_css.is_empty() {
-                    if self.tailwind {
-                        run.insert("tailwind".into(), json!(run_css.tailwind()));
-                    }
-                    run.insert("css".into(), run_css.to_json());
+            }
+            let decoration = n["styleOverrideTable"][style.to_string()]
+                .get("textDecoration")
+                .filter(|_| style != 0)
+                .unwrap_or(&n["style"]["textDecoration"]);
+            match decoration.as_str() {
+                Some("UNDERLINE") => run_css.lit("text-decoration-line", "underline"),
+                Some("STRIKETHROUGH") => run_css.lit("text-decoration-line", "line-through"),
+                Some("NONE") => run_css.lit("text-decoration-line", "none"),
+                _ => {}
+            }
+            if !run_css.is_empty() {
+                if self.tailwind {
+                    run.insert("tailwind".into(), json!(run_css.tailwind()));
                 }
+                run.insert("css".into(), run_css.to_json());
             }
             out.push(Value::Object(run));
         }
@@ -2220,6 +2265,7 @@ impl Cx<'_> {
         style: &Value,
         typography: &Map<String, Value>,
         css: &mut Css,
+        run: bool,
     ) {
         for (name, prop) in [
             ("font_family", "font-family"),
@@ -2237,7 +2283,7 @@ impl Cx<'_> {
                 "line_height" if e["raw"] == "auto" && e.get("variable_id").is_none() => {
                     Some(CssVal::lit("normal"))
                 }
-                "letter_spacing" => self.css_value(id, prop, e, Want::PxNonZero),
+                "letter_spacing" if !run => self.css_value(id, prop, e, Want::PxNonZero),
                 _ => self.css_value(id, prop, e, Want::Px),
             };
             if let Some(v) = v {
@@ -2246,12 +2292,19 @@ impl Cx<'_> {
         }
         if style["italic"] == true {
             css.lit("font-style", "italic");
+        } else if run && style["italic"] == false {
+            css.lit("font-style", "normal");
         }
         match style["textAlignHorizontal"].as_str() {
+            Some("LEFT") if run => css.lit("text-align", "left"),
             Some("CENTER") => css.lit("text-align", "center"),
             Some("RIGHT") => css.lit("text-align", "right"),
             Some("JUSTIFIED") => css.lit("text-align", "justify"),
             _ => {}
+        }
+        if run && style["textCase"].is_string() {
+            css.lit("text-transform", "none");
+            css.lit("font-variant-caps", "normal");
         }
         match style["textCase"].as_str() {
             Some("UPPER") => css.lit("text-transform", "uppercase"),
@@ -2275,11 +2328,11 @@ impl Cx<'_> {
     fn icon(&self, n: &Value, id: &str, node_type: &str) -> Option<Value> {
         let assets = self.assets?;
         let icon = match node_type {
-            "INSTANCE" => {
+            "INSTANCE" => assets.icon(None, id).or_else(|| {
                 let cid = n["componentId"].as_str()?;
                 let key = self.components[cid]["key"].as_str();
-                assets.icon(key, cid)?
-            }
+                assets.icon(key, cid)
+            })?,
             _ => assets.icon(None, id)?,
         };
         Some(json!({
@@ -2404,6 +2457,240 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn mixed_runs_reset_inherited_defaults_and_own_their_decorations() {
+        let tree = json!({"id": "1:1", "type": "TEXT", "characters": "ABC",
+        "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 20},
+        "style": {"italic": true, "textCase": "UPPER", "letterSpacing": 2,
+            "textDecoration": "UNDERLINE", "textAlignHorizontal": "RIGHT"},
+        "characterStyleOverrides": [0, 1, 2],
+        "styleOverrideTable": {
+            "1": {"italic": false, "textCase": "ORIGINAL", "letterSpacing": 0,
+                "textDecoration": "NONE", "textAlignHorizontal": "LEFT"},
+            "2": {"fontSize": 12}
+        }});
+        let out = spec(&tree);
+        let node = &out["node"];
+        assert_eq!(node["css"]["font-style"], "italic");
+        assert_eq!(node["css"]["text-transform"], "uppercase");
+        assert_eq!(node["css"]["letter-spacing"], "2px");
+        assert!(node["css"].get("text-decoration-line").is_none());
+        let runs = &node["content"]["runs"];
+        assert_eq!(runs[0]["css"]["text-decoration-line"], "underline");
+        assert_eq!(
+            runs[1]["css"],
+            json!({
+                "font-style": "normal", "text-transform": "none", "font-variant-caps": "normal",
+                "letter-spacing": "0px", "text-decoration-line": "none", "text-align": "left"
+            })
+        );
+        assert_eq!(runs[2]["css"]["text-decoration-line"], "underline");
+        assert!(runs[2]["css"].get("font-style").is_none());
+        assert_eq!(out["unsupported"], json!([]));
+        let mut tree = tree;
+        tree["style"]["textCase"] = json!("SMALL_CAPS");
+        tree["styleOverrideTable"]["1"]["textCase"] = json!("LOWER");
+        let out = spec(&tree);
+        assert_eq!(
+            out["node"]["content"]["runs"][1]["css"]["font-variant-caps"],
+            "normal"
+        );
+        assert_eq!(
+            out["node"]["content"]["runs"][1]["css"]["text-transform"],
+            "lowercase"
+        );
+    }
+
+    #[test]
+    fn full_ellipses_are_round_and_arcs_are_vector_assets() {
+        let mut tree = json!({"id": "1:1", "type": "ELLIPSE",
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 50},
+            "fills": [{"type": "SOLID", "color": {"r": 1, "g": 0, "b": 0}}]});
+        let full = spec(&tree);
+        assert_eq!(full["node"]["css"]["border-radius"], "50%");
+        assert_eq!(full["node"]["css"]["background-color"], "#ff0000");
+        for (end, inner) in [(std::f64::consts::PI, 0.0), (std::f64::consts::TAU, 0.5)] {
+            tree["arcData"] = json!({"startingAngle": 0, "endingAngle": end, "innerRadius": inner});
+            let out = spec(&tree);
+            assert!(out["node"]["css"].get("background-color").is_none());
+            assert!(out["node"]["css"].get("border-radius").is_none());
+            assert_eq!(
+                out["node"]["content"]["assets"][0],
+                json!({"kind": "vector", "node_id": "1:1", "format": "svg"})
+            );
+        }
+        tree["arcData"] =
+            json!({"startingAngle": 0, "endingAngle": std::f64::consts::TAU, "innerRadius": 0});
+        assert_eq!(spec(&tree)["node"]["css"]["border-radius"], "50%");
+    }
+
+    #[test]
+    fn explicitly_exported_instance_precedes_its_main_component() {
+        let icon = |id: &str, component: &str, file: &str| {
+            json!({"node_id": id,
+            "component": component, "file": file, "key": if id == "9:9" { Some("MainKey") } else { None },
+            "path": format!("src/icons/{component}.tsx"), "svg": format!("src/icons/svg/{component}.svg")})
+        };
+        let assets = AssetIndex::from_json(
+            &json!({"icons": [
+                icon("1:3", "IconInstance", "ABCDEFGHIJKLMNOPQRSTUV"), icon("9:9", "IconMain", "ABCDEFGHIJKLMNOPQRSTUV")
+            ]}),
+            "test",
+        )
+        .unwrap()
+        .for_file(Some("ABCDEFGHIJKLMNOPQRSTUV"));
+        let vars = json!({"snapshot": {"state": "none"}, "variables": []});
+        let tree = json!({"id": "1:3", "type": "INSTANCE", "componentId": "9:9"});
+        let components = json!({"9:9": {"key": "MainKey"}});
+        let run = |assets: &AssetIndex, components: &Value| {
+            build(
+                &tree,
+                &vars,
+                components,
+                &ExportOptions::default(),
+                false,
+                None,
+                Some(assets),
+            )
+        };
+        assert_eq!(
+            run(&assets, &components)["node"]["content"]["assets"][0]["component"],
+            "IconInstance"
+        );
+        let foreign = assets.for_file(Some("ZYXWVUTSRQPONMLKJIHGFE"));
+        assert_eq!(
+            run(&foreign, &components)["node"]["content"]["assets"][0]["component"],
+            "IconMain"
+        );
+        assert!(
+            run(&foreign, &json!({}))["node"]["content"]
+                .get("assets")
+                .is_none()
+        );
+        let instance_only = AssetIndex::from_json(
+            &json!({"icons": [icon("1:3", "IconInstance", "ABCDEFGHIJKLMNOPQRSTUV")]}),
+            "test",
+        )
+        .unwrap()
+        .for_file(Some("ABCDEFGHIJKLMNOPQRSTUV"));
+        assert_eq!(
+            run(&instance_only, &components)["node"]["content"]["assets"][0]["component"],
+            "IconInstance"
+        );
+    }
+
+    #[test]
+    fn bound_paints_retain_paint_opacity_and_token_alpha() {
+        let mut vars = unit_vars();
+        vars["variables"][0] = json!({"source": "imported", "variable_id": "V:1", "name": "red",
+            "resolved_type": "COLOR", "collection": "C", "collection_id": "C:1",
+            "default_mode": "M", "scopes": ["ALL_SCOPES"],
+            "values_by_mode": {"M": {"r": 1, "g": 0, "b": 0, "a": 0.5}}});
+        let paint = json!({"type": "SOLID", "opacity": 0.5, "color": {"r": 1, "g": 0, "b": 0, "a": 0.5},
+            "boundVariables": {"color": {"type": "VARIABLE_ALIAS", "id": "V:1"}}});
+        for ty in ["RECTANGLE", "TEXT"] {
+            let tree = json!({"id": "1:1", "type": ty, "characters": "A", "fills": [paint],
+                "strokes": [paint], "strokeWeight": 2, "strokeAlign": "INSIDE"});
+            let out = build(
+                &tree,
+                &vars,
+                &json!({}),
+                &ExportOptions::default(),
+                false,
+                None,
+                None,
+            );
+            let node = &out["node"];
+            assert_eq!(node["values"]["fill"][0]["raw"], "#ff000040");
+            assert_eq!(node["values"]["fill"][0]["paint_opacity"], 0.5);
+            assert_eq!(
+                node["css"][if ty == "TEXT" {
+                    "color"
+                } else {
+                    "background-color"
+                }],
+                "color-mix(in srgb, var(--red) 50%, transparent)"
+            );
+            if ty != "TEXT" {
+                assert_eq!(
+                    node["css"]["outline-color"],
+                    "color-mix(in srgb, var(--red) 50%, transparent)"
+                );
+            }
+            assert!(node["css"].get("opacity").is_none());
+        }
+    }
+
+    #[test]
+    fn converted_stroke_lengths_remain_symbolic_for_offsets_and_insets() {
+        let mut tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL",
+            "strokes": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0}}],
+            "strokeWeight": 2, "strokeAlign": "INSIDE",
+            "boundVariables": {"strokeWeight": {"type": "VARIABLE_ALIAS", "id": "V:1"}},
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 50},
+            "children": [{"id": "1:2", "type": "RECTANGLE", "layoutPositioning": "ABSOLUTE",
+                "absoluteBoundingBox": {"x": 10, "y": 10, "width": 20, "height": 10}}]});
+        let run = |tree: &Value| {
+            build(
+                tree,
+                &unit_vars(),
+                &json!({}),
+                &ExportOptions::default(),
+                false,
+                None,
+                None,
+            )
+        };
+        for (align, factor) in [("INSIDE", "-1"), ("CENTER", "-0.5")] {
+            tree["strokeAlign"] = json!(align);
+            let out = run(&tree);
+            assert_eq!(
+                out["node"]["css"]["outline-offset"],
+                format!("calc(calc(var(--space-raw) * 1px) * {factor})")
+            );
+        }
+        tree["strokeAlign"] = json!("INSIDE");
+        tree["strokesIncludedInLayout"] = json!(true);
+        let out = run(&tree);
+        let css = &out["node"]["children"][0]["css"];
+        assert_eq!(css["left"], "calc(10px - calc(var(--space-raw) * 1px))");
+        assert_eq!(css["top"], "calc(10px - calc(var(--space-raw) * 1px))");
+    }
+
+    #[test]
+    fn root_value_matching_uses_collection_ids_for_duplicate_display_names() {
+        let vars = json!({"snapshot": {"state": "current"}, "variables": [
+            {"source": "imported", "variable_id": "V:1", "name": "a", "resolved_type": "FLOAT",
+                "collection": "Same", "collection_id": "C:1", "default_mode": "DefaultA", "scopes": ["GAP"],
+                "values_by_mode": {"DefaultA": 1, "OtherA": 2}},
+            {"source": "imported", "variable_id": "V:2", "name": "b", "resolved_type": "FLOAT",
+                "collection": "Same", "collection_id": "C:2", "default_mode": "DefaultB", "scopes": ["GAP"],
+                "values_by_mode": {"DefaultB": 3, "OtherB": 4}}
+        ]});
+        let options = ExportOptions {
+            modes: BTreeMap::from([
+                ("Same/OtherA".into(), ":root".into()),
+                ("Same/OtherB".into(), ":root".into()),
+            ]),
+            ..ExportOptions::default()
+        };
+        for (gap, id) in [(2, "V:1"), (4, "V:2")] {
+            let out = build(
+                &json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL", "itemSpacing": gap}),
+                &vars,
+                &json!({}),
+                &options,
+                false,
+                None,
+                None,
+            );
+            assert_eq!(
+                out["node"]["layout"]["gap"]["matches"][0]["variable_id"], id,
+                "{out}"
+            );
+        }
     }
 
     #[test]

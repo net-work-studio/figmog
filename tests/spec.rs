@@ -584,3 +584,59 @@ fn spec_follows_the_projects_token_mode_mapping() {
     let stderr = String::from_utf8_lossy(&bad.get_output().stderr).to_string();
     assert!(stderr.contains("tokens.modes"), "{stderr}");
 }
+
+#[test]
+fn font_family_hints_match_the_css_string_values() {
+    let families = [
+        "Foo_Bar",
+        "O'Reilly",
+        "Space Family",
+        "\"Quoted\" Family",
+        r"Back\Slash_Pro",
+        "Fancy (Alt)_Face",
+        "Foo[Bar]_Alt",
+        "Ångström_Face",
+    ];
+    let children: Vec<Value> = families.iter().enumerate().map(|(i, family)| {
+        json!({"id": format!("2:{i}"), "name": family, "type": "TEXT", "characters": "Font sample",
+            "absoluteBoundingBox": {"x": 0, "y": i * 20, "width": 200, "height": 20},
+            "style": {"fontFamily": family}})
+    }).collect();
+    let file = json!({"name": "Synthetic font names", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
+        "document": {"id": "0:0", "type": "DOCUMENT", "name": "Fonts", "children": [
+            {"id": "0:1", "type": "CANVAS", "name": "Fonts", "children": [
+                {"id": "1:0", "type": "FRAME", "name": "Fonts", "layoutMode": "VERTICAL",
+                    "absoluteBoundingBox": {"x": 0, "y": 0, "width": 200, "height": 160}, "children": children}
+            ]}
+        ]}, "components": {}, "styles": {}});
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("fonts.json");
+    std::fs::write(&input, serde_json::to_vec(&file).unwrap()).unwrap();
+    let db = dir.path().join("db").display().to_string();
+    common::command()
+        .args(["--db", &db, "pull", "--from-file"])
+        .arg(&input)
+        .assert()
+        .success();
+    let output: Value =
+        serde_json::from_slice(&stdout(&db, &["spec", "1:0", "--tailwind"])).unwrap();
+    let cases: Vec<Value> = output["node"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(families)
+        .map(|(node, family)| {
+            let hint = node["tailwind"]
+                .as_str()
+                .unwrap()
+                .split_ascii_whitespace()
+                .find(|hint| hint.starts_with("[font-family:"))
+                .unwrap();
+            json!({"family": family, "css": node["css"]["font-family"], "tailwind": hint})
+        })
+        .collect();
+    assert_eq!(cases.len(), families.len());
+    let mut bytes = serde_json::to_vec_pretty(&cases).unwrap();
+    bytes.push(b'\n');
+    golden("font-families.json", &bytes);
+}

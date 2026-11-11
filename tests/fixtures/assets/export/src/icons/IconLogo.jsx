@@ -3,7 +3,7 @@
 import { useId } from "react";
 
 export function IconLogo(props) {
-  const uid = `figmog${useId().replace(/[^A-Za-z0-9_-]/g, "")}`;
+  const uid = `figmog${useId().split("").map((c) => c.charCodeAt(0).toString(16).padStart(4, "0")).join("")}`;
   return (
     <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden={props["aria-label"] || props["aria-labelledby"] ? undefined : true} {...props}>
       <mask id={`${uid}-0`} style={{ maskType: "alpha" }} maskUnits="userSpaceOnUse" x="0" y="0" width="24" height="24">

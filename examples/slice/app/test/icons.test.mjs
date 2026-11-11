@@ -86,6 +86,23 @@ describe("generated icon components", () => {
     }
   });
 
+  test("independent roots keep distinct identifier prefixes distinct", () => {
+    const { IconLogo, IconStar } = components;
+    const prefixes = ["a:b", "ab", "a b", "a/b", "😀", "😁"];
+    const markup = prefixes.map((identifierPrefix) => renderToStaticMarkup(
+      createElement(Fragment, null, createElement(IconLogo), createElement(IconStar)),
+      { identifierPrefix },
+    )).join("");
+    const all = ids(markup);
+    assert.equal(all.length, prefixes.length * 3);
+    assert.equal(new Set(all).size, all.length, `duplicate ids across roots: ${all.join(", ")}`);
+    for (const svg of svgs(markup)) {
+      const own = new Set(ids(svg));
+      for (const ref of refs(svg)) assert.ok(own.has(ref), `#${ref} does not resolve inside ${svg}`);
+      for (const id of own) assert.match(id, /^[A-Za-z0-9_-]+$/);
+    }
+  });
+
   test("single-color icons follow currentColor; the multicolor logo keeps its colors", () => {
     const { IconLogo, IconStar, IconArrowRight } = components;
     const star = render(createElement(IconStar));

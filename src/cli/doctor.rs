@@ -10,7 +10,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -156,12 +156,11 @@ pub(super) fn cmd_doctor(upstream: &str) -> (Value, bool) {
     // file_access, variables_access
     match (&token, &key) {
         (Some(token), Some(key)) => {
-            let api = UreqApi::for_sessions(token.clone()).with_timeout(API_TIMEOUT);
-            let access = file_access_check(&api, key);
+            let access = figma_check("file_access", token, key, file_access_check);
             let reached = access.status == Status::Ok;
             checks.push(access);
             checks.push(if reached {
-                variables_check(&api, key)
+                figma_check("variables_access", token, key, variables_check)
             } else {
                 check(
                     "variables_access",
@@ -273,6 +272,59 @@ fn unreachable(name: &'static str, error: &ApiError) -> Check {
         Status::Warn,
         format!("could not reach Figma ({error}); rerun when online"),
     )
+}
+
+/// Bound the complete check, including the synchronous system resolver
+/// ureq runs before its socket deadlines. Workers own their client and
+/// inputs, so a timed-out check can be abandoned without delaying doctor.
+fn figma_check(
+    name: &'static str,
+    token: &str,
+    key: &str,
+    request: fn(&dyn FigmaApi, &str) -> Check,
+) -> Check {
+    let token = token.to_string();
+    let key = key.to_string();
+    check_within(name, API_TIMEOUT, move |deadline| {
+        let api = UreqApi::for_sessions(token)
+            .with_timeout(deadline.saturating_duration_since(Instant::now()));
+        request(&api, &key)
+    })
+}
+
+/// Wait for at most one overall budget. Dropping the receiver discards a
+/// late result; dropping the worker's handle detaches it rather than joining
+/// a stuck resolver. The HTTP client also receives only the remaining budget.
+fn check_within(
+    name: &'static str,
+    timeout: Duration,
+    request: impl FnOnce(Instant) -> Check + Send + 'static,
+) -> Check {
+    let deadline = Instant::now() + timeout;
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name(format!("figmog-doctor-{name}"))
+        .spawn(move || {
+            let result = request(deadline);
+            let _ = tx.send((Instant::now(), result));
+        });
+    if let Err(error) = spawned {
+        return unreachable(name, &ApiError::Network(format!("starting check: {error}")));
+    }
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok((finished, result)) if finished <= deadline => result,
+        Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => unreachable(
+            name,
+            &ApiError::Network(format!(
+                "check took longer than {} s, including name resolution",
+                timeout.as_secs_f64()
+            )),
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => unreachable(
+            name,
+            &ApiError::Network("check worker ended without a result".into()),
+        ),
+    }
 }
 
 /// `GET /v1/files/:key/meta` (Tier 3, cheap).
@@ -493,6 +545,98 @@ fn resolve_within(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// A stalled lookup inside either Figma operation must not hold up
+    /// the report. No real resolver or Figma service is needed to park it.
+    #[test]
+    fn stalled_figma_checks_warn_at_the_deadline_and_allow_later_checks() {
+        struct StalledApi {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl StalledApi {
+            fn wait(&self) {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+        }
+        impl FigmaApi for StalledApi {
+            fn file_meta(&self, _: &str) -> Result<crate::api::FileMetaResp, ApiError> {
+                self.wait();
+                Ok(crate::api::FileMetaResp {
+                    name: "Synthetic".into(),
+                    last_touched_at: "synthetic".into(),
+                })
+            }
+            fn file(&self, _: &str, _: bool) -> Result<Value, ApiError> {
+                unreachable!("doctor only requests file metadata");
+            }
+            fn variables_local(&self, _: &str) -> Result<Option<Value>, ApiError> {
+                self.wait();
+                Ok(Some(json!({})))
+            }
+        }
+        for (name, request) in [
+            (
+                "file_access",
+                file_access_check as fn(&dyn FigmaApi, &str) -> Check,
+            ),
+            ("variables_access", variables_check),
+        ] {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let started = Instant::now();
+            let result = check_within(name, Duration::from_millis(100), move |_| {
+                let api = StalledApi {
+                    started: started_tx,
+                    release: wait,
+                };
+                let result = request(&api, "synthetic-file");
+                finished_tx.send(result.status).unwrap();
+                result
+            });
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(result.name, name);
+            assert_eq!(result.status, Status::Warn);
+            assert!(
+                result.detail.contains("including name resolution"),
+                "{}",
+                result.detail
+            );
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let following = check_within("following", Duration::from_secs(2), |_| {
+                check("following", Status::Ok, "continued after the stalled check")
+            });
+            assert_eq!(following.status, Status::Ok);
+            // The original operation can finish later without replacing the
+            // warning or blocking the next check. Release it to leave no
+            // parked test worker behind.
+            release.send(()).unwrap();
+            assert_eq!(
+                finished_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Status::Ok
+            );
+        }
+    }
+
+    #[test]
+    fn figma_check_deadline_keeps_completed_results_and_worker_failures() {
+        let result = check_within("file_access", Duration::from_secs(2), |_| {
+            check(
+                "file_access",
+                Status::Fail,
+                "synthetic authentication failure",
+            )
+        });
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(result.detail, "synthetic authentication failure");
+        let result = check_within("variables_access", Duration::from_secs(2), |_| {
+            panic!("synthetic worker failure")
+        });
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("worker ended without a result"));
+    }
 
     /// Review finding (NWS-2946): `localhost` and `*.localhost` go straight
     /// to loopback, never through a resolver that could stall doctor.
