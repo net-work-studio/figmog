@@ -374,6 +374,145 @@ fn a_pull_taking_the_worker_answers_queued_images_busy() {
     h.wait_for("succeeded");
 }
 
+#[test]
+fn queued_images_stay_bounded_across_disconnected_requesters_and_recover() {
+    const QUEUE_LIMIT: usize = sessions::MAX_QUEUED_IMAGES;
+
+    // Drive the real MCP handler and pending-call bookkeeping. Each caller
+    // gets a fresh connection id, then disconnects after its call is accepted.
+    fn submit(
+        manager: &mut SessionManager,
+        offload: &mut Offload,
+        pending: &mut Pending,
+        requester: u64,
+    ) -> Option<Value> {
+        let to = ReplyTo::Socket(requester);
+        assert_eq!(pending.count(to), 0, "a new caller has a fresh allowance");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut handler = FnHandler(|name: &str, args: &Value| {
+            handle_tool_call(
+                manager,
+                offload,
+                &cancel,
+                "disabled",
+                Duration::from_secs(3600),
+                name,
+                args,
+                sessions::SessionResolution::ExistingOnly,
+            )
+        });
+        let reply = mcp::dispatch_message(
+            &frame(json!(1), "figmog_images", json!({"ids": ["0:0"]})),
+            &dispatch::tool_registry(),
+            &mut handler,
+            ToolErrorMode::JsonRpc,
+        )
+        .unwrap();
+        let response = match reply {
+            Reply::Later(call) => {
+                offload.park(&call);
+                pending.insert(to, call);
+                None
+            }
+            Reply::Now(response) => Some(response),
+        };
+        cancel.store(true, Ordering::Relaxed);
+        response
+    }
+
+    fn complete(done: Done, pending: &mut Pending) -> Option<u64> {
+        let (to, call) = pending.remove(done.token)?;
+        assert!(matches!(
+            &done.answer,
+            Answer::Output(Ok(ToolOutput::Raw(_)))
+        ));
+        let response: Value = serde_json::from_str(&answer_frame(done.answer, call)).unwrap();
+        assert_eq!(response["id"], 1);
+        let ReplyTo::Socket(requester) = to else {
+            panic!("image response routed to another requester");
+        };
+        Some(requester)
+    }
+
+    // Always release the stalled worker before the harness drops, including
+    // when an admission assertion fails against an unbounded queue.
+    struct ReleaseOnDrop(mpsc::Sender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    let mut h = mirrored_harness();
+    let mut offload = Offload::new(None);
+    let mut pending = Pending::default();
+    let _release_on_drop = ReleaseOnDrop(h.release.clone());
+    h.api.block_images.store(true, Ordering::Relaxed);
+    assert!(submit(&mut h.manager, &mut offload, &mut pending, 0).is_none());
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "render"
+    );
+    // The first call remains stalled, but later calls may finish normally.
+    h.api.block_images.store(false, Ordering::Relaxed);
+    for requester in 1..=QUEUE_LIMIT as u64 {
+        assert!(submit(&mut h.manager, &mut offload, &mut pending, requester).is_none());
+    }
+    assert_eq!(pending.calls.len(), QUEUE_LIMIT + 1);
+
+    // Connection turnover must not grant more queue capacity or retain more
+    // pending metadata, even though every connection has its own allowance.
+    for requester in (QUEUE_LIMIT + 1)..=(QUEUE_LIMIT * 3) {
+        let response = submit(&mut h.manager, &mut offload, &mut pending, requester as u64)
+            .expect("a full image queue must reject a fresh requester promptly");
+        assert_eq!(response["error"]["code"], -32000);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("image queue is full")
+        );
+        // Rejection may drop a reply allocated before admission. As in the
+        // loop, discard completions for tokens that were never parked.
+        while let Ok(done) = offload.done_rx.try_recv() {
+            assert!(complete(done, &mut pending).is_none());
+        }
+        assert_eq!(pending.calls.len(), QUEUE_LIMIT + 1);
+        assert_eq!(pending.per_requester.len(), QUEUE_LIMIT + 1);
+    }
+
+    h.release.send(()).unwrap();
+    let first = offload
+        .done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(complete(first, &mut pending), Some(0));
+    h.manager.sessions[0].maintain(false);
+    let recovered = (QUEUE_LIMIT * 3 + 1) as u64;
+    assert!(submit(&mut h.manager, &mut offload, &mut pending, recovered).is_none());
+
+    let mut completed = std::collections::BTreeSet::from([0]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !pending.is_empty() {
+        h.manager.sessions[0].maintain(false);
+        while let Ok(done) = offload.done_rx.try_recv() {
+            if let Some(requester) = complete(done, &mut pending) {
+                assert!(completed.insert(requester), "duplicate response");
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "accepted image work did not drain"
+        );
+        std::thread::yield_now();
+    }
+    // Accepted file-worker work stays durable after disconnect; capacity
+    // rejection must not discard those calls or leave their metadata behind.
+    assert_eq!(completed.len(), QUEUE_LIMIT + 2);
+    assert!(completed.contains(&recovered));
+    assert!(pending.per_requester.is_empty());
+}
+
 /// Spawn a serve loop over `manager` whose stdout frames land on the
 /// returned receiver.
 fn spawn_stdio_loop(
@@ -639,14 +778,20 @@ fn stdin_eof_stops_the_desktop_queue_but_delivers_the_in_flight_call() {
     )))
     .unwrap();
     tx.send(Incoming::StdinClosed).unwrap();
-    let drained = stdout.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(drained["id"], "img2", "{drained}");
-    assert_eq!(drained["result"]["isError"], true, "{drained}");
+    let mut responses = BTreeMap::new();
+    // Both queued calls are rejected before either active operation is
+    // released. Their relative completion order is intentionally free.
+    for _ in 0..2 {
+        let response = stdout.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        responses.insert(response["id"].as_str().unwrap().to_string(), response);
+    }
+    assert!(responses.contains_key("img2"));
+    assert!(responses.contains_key("b"));
 
     desktop_release.send(()).unwrap();
     image_release.send(()).unwrap();
-    let mut responses = BTreeMap::new();
-    for _ in 0..3 {
+    for _ in 0..2 {
         let response = stdout.recv_timeout(Duration::from_secs(5)).unwrap();
         responses.insert(response["id"].as_str().unwrap().to_string(), response);
     }
@@ -696,6 +841,8 @@ fn broken_stdout_stops_the_desktop_queue_before_waiting_for_reads() {
     let read_gate = Arc::new(Mutex::new(read_gate));
     let mut offload = Offload::new(Some(desktop));
     offload.exit_drain = Duration::from_secs(3);
+    let (stopped_tx, stopped) = mpsc::channel();
+    offload.stopped = Some(stopped_tx);
     offload.reads.before_read = Some(Arc::new(move |name: &str| {
         let _ = read_seen_tx.send(name.to_string());
         let _ = read_gate
@@ -753,7 +900,7 @@ fn broken_stdout_stops_the_desktop_queue_before_waiting_for_reads() {
         json!({"jsonrpc":"2.0", "id":"p", "method":"ping"}).to_string(),
     ))
     .unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    stopped.recv_timeout(Duration::from_secs(5)).unwrap();
     // A completes during that wait; B must not be sent upstream.
     desktop_release.send(()).unwrap();
     assert!(

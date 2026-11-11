@@ -14,6 +14,7 @@ pub(crate) mod auth;
 pub mod cache;
 pub mod cli;
 mod compact;
+mod deep_json;
 mod dispatch;
 pub mod flatten;
 pub(crate) mod ident;
@@ -34,3 +35,6 @@ pub(crate) mod tokens;
 pub(crate) mod upstream;
 pub mod vars;
 pub(crate) mod watch;
+
+#[cfg(test)]
+mod test_support;

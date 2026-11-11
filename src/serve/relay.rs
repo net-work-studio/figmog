@@ -30,6 +30,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::time::Instant;
 
+use crate::deep_json::OwnedValue;
 use serde_json::{Value, json};
 
 use crate::ident::parse_file_ref;
@@ -59,7 +60,7 @@ enum Msg {
 struct Sent {
     /// The agent's own id for it; `None` for the relay's own requests,
     /// whose answers are not the agent's.
-    agent_id: Option<Value>,
+    agent_id: Option<OwnedValue>,
     method: String,
     /// The frame as sent, with its owner-link id (re-sent after "not
     /// accepted").
@@ -79,7 +80,7 @@ struct Relay {
     /// Files this relay's agent referenced (for the sole-file default).
     referenced: BTreeSet<String>,
     /// The agent's `initialize`, replayed on reconnect.
-    initialize: Option<Value>,
+    initialize: Option<String>,
     writer: Option<UnixStream>,
     epoch: u64,
     pending: BTreeMap<String, Sent>,
@@ -113,6 +114,13 @@ pub(crate) fn run_relay(
         && let Err(error) = shared_store(&layout, key)
     {
         eprintln!("figmog: {error}");
+    }
+    if settings.watch
+        && let Some(key) = &default_key
+        && !attach.contains(key)
+    {
+        shared_store(&layout, key)?;
+        attach.push(key.clone());
     }
     let paths = OwnerPaths::ensure(&layout.mirror_root)?;
     let (tx, rx) = mpsc::channel();
@@ -148,14 +156,10 @@ pub(crate) fn run_relay(
     );
 
     std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            match line {
-                Ok(line) => {
-                    if tx.send(Msg::Stdin(line)).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => break,
+        let mut reader = std::io::stdin().lock();
+        while let Ok(Some(line)) = super::read_bounded_line(&mut reader) {
+            if tx.send(Msg::Stdin(line)).is_err() {
+                return;
             }
         }
         let _ = tx.send(Msg::StdinEof);
@@ -187,11 +191,18 @@ fn to_agent(frame: &str) -> bool {
 /// The answer to `id` when the relay cannot forward it: a tool error as
 /// MCP content (like stdio always got) for `tools/call`, else a JSON-RPC
 /// error.
-fn local_error(id: Value, method: &str, message: &str) -> Value {
+fn local_error(id: OwnedValue, method: &str, message: &str) -> OwnedValue {
     if method == "tools/call" {
-        crate::mcp::call_response(id, ToolErrorMode::McpContent, Err(message.to_string()))
+        OwnedValue(crate::mcp::call_response(
+            id,
+            ToolErrorMode::McpContent,
+            Err(message.to_string()),
+        ))
     } else {
-        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": message}})
+        let mut response =
+            OwnedValue(json!({"jsonrpc": "2.0", "error": {"code": -32000, "message": message}}));
+        response.insert("id".into(), id);
+        response
     }
 }
 
@@ -236,9 +247,11 @@ impl Relay {
         self.writer = Some(writer);
         if let Some(initialize) = self.initialize.clone() {
             let owner_id = self.owner_id();
-            let mut replay = initialize;
-            replay["id"] = json!(owner_id);
-            let frame = replay.to_string();
+            let mut replay =
+                crate::deep_json::from_str(&initialize).map_err(|error| error.to_string())?;
+            replay.insert("id".into(), OwnedValue(json!(owner_id)));
+            let frame =
+                crate::deep_json::to_string(&replay.0).map_err(|error| error.to_string())?;
             self.pending.insert(
                 owner_id,
                 Sent {
@@ -294,13 +307,18 @@ impl Relay {
     }
 
     /// Send the agent's request `frame` under a fresh owner-link id.
-    fn forward_request(&mut self, mut frame: Value, agent_id: Value, method: String) -> bool {
+    fn forward_request(
+        &mut self,
+        mut frame: OwnedValue,
+        agent_id: OwnedValue,
+        method: String,
+    ) -> bool {
         let owner_id = self.owner_id();
-        frame["id"] = json!(owner_id);
+        frame.insert("id".into(), OwnedValue(json!(owner_id)));
         let sent = Sent {
             agent_id: Some(agent_id),
             method,
-            frame: frame.to_string(),
+            frame: crate::deep_json::to_string(&frame.0).expect("Value serializes"),
             epoch: 0,
             resends: 0,
         };
@@ -311,7 +329,10 @@ impl Relay {
     fn send(&mut self, owner_id: String, mut sent: Sent) -> bool {
         if let Err(error) = self.ensure_connected() {
             return match sent.agent_id {
-                Some(id) => to_agent(&local_error(id, &sent.method, &error).to_string()),
+                Some(id) => to_agent(
+                    &crate::deep_json::to_string(&local_error(id, &sent.method, &error).0)
+                        .expect("Value serializes"),
+                ),
                 None => true,
             };
         }
@@ -365,28 +386,43 @@ impl Relay {
     /// One agent frame: route it with this worktree's file and forward it,
     /// or answer it here.
     fn on_agent(&mut self, line: String) -> bool {
-        let Ok(mut frame) = serde_json::from_str::<Value>(&line) else {
-            // The owner answers the parse error.
-            return self.forward(&line);
+        let Ok(mut frame) = crate::deep_json::from_str(&line) else {
+            // Parse failures have no request id to track in `pending`.
+            // Answer here so an immediately queued stdin EOF cannot drop
+            // the response while it is still on its way from the owner.
+            return to_agent(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {"code": -32700, "message": "parse error"},
+                })
+                .to_string(),
+            );
         };
         let method = frame["method"].as_str().unwrap_or_default().to_string();
         // Every id-bearing frame but a notification is answered by the
         // owner — also one with an empty, missing or non-string method
         // ("method not found") — so it gets an owner-link id like any
         // request: its answer must never be matched against another
-        // pending request whose owner-link id it happens to share. Only
-        // notifications (and unparseable frames, above) pass unchanged.
-        let id = frame.get("id").cloned();
+        // pending request whose owner-link id it happens to share. Frames
+        // without request ids and notifications pass unchanged.
+        let id = frame
+            .0
+            .get_mut("id")
+            .map(|id| OwnedValue(std::mem::take(id)));
         let Some(id) = id.filter(|_| !method.starts_with("notifications/")) else {
             return self.forward(&line);
         };
         if method == "initialize" {
-            self.initialize = Some(frame.clone());
+            self.initialize = Some(line.clone());
         }
         if method == "tools/call"
-            && let Err(message) = self.route(&mut frame)
+            && let Err(message) = self.route(&mut frame.0)
         {
-            return to_agent(&local_error(id, &method, &message).to_string());
+            return to_agent(
+                &crate::deep_json::to_string(&local_error(id, &method, &message).0)
+                    .expect("Value serializes"),
+            );
         }
         self.forward_request(frame, id, method)
     }
@@ -402,6 +438,7 @@ impl Relay {
             return Ok(());
         }
         let args = &frame["params"]["arguments"];
+        crate::dispatch::validate_object_args(args)?;
         let explicit = match args.get("file") {
             Some(Value::String(file)) => Some(file.clone()),
             // Not a string: the owner reports the type error.
@@ -443,7 +480,10 @@ impl Relay {
         shared_store(&self.layout, &key)?;
         let params = &mut frame["params"];
         if !params["arguments"].is_object() {
-            params["arguments"] = json!({});
+            drop(OwnedValue(std::mem::replace(
+                &mut params["arguments"],
+                json!({}),
+            )));
         }
         params["arguments"]["file"] = json!(key);
         Ok(())
@@ -453,7 +493,7 @@ impl Relay {
     /// agent's own id; drop answers to the relay's own requests; re-send a
     /// request the owner did not accept.
     fn on_owner(&mut self, epoch: u64, line: &str) -> bool {
-        let Ok(mut frame) = serde_json::from_str::<Value>(line) else {
+        let Ok(mut frame) = crate::deep_json::from_str(line) else {
             return true;
         };
         if frame.get("method").is_some() {
@@ -466,13 +506,13 @@ impl Relay {
             // parse): the agent's, as is.
             return to_agent(line);
         };
-        let Some(sent) = self.pending.remove(&owner_id) else {
+        let Some(mut sent) = self.pending.remove(&owner_id) else {
             return to_agent(line);
         };
-        let Some(agent_id) = sent.agent_id.clone() else {
+        if sent.agent_id.is_none() {
             // The relay's own request (its replayed `initialize`).
             return true;
-        };
+        }
         if frame["error"]["code"].as_i64() == Some(owner::NOT_ACCEPTED)
             && sent.resends < MAX_RESENDS
         {
@@ -486,8 +526,8 @@ impl Relay {
             };
             return self.send(owner_id, resent);
         }
-        frame["id"] = agent_id;
-        to_agent(&frame.to_string())
+        frame.insert("id".into(), sent.agent_id.take().expect("checked above"));
+        to_agent(&crate::deep_json::to_string(&frame.0).expect("Value serializes"))
     }
 
     /// The owner connection of `epoch` ended: answer what it owed, then
@@ -514,7 +554,7 @@ impl Relay {
                 "outcome unknown: the background figmog exited before answering; check \
                  figmog_status or figmog_files before retrying",
             );
-            if !to_agent(&answer.to_string()) {
+            if !to_agent(&crate::deep_json::to_string(&answer.0).expect("Value serializes")) {
                 return false;
             }
         }
@@ -526,5 +566,111 @@ impl Relay {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufReader;
+
+    fn configured_relay() -> (tempfile::TempDir, Relay, UnixStream) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::discover(dir.path()).unwrap();
+        let paths = OwnerPaths::ensure(&layout.mirror_root).unwrap();
+        let (writer, reader) = UnixStream::pair().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let relay = Relay {
+            layout,
+            paths,
+            settings: Settings {
+                watch: false,
+                interval: 10,
+                upstream: None,
+            },
+            attach: vec![],
+            default_key: Some("ABC1234567890".into()),
+            referenced: BTreeSet::new(),
+            initialize: None,
+            writer: Some(writer),
+            epoch: 1,
+            pending: BTreeMap::new(),
+            tx,
+            next_id: 0,
+        };
+        (dir, relay, reader)
+    }
+
+    #[test]
+    fn malformed_agent_frames_are_answered_without_forwarding_to_the_owner() {
+        let (_dir, mut relay, mut reader) = configured_relay();
+        assert!(relay.on_agent("{\n".into()));
+        reader.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            std::io::Read::read(&mut reader, &mut byte)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(relay.pending.is_empty());
+    }
+
+    #[test]
+    fn valid_json_with_a_null_id_remains_a_tracked_request() {
+        let (_dir, mut relay, reader) = configured_relay();
+        assert!(relay.on_agent(json!({"jsonrpc": "2.0", "id": null}).to_string()));
+        let mut line = String::new();
+        BufReader::new(reader).read_line(&mut line).unwrap();
+        let forwarded: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(forwarded["id"], "figmog-relay-0");
+        assert!(
+            relay.pending["figmog-relay-0"]
+                .agent_id
+                .as_ref()
+                .unwrap()
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn deep_agent_arguments_keep_worktree_routing_and_request_id_remapping() {
+        let (_dir, mut relay, reader) = configured_relay();
+        let value = format!("{}0{}", "[".repeat(512), "]".repeat(512));
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":"agent","method":"tools/call","params":{{"name":"figmog_search","arguments":{{"equals":{value}}}}}}}"#
+        );
+        assert!(relay.on_agent(request));
+        let mut line = String::new();
+        BufReader::new(reader).read_line(&mut line).unwrap();
+        let forwarded = crate::deep_json::from_str(&line).unwrap();
+        assert_eq!(forwarded["params"]["arguments"]["file"], "ABC1234567890");
+        assert_eq!(forwarded["id"], "figmog-relay-0");
+        assert_eq!(
+            relay.pending["figmog-relay-0"]
+                .agent_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            Some("agent")
+        );
+    }
+    #[test]
+    fn local_argument_type_errors_are_not_normalized_into_valid_requests() {
+        let (_dir, mut relay, _reader) = configured_relay();
+        for name in [
+            "figmog_sync",
+            "figmog_status",
+            "figmog_open",
+            "figmog_files",
+        ] {
+            for args in [json!([]), json!(true), json!(1), json!("invalid")] {
+                let mut frame = json!({"params": {"name": name, "arguments": args}});
+                let error = relay.route(&mut frame).unwrap_err();
+                assert!(error.contains("object"), "{name}: {error}");
+                assert_eq!(frame["params"]["arguments"], args);
+            }
+        }
+        assert!(relay.referenced.is_empty());
     }
 }

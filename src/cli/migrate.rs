@@ -66,19 +66,23 @@ pub(super) fn cmd_migrate(layout: &Layout, key: Option<String>) -> Result<Value,
         None => candidate_keys(layout)?,
     };
     let mut migrated = Vec::new();
+    let mut failed = Vec::new();
     for key in keys {
-        if let Some(moved) = migrate_key(layout, &key)? {
-            migrated.push(json!({
+        match migrate_key(layout, &key) {
+            Ok(Some(moved)) => migrated.push(json!({
                 "file": moved.key,
                 "from": moved.from.display().to_string(),
                 "to": moved.to.display().to_string(),
                 "resumed": moved.resumed,
-            }));
+            })),
+            Ok(None) => {}
+            Err(error) => failed.push(json!({"file": key, "error": error})),
         }
     }
     Ok(json!({
         "mirror_root": layout.mirror_root.display().to_string(),
         "migrated": migrated,
+        "failed": failed,
     }))
 }
 
@@ -117,15 +121,20 @@ fn candidate_keys(layout: &Layout) -> Result<BTreeSet<String>, String> {
             Err(e) => Err(format!("reading {}: {e}", dir.display())),
         }
     };
-    for name in names(&layout.local_root)? {
-        if is_file_key(&name) && exists(&layout.legacy_dir(&name).join("db")) {
-            keys.insert(name);
-        } else if let Some(key) = name
-            .strip_prefix('.')
-            .and_then(|n| n.strip_suffix(".deleting"))
-            .filter(|k| is_file_key(k))
-        {
-            keys.insert(key.to_string());
+    for root in layout.legacy_roots() {
+        if root == layout.mirror_root {
+            continue;
+        }
+        for name in names(&root)? {
+            if is_file_key(&name) && exists(&root.join(&name).join("db")) {
+                keys.insert(name);
+            } else if let Some(key) = name
+                .strip_prefix('.')
+                .and_then(|n| n.strip_suffix(".deleting"))
+                .filter(|k| is_file_key(k))
+            {
+                keys.insert(key.to_string());
+            }
         }
     }
     for name in names(&layout.mirror_root)? {
@@ -215,6 +224,17 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
         // Outside Git the old and shared locations are the same directory.
         return Ok(None);
     }
+    let sources = layout.legacy_stores(key);
+    if sources.len() > 1 {
+        return Err(format!(
+            "refusing to migrate {key}: multiple legacy mirrors exist at {}; move or remove redundant copies first",
+            sources
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     let legacy = layout.legacy_dir(key);
     let dest = layout.shared_dir(key);
     let staging = staging_dir(layout, key);
@@ -236,7 +256,11 @@ pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, S
         // old mirror was moved; this checkout's own old mirror may be an
         // independent copy that must survive.
         let source = read_marker(&marker)?;
-        let ours = same_path(&source, &legacy);
+        let ours = layout
+            .legacy_roots()
+            .iter()
+            .any(|root| root != &layout.mirror_root && same_path(&source, &root.join(key)));
+        let legacy = source.clone();
         if !ours && exists(&source) {
             return Err(format!(
                 "an interrupted `figmog migrate` of {key} moved the old mirror at {} into {}; \
@@ -376,6 +400,7 @@ mod tests {
             config: ProjectConfig::default(),
             mirror_root: dir.join("git/figmog"),
             local_root: dir.join(".figmog"),
+            legacy_roots: Vec::new(),
         }
     }
 
@@ -400,6 +425,7 @@ mod tests {
             out,
             json!({
                 "mirror_root": layout.mirror_root.display().to_string(),
+                "failed": [],
                 "migrated": [{
                     "file": KEY,
                     "from": layout.legacy_dir(KEY).display().to_string(),
@@ -634,6 +660,7 @@ mod tests {
             config: ProjectConfig::default(),
             mirror_root: layout.mirror_root.clone(),
             local_root: root.join(".figmog"),
+            legacy_roots: Vec::new(),
         }
     }
 
@@ -797,5 +824,59 @@ mod tests {
         legacy_store(&layout);
         assert_eq!(cmd_migrate(&layout, None).unwrap()["migrated"], json!([]));
         assert!(layout.legacy_dir(KEY).join("db/sentinel").exists());
+    }
+    #[test]
+    fn migrate_all_reports_failures_and_still_moves_later_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let failed = "AaaaSyntheticKey";
+        let successful = "ZzzzSyntheticKey";
+        for key in [failed, successful] {
+            drop(
+                open_store_checked(&layout.legacy_dir(key).join("db"), |p| {
+                    crate::open_store!(p)
+                })
+                .unwrap(),
+            );
+        }
+        fs::create_dir_all(layout.shared_dir(failed).join("db")).unwrap();
+        let out = cmd_migrate(&layout, None).unwrap();
+        assert_eq!(out["failed"][0]["file"], failed);
+        assert_eq!(out["failed"].as_array().unwrap().len(), 1);
+        assert_eq!(out["migrated"][0]["file"], successful);
+        assert!(layout.local_root.join(failed).join("db").exists());
+        assert!(!layout.local_root.join(successful).exists());
+        assert!(layout.shared_dir(successful).join("db").exists());
+    }
+
+    #[test]
+    fn migrate_discovers_and_moves_nested_legacy_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout(dir.path());
+        let nested_root = layout.project_root.join("packages/app/.figmog");
+        let old = nested_root.join(KEY);
+        drop(open_store_checked(&old.join("db"), |p| crate::open_store!(p)).unwrap());
+        layout.legacy_roots = vec![nested_root];
+        let out = cmd_migrate(&layout, None).unwrap();
+        assert_eq!(out["migrated"][0]["from"], old.display().to_string());
+        assert!(out["failed"].as_array().unwrap().is_empty());
+        assert!(!old.exists());
+        assert!(layout.shared_dir(KEY).join("db").exists());
+    }
+    #[test]
+    fn interrupted_nested_cleanup_recognizes_a_source_without_its_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout(dir.path());
+        let nested = layout.project_root.join("packages/app/.figmog");
+        layout.legacy_roots = vec![nested.clone()];
+        let source = nested.join(KEY);
+        drop(open_store_checked(&source.join("db"), |p| crate::open_store!(p)).unwrap());
+        let dest = interrupted_after_rename(&layout);
+        fs::remove_dir_all(source.join("db")).unwrap();
+        let moved = migrate_key(&layout, KEY).unwrap().unwrap();
+        assert!(moved.resumed);
+        assert_eq!(moved.from, source);
+        assert!(!source.exists());
+        assert!(!dest.join(MIGRATED_MARKER).exists());
     }
 }

@@ -24,19 +24,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
+use crate::deep_json::OwnedValue;
 use crate::tokens::{ExportOptions, Theme, color, export_css};
 
 /// One authoritative variable row of `figmog vars --snapshot`.
-struct Var {
+struct Var<'a> {
     name: String,
     resolved_type: String,
     collection: String,
     default_mode: Option<String>,
     scopes: Vec<String>,
     /// Mode name → raw value or alias.
-    values: BTreeMap<String, Value>,
+    values: BTreeMap<String, &'a Value>,
 }
 
 /// A comparable value: a `#rrggbb[aa]` color, a number, or a string.
@@ -58,8 +59,8 @@ impl Lit {
 }
 
 /// Everything the spec needs from the variable snapshot.
-struct Tokens {
-    vars: BTreeMap<String, Var>,
+struct Tokens<'a> {
+    vars: BTreeMap<String, Var<'a>>,
     /// Variable id → custom property name, from the token export.
     css: BTreeMap<String, String>,
     /// Variable id → its value in the root mode (the theme collection's
@@ -119,24 +120,40 @@ pub fn build(tree: &Value, vars: &Value) -> Value {
         tokens: &tokens,
         unsupported: BTreeSet::new(),
     };
-    let node = cx.node(tree, Parent::Root);
+    let node = cx.tree(tree);
     let unsupported: Vec<Value> = cx
         .unsupported
         .into_iter()
         .map(|(id, reason)| json!({"id": id, "reason": reason}))
         .collect();
-    let mut snapshot = vars["snapshot"].as_object().cloned().unwrap_or_default();
-    snapshot.insert("css_unavailable".into(), css_unavailable);
-    snapshot.insert("theme".into(), json!(theme));
-    json!({
-        "node": node,
-        "tokens_snapshot": snapshot,
-        "unsupported": unsupported,
-    })
+    let mut snapshot = if vars["snapshot"].is_object() {
+        copy_value(&vars["snapshot"])
+    } else {
+        OwnedValue::object()
+    };
+    snapshot.insert("css_unavailable".into(), OwnedValue(css_unavailable));
+    snapshot.insert("theme".into(), OwnedValue(json!(theme)));
+    let mut result = OwnedValue(json!({"unsupported": unsupported}));
+    result.insert("node".into(), node);
+    result.insert("tokens_snapshot".into(), snapshot);
+    result.into_inner()
 }
 
-impl Tokens {
-    fn new(vars: &Value, css: BTreeMap<String, String>, theme: Option<&Theme>) -> Tokens {
+/// Raw properties may contain arbitrary JSON, including malformed values at
+/// otherwise scalar fields. Keep their copies guarded and use the growing-stack
+/// boundary for containers instead of `Value::clone`'s recursive implementation.
+fn copy_value(value: &Value) -> OwnedValue {
+    match value {
+        Value::Array(_) | Value::Object(_) => crate::deep_json::from_str(
+            &crate::deep_json::to_string(value).expect("serialize raw spec property"),
+        )
+        .expect("parse serialized raw spec property"),
+        _ => OwnedValue(value.clone()),
+    }
+}
+
+impl<'a> Tokens<'a> {
+    fn new(vars: &'a Value, css: BTreeMap<String, String>, theme: Option<&Theme>) -> Tokens<'a> {
         let mut all = BTreeMap::new();
         for row in vars["variables"].as_array().into_iter().flatten() {
             if row["source"] != "imported" {
@@ -159,7 +176,7 @@ impl Tokens {
                         .collect(),
                     values: row["values_by_mode"]
                         .as_object()
-                        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .map(|m| m.iter().map(|(k, v)| (k.clone(), v)).collect())
                         .unwrap_or_default(),
                 },
             );
@@ -176,19 +193,21 @@ impl Tokens {
     }
 
     /// A bound value: the token, its CSS name and the raw value.
-    fn bound(&self, variable_id: &str, raw: Value) -> Value {
-        json!({
+    fn bound(&self, variable_id: &str, raw: OwnedValue) -> OwnedValue {
+        let mut out = OwnedValue(json!({
             "token": self.vars.get(variable_id).map(|v| v.name.clone()),
             "variable_id": variable_id,
             "css": self.css.get(variable_id),
-            "raw": raw,
-        })
+        }));
+        out.insert("raw".into(), raw);
+        out
     }
 
     /// An unbound value: flagged untokenized, plus every eligible token
     /// whose root value equals it.
-    fn untokenized(&self, raw: Value, lit: Option<&Lit>, prop: Prop) -> Value {
-        let mut out = json!({"untokenized": true, "raw": raw});
+    fn untokenized(&self, raw: OwnedValue, lit: Option<&Lit>, prop: Prop) -> OwnedValue {
+        let mut out = OwnedValue(json!({"untokenized": true}));
+        out.insert("raw".into(), raw);
         let Some(lit) = lit else {
             return out;
         };
@@ -206,18 +225,25 @@ impl Tokens {
             .collect();
         matches.sort();
         if !matches.is_empty() {
-            out["matches"] = matches
+            let matches = matches
                 .into_iter()
                 .map(
                     |(name, id)| json!({"token": name, "variable_id": id, "css": self.css.get(id)}),
                 )
                 .collect();
+            out.insert("matches".into(), OwnedValue(Value::Array(matches)));
         }
         out
     }
 
     /// The value entry for `raw` with optional binding `variable_id`.
-    fn entry(&self, binding: Option<String>, raw: Value, lit: Option<&Lit>, prop: Prop) -> Value {
+    fn entry(
+        &self,
+        binding: Option<String>,
+        raw: OwnedValue,
+        lit: Option<&Lit>,
+        prop: Prop,
+    ) -> OwnedValue {
         match binding {
             Some(id) => self.bound(&id, raw),
             None => self.untokenized(raw, lit, prop),
@@ -228,7 +254,7 @@ impl Tokens {
 /// A variable's value in its root mode, aliases followed (bounded, so a
 /// cyclic snapshot can't loop).
 fn root_value(
-    all: &BTreeMap<String, Var>,
+    all: &BTreeMap<String, Var<'_>>,
     theme: Option<&Theme>,
     id: &str,
     depth: usize,
@@ -285,26 +311,32 @@ enum Parent {
     Other,
 }
 
-struct Cx<'a> {
-    tokens: &'a Tokens,
+struct Cx<'a, 'vars> {
+    tokens: &'a Tokens<'vars>,
     unsupported: BTreeSet<(String, String)>,
 }
 
 /// `SOLID` paint color as `#rrggbb[aa]`, the paint's opacity folded into
 /// alpha — the same rendering `figmog tokens export` uses for a COLOR.
 fn paint_color(paint: &Value) -> Option<String> {
-    let mut c = paint.get("color")?.clone();
+    let c = paint.get("color")?;
     let opacity = paint.get("opacity").and_then(Value::as_f64).unwrap_or(1.0);
     let a = c.get("a").and_then(Value::as_f64).unwrap_or(1.0);
-    c["a"] = json!(a * opacity);
-    color(&c)
+    // Only channels influence the color; unrelated, potentially deep paint
+    // properties never need to be copied.
+    color(&json!({
+        "r": c.get("r")?.as_f64()?,
+        "g": c.get("g")?.as_f64()?,
+        "b": c.get("b")?.as_f64()?,
+        "a": a * opacity,
+    }))
 }
 
 fn lower(v: &Value, default: &str) -> String {
     v.as_str().unwrap_or(default).to_ascii_lowercase()
 }
 
-impl Cx<'_> {
+impl Cx<'_, '_> {
     fn unsupported(&mut self, id: &str, reason: impl Into<String>) {
         self.unsupported.insert((id.to_string(), reason.into()));
     }
@@ -331,22 +363,65 @@ impl Cx<'_> {
     }
 
     /// A numeric property: bound or untokenized, raw value as stored.
-    fn number(&mut self, n: &Value, id: &str, key: &str, raw: Value, prop: Prop) -> Option<Value> {
+    fn number(
+        &mut self,
+        n: &Value,
+        id: &str,
+        key: &str,
+        raw: OwnedValue,
+        prop: Prop,
+    ) -> Option<OwnedValue> {
         let binding = self.binding(n, id, key).ok()?;
         let lit = raw.as_f64().map(Lit::Number);
         Some(self.tokens.entry(binding, raw, lit.as_ref(), prop))
     }
 
-    fn node(&mut self, n: &Value, parent: Parent) -> Value {
+    /// Visit in child order and assemble children in postorder. Both pending
+    /// and finished outputs remain guarded if construction exits early.
+    fn tree(&mut self, root: &Value) -> OwnedValue {
+        enum Task<'a> {
+            Visit(&'a Value, Parent),
+            Finish(OwnedValue, usize),
+        }
+        let mut pending = vec![Task::Visit(root, Parent::Root)];
+        let mut finished = Vec::new();
+        while let Some(task) = pending.pop() {
+            match task {
+                Task::Visit(n, parent) => {
+                    let (out, child_parent) = self.node(n, parent);
+                    if let Some(child_parent) = child_parent {
+                        let kids = n["children"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+                        pending.push(Task::Finish(out, kids.len()));
+                        pending.extend(kids.iter().rev().map(|n| Task::Visit(n, child_parent)));
+                    } else {
+                        finished.push(out);
+                    }
+                }
+                Task::Finish(mut out, count) => {
+                    let mut children = OwnedValue::array();
+                    for child in finished.drain(finished.len() - count..) {
+                        children.push(child);
+                    }
+                    out.insert("children".into(), children);
+                    finished.push(out);
+                }
+            }
+        }
+        finished.pop().expect("one root")
+    }
+
+    /// One node's own fields and its children's layout context. Hidden layers
+    /// omit their descendants, matching the recursive traversal's contract.
+    fn node(&mut self, n: &Value, parent: Parent) -> (OwnedValue, Option<Parent>) {
         let id = n["id"].as_str().unwrap_or_default().to_string();
         let node_type = n["type"].as_str().unwrap_or_default().to_string();
-        let mut out = Map::new();
-        out.insert("id".into(), json!(id));
-        out.insert("name".into(), n["name"].clone());
-        out.insert("type".into(), json!(node_type));
+        let mut out = OwnedValue::object();
+        out.insert("id".into(), OwnedValue(json!(id)));
+        out.insert("name".into(), copy_value(&n["name"]));
+        out.insert("type".into(), OwnedValue(json!(node_type)));
         if n["visible"] == false {
             self.unsupported(&id, "hidden layer (visible: false): not specified");
-            return Value::Object(out);
+            return (out, None);
         }
         if let Some(o) = n["opacity"].as_f64().filter(|o| *o < 1.0) {
             self.unsupported(&id, format!("layer opacity {o}: not specified"));
@@ -400,32 +475,38 @@ impl Cx<'_> {
                 "layoutPositioning ABSOLUTE: position and sizing not specified",
             );
         }
-        let mut layout = Map::new();
+        let mut layout = OwnedValue::object();
         if let Some(d) = dir {
-            layout.insert("direction".into(), json!(d.to_ascii_lowercase()));
+            layout.insert(
+                "direction".into(),
+                OwnedValue(json!(d.to_ascii_lowercase())),
+            );
             let primary = n["primaryAxisAlignItems"].as_str().unwrap_or("MIN");
             let gap = if primary == "SPACE_BETWEEN" {
-                Some(json!("auto"))
+                Some(OwnedValue(json!("auto")))
             } else {
-                let raw = n.get("itemSpacing").cloned().unwrap_or(json!(0));
+                let raw = n
+                    .get("itemSpacing")
+                    .map(copy_value)
+                    .unwrap_or(OwnedValue(json!(0)));
                 self.number(n, &id, "itemSpacing", raw, GAP)
             };
             if let Some(gap) = gap {
                 layout.insert("gap".into(), gap);
             }
-            let mut padding = Map::new();
+            let mut padding = OwnedValue::object();
             for (side, key) in [
                 ("top", "paddingTop"),
                 ("right", "paddingRight"),
                 ("bottom", "paddingBottom"),
                 ("left", "paddingLeft"),
             ] {
-                let raw = n.get(key).cloned().unwrap_or(json!(0));
+                let raw = n.get(key).map(copy_value).unwrap_or(OwnedValue(json!(0)));
                 if let Some(e) = self.number(n, &id, key, raw, GAP) {
                     padding.insert(side.into(), e);
                 }
             }
-            layout.insert("padding".into(), Value::Object(padding));
+            layout.insert("padding".into(), padding);
             let align = |v: &Value| match v.as_str().unwrap_or("MIN") {
                 "MIN" => "start".to_string(),
                 "MAX" => "end".to_string(),
@@ -434,10 +515,10 @@ impl Cx<'_> {
             };
             layout.insert(
                 "align".into(),
-                json!({
+                OwnedValue(json!({
                     "primary": align(&n["primaryAxisAlignItems"]),
                     "counter": align(&n["counterAxisAlignItems"]),
-                }),
+                })),
             );
         }
         let has_sizing_fields =
@@ -455,26 +536,25 @@ impl Cx<'_> {
             };
             layout.insert(
                 "sizing".into(),
-                json!({
+                OwnedValue(json!({
                     "horizontal": sizing(n, "HORIZONTAL", dir, parent_dir),
                     "vertical": sizing(n, "VERTICAL", dir, parent_dir),
-                }),
+                })),
             );
         }
-        if !layout.is_empty()
-            && let Some(b) = n.get("absoluteBoundingBox")
-        {
-            layout.insert(
-                "size".into(),
-                json!({"width": b["width"], "height": b["height"]}),
-            );
+        let has_layout = !layout.as_object().expect("layout object").is_empty();
+        if has_layout && let Some(b) = n.get("absoluteBoundingBox") {
+            let mut size = OwnedValue::object();
+            size.insert("width".into(), copy_value(&b["width"]));
+            size.insert("height".into(), copy_value(&b["height"]));
+            layout.insert("size".into(), size);
         }
-        if !layout.is_empty() {
-            out.insert("layout".into(), Value::Object(layout));
+        if has_layout {
+            out.insert("layout".into(), layout);
         }
 
         // Values.
-        let mut values = Map::new();
+        let mut values = OwnedValue::object();
         let mixed_text = node_type == "TEXT"
             && n["characterStyleOverrides"]
                 .as_array()
@@ -487,16 +567,16 @@ impl Cx<'_> {
         } else {
             let fills = self.paints(n, &id, "fills", fill_prop(&node_type));
             if !fills.is_empty() {
-                values.insert("fill".into(), Value::Array(fills));
+                values.insert("fill".into(), OwnedValue(Value::Array(fills)));
             }
         }
         let strokes = self.paints(n, &id, "strokes", STROKE_COLOR);
         if !strokes.is_empty() {
-            values.insert("stroke".into(), Value::Array(strokes));
+            values.insert("stroke".into(), OwnedValue(Value::Array(strokes)));
             if n.get("individualStrokeWeights").is_some() {
                 self.unsupported(&id, "individualStrokeWeights: stroke weight not specified");
-            } else if let Some(raw) = n.get("strokeWeight").cloned()
-                && let Some(e) = self.number(n, &id, "strokeWeight", raw, STROKE_WEIGHT)
+            } else if let Some(raw) = n.get("strokeWeight")
+                && let Some(e) = self.number(n, &id, "strokeWeight", copy_value(raw), STROKE_WEIGHT)
             {
                 values.insert("stroke_weight".into(), e);
             }
@@ -506,19 +586,21 @@ impl Cx<'_> {
         }
         if node_type == "TEXT" && !mixed_text {
             let typography = self.typography(n, &id);
-            if !typography.is_empty() {
-                values.insert("typography".into(), Value::Object(typography));
+            if !typography
+                .as_object()
+                .expect("typography object")
+                .is_empty()
+            {
+                values.insert("typography".into(), typography);
             }
         }
-        out.insert("values".into(), Value::Object(values));
+        out.insert("values".into(), values);
 
         let child_parent = match dir {
             Some(d) => Parent::Auto(d),
             None => Parent::Other,
         };
-        let children: Vec<Value> = kids.iter().map(|k| self.node(k, child_parent)).collect();
-        out.insert("children".into(), Value::Array(children));
-        Value::Object(out)
+        (out, Some(child_parent))
     }
 
     /// Visible `SOLID` paints of `fills`/`strokes` as value entries;
@@ -550,14 +632,18 @@ impl Cx<'_> {
                 continue;
             };
             let lit = Lit::Color(hex.clone());
-            out.push(self.tokens.entry(binding, json!(hex), Some(&lit), prop));
+            out.push(
+                self.tokens
+                    .entry(binding, OwnedValue(json!(hex)), Some(&lit), prop)
+                    .into_inner(),
+            );
         }
         out
     }
 
     /// The four corner radii, each bound or untokenized; `None` when the
     /// node has no radius.
-    fn radius(&mut self, n: &Value, id: &str) -> Option<Value> {
+    fn radius(&mut self, n: &Value, id: &str) -> Option<OwnedValue> {
         const CORNERS: [(&str, &str); 4] = [
             ("top_left", "topLeftRadius"),
             ("top_right", "topRightRadius"),
@@ -572,23 +658,23 @@ impl Cx<'_> {
         if n.get("cornerRadius").is_none() && per_corner.is_none() && !any_bound {
             return None;
         }
-        let mut out = Map::new();
+        let mut out = OwnedValue::object();
         for (i, (side, key)) in CORNERS.iter().enumerate() {
             let raw = per_corner
                 .and_then(|r| r.get(i))
                 .or_else(|| n.get("cornerRadius"))
-                .cloned()
-                .unwrap_or(json!(0));
+                .map(copy_value)
+                .unwrap_or(OwnedValue(json!(0)));
             if let Some(e) = self.number(n, id, key, raw, RADIUS) {
                 out.insert(side.to_string(), e);
             }
         }
-        Some(Value::Object(out))
+        Some(out)
     }
 
     /// A TEXT node's type style: family, size, weight, line height and
     /// letter spacing.
-    fn typography(&mut self, n: &Value, id: &str) -> Map<String, Value> {
+    fn typography(&mut self, n: &Value, id: &str) -> OwnedValue {
         const FIELDS: [(&str, &str, &str, Prop); 5] = [
             (
                 "font_family",
@@ -637,22 +723,22 @@ impl Cx<'_> {
             ),
         ];
         let style = &n["style"];
-        let mut out = Map::new();
+        let mut out = OwnedValue::object();
         for (name, field, binding_key, prop) in FIELDS {
             let Ok(binding) = self.binding(n, id, binding_key) else {
                 continue;
             };
             let auto_line = name == "line_height" && style["lineHeightUnit"] == "INTRINSIC_%";
             let raw = if auto_line {
-                json!("auto")
+                OwnedValue(json!("auto"))
             } else {
                 match style.get(field) {
-                    Some(raw) => raw.clone(),
-                    None if binding.is_some() => Value::Null,
+                    Some(raw) => copy_value(raw),
+                    None if binding.is_some() => OwnedValue(Value::Null),
                     None => continue,
                 }
             };
-            let lit = match (&raw, auto_line) {
+            let lit = match (&*raw, auto_line) {
                 (_, true) => None,
                 (Value::String(s), _) => Some(Lit::Text(s.clone())),
                 (raw, _) => raw.as_f64().map(Lit::Number),

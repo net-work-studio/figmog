@@ -80,7 +80,7 @@ pub struct Export {
 }
 
 /// One authoritative variable row of `figmog vars --snapshot`.
-struct Var {
+struct Var<'a> {
     id: String,
     name: String,
     resolved_type: String,
@@ -89,7 +89,7 @@ struct Var {
     scopes: Vec<String>,
     web: Option<String>,
     /// Mode name → raw value.
-    values: BTreeMap<String, Value>,
+    values: BTreeMap<String, &'a Value>,
 }
 
 /// How a FLOAT is emitted, from its scopes.
@@ -146,9 +146,8 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         });
     }
     let mut report = BTreeSet::new();
-    let rows = vars["variables"].as_array().cloned().unwrap_or_default();
-    let mut all: BTreeMap<String, Var> = BTreeMap::new();
-    for row in &rows {
+    let mut all: BTreeMap<String, Var<'_>> = BTreeMap::new();
+    for row in vars["variables"].as_array().into_iter().flatten() {
         let id = row["variable_id"].as_str().unwrap_or_default().to_string();
         if row["source"] != "imported" {
             report.insert(entry(
@@ -182,7 +181,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
                 web: row["code_syntax"]["WEB"].as_str().map(str::to_string),
                 values: row["values_by_mode"]
                     .as_object()
-                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v)).collect())
                     .unwrap_or_default(),
             },
         );
@@ -192,7 +191,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
     // The modes each variable is emitted in: its root mode (the theme's
     // light mode for the theme collection, else its default) and, for the
     // theme collection, the dark mode.
-    let modes_of = |v: &Var| -> Vec<String> {
+    let modes_of = |v: &Var<'_>| -> Vec<String> {
         match &theme {
             Some(t) if t.collection == v.collection => {
                 vec![t.light_mode.clone(), t.dark_mode.clone()]
@@ -515,7 +514,7 @@ fn comment_safe(s: &str) -> String {
 /// otherwise the one collection with a mode named like "dark" (none ⇒ no
 /// theme blocks; several ⇒ an error asking for `--collection`).
 fn choose_theme(
-    all: &BTreeMap<String, Var>,
+    all: &BTreeMap<String, Var<'_>>,
     opts: &ExportOptions,
 ) -> Result<Option<Theme>, String> {
     // Collection name → (mode names, default modes).

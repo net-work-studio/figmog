@@ -13,23 +13,22 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::json;
 
+use crate::deep_json::OwnedValue;
 use crate::mcp::{PendingCall, ToolOutput};
 use crate::session_view::ReadLease;
 use crate::sessions::{self, FilesRead, StatusRead};
 
 use super::DeferredReply;
 
-/// Local reads answered inline on the loop: point lookups bounded by the
-/// page count (`pages`: one `by_type` index lookup), one node, its direct
-/// children and bound variables (`node`), or its depth (`path`) —
-/// measured at well under a millisecond on a 100k-node mirror. Every other
-/// local read runs on a read worker, including `figmog_components` (it
-/// scans both component tables) and `figmog_status`/`figmog_files` (cheap
-/// since NWS-2942 — the view carries its node count — but they still lease
-/// views, and stay off the loop with the other leased reads).
-const INLINE_READS: &[&str] = &["figmog_pages", "figmog_node", "figmog_path"];
+/// Only page-list and ancestor-path lookups stay inline. Even a point
+/// `figmog_node` lookup may contain arbitrarily large raw geometry or a
+/// wide direct-child list, so every node response runs on a read worker.
+const INLINE_READS: &[&str] = &["figmog_pages", "figmog_path"];
+
+/// Global queued-read bound, independent of connection/requester count.
+pub(crate) const MAX_QUEUED_READS: usize = 128;
 
 pub(crate) fn is_inline_read(name: &str) -> bool {
     INLINE_READS.contains(&name)
@@ -49,7 +48,7 @@ pub(crate) enum ReadTask {
     Tool {
         lease: ReadLease,
         name: String,
-        args: Value,
+        args: OwnedValue,
         explicit_key: Option<String>,
         url_key: Option<String>,
     },
@@ -117,7 +116,7 @@ pub(crate) type ReadHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// on its own thread.
 #[derive(Default)]
 pub(crate) struct ReadPool {
-    jobs: Option<mpsc::Sender<ReadJob>>,
+    jobs: Option<mpsc::SyncSender<ReadJob>>,
     workers: Vec<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     /// Test hook run on the worker, lease held, before each read.
@@ -131,13 +130,20 @@ impl ReadPool {
             self.spawn();
         }
         if let Some(jobs) = &self.jobs {
-            // A dead pool drops the job; its reply answers with an error.
-            let _ = jobs.send(ReadJob { staged, call });
+            match jobs.try_send(ReadJob { staged, call }) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(job)) => job.staged.reply.send(
+                    Err("read workers are busy: too many queued reads; retry later".into()),
+                    false,
+                ),
+                // A dead pool drops the job; its reply answers with an error.
+                Err(mpsc::TrySendError::Disconnected(_)) => {}
+            }
         }
     }
 
     fn spawn(&mut self) {
-        let (jobs, queue) = mpsc::channel::<ReadJob>();
+        let (jobs, queue) = mpsc::sync_channel::<ReadJob>(MAX_QUEUED_READS);
         let queue = Arc::new(Mutex::new(queue));
         for n in 0..pool_size() {
             let queue = queue.clone();
@@ -178,7 +184,8 @@ impl ReadPool {
                                     Err("read worker panicked; retry and inspect server stderr"
                                         .into())
                                 });
-                        let mut frame = call.finish(output).to_string();
+                        let response = OwnedValue(call.finish(output));
+                        let mut frame = crate::deep_json::to_string(&response.0).unwrap();
                         frame.push('\n');
                         reply.send_frame(frame);
                     }

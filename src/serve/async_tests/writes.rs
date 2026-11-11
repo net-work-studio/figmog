@@ -14,6 +14,7 @@ struct Live {
     tx: mpsc::Sender<Incoming>,
     thread: Option<std::thread::JoinHandle<Result<(), String>>>,
     socket: PathBuf,
+    root: StoreRoot,
     _dir: tempfile::TempDir,
 }
 
@@ -28,6 +29,7 @@ impl Live {
         let (tx, rx) = mpsc::channel();
         let registry: ConnRegistry = Arc::default();
         spawn_socket_acceptor(listener, tx.clone(), registry.clone());
+        let root = manager.root.clone();
         let thread = std::thread::spawn(move || {
             serve_loop_with_offload(
                 manager,
@@ -45,6 +47,7 @@ impl Live {
             tx,
             thread: Some(thread),
             socket,
+            root,
             _dir: dir,
         }
     }
@@ -53,8 +56,17 @@ impl Live {
     fn write(
         &self,
         tool: &'static str,
-        args: Value,
+        mut args: Value,
     ) -> std::thread::JoinHandle<Result<Value, String>> {
+        args["db"] = json!(
+            canonical_store_path(
+                &self
+                    .root
+                    .store_path(args["file"].as_str().unwrap())
+                    .unwrap()
+            )
+            .unwrap()
+        );
         let stream = UnixStream::connect(&self.socket).unwrap();
         std::thread::spawn(move || crate::cli::write_over_stream(stream, tool, args))
     }
@@ -64,8 +76,17 @@ impl Live {
     fn write_local(
         &self,
         tool: &'static str,
-        args: Value,
+        mut args: Value,
     ) -> std::thread::JoinHandle<Result<Value, String>> {
+        args["db"] = json!(
+            canonical_store_path(
+                &self
+                    .root
+                    .store_path(args["file"].as_str().unwrap())
+                    .unwrap()
+            )
+            .unwrap()
+        );
         let root = self.socket.parent().unwrap().to_path_buf();
         std::thread::spawn(move || crate::cli::write_over_local(&root, tool, args))
     }
@@ -97,6 +118,43 @@ fn settle() {
 
 fn churn(value: &Value) -> String {
     serde_json::to_string_pretty(&value["result"]).unwrap()
+}
+
+#[test]
+fn saved_null_rejects_before_network_or_reset_even_with_credentials() {
+    let Harness {
+        api,
+        manager,
+        _dir: _store_dir,
+        ..
+    } = Harness::new();
+    let live = Live::start(manager, Offload::new(None));
+    live.write(PULL, json!({"file": KEY, "from_file": fixture("saved")}))
+        .join()
+        .unwrap()
+        .unwrap();
+
+    for fresh in [false, true] {
+        let error = live
+            .write(
+                PULL,
+                json!({"file": KEY, "from_file": null, "fresh": fresh}),
+            )
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("missing field: name"), "{error}");
+        assert_eq!(api.calls.load(Ordering::SeqCst), 0);
+        let response = live
+            .call("figmog_node", json!({"file": KEY, "id": "0:0"}))
+            .join()
+            .unwrap();
+        let node: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(node["name"], "saved", "{node}");
+    }
+    live.stop();
 }
 
 /// Plain and `--geometry` network pulls and a variable import through the
@@ -453,4 +511,119 @@ fn a_vanished_owner_leaves_the_outcome_unknown_and_is_not_retried() {
     let (request, rest) = owner.join().unwrap();
     assert!(request.contains(PULL));
     assert!(rest.is_empty(), "the write was sent again: {rest}");
+}
+
+#[test]
+fn shutdown_deadline_covers_a_blocked_synchronous_fresh_reopen() {
+    let h = Harness::new();
+    let Harness {
+        release,
+        entered,
+        mut manager,
+        ..
+    } = h;
+    let (reopening, seen_reopen) = mpsc::channel();
+    let (resume, wait) = mpsc::channel();
+    let wait = Arc::new(Mutex::new(wait));
+    manager.sessions[0].before_reopen(Arc::new(move || {
+        reopening.send(()).unwrap();
+        wait.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+    }));
+    let mut offload = Offload::new(None);
+    offload.exit_drain = Duration::from_millis(300);
+    let mut live = Live::start(manager, offload);
+    let fresh = live.write(PULL, json!({"file": KEY, "fresh": true}));
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    live.tx.send(Incoming::StdinClosed).unwrap();
+    // Give the serving thread time to enter shutdown before validation finishes.
+    std::thread::sleep(Duration::from_millis(50));
+    release.send(()).unwrap();
+    seen_reopen.recv_timeout(Duration::from_secs(5)).unwrap();
+    let returned = Instant::now() + Duration::from_secs(2);
+    while !live.thread.as_ref().unwrap().is_finished() {
+        assert!(
+            Instant::now() < returned,
+            "shutdown waited on synchronous reopen"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    live.thread.take().unwrap().join().unwrap().unwrap();
+    resume.send(()).unwrap();
+    let _ = fresh.join().unwrap();
+}
+
+#[test]
+fn cli_writes_queued_during_changed_metadata_precede_its_followup_pull() {
+    for import in [false, true] {
+        let mut h = Harness::new();
+        h.mirror_from_watch();
+        h.api.block_meta.store(true, Ordering::Relaxed);
+        *h.api.metadata.lock().unwrap() = "changed".into();
+        let now = Instant::now() + Duration::from_secs(60);
+        assert!(h.manager.sessions[0].poll_at(Duration::from_secs(10), now));
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "metadata"
+        );
+        let operation = if import {
+            sessions::WriteOp::Import {
+                content: include_bytes!("../../../tests/fixtures/variables-export.json").to_vec(),
+                label: "synthetic variables".into(),
+                allow_empty: false,
+                dry_run: false,
+            }
+        } else {
+            sessions::WriteOp::Pull {
+                source: sessions::PullSource::File(crate::deep_json::OwnedValue(fixture("saved"))),
+                fresh: false,
+                geometry: false,
+            }
+        };
+        let (answer, result) = mpsc::channel();
+        h.manager.sessions[0].write(
+            "write-before-followup".into(),
+            operation,
+            Box::new(move |value| {
+                let _ = answer.send(value);
+            }),
+        );
+        assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        h.release.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            h.manager.sessions[0].maintain_at(now, true);
+            if let Ok(value) = result.try_recv() {
+                value.unwrap();
+                break;
+            }
+            if let Ok(event) = h.entered.try_recv() {
+                // Do not strand the network worker if the old ordering
+                // dispatched its gated fetch before answering this write.
+                h.release.send(()).unwrap();
+                panic!("CLI write was bypassed by the poll's {event} follow-up");
+            }
+            assert!(Instant::now() < deadline, "queued CLI write did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            h.entered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "fetch"
+        );
+        // The local result is already published while the following
+        // network fetch remains blocked, regardless of the local op kind.
+        let status = h.manager.sessions[0].status().unwrap();
+        if import {
+            assert_eq!(status["variables"]["state"], "current");
+            assert_eq!(status["variables"]["source"], "file");
+        } else {
+            assert_eq!(status["version"], "saved");
+        }
+        h.release.send(()).unwrap();
+        h.finish_pull_at(now + Duration::from_secs(1));
+        assert_eq!(h.api.calls.load(Ordering::Relaxed), 2);
+    }
 }

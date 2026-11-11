@@ -11,6 +11,93 @@ fn fixture(version: &str) -> Value {
         "document": {"id": "0:0", "name": version, "type": "DOCUMENT"}})
 }
 
+#[test]
+fn invalid_local_arguments_do_not_open_or_pull_a_mirror() {
+    let mut h = Harness::new();
+    let missing = "NEW1234567890";
+    for (name, args) in [
+        ("figmog_tree", json!({"file": missing, "depth": "bad"})),
+        (
+            "figmog_search",
+            json!({"file": missing, "query": "q", "limit": false}),
+        ),
+        ("figmog_tree", json!([1, 2])),
+    ] {
+        let response = h.call(name, args);
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let error = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("expected"), "{error}");
+        assert!(!error.contains("not ready"), "{error}");
+    }
+    assert_eq!(h.manager.sessions.len(), 1);
+    assert!(!h.manager.root.store_path(missing).unwrap().exists());
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn cancelled_socket_calls_cannot_open_sync_or_forward() {
+    let mut h = Harness::new();
+    let mut offload = Offload::new(None);
+    let cancelled = Arc::new(AtomicBool::new(true));
+    for name in ["figmog_open", "figmog_sync", "figmog_tree", "set_node_name"] {
+        let result = handle_tool_call(
+            &mut h.manager,
+            &mut offload,
+            &cancelled,
+            "disabled",
+            Duration::ZERO,
+            name,
+            &json!({"file": "NEW1234567890"}),
+            sessions::SessionResolution::AutoOpen,
+        );
+        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+    }
+    assert_eq!(h.manager.sessions.len(), 1);
+    assert!(!h.manager.root.store_path("NEW1234567890").unwrap().exists());
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn detached_read_keeps_fjall_store_locked_after_session_closes() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    let lease = h.manager.sessions[0].lease().unwrap();
+    let path = h.manager.root.store_path("ABC1234567890").unwrap();
+    h.manager.close_reads(Instant::now());
+    h.manager.sessions.clear();
+    let result = crate::cli::open_store_checked(&path, |path| crate::open_store!(path));
+    assert!(matches!(result, Err(error) if error.contains("locked")));
+    assert!(sessions::read_tool(lease.view(), "figmog_node", &json!({"id":"0:0"})).is_ok());
+    drop(lease);
+    assert!(crate::cli::open_store_checked(&path, |path| crate::open_store!(path)).is_ok());
+}
+
+#[test]
+fn reset_preserves_a_pull_acknowledged_while_reads_drain() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    let lease = h.manager.sessions[0].lease().unwrap();
+    h.manager
+        .begin_reset("ABC1234567890", sessions::StoreReset::Reopen)
+        .unwrap();
+    let accepted = h.value("figmog_sync", json!({}));
+    assert!(h.manager.service_resets().is_empty());
+    drop(lease);
+    assert!(h.manager.service_resets().pop().unwrap().1.is_ok());
+    h.manager.sessions[0].maintain(false);
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    let status = h.wait_for("succeeded");
+    assert_eq!(status["pull"]["last_success"]["job_id"], accepted["job_id"]);
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 2);
+}
+
 struct Api {
     response: Mutex<Result<Value, ApiError>>,
     metadata: Mutex<String>,
@@ -95,6 +182,7 @@ fn call_and_wait(
             interval,
             name,
             args,
+            sessions::SessionResolution::AutoOpen,
         )
     });
     let reply = mcp::dispatch_message(
@@ -1697,4 +1785,308 @@ fn ordinary_metadata_retries_preserve_retry_after_before_and_after_normal_round(
         h.release.send(()).unwrap();
         h.finish_poll_at(base + Duration::from_secs(seconds));
     }
+}
+
+#[test]
+fn reads_of_missing_files_do_not_initialize_a_store() {
+    let mut h = Harness::new();
+    let missing = "NEW1234567890";
+    for name in ["figmog_status", "figmog_pages", "figmog_vars"] {
+        let result = handle_tool_call(
+            &mut h.manager,
+            &mut Offload::new(None),
+            &Arc::new(AtomicBool::new(false)),
+            "disabled",
+            Duration::ZERO,
+            name,
+            &json!({"file": missing}),
+            sessions::SessionResolution::ExistingOnly,
+        );
+        assert!(matches!(result, Err(message) if message.contains("no mirror here")));
+        assert!(!h.manager.root.store_path(missing).unwrap().exists());
+    }
+    assert_eq!(h.api.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn in_process_startup_uses_the_project_default_without_an_explicit_file() {
+    const KEY: &str = "CFG1234567890";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("figmog.toml"),
+        format!("[files]\ndefault = \"{KEY}\"\n"),
+    )
+    .unwrap();
+    let layout = crate::project::Layout::discover(dir.path()).unwrap();
+    {
+        let mut store = crate::open_store!(layout.mirror_root.join(KEY).join("db"));
+        store::sync(
+            &mut store,
+            &Default::default(),
+            &crate::flatten::flatten_file(&fixture("configured")).unwrap(),
+            1,
+        );
+    }
+    let (mut manager, track_current) = build_sessions(
+        None,
+        &[],
+        true,
+        &None,
+        StoreRoot::Project(layout.clone()),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(track_current);
+    assert_eq!(manager.default_key.as_deref(), Some(KEY));
+    let response = call_and_wait(
+        &mut manager,
+        &mut Offload::new(None),
+        "disabled",
+        true,
+        Duration::ZERO,
+        &dispatch::tool_registry(),
+        &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"figmog_status", "arguments":{}}}),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let status: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(status["version"], "configured");
+    drop(manager);
+
+    let (manager, _) = build_sessions(
+        None,
+        &["EXPLICIT12345".into()],
+        true,
+        &None,
+        StoreRoot::Project(layout.clone()),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert_eq!(manager.default_key.as_deref(), Some("EXPLICIT12345"));
+    assert_eq!(manager.sessions.len(), 1);
+    drop(manager);
+
+    let (manager, _) = build_sessions(
+        None,
+        &[],
+        true,
+        &None,
+        StoreRoot::Fixed(dir.path().join("fixed")),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(manager.sessions.is_empty());
+    drop(manager);
+
+    let db = dir.path().join("override/db");
+    let (manager, track_current) = build_sessions(
+        Some(db.clone()),
+        &[],
+        true,
+        &None,
+        StoreRoot::Project(layout),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(!track_current);
+    assert_eq!(manager.sessions.len(), 1);
+    assert_eq!(manager.sessions[0].path, db);
+}
+
+#[test]
+fn routed_write_rejects_a_different_store_before_admission() {
+    let mut h = Harness::new();
+    let mut offload = Offload::new(None);
+    let result = handle_tool_call(
+        &mut h.manager,
+        &mut offload,
+        &Arc::new(AtomicBool::new(false)),
+        "disabled",
+        Duration::ZERO,
+        crate::serve::writes::PULL,
+        &json!({"file": "ABC1234567890", "db": h._dir.path().join("other/db"), "from_file": fixture("2")}),
+        sessions::SessionResolution::ExistingOnly,
+    );
+    assert!(
+        matches!(result, Err(error) if error.contains("different store") && error.contains("nothing was applied"))
+    );
+    assert!(!h._dir.path().join("other").exists());
+    assert!(!h.manager.sessions[0].has_writes());
+}
+
+#[test]
+fn session_close_obeys_the_deadline_with_a_blocked_network_worker() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let before = Instant::now();
+    h.manager.close_and_compact(before);
+    assert!(before.elapsed() < Duration::from_secs(1));
+    assert!(h.manager.sessions.is_empty());
+    h.release.send(()).unwrap();
+}
+
+#[test]
+fn closing_frames_preserve_parse_and_method_errors() {
+    let malformed = closing_response("{").unwrap();
+    assert_eq!(malformed["error"]["code"], -32700);
+    let invalid = closing_response(r#"{"jsonrpc":"2.0","id":9,"method":42}"#).unwrap();
+    assert_eq!(invalid["id"], 9);
+    assert_eq!(invalid["error"]["code"], -32601);
+    let refused = closing_response(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#).unwrap();
+    assert_eq!(refused["error"]["code"], crate::owner::NOT_ACCEPTED);
+}
+
+#[test]
+fn fresh_apply_keeps_reads_behind_the_reset_barrier_until_publication() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(30)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    h.gate_stages.store(true, Ordering::Relaxed);
+    let (answer, result) = mpsc::channel();
+    h.manager.sessions[0].write(
+        "fresh-test".into(),
+        sessions::WriteOp::Pull {
+            source: sessions::PullSource::File(crate::deep_json::OwnedValue(fixture("2"))),
+            fresh: true,
+            geometry: false,
+        },
+        Box::new(move |value| {
+            let _ = answer.send(value);
+        }),
+    );
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(30)).unwrap(),
+        "flattening"
+    );
+    h.release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        h.manager.sessions[0].maintain(false);
+        h.manager.service_resets();
+        if let Ok(stage) = h.entered.try_recv() {
+            assert_eq!(stage, "applying");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    for name in ["figmog_status", "figmog_node"] {
+        let value = h.call(name, json!({"id": "0:0"}));
+        assert!(
+            value["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("being reset"),
+            "{value}"
+        );
+    }
+    h.release.send(()).unwrap();
+    assert_eq!(
+        h.entered.recv_timeout(Duration::from_secs(30)).unwrap(),
+        "publishing"
+    );
+    h.release.send(()).unwrap();
+    loop {
+        h.manager.sessions[0].maintain(false);
+        if let Ok(value) = result.try_recv() {
+            value.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(h.value("figmog_status", json!({}))["version"], "2");
+}
+
+#[test]
+fn fresh_apply_failure_does_not_mark_the_cleared_store_mirrored() {
+    let mut h = Harness::new();
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(30)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
+    let path = h.manager.sessions[0].path.clone();
+    h.manager.sessions.clear();
+    let session = sessions::open_session_with_hooks(
+        path,
+        "ABC1234567890".into(),
+        None,
+        None,
+        sessions::WorkerHooks {
+            on_phase: Some(Arc::new(|phase| {
+                if phase == "applying" {
+                    panic!("injected apply failure");
+                }
+            })),
+        },
+    )
+    .unwrap();
+    h.manager.sessions.push(session);
+    let (answer, result) = mpsc::channel();
+    h.manager.sessions[0].write(
+        "failed-fresh-test".into(),
+        sessions::WriteOp::Pull {
+            source: sessions::PullSource::File(crate::deep_json::OwnedValue(fixture("2"))),
+            fresh: true,
+            geometry: false,
+        },
+        Box::new(move |value| {
+            let _ = answer.send(value);
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        h.manager.sessions[0].maintain(false);
+        h.manager.service_resets();
+        if let Ok(value) = result.try_recv() {
+            assert!(value.unwrap_err().starts_with("outcome unknown:"));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!h.manager.sessions[0].mirrored);
+    let result = h.manager.sessions[0].dispatch("figmog_node", &json!({"id": "0:0"}));
+    assert!(matches!(result, Err(error) if error.contains("not ready")));
+}
+
+#[test]
+fn a_successful_routed_pull_clears_the_previous_pull_retry_delay() {
+    let mut h = Harness::new();
+    *h.api.response.lock().unwrap() = Err(ApiError::Network("offline".into()));
+    h.value("figmog_sync", json!({}));
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("failed");
+    *h.api.response.lock().unwrap() = Ok(fixture("2"));
+    let (answer, result) = mpsc::channel();
+    h.manager.sessions[0].write(
+        "retry-clear-test".into(),
+        sessions::WriteOp::Pull {
+            source: sessions::PullSource::File(crate::deep_json::OwnedValue(fixture("1"))),
+            fresh: false,
+            geometry: false,
+        },
+        Box::new(move |value| {
+            let _ = answer.send(value);
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        h.manager.sessions[0].maintain(false);
+        if let Ok(value) = result.try_recv() {
+            value.unwrap();
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let accepted = h.value("figmog_sync", json!({}));
+    assert_eq!(accepted["state"], "running");
+    h.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.release.send(()).unwrap();
+    h.wait_for("succeeded");
 }

@@ -2,6 +2,8 @@
 //! registry merge, and uncached forwarding. Desktop calls have no authoritative
 //! file/revision context and must not reuse a mirror's response cache.
 
+use std::borrow::Cow;
+
 use serde_json::{Value, json};
 
 use crate::mcp::ToolDef;
@@ -34,7 +36,8 @@ pub(crate) fn merge_registry(
     mut local: Vec<ToolDef>,
     upstream_tools: &[Value],
 ) -> (Vec<ToolDef>, Vec<String>) {
-    let mut seen_names: std::collections::BTreeSet<&str> = local.iter().map(|t| t.name).collect();
+    let mut seen_names: std::collections::BTreeSet<String> =
+        local.iter().map(|tool| tool.name.to_string()).collect();
     let mut dropped = Vec::new();
     for tool in upstream_tools {
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
@@ -52,32 +55,14 @@ pub(crate) fn merge_registry(
             .get("inputSchema")
             .cloned()
             .unwrap_or_else(|| json!({"type": "object"}));
-        let name = intern(name.to_string());
-        seen_names.insert(name);
+        seen_names.insert(name.to_string());
         local.push(ToolDef {
-            name,
-            description: intern(format!("[via Figma desktop] {description}")),
+            name: Cow::Owned(name.to_string()),
+            description: Cow::Owned(format!("[via Figma desktop] {description}")),
             input_schema,
         });
     }
     (local, dropped)
-}
-
-/// A `&'static str` for `text`, as `ToolDef` needs. `figmog serve`
-/// re-merges whenever the desktop app appears, disappears or changes its
-/// tool list (NWS-2959), so each distinct string is leaked once and reused
-/// by every later merge: memory stays bounded by the distinct upstream
-/// names and descriptions seen, however often the desktop comes and goes.
-fn intern(text: String) -> &'static str {
-    static INTERNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-    let mut interned = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = interned.get(text.as_str()) {
-        return existing;
-    }
-    let leaked: &'static str = Box::leak(text.into_boxed_str());
-    interned.insert(leaked);
-    leaked
 }
 
 /// Execute one desktop `tools/call` without consulting a mirror's cache.
@@ -104,8 +89,8 @@ mod tests {
 
     fn local_tool(name: &'static str) -> ToolDef {
         ToolDef {
-            name,
-            description: "d",
+            name: Cow::Borrowed(name),
+            description: Cow::Borrowed("d"),
             input_schema: json!({"type": "object"}),
         }
     }
@@ -205,12 +190,36 @@ mod tests {
     }
 
     #[test]
-    fn repeated_merges_reuse_interned_upstream_strings() {
-        let upstream = vec![json!({"name": "get_code", "description": "d"})];
-        let (first, _) = merge_registry(vec![], &upstream);
-        let (second, _) = merge_registry(vec![], &upstream);
-        assert!(std::ptr::eq(first[0].name, second[0].name));
-        assert!(std::ptr::eq(first[0].description, second[0].description));
+    fn changing_upstream_metadata_is_owned_by_each_registry() {
+        let (first, _) = merge_registry(
+            vec![local_tool("figmog_status")],
+            &[json!({"name": "get_first", "description": "initial metadata"})],
+        );
+        assert!(matches!(first[0].name, Cow::Borrowed(_)));
+        assert!(matches!(first[0].description, Cow::Borrowed(_)));
+        assert!(matches!(first[1].name, Cow::Owned(_)));
+        assert!(matches!(first[1].description, Cow::Owned(_)));
+
+        for revision in 0..64 {
+            let name = format!("get_revision_{revision}");
+            let description = format!("metadata revision {revision}");
+            let (registry, _) = merge_registry(
+                Vec::new(),
+                &[json!({"name": name, "description": description})],
+            );
+            // Each registry owns the changing strings rather than leaving
+            // their allocations in a process-global interner. Dropping the
+            // source JSON or a later registry cannot invalidate the first.
+            assert!(matches!(registry[0].name, Cow::Owned(_)));
+            assert!(matches!(registry[0].description, Cow::Owned(_)));
+            assert_eq!(registry[0].name, name);
+            assert_eq!(
+                registry[0].description,
+                format!("[via Figma desktop] {description}")
+            );
+        }
+        assert_eq!(first[1].name, "get_first");
+        assert_eq!(first[1].description, "[via Figma desktop] initial metadata");
     }
 
     #[test]

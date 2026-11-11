@@ -16,7 +16,8 @@ removed) verbatim, for provenance only — don't treat them as current.
   `text`, `instances_of`, `styled_by`, `bound_to`, `by_type`,
   `components`, `component_sets`, `styles`, `variables`,
   `variable_collections`, `meta`, `proxy_cache`, `mirror_config`,
-  `images`, `image_pins`, `variable_snapshot`) are on-disk schema — renaming one changes what store
+  `images`, `image_pins`, `variable_snapshot`; maintenance keyspace
+  `figmog_maintenance`) are on-disk schema — renaming one changes what store
   directory an unmodified binary can open. `Id`/`Rec` are append-only
   enums: postcard encodes variant indices positionally, so a new variant
   goes at the end of each enum, never inserted or reordered.
@@ -52,7 +53,7 @@ removed) verbatim, for provenance only — don't treat them as current.
   clean exit-1 message.
 - **Pin-bump checklist: store compaction.** `src/compact.rs` (NWS-2941)
   drives fjall directly: `SingleWriterTxKeyspace::inner()` and
-  `Keyspace::rotate_memtable_and_wait()` are `#[doc(hidden)]` in fjall
+  `Keyspace::rotate_memtable()` / `Keyspace::sealed_memtable_count()` are `#[doc(hidden)]` in fjall
   3.1.9 (public, undocumented), and the journal retirement it relies on
   — fjall seals the active journal during a flush only once the journal
   writer's position passes 64,000,000 bytes, then deletes it once every
