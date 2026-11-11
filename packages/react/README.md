@@ -56,6 +56,9 @@ component, an array — is skipped with a warning on the dev server's console,
 never half-marked; so is one that already has `data-figmog`, or that several
 map entries resolve to through equivalent paths or aliased exports. Explicit
 markers passed through props spreads override the automatic defaults.
+Local identifiers passed to `memo` or `forwardRef` are followed only when
+the module contains no writes or repeated declarations for those names
+or their aliases; uncertain bindings are skipped with a warning.
 One component renders many instances (every card gets the same attributes), so
 verification captures through a `data-testid` in figmog.targets.json, not
 through these.

@@ -65,6 +65,67 @@ describe("markModule", () => {
     }
   });
 
+  test("skips reassigned wrapper arguments and aliases without marking stale functions", async () => {
+    const functions = "function Initial() { return <div/>; } function Actual() { return <span/>; } ";
+    const cases = [
+      "let Inner = Initial; Inner = Actual; export const Card = memo(Inner);",
+      "var Inner = Initial; Inner = Actual; export const Card = React.forwardRef(Inner);",
+      "let Inner = Initial; const Alias = Inner; Inner = Actual; export const Card = memo(Alias);",
+      "let Inner = Initial; const Alias = memo(Inner); Inner = Actual; export const Card = memo(Alias);",
+      "Initial = Actual; export const Card = memo(Initial);",
+      "let Inner = Initial; Inner ||= Actual; export const Card = memo(Inner);",
+      "var Inner = Initial; var Inner = Actual; export const Card = memo(Inner);",
+      "var Inner = Initial; var Inner; export const Card = memo(Inner);",
+      "let Inner = Initial; ({ value: Inner } = { value: Actual }); export const Card = memo(Inner);",
+      "let Inner = Initial; [Inner] = [Actual]; export const Card = memo(Inner);",
+      "let Inner = Initial; ({ value: Inner = Actual } = {}); export const Card = memo(Inner);",
+      "let Inner = Initial; [Inner, ...Inner] = [Actual]; export const Card = memo(Inner);",
+      "let Inner = Initial; function replace() { Inner = Actual; } export const Card = memo(Inner);",
+      "let Inner = Initial; for (Inner of [Actual]) {} export const Card = memo(Inner);",
+      "var Inner = Initial; for (var Inner of [Actual]) {} export const Card = memo(Inner);",
+      "let Inner = Initial; for (Inner in {}) {} export const Card = memo(Inner);",
+      "let Inner = Initial; for ({ value: Inner } of [{ value: Actual }]) {} export const Card = memo(Inner);",
+      "let Inner = Initial; Inner++; export const Card = memo(Inner);",
+      "export let Card = Initial; Card = Actual;",
+      "let Inner = Initial; Inner = Actual; export { Inner as Card };",
+    ];
+    for (const code of cases) {
+      const outcome = mark(functions + code);
+      assert.equal(outcome.code, null, code);
+      assert.deepEqual(outcome.marked, [], code);
+      assert.equal(outcome.skipped.length, 1, code);
+      assert.match(outcome.skipped[0]?.reason ?? "", /binding .* may be reassigned/, code);
+    }
+    const source = functions + cases[0];
+    const outcome = mark(source);
+    const compiled = await transformWithOxc(outcome.code ?? source, "Card.jsx", {
+      jsx: { development: false, pragma: "h", runtime: "classic" },
+    });
+    const components = new Function("h", "memo", `${compiled.code.replace("export const Card", "const Card")}\n` +
+      "return { Card, Initial };")(
+      (tag: string, props: Record<string, unknown> | null) => ({ tag, props }),
+      (component: unknown) => component,
+    ) as Record<string, () => { tag: string; props: Record<string, unknown> | null }>;
+    assert.deepEqual(components.Card?.(), { tag: "span", props: null });
+    assert.deepEqual(components.Initial?.(), { tag: "div", props: null });
+
+    const mixed = mark(source + " export const Panel = () => <aside/>;", [
+      SPEC, { exportName: "Panel", figma: "component:panel", node: null },
+    ]);
+    assert.deepEqual(mixed.marked, ["Panel"]);
+    assert.deepEqual(mixed.skipped.map(({ exportName }) => exportName), ["Card"]);
+    assert.equal(mixed.code, source + ' export const Panel = () => <aside data-figmog={"component:panel"}/>;');
+  });
+
+  test("follows stable mutable locals and ignores writes to their properties", () => {
+    for (const declaration of ["let", "var"]) {
+      const outcome = mark(`function Inner() { return <div/>; } ${declaration} Alias = Inner; ` +
+        'Alias.displayName = "Card"; export const Card = memo(Alias);');
+      assert.deepEqual(outcome.skipped, []);
+      assert.deepEqual(outcome.marked, ["Card"]);
+    }
+  });
+
   test("skips missing, imported and cyclic wrapper arguments without following them forever", () => {
     const cases = [
       "export const Card = memo(Missing);",

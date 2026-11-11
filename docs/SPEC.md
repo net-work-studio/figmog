@@ -2956,8 +2956,12 @@ transform runs before JSX compilation (`enforce: "pre"`), parses the module
 with Vite's own parser, and finds the export (function declaration, arrow
 or function expression, `export { Local as Name }`, `export default
 function Name`, `memo(...)`/`forwardRef(...)` wrappers, including local
-identifiers passed to them) and every value its
-own body returns. It marks only when **every** return is a DOM element
+identifiers passed to them) and every value its own body returns. It follows
+local bindings only when the module contains no writes or repeated declarations
+for their names, including every binding followed through an alias chain.
+This conservative check includes closures and shadowed names; uncertain
+bindings are skipped with a warning rather than marking a stale initializer.
+It marks only when **every** return is a DOM element
 (lowercase JSX tag), `null`, or a conditional of those; a fragment, a
 component element (`<Card>` — its props may not reach the DOM), an array or
 anything else skips the whole component with a dev-server warning, and so

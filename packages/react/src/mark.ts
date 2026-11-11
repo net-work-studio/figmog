@@ -87,20 +87,31 @@ function unwrap(node: Node): Node {
   return current;
 }
 
-/** The component function behind an exported value, or `null`. */
-function componentFunction(value: Node, locals: ReadonlyMap<string, Node>): Node | null {
+type ComponentResolution = { fn: Node; reason: null } | { fn: null; reason: string };
+
+/** Resolve only bindings whose declaration still describes their value. */
+function componentFunction(
+  value: string,
+  locals: ReadonlyMap<string, Node>,
+  writes: ReadonlySet<string>,
+): ComponentResolution {
   const seen = new Set<Node>();
-  let current = value;
+  let current: Node | string = value;
   while (true) {
+    if (typeof current === "string") {
+      if (writes.has(current)) return { fn: null, reason: `binding ${current} may be reassigned; mark it explicitly` };
+      const local = locals.get(current);
+      if (local === undefined) return { fn: null, reason: "not a function component" };
+      current = local;
+    }
     const node = unwrap(current);
-    if (seen.has(node)) return null;
+    if (seen.has(node)) return { fn: null, reason: "not a function component" };
     seen.add(node);
-    if (FUNCTIONS.has(node.type)) return node;
+    if (FUNCTIONS.has(node.type)) return { fn: node, reason: null };
     if (node.type === "Identifier") {
       const id = name(node);
-      const local = id === null ? undefined : locals.get(id);
-      if (local === undefined) return null;
-      current = local;
+      if (id === null) return { fn: null, reason: "not a function component" };
+      current = id;
       continue;
     }
     if (node.type === "CallExpression") {
@@ -113,20 +124,20 @@ function componentFunction(value: Node, locals: ReadonlyMap<string, Node>): Node
         continue;
       }
     }
-    return null;
+    return { fn: null, reason: "not a function component" };
   }
 }
 
 /** Top-level bindings and exports of a module. */
-function bindings(program: Node): { locals: Map<string, Node>; exports: Map<string, Node | string> } {
+function bindings(program: Node): { locals: Map<string, Node>; exports: Map<string, string> } {
   const locals = new Map<string, Node>();
-  const exports = new Map<string, Node | string>();
+  const exports = new Map<string, string>();
   const declare = (declaration: Node, exported: boolean): void => {
     if (declaration.type === "FunctionDeclaration") {
       const id = name(child(declaration, "id"));
       if (id !== null) {
         locals.set(id, declaration);
-        if (exported) exports.set(id, declaration);
+        if (exported) exports.set(id, id);
       }
     } else if (declaration.type === "VariableDeclaration") {
       for (const declarator of list(declaration, "declarations")) {
@@ -134,7 +145,7 @@ function bindings(program: Node): { locals: Map<string, Node>; exports: Map<stri
         const init = child(declarator, "init");
         if (id !== null && init !== null) {
           locals.set(id, init);
-          if (exported) exports.set(id, init);
+          if (exported) exports.set(id, id);
         }
       }
     }
@@ -156,13 +167,64 @@ function bindings(program: Node): { locals: Map<string, Node>; exports: Map<stri
       if (declaration !== null && declaration.type === "FunctionDeclaration") {
         declare(declaration, false);
         const id = name(child(declaration, "id"));
-        if (id !== null && !exports.has(id)) exports.set(id, declaration);
+        if (id !== null && !exports.has(id)) exports.set(id, id);
       }
     } else {
       declare(statement, false);
     }
   }
   return { locals, exports };
+}
+
+/** Names written by an assignment pattern; member properties do not rebind. */
+function assignedNames(value: Node | null, out: Set<string>): void {
+  if (value === null) return;
+  const node = unwrap(value);
+  const id = name(node);
+  if (node.type === "Identifier" && id !== null) out.add(id);
+  else if (node.type === "ObjectPattern") {
+    for (const property of list(node, "properties")) {
+      assignedNames(child(property, property.type === "RestElement" ? "argument" : "value"), out);
+    }
+  } else if (node.type === "ArrayPattern") {
+    for (const element of list(node, "elements")) assignedNames(element, out);
+  } else if (node.type === "RestElement" || node.type === "AssignmentPattern") {
+    assignedNames(child(node, node.type === "RestElement" ? "argument" : "left"), out);
+  }
+}
+
+/**
+ * Fail closed on syntactic writes anywhere in the module, including closures
+ * that might run before a wrapper is created. Repeated declarations also make
+ * an initializer uncertain. Shadowed names may cause a conservative skip; we
+ * never infer execution order or use a stale initializer to claim a JSX root.
+ */
+function writtenBindings(program: Node): Set<string> {
+  const writes = new Set<string>();
+  const declarations = new Set<string>();
+  const visit = (node: Node): void => {
+    let declared: Node | null = null;
+    if (node.type === "VariableDeclarator" || node.type === "FunctionDeclaration") declared = child(node, "id");
+    if (declared !== null) {
+      const names = new Set<string>();
+      assignedNames(declared, names);
+      for (const id of names) {
+        if (declarations.has(id)) writes.add(id);
+        declarations.add(id);
+      }
+    }
+    if (node.type === "AssignmentExpression") assignedNames(child(node, "left"), writes);
+    else if (node.type === "UpdateExpression") assignedNames(child(node, "argument"), writes);
+    else if (node.type === "ForInStatement" || node.type === "ForOfStatement") {
+      assignedNames(child(node, "left"), writes);
+    }
+    for (const value of Object.values(node as unknown as Record<string, unknown>)) {
+      if (Array.isArray(value)) value.filter(isNode).forEach(visit);
+      else if (isNode(value)) visit(value);
+    }
+  };
+  visit(program);
+  return writes;
 }
 
 /** Every value a component function can return (its own `return`s only). */
@@ -231,7 +293,8 @@ function language(filename: string): "jsx" | "tsx" | null {
  * of each component in `specs`. A component is skipped, with a reason, when it
  * is not found, is not a function component, returns a fragment, a component
  * element or anything else that is not one DOM element on every path, or
- * already carries the attributes (explicit markers win).
+ * already carries the attributes (explicit markers win). Bindings with writes
+ * or repeated declarations are skipped rather than following stale values.
  */
 export function markModule(code: string, filename: string, specs: readonly MarkSpec[]): MarkOutcome {
   const skipped: { exportName: string; reason: string }[] = [];
@@ -250,15 +313,17 @@ export function markModule(code: string, filename: string, specs: readonly MarkS
     return { code: null, marked, skipped };
   }
   const { locals, exports } = bindings(program);
+  const writes = writtenBindings(program);
   const inserts: { at: number; text: string }[] = [];
   // Resolve every export before editing: several export names can refer to
   // the same function (or return the same root). None can claim that element.
   const candidates = [...specs].sort((a, b) => a.exportName.localeCompare(b.exportName)).map((spec) => {
     const exported = exports.get(spec.exportName);
-    const value = typeof exported === "string" ? locals.get(exported) : exported;
-    const fn = value === undefined ? null : componentFunction(value, locals);
+    const { fn, reason: resolutionReason } = exported === undefined
+      ? { fn: null, reason: "no such export" }
+      : componentFunction(exported, locals, writes);
     const elements: Node[] = [];
-    let reason = value === undefined ? "no such export" : fn === null ? "not a function component" : null;
+    let reason = resolutionReason;
     if (fn !== null) {
       for (const result of returned(fn)) {
         reason = roots(result, elements);
