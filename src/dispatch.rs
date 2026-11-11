@@ -459,10 +459,7 @@ impl ReadCommand {
                 x: require_f64(args, "x")?,
                 y: require_f64(args, "y")?,
                 page: require_str(args, "page")?,
-                under: args
-                    .get("under")
-                    .map(|_| require_str(args, "under"))
-                    .transpose()?,
+                under: arg_str(args, "under")?,
                 limit: match args.get("limit") {
                     None => query::DEFAULT_AT_LIMIT,
                     Some(value) => json_usize(value)
@@ -1071,6 +1068,38 @@ mod tests {
             assert_eq!(arg_f64(&args, "k"), Ok(None));
             assert_eq!(arg_str_array(&args, "k"), Ok(None));
         }
+    }
+
+    #[test]
+    fn at_under_accepts_null_without_changing_the_default_scope() {
+        let mut args = json!({"x": 0, "y": 0, "page": "0:1"});
+        let expected = Some(ReadCommand::At {
+            x: 0.0,
+            y: 0.0,
+            page: "0:1".into(),
+            under: None,
+            limit: query::DEFAULT_AT_LIMIT,
+        });
+        assert_eq!(
+            ReadCommand::from_tool_args("figmog_at", &args),
+            Ok(expected.clone())
+        );
+        args["under"] = Value::Null;
+        assert_eq!(
+            ReadCommand::from_tool_args("figmog_at", &args),
+            Ok(expected)
+        );
+
+        args["under"] = json!("1:1");
+        assert!(matches!(
+            ReadCommand::from_tool_args("figmog_at", &args),
+            Ok(Some(ReadCommand::At { under: Some(under), .. })) if under == "1:1"
+        ));
+        args["under"] = json!(123);
+        assert_eq!(
+            ReadCommand::from_tool_args("figmog_at", &args),
+            Err("expected string for `under`, got number".into())
+        );
     }
 
     #[test]
