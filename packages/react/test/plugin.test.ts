@@ -3,12 +3,15 @@
 // so no Rust build is needed. The end-to-end run against the real figmog
 // binary is examples/dev-plugin's test.
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { chromium } from "playwright";
 import { build, createLogger, createServer, type InlineConfig, type ViteDevServer } from "vite";
 import { BRIDGE_PATH, fileKey, isLoopbackAddress, isLoopbackHost } from "../src/bridge.js";
@@ -355,7 +358,7 @@ describe("bridge", () => {
     assert.deepEqual(reply, { status: 403, cors: undefined });
   });
 
-  test("never exposes token-bearing HTML to another localhost origin", async () => {
+  test("never exposes token-bearing HTML to another localhost origin", async (t) => {
     const reply = await fetch(`http://localhost:${port}/`, { headers: { origin: `http://localhost:${port + 1}` } });
     assert.equal(reply.status, 403);
     assert.equal(reply.headers.get("access-control-allow-origin"), null);
@@ -365,7 +368,12 @@ describe("bridge", () => {
     assert.match(await same.text(), /__FIGMOG_BRIDGE__/);
 
     const other = await serveFixtures();
-    const browser = await chromium.launch({ headless: true });
+    t.after(other.close);
+    const executablePath = process.env["FIGMOG_SHOT_CHROMIUM"];
+    const browser = await chromium.launch({
+      headless: true,
+      ...(executablePath === undefined || executablePath === "" ? {} : { executablePath }),
+    });
     try {
       const tab = await browser.newPage();
       await tab.goto(`${other.origin}/card.html`);
@@ -379,8 +387,41 @@ describe("bridge", () => {
       assert.equal(readable, false, "another localhost page cannot read the injected credential");
     } finally {
       await browser.close();
-      await other.close();
     }
+  });
+
+  test("a browser startup failure releases the fixture server and exits", async () => {
+    const missing = join(work, "missing-chromium");
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      FIGMOG_SHOT_CHROMIUM: missing,
+      PLAYWRIGHT_BROWSERS_PATH: join(work, "no-playwright-browsers"),
+    };
+    // A child run needs readable TAP, not the parent worker's binary IPC reporter.
+    delete env["NODE_TEST_CONTEXT"];
+    await assert.rejects(
+      // Run in one process so the timeout also bounds any leaked HTTP server.
+      promisify(execFile)(process.execPath, [
+        "--test-name-pattern=never exposes token-bearing HTML",
+        fileURLToPath(import.meta.url),
+      ], {
+        env,
+        killSignal: "SIGKILL",
+        timeout: 15_000,
+      }),
+      (error: unknown) => {
+        const failure = error as Error & {
+          code?: number; killed?: boolean; signal?: string | null; stdout?: string; stderr?: string;
+        };
+        const output = `${failure.stdout ?? ""}${failure.stderr ?? ""}`;
+        assert.equal(failure.killed, false, `the failed launch must exit without leaking its fixture server: ${output}`);
+        assert.equal(failure.code, 1, output);
+        assert.equal(failure.signal, null, output);
+        assert.match(output, /executable.*doesn't exist/i);
+        assert.ok(output.includes(missing), output);
+        return true;
+      },
+    );
   });
 
   test("refuses peers that are not this machine, even with forged headers", async (t) => {

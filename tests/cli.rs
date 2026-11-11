@@ -795,8 +795,9 @@ fn import_variables_output_shape_is_the_variable_count_alone() {
 /// `figmog_images`, NWS-2968 `figmog_spec`), every one `source: "local"`.
 #[test]
 fn tools_output_shape_is_name_source_cacheable_rows() {
+    // Inspect this binary's local registry, independent of a running project owner.
     let out = common::command()
-        .args(["tools", "--no-upstream"])
+        .args(["tools", "--no-upstream", "--no-socket"])
         .assert()
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
