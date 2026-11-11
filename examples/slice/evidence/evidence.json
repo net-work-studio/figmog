@@ -2,29 +2,29 @@
   "builds": {
     "after": {
       "card": "examples/slice/app/src/Card.jsx",
-      "commit": "ae92e5d23b16459569d012354d32b5d533138434",
+      "commit": "aaccca4b0ada21010c8094d17a4d96c7f304c11e",
       "dirty": false,
       "tree": {
         "files": 8,
-        "sha256": "78595d5aa820902a186a113cf7fbc34b7ff917eae4a24f7ae05b02396be5bdd5"
+        "sha256": "8dfbda178d0ce89f5880c7b17454561ec8abb553b1f06bbd5ca2521e08303481"
       }
     },
     "before": {
       "card": "examples/slice/app/baseline/Card.jsx",
-      "commit": "ae92e5d23b16459569d012354d32b5d533138434",
+      "commit": "aaccca4b0ada21010c8094d17a4d96c7f304c11e",
       "dirty": false,
       "tree": {
         "files": 8,
-        "sha256": "f61789bb6dcba66c74430cf069b7a5e61b2e47ab7478ec6ed0587bdf8767364c"
+        "sha256": "146992474643837b339ffc41f3c617b4fd7d0ee6fc136de66ccb9b33709ff8fc"
       }
     },
     "broken": {
       "card": "examples/slice/app/variants/Card.wrong-padding.jsx",
-      "commit": "ae92e5d23b16459569d012354d32b5d533138434",
+      "commit": "aaccca4b0ada21010c8094d17a4d96c7f304c11e",
       "dirty": false,
       "tree": {
         "files": 8,
-        "sha256": "c81174f45258da41b5730052f32adc41d7e678b26da6bcd7cbbc0f266ed31a25"
+        "sha256": "be9a1303cd6a0ad44b3799d6334eaf1aac4bc8a1e7cd36685de26ecad1566230"
       }
     }
   },
@@ -213,7 +213,7 @@
   "scoreNote": "advisory: 100 * (1 - mismatched / (W*H)) against the Figma render; never a pass/fail gate",
   "spec": {
     "path": "examples/slice/spec/card.spec.json",
-    "sha256": "11cc71c173e857257d00a6e4f41748f4b2f7a375fdf3dcedfabdfcaa89868e92"
+    "sha256": "dfaef89d3d51b9f2ccb43a99991f1cb66fa853b86082dec75c03b0139d90f164"
   },
   "tokens": {
     "css": {

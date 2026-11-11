@@ -36,8 +36,8 @@ Figma: ![figma](correct/390/figma.png) before: ![before](correct/390/before.png)
 - Figma render: stand-in for version 4243, `examples/slice/figma/card-render.json`
 - Token snapshot: `tests/fixtures/spec/variables.json` digest `fnv1a64:fd631e535712b153` (exported_at 2026-11-02T09:00:00Z)
 - Token CSS: `examples/slice/app/src/tokens.css` sha256 `e93ad00bdcda5672`
-- Build `before`: card `examples/slice/app/baseline/Card.jsx`, commit `ae92e5d23b16`, tree sha256 `f61789bb6dcba66c` (8 files)
-- Build `after`: card `examples/slice/app/src/Card.jsx`, commit `ae92e5d23b16`, tree sha256 `78595d5aa820902a` (8 files)
-- Build `broken`: card `examples/slice/app/variants/Card.wrong-padding.jsx`, commit `ae92e5d23b16`, tree sha256 `c81174f45258da41` (8 files)
+- Build `before`: card `examples/slice/app/baseline/Card.jsx`, commit `aaccca4b0ada`, tree sha256 `146992474643837b` (8 files)
+- Build `after`: card `examples/slice/app/src/Card.jsx`, commit `aaccca4b0ada`, tree sha256 `8dfbda178d0ce89f` (8 files)
+- Build `broken`: card `examples/slice/app/variants/Card.wrong-padding.jsx`, commit `aaccca4b0ada`, tree sha256 `be9a1303cd6a0ad4` (8 files)
 - Contract: viewports 1440x900, 390x844; light mode, default state, local only; selector `[data-testid="slice-card"]`
 - Full record: `examples/slice/evidence/evidence.json`
