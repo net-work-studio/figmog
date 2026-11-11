@@ -1,0 +1,55 @@
+examples/slice/app/test/build-inputs.test.mjs
+  s_d336666e6b7163::t_a726d45e6dc6f4 1-49
+packages/react/src/compare.ts
+  s_d336666e6b7163::t_9b1373580b1f52 1,165-169,171-172,174,181-208,224-226,234-236
+src/query.rs
+  s_d336666e6b7163::t_c94f43895d12b4 913-915,928,940
+packages/react/README.md
+  s_d336666e6b7163::t_5ffb3a66beb7a0 142-146
+examples/slice/README.md
+  s_d336666e6b7163::t_c292fa4d0fea36 96-99
+src/spec.rs
+  s_d336666e6b7163::t_c94f43895d12b4 36,168,264,578-585
+  s_d336666e6b7163::t_515ea45ced5aaf 883-952
+packages/react/test/compare.test.ts
+  s_d336666e6b7163::t_21cb17fc0b519a 2-4,6,49-179
+docs/SPEC.md
+  s_d336666e6b7163::t_df53f78f3f2916 1312-1314,1358-1359,2003-2004
+  s_d336666e6b7163::t_63a67274c014bb 1329-1330,1356-1357,2033-2034
+src/tokens.rs
+  s_d336666e6b7163::t_c94f43895d12b4 63,89,165-167,176,202,526-532,534-543,545,547,549-555,557-559,563-565,573-574,582,587,594-597,642,760,856,860
+  s_d336666e6b7163::t_5a670889a7705f 1008,1013,1015-1017,1024,1026-1028,1057,1059-1085
+  s_d336666e6b7163::t_69cfdd8e23f5e2 556,560-562,566-567,967,992,1009-1012,1014,1018-1023,1025,1029-1056,1058,1086
+examples/slice/app/src/index.css
+  s_d336666e6b7163::t_c292fa4d0fea36 10,12-15
+examples/slice/spec/card.spec.json
+  s_9cf6a020dd8111::t_4eba25ec587634 332
+tests/fixtures/spec/card.spec.json
+  s_9cf6a020dd8111::t_0bebb97f082995 397
+tests/tokens.rs
+  s_d336666e6b7163::t_4ab6a81bc87b02 60,164-211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aaccca4b0ada21010c8094d17a4d96c7f304c11e",
+  "prompts": {},
+  "sessions": {
+    "s_9cf6a020dd8111": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c659-8327-7e80-92e0-5a3276c64bdd",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    },
+    "s_d336666e6b7163": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa8-a0b6-7dc1-bd6e-bc0081b6f0e4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
