@@ -1,0 +1,24 @@
+docs/SPEC.md
+  s_d00caf59bef041::t_a84e34020c5ea2 1083-1087
+src/serve/relay.rs
+  s_d00caf59bef041::t_f2f6ec525d21ba 279-286,312,799-837,843-864,870-919,926-941
+  s_d00caf59bef041::t_2c6448ea6c02d9 838-842,865-869,920-925
+  s_d00caf59bef041::t_41270758bec25c 58,320-321,331-333,383-384
+  s_d00caf59bef041::t_79314787bb1c49 942
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f0c8c666f141fda693e1ba58fb410259906db4da",
+  "prompts": {},
+  "sessions": {
+    "s_d00caf59bef041": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa7-9721-7ac1-9380-ea52571e7db3",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
