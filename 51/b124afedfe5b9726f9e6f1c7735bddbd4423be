@@ -1,0 +1,19 @@
+tests/owner.rs
+  s_ca147dff344902::t_696a835a78ac45 436,467,903-904,908-923,925,961
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "51b124afedfe5b9726f9e6f1c7735bddbd4423be",
+  "prompts": {},
+  "sessions": {
+    "s_ca147dff344902": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1cfc9-f4be-7613-874c-a6f9a53d891a",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
