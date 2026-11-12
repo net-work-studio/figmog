@@ -1080,7 +1080,11 @@ If the owner connection drops with requests unanswered (the owner crashed
 or was killed), the relay answers each with an `outcome unknown` tool error
 and starts reconnecting at once while stdin remains open. Runtime reconnects
 run off the event loop; queued requests wait for a connection without delaying
-EOF handling. On every new connection the relay repeats the
+EOF handling. Replies already read from the owner retain their agent IDs and
+are handled before unanswered requests are classified as unknown outcomes.
+Write failures shut down the socket; only the reader reports the terminal
+disconnect after enqueueing its replies, preserving buffered `not accepted`
+retries as well. On every new connection the relay repeats the
 handshake (with its startup files) and the agent's `initialize` (under a
 relay-internal id whose answer it swallows), so notifications keep
 flowing.

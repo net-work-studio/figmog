@@ -55,7 +55,7 @@ enum Msg {
     StdoutGone,
     /// A frame from the owner connection of this epoch.
     Owner(u64, String),
-    /// The owner connection of this epoch ended.
+    /// Only the reader sends this, after every frame it has read.
     OwnerGone(u64),
     Connected(u64, Result<OwnerConn, String>),
 }
@@ -276,6 +276,14 @@ impl Relay {
     }
 
     fn install(&mut self, connection: OwnerConn) -> Result<owner::OwnerInfo, String> {
+        self.install_with_reader_hook(connection, || {})
+    }
+
+    fn install_with_reader_hook(
+        &mut self,
+        connection: OwnerConn,
+        mut after_read: impl FnMut() + Send + 'static,
+    ) -> Result<owner::OwnerInfo, String> {
         let OwnerConn {
             reader,
             writer,
@@ -301,6 +309,7 @@ impl Relay {
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
+                        after_read();
                         let line = line.trim_end_matches(['\n', '\r']).to_string();
                         if tx.send(Msg::Owner(epoch, line)).is_err() {
                             return;
@@ -308,18 +317,21 @@ impl Relay {
                     }
                 }
             }
+            // Sole terminal event: all replies read above must reach the
+            // event loop before their pending agent-ID mappings retire.
             let _ = tx.send(Msg::OwnerGone(epoch));
         });
         let (frames, queue) = mpsc::channel::<String>();
-        let tx = self.tx.clone();
         std::thread::spawn(move || {
             for frame in queue {
                 if writeln!(output, "{frame}")
                     .and_then(|()| output.flush())
                     .is_err()
                 {
+                    // Wake the reader, which orders OwnerGone after any
+                    // reply it has read. A writer terminal event could
+                    // overtake that reply and discard its ID mapping.
                     let _ = output.shutdown(std::net::Shutdown::Both);
-                    let _ = tx.send(Msg::OwnerGone(epoch));
                     return;
                 }
             }
@@ -368,8 +380,9 @@ impl Relay {
             .as_ref()
             .is_some_and(|output| output.send(frame.to_owned()).is_ok());
         if !ok {
+            // Queue failure also leaves terminal ordering to the reader.
+            // Shutdown wakes it without retiring its buffered replies.
             self.disconnect();
-            let _ = self.tx.send(Msg::OwnerGone(self.epoch));
         }
         ok
     }
@@ -782,6 +795,150 @@ impl Relay {
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    fn check_buffered_reply_before_write_failure(queue_failure: bool, not_accepted: bool) {
+        use std::time::Duration;
+
+        let (_dir, mut relay, _old_peer) = configured_relay();
+        relay.disconnect();
+        let (tx, rx) = mpsc::channel();
+        relay.tx = tx;
+        let (answers, received) = mpsc::channel();
+        relay.stdout.take().unwrap().finish(Instant::now());
+        relay.stdout = Some(super::super::output::StdioWriter::spawn(move |frame| {
+            answers.send(frame.to_owned()).is_ok()
+        }));
+        let (read, paused) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let (writer, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        relay
+            .install_with_reader_hook(
+                OwnerConn {
+                    reader: BufReader::new(writer.try_clone().unwrap()),
+                    writer,
+                    info: owner::OwnerInfo {
+                        pid: 42,
+                        generation: "reply-order".into(),
+                        settings: None,
+                        attach_errors: vec![],
+                    },
+                },
+                move || {
+                    read.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(2)).unwrap();
+                },
+            )
+            .unwrap();
+        // A refusal queues its retry without starting an unrelated owner.
+        relay.connecting = Some(Connecting {
+            id: 1,
+            cancel: Arc::default(),
+        });
+        assert!(
+            relay.on_agent(
+                json!({"jsonrpc":"2.0", "id":"agent-A", "method":"tools/list"}).to_string()
+            )
+        );
+        let mut line = String::new();
+        BufReader::new(peer.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        let reply = if not_accepted {
+            json!({"jsonrpc":"2.0", "id":request["id"],
+                "error":{"code":owner::NOT_ACCEPTED,"message":"closing"}})
+        } else {
+            json!({"jsonrpc":"2.0", "id":request["id"], "result":{"answer":"A"}})
+        };
+        writeln!(peer, "{reply}").unwrap();
+        paused.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(peer);
+        if queue_failure {
+            // Stop the writer normally, then fail the event loop's queue
+            // send independently of a socket write failure.
+            relay.owner_output.take();
+            let (sender, receiver) = mpsc::channel();
+            drop(receiver);
+            relay.owner_output = Some(sender);
+        }
+        assert!(
+            relay.on_agent(
+                json!({"jsonrpc":"2.0", "id":"agent-B", "method":"tools/list"}).to_string()
+            )
+        );
+        if !queue_failure {
+            // Receiver teardown proves the real output worker has failed
+            // its socket write before the reader may enqueue A's reply.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while relay
+                .owner_output
+                .as_ref()
+                .unwrap()
+                .send(String::new())
+                .is_ok()
+            {
+                assert!(Instant::now() < deadline, "writer did not fail");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        release.send(()).unwrap();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                Msg::Owner(epoch, line) => assert!(relay.on_owner(epoch, &line)),
+                Msg::OwnerGone(epoch) => {
+                    assert!(relay.owner_gone(epoch, false));
+                    break;
+                }
+                _ => panic!("unexpected relay event"),
+            }
+        }
+        relay
+            .stdout
+            .take()
+            .unwrap()
+            .finish(Instant::now() + Duration::from_secs(2));
+        let answers: Vec<Value> = received
+            .try_iter()
+            .map(|frame| serde_json::from_str(&frame).unwrap())
+            .collect();
+        if not_accepted {
+            assert_eq!(answers.len(), 1, "{answers:?}");
+            let Some(Outgoing::Request(id, sent)) = relay.outgoing.pop_front() else {
+                panic!("buffered refusal lost its retry");
+            };
+            assert_eq!(id, request["id"].as_str().unwrap());
+            assert_eq!(sent.agent_id.as_ref().unwrap().as_str(), Some("agent-A"));
+            assert_eq!(sent.resends, 1);
+        } else {
+            assert_eq!(answers.len(), 2, "{answers:?}");
+            assert_eq!(answers[0]["id"], "agent-A", "{answers:?}");
+            assert_eq!(answers[0]["result"]["answer"], "A", "{answers:?}");
+        }
+        let unknown = answers.last().unwrap();
+        assert_eq!(unknown["id"], "agent-B", "{answers:?}");
+        assert!(
+            unknown["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("outcome unknown")
+        );
+        assert!(relay.pending.is_empty());
+    }
+
+    #[test]
+    fn buffered_owner_replies_precede_write_failure_cleanup() {
+        for queue_failure in [false, true] {
+            check_buffered_reply_before_write_failure(queue_failure, false);
+        }
+    }
+
+    #[test]
+    fn buffered_not_accepted_replies_survive_write_failures() {
+        for queue_failure in [false, true] {
+            check_buffered_reply_before_write_failure(queue_failure, true);
+        }
+    }
 
     #[test]
     fn not_accepted_reconnect_during_eof_keeps_the_original_deadline() {
