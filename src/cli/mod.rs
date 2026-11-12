@@ -688,7 +688,11 @@ fn requested_file(args: &Value) -> Result<Option<String>, String> {
 /// Management tools don't target an existing mirror, and desktop tools
 /// use the desktop's own context rather than local mirror routing.
 pub(crate) fn is_per_file_local_tool(tool: &str) -> bool {
-    crate::proxy::is_local_tool(tool) && !matches!(tool, "figmog_open" | "figmog_files")
+    crate::proxy::is_local_tool(tool)
+        && !matches!(
+            tool,
+            "figmog_open" | "figmog_files" | crate::serve::writes::OPERATION
+        )
 }
 
 /// For per-file local tools, inject the project default's key
@@ -711,9 +715,9 @@ pub(crate) fn is_per_file_local_tool(tool: &str) -> bool {
 /// in-process serve keeps its own-default behavior, while the shared
 /// background owner is not asked at all ([`route_for`]).
 ///
-/// Never applied to desktop tools or `figmog_files`, which have no mirror
-/// routing, nor to `figmog_open`: its own `file` argument names the file
-/// *to open*, not a routing hint — it's required, and direct mode's own
+/// Never applied to desktop tools, `figmog_files`, or operation receipt
+/// queries, which have no mirror routing, nor to `figmog_open`: its own
+/// `file` argument names the file *to open*, not a routing hint — it's required, and direct mode's own
 /// dispatch correctly rejects an omitted one; silently defaulting it here
 /// would let `figmog call figmog_open`
 /// (no `--args`) succeed over the socket while the exact same invocation
@@ -1210,23 +1214,6 @@ fn open_store_owned<T>(
         }
     })?;
     Ok(OwnedStore::new(store, owner))
-}
-
-/// Whether fjall's own writer lock on the store at `owner.path` is held by
-/// someone else (an older binary's serve holds only that one): the store
-/// is opened and closed at once with its panics caught, like
-/// [`open_store_checked`] — the same `"Locked"` payload match (see the
-/// pin-bump checklist in `AGENTS.md`). Any other failure — a store left
-/// damaged, such as one an interrupted `figmog migrate` half deleted
-/// (NWS-2964) — is not lock contention and reads as `false`, never as an
-/// exit.
-fn writer_locked(owner: &StoreOwner) -> bool {
-    let path = owner.path.clone();
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(|| drop(crate::open_store!(&path)));
-    std::panic::set_hook(prev_hook);
-    result.is_err_and(|payload| panic_message(&*payload).contains("Locked"))
 }
 
 /// Best-effort text for a caught panic's payload: `&str`/`String` cover

@@ -533,7 +533,8 @@ default at all, and an omitted `file` then errors, naming
 Startup opens stores before serving and queues an initial pull for each
 missing mirror when watch is enabled. It never waits for network pulls;
 those failures appear in job state while the server stays available.
-`--no-watch` queues no startup pulls. Invalid paths, store locks and required
+`--no-watch` still opens the selected startup stores, including the project
+default, but queues no startup pulls. Invalid paths, store locks and required
 watch credentials still fail startup. Explicit first references queue the
 same asynchronous lifecycle, regardless of watch mode.
 
@@ -634,7 +635,9 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   `figmog_internal_operation {id}` (any connection) returns `{"id",
   "state": "succeeded", "result"}`, `{"id", "state": "failed", "error"}`,
   `{"id", "state": "running"}`, or an unknown-operation error (another
-  process's id, or expired). Receipts and ids are in memory only.
+  process's id, or expired). This is a process-scoped management query:
+  its ID is sufficient even when the checkout has no default or current
+  file. Receipts and ids are in memory only.
 - *Ordering and coalescing.* Writes run on the file's worker (still its
   only writer) in arrival order, ahead of queued watch/sync jobs, and,
   like a direct pull, without waiting out a failed pull's backoff. Two
@@ -649,7 +652,9 @@ the agent tool surface is unchanged (agents keep `figmog_open`/`figmog_sync`).
   store, reads queue no implicit first pull. A successful routed pull
   updates `last_success` (`"job_id": null`, plus `"operation"`) and clears
   the failed-pull watch deferral while preserving independent metadata
-  Retry-After and ordinary cadence; it is not a lifecycle job.
+  Retry-After and ordinary cadence, including across a fresh store reopen.
+  Pending expedited observations and owed polls also survive the reopen.
+  A routed pull is not a lifecycle job.
 - *Validation first.* `from_file` (a parsed `GET /v1/files/:key`
   response) and `content` (an export's exact text; the snapshot digest is
   over it) are checked — parse, flatten, variable entries — before any
@@ -971,8 +976,9 @@ lock file that disappears or is replaced makes its holder shut down (see
 **Socket.** `<runtime directory>/<16 hex>.sock`, the hex a 64-bit FNV-1a
 hash of the project identity. A valid user-owned mode-0700
 `$XDG_RUNTIME_DIR` is preferred, with a private `figmog` child; otherwise
-`/tmp/figmog-<uid>` is used. Paths that would reach macOS's 104-byte limit
-fall back to the short `/tmp` address. Directories and sockets are checked
+`/tmp/figmog-<uid>` is used. Non-UTF-8 paths and paths that would reach
+macOS's 104-byte limit fall back to the short `/tmp` address, so discovery
+can represent the exact socket path in JSON. Directories and sockets are checked
 for ownership, modes and symlinks before connecting, and the connected
 peer must have the current uid. Discovery must name the expected socket.
 An unsafe or pre-planted runtime directory produces an actionable error;
@@ -1031,7 +1037,11 @@ per-file call to the owner when the invoking worktree resolves no file
 (no explicit `file`, node URL or project default): it reports that
 worktree's "no mirror here" rather than another worktree's file. The owner
 itself never treats its one open session as a default. Desktop and
-management calls pass through unchanged. Every request a relay forwards
+management calls pass through unchanged. Typed read and management arguments
+are validated before selecting a default, checking migration state, or recording
+a referenced file. A rejected request therefore cannot change the relay's
+sole-file fallback. Unknown tool names pass through without changing it.
+Every request a relay forwards
 — any frame with an `id` that is not a `notifications/` method, including
 one whose method is empty, missing or not a string (the owner answers it
 "method not found") — goes to the owner under a relay-assigned id, mapped back to the agent's own
@@ -1069,10 +1079,22 @@ serve"). A write
 the owner accepted is never retried: NWS-2963's `outcome unknown` stands.
 If the owner connection drops with requests unanswered (the owner crashed
 or was killed), the relay answers each with an `outcome unknown` tool error
-and reconnects at once. On every new connection the relay repeats the
+and starts reconnecting at once while stdin remains open. Runtime reconnects
+run off the event loop; queued requests wait for a connection without delaying
+EOF handling. On every new connection the relay repeats the
 handshake (with its startup files) and the agent's `initialize` (under a
 relay-internal id whose answer it swallows), so notifications keep
 flowing.
+
+**Agent output and EOF.** Relay responses use a dedicated stdout writer,
+so a client that stops reading cannot block the event loop from receiving
+stdin EOF. Writes to the owner are queued off the event loop as well. Pending
+replies, reconnects and the final output flush share the original 15-second
+exit-drain deadline. At expiry, connection work is cancelled, including a
+blocked connect or handshake; a late connection cannot attach, initialize, or
+resend requests. No further owner launch is started after cancellation. The
+owner connection closes before the final flush, so blocked output cannot keep
+the owner attached. Initial startup retains its separate 60-second budget.
 
 **Notifications.** Notifications from the owner — `tools/list_changed`
 from desktop re-detection (§8) — are forwarded verbatim to the relay's
@@ -1936,26 +1958,32 @@ When mirror and legacy roots coincide it is a no-op. Per key:
    migration of the key holds it — from any worktree — this one is
    refused with a message to rerun once it finishes.
 1. Refuse if `<mirror root>/<key>` already exists.
-2. Open the old store through `open_store_checked` — its ownership anchor
+2. Open the old store with its ownership anchor
    *and* fjall's own writer lock, so a running serve (even an older binary)
    fails this with the standard "store is locked" error — then close the
-   database but keep the anchor.
+   database to quiesce its workers, then acquire and retain the same native
+   file lock fjall uses on `db/lock`, alongside the anchor. Revalidate the
+   directory and lock identities; if an older writer wins this transition,
+   fail before copying or deleting anything.
 3. Remove any staging dir `<mirror root>/.<key>.migrating` left by an
    interrupted run (safe: the migration lock excludes a live one), copy the old directory into it (regular files and
    directories only, fsynced; the lock anchor is not copied), take a fresh
-   anchor on the staged `db/`, and write `migrated-from` naming the source.
+   anchor and native writer lock on the staged `db/`, and write
+   `migrated-from` naming the source. Revalidate source and staged ownership
+   before publication.
 4. Atomically rename the staging dir to `<mirror root>/<key>`; the staged
-   anchor (still held) moves with it, so the destination is owned the
-   moment it appears.
+   anchor and writer lock (still held) move with it, so the destination is
+   owned the moment it appears.
 5. Atomically rename the old directory to its tombstone
-   `.figmog/.<key>.deleting` beside it (its anchor is still held and its
-   fjall lock was checked in 2), remove the tombstone recursively, then the
-   marker. A tombstone is never opened as a store.
+   `.figmog/.<key>.deleting` beside it, retaining both locks. Revalidate the
+   renamed tombstone and remove it recursively, then the marker. Never revisit
+   the old source pathname: an older process may have created a new store
+   there after the rename. A tombstone is never opened as a store.
 
 A crash during 3 leaves the old store intact and active (the staging dir
 is ignored and redone on rerun). A crash after 4 leaves the marker, which
 the active-store rules report and a rerun finishes by doing 5 while holding
-both stores' anchors *and* fjall writer locks (as in 2, so an older
+both stores' anchors *and* native fjall writer locks (as in 2, so an older
 binary's serve on either store refuses it). The marker names the source
 checkout's old directory, and only a rerun from that checkout removes it:
 another worktree's own old mirror is an independent copy, so there the
@@ -1964,9 +1992,11 @@ source is already gone, when it just removes the source's tombstone (if
 any) and the marker. A crash during 5's deletion leaves a half-deleted
 tombstone, which a rerun removes without opening it. An old directory an
 older binary's interrupted step 5 left half deleted in place is still
-checked for anchors and fjall locks, but failing to open as a store (it is
-not lock contention) does not stop the rerun from retiring it. A stray
-tombstone with no marker is removed by any rerun.
+protected by anchors and native writer locks without opening or recovering
+its contents. The same protection applies while removing stale staging
+directories and tombstones; missing lock files inside these partial private
+trees are created without initializing a database. A stray tombstone with no
+marker is removed by any rerun.
 
 ## 17. Binding-aware spec (NWS-2968)
 

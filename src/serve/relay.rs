@@ -24,9 +24,10 @@
 //! startup files) and the agent's `initialize`, so notifications such as
 //! `tools/list_changed` keep reaching the agent.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -50,10 +51,29 @@ const OWNER_ID: &str = "figmog-relay-";
 enum Msg {
     Stdin(String),
     StdinEof,
+    /// The agent closed its output stream.
+    StdoutGone,
     /// A frame from the owner connection of this epoch.
     Owner(u64, String),
     /// The owner connection of this epoch ended.
     OwnerGone(u64),
+    Connected(u64, Result<OwnerConn, String>),
+}
+
+struct Connecting {
+    id: u64,
+    cancel: Arc<owner::ConnectCancel>,
+}
+
+impl Drop for Connecting {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+enum Outgoing {
+    Request(String, Sent),
+    Notification(String),
 }
 
 /// A forwarded request awaiting its answer, keyed by its owner-link id.
@@ -82,11 +102,25 @@ struct Relay {
     /// The agent's `initialize`, replayed on reconnect.
     initialize: Option<String>,
     writer: Option<UnixStream>,
+    owner_output: Option<mpsc::Sender<String>>,
+    connecting: Option<Connecting>,
+    next_connect: u64,
+    outgoing: VecDeque<Outgoing>,
+    drain_until: Option<Instant>,
+    /// Agent output never blocks the relay's request and shutdown loop.
+    stdout: Option<super::output::StdioWriter>,
     epoch: u64,
     pending: BTreeMap<String, Sent>,
     tx: mpsc::Sender<Msg>,
     /// The next owner-link request id's number.
     next_id: u64,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.connecting.take();
+        self.disconnect();
+    }
 }
 
 /// Run `figmog serve` as a relay. `files` are its startup files; the
@@ -111,12 +145,6 @@ pub(crate) fn run_relay(
         None => layout.default_key()?,
     };
     if let Some(key) = &default_key
-        && let Err(error) = shared_store(&layout, key)
-    {
-        eprintln!("figmog: {error}");
-    }
-    if settings.watch
-        && let Some(key) = &default_key
         && !attach.contains(key)
     {
         shared_store(&layout, key)?;
@@ -124,6 +152,14 @@ pub(crate) fn run_relay(
     }
     let paths = OwnerPaths::ensure(&layout.mirror_root)?;
     let (tx, rx) = mpsc::channel();
+    let output_tx = tx.clone();
+    let stdout = super::output::StdioWriter::spawn(move |frame| {
+        let written = write_agent(frame);
+        if !written {
+            let _ = output_tx.send(Msg::StdoutGone);
+        }
+        written
+    });
     let mut relay = Relay {
         layout,
         paths,
@@ -133,6 +169,12 @@ pub(crate) fn run_relay(
         referenced: BTreeSet::new(),
         initialize: None,
         writer: None,
+        owner_output: None,
+        connecting: None,
+        next_connect: 0,
+        outgoing: VecDeque::new(),
+        drain_until: None,
+        stdout: Some(stdout),
         epoch: 0,
         pending: BTreeMap::new(),
         tx: tx.clone(),
@@ -164,7 +206,15 @@ pub(crate) fn run_relay(
         }
         let _ = tx.send(Msg::StdinEof);
     });
-    relay.run(&rx);
+    let deadline = relay
+        .run(&rx)
+        .unwrap_or_else(|| Instant::now() + super::EXIT_DRAIN);
+    relay.connecting.take();
+    // The reader holds another descriptor for this connection. Shut down
+    // both halves before waiting on the agent's output, so an unread pipe
+    // cannot keep the owner attached for the rest of the drain budget.
+    relay.disconnect();
+    relay.stdout.take().unwrap().finish(deadline);
     Ok(())
 }
 
@@ -182,8 +232,8 @@ fn shared_store(layout: &Layout, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// One frame to stdout. `false`: the agent is gone.
-fn to_agent(frame: &str) -> bool {
+/// One frame to stdout, called only by the output worker.
+fn write_agent(frame: &str) -> bool {
     let mut stdout = std::io::stdout();
     writeln!(stdout, "{frame}").is_ok() && stdout.flush().is_ok()
 }
@@ -207,19 +257,35 @@ fn local_error(id: OwnedValue, method: &str, message: &str) -> OwnedValue {
 }
 
 impl Relay {
+    fn to_agent(&self, frame: &str) -> bool {
+        self.stdout
+            .as_ref()
+            .is_some_and(|stdout| stdout.send(frame.to_owned()))
+    }
+
     /// Connect (launching an owner if needed), handshake with the startup
     /// files, start this connection's reader, and replay `initialize`.
     fn connect(&mut self) -> Result<owner::OwnerInfo, String> {
-        let OwnerConn {
-            reader,
-            writer,
-            info,
-        } = owner::connect_or_launch(
+        let connection = owner::connect_or_launch(
             &self.paths,
             &self.layout.project_root,
             &self.settings,
             &self.attach,
         )?;
+        self.install(connection)
+    }
+
+    fn install(&mut self, connection: OwnerConn) -> Result<owner::OwnerInfo, String> {
+        let OwnerConn {
+            reader,
+            writer,
+            info,
+        } = connection;
+        if self.expired() {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+            return Err("relay EOF drain deadline expired".into());
+        }
+        let mut output = writer.try_clone().map_err(|error| error.to_string())?;
         if let Some(owner_settings) = &info.settings {
             for note in owner::settings_notes(&self.settings, owner_settings, info.pid) {
                 eprintln!("{note}");
@@ -244,7 +310,26 @@ impl Relay {
             }
             let _ = tx.send(Msg::OwnerGone(epoch));
         });
+        let (frames, queue) = mpsc::channel::<String>();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            for frame in queue {
+                if writeln!(output, "{frame}")
+                    .and_then(|()| output.flush())
+                    .is_err()
+                {
+                    let _ = output.shutdown(std::net::Shutdown::Both);
+                    let _ = tx.send(Msg::OwnerGone(epoch));
+                    return;
+                }
+            }
+        });
         self.writer = Some(writer);
+        self.owner_output = Some(frames);
+        if self.expired() {
+            self.disconnect();
+            return Err("relay EOF drain deadline expired".into());
+        }
         if let Some(initialize) = self.initialize.clone() {
             let owner_id = self.owner_id();
             let mut replay =
@@ -275,33 +360,128 @@ impl Relay {
     }
 
     fn write_owner(&mut self, frame: &str) -> bool {
-        let Some(writer) = &mut self.writer else {
+        if self.expired() {
             return false;
-        };
-        let ok = writeln!(writer, "{frame}")
-            .and_then(|()| writer.flush())
-            .is_ok();
+        }
+        let ok = self
+            .owner_output
+            .as_ref()
+            .is_some_and(|output| output.send(frame.to_owned()).is_ok());
         if !ok {
-            self.writer = None;
+            self.disconnect();
+            let _ = self.tx.send(Msg::OwnerGone(self.epoch));
         }
         ok
     }
 
-    /// Reconnect if the owner connection is gone. `Err`: no owner.
-    fn ensure_connected(&mut self) -> Result<(), String> {
-        if self.writer.is_none() {
-            self.connect().map_err(|error| {
-                eprintln!("figmog: {error}");
-                error
-            })?;
+    fn disconnect(&mut self) {
+        self.owner_output.take();
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
         }
-        Ok(())
+    }
+
+    fn expired(&self) -> bool {
+        self.drain_until
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// All runtime connection work is off the event loop. Cancelling the
+    /// retained attempt interrupts HELLO and forbids subsequent launches.
+    fn begin_connect(&mut self) {
+        if self.connecting.is_some() || self.expired() {
+            return;
+        }
+        self.next_connect += 1;
+        let id = self.next_connect;
+        let cancel = Arc::new(owner::ConnectCancel::default());
+        self.connecting = Some(Connecting {
+            id,
+            cancel: cancel.clone(),
+        });
+        let paths = self.paths.clone();
+        let cwd = self.layout.project_root.clone();
+        let settings = self.settings.clone();
+        let attach = self.attach.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result =
+                owner::connect_or_launch_cancelled(&paths, &cwd, &settings, &attach, &cancel);
+            if cancel.is_cancelled() {
+                if let Ok(connection) = result {
+                    let _ = connection.writer.shutdown(std::net::Shutdown::Both);
+                }
+                return;
+            }
+            let _ = tx.send(Msg::Connected(id, result));
+        });
+    }
+
+    fn connected(&mut self, id: u64, result: Result<OwnerConn, String>) -> bool {
+        if self
+            .connecting
+            .as_ref()
+            .is_none_or(|attempt| attempt.id != id)
+            || self.expired()
+        {
+            if self.expired() {
+                self.connecting.take();
+            }
+            if let Ok(connection) = result {
+                let _ = connection.writer.shutdown(std::net::Shutdown::Both);
+            }
+            return !self.expired();
+        }
+        let attempt = self.connecting.take().expect("checked above");
+        let result = result.and_then(|connection| {
+            attempt.cancel.release();
+            self.install(connection)
+        });
+        match result {
+            Ok(_) => {
+                while self.writer.is_some()
+                    && let Some(outgoing) = self.outgoing.pop_front()
+                {
+                    if self.expired() {
+                        return false;
+                    }
+                    match outgoing {
+                        Outgoing::Request(id, sent) => {
+                            self.send(id, sent);
+                        }
+                        Outgoing::Notification(frame) => {
+                            self.forward(&frame);
+                        }
+                    }
+                }
+                true
+            }
+            Err(error) => {
+                eprintln!("figmog: {error}");
+                while let Some(outgoing) = self.outgoing.pop_front() {
+                    if let Outgoing::Request(_, sent) = outgoing
+                        && let Some(id) = sent.agent_id
+                        && !self.to_agent(
+                            &crate::deep_json::to_string(&local_error(id, &sent.method, &error).0)
+                                .expect("Value serializes"),
+                        )
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
     }
 
     /// Send a notification (or a frame the owner must reject) as is.
     fn forward(&mut self, frame: &str) -> bool {
-        if self.ensure_connected().is_ok() {
+        if self.writer.is_some() {
             let _ = self.write_owner(frame);
+        } else if !self.expired() {
+            self.outgoing
+                .push_back(Outgoing::Notification(frame.to_owned()));
+            self.begin_connect();
         }
         true
     }
@@ -327,14 +507,13 @@ impl Relay {
 
     /// Send (or re-send) a pending request on the current connection.
     fn send(&mut self, owner_id: String, mut sent: Sent) -> bool {
-        if let Err(error) = self.ensure_connected() {
-            return match sent.agent_id {
-                Some(id) => to_agent(
-                    &crate::deep_json::to_string(&local_error(id, &sent.method, &error).0)
-                        .expect("Value serializes"),
-                ),
-                None => true,
-            };
+        if self.expired() {
+            return false;
+        }
+        if self.writer.is_none() {
+            self.outgoing.push_back(Outgoing::Request(owner_id, sent));
+            self.begin_connect();
+            return true;
         }
         sent.epoch = self.epoch;
         let frame = sent.frame.clone();
@@ -345,25 +524,34 @@ impl Relay {
         true
     }
 
-    fn run(&mut self, rx: &mpsc::Receiver<Msg>) {
-        let mut drain_until: Option<Instant> = None;
+    /// Return the EOF deadline so final stdout flushing shares its budget.
+    fn run(&mut self, rx: &mpsc::Receiver<Msg>) -> Option<Instant> {
+        self.run_with_drain(rx, super::EXIT_DRAIN)
+    }
+
+    fn run_with_drain(
+        &mut self,
+        rx: &mpsc::Receiver<Msg>,
+        budget: std::time::Duration,
+    ) -> Option<Instant> {
         loop {
-            if let Some(deadline) = drain_until
-                && (!self.pending.values().any(|sent| sent.agent_id.is_some())
+            if let Some(deadline) = self.drain_until
+                && ((!self.pending.values().any(|sent| sent.agent_id.is_some())
+                    && !self.outgoing.iter().any(|outgoing| matches!(outgoing, Outgoing::Request(_, sent) if sent.agent_id.is_some())))
                     || Instant::now() >= deadline)
             {
-                return;
+                return self.stop();
             }
-            let msg = match drain_until {
+            let msg = match self.drain_until {
                 Some(deadline) => {
                     match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                         Ok(msg) => msg,
-                        Err(_) => return,
+                        Err(_) => return self.stop(),
                     }
                 }
                 None => match rx.recv() {
                     Ok(msg) => msg,
-                    Err(_) => return,
+                    Err(_) => return self.stop(),
                 },
             };
             let alive = match msg {
@@ -371,16 +559,24 @@ impl Relay {
                 Msg::StdinEof => {
                     // Answers already owed are still delivered, within the
                     // same bound the in-process serve used.
-                    drain_until = Some(Instant::now() + super::EXIT_DRAIN);
+                    self.drain_until = Some(Instant::now() + budget);
                     true
                 }
+                Msg::StdoutGone => false,
                 Msg::Owner(epoch, line) => self.on_owner(epoch, &line),
-                Msg::OwnerGone(epoch) => self.owner_gone(epoch, drain_until.is_none()),
+                Msg::OwnerGone(epoch) => self.owner_gone(epoch, self.drain_until.is_none()),
+                Msg::Connected(id, result) => self.connected(id, result),
             };
             if !alive {
-                return;
+                return self.stop();
             }
         }
+    }
+
+    fn stop(&mut self) -> Option<Instant> {
+        self.connecting.take();
+        self.disconnect();
+        self.drain_until
     }
 
     /// One agent frame: route it with this worktree's file and forward it,
@@ -390,7 +586,7 @@ impl Relay {
             // Parse failures have no request id to track in `pending`.
             // Answer here so an immediately queued stdin EOF cannot drop
             // the response while it is still on its way from the owner.
-            return to_agent(
+            return self.to_agent(
                 &json!({
                     "jsonrpc": "2.0",
                     "id": null,
@@ -419,7 +615,7 @@ impl Relay {
         if method == "tools/call"
             && let Err(message) = self.route(&mut frame.0)
         {
-            return to_agent(
+            return self.to_agent(
                 &crate::deep_json::to_string(&local_error(id, &method, &message).0)
                     .expect("Value serializes"),
             );
@@ -438,23 +634,37 @@ impl Relay {
             return Ok(());
         }
         let args = &frame["params"]["arguments"];
+        // Match the owner's typed validation before a rejected request
+        // can affect this relay's sole-file default or admission checks.
+        let read = crate::dispatch::ReadCommand::from_tool_args(&name, args)?;
+        if read.is_none()
+            && !matches!(
+                name.as_str(),
+                "figmog_files" | "figmog_open" | "figmog_sync" | "figmog_images"
+            )
+        {
+            // MCP rejects unknown names before examining arguments.
+            return Ok(());
+        }
         crate::dispatch::validate_object_args(args)?;
-        let explicit = match args.get("file") {
-            Some(Value::String(file)) => Some(file.clone()),
-            // Not a string: the owner reports the type error.
-            Some(Value::Null) | None => None,
-            Some(_) => return Ok(()),
-        };
         if name == "figmog_files" {
             return Ok(());
         }
         if name == "figmog_open" {
-            if let Some(key) = explicit.as_deref().and_then(parse_file_ref) {
+            let file = crate::dispatch::require_str(args, "file")?;
+            crate::dispatch::arg_bool(args, "geometry")?;
+            if let Some(key) = parse_file_ref(&file) {
                 shared_store(&self.layout, &key)?;
                 self.referenced.insert(key);
             }
             return Ok(());
         }
+        if name == "figmog_images" {
+            crate::dispatch::require_str_array(args, "ids")?;
+            crate::dispatch::arg_str(args, "format")?;
+            crate::dispatch::arg_f64(args, "scale")?;
+        }
+        let explicit = crate::dispatch::arg_str(args, "file")?;
         if let Some(file) = explicit {
             // An unparseable `file` is the owner's error to report.
             if let Some(key) = parse_file_ref(&file) {
@@ -499,15 +709,15 @@ impl Relay {
         if frame.get("method").is_some() {
             // Notifications from the current connection only (a replaced
             // connection's would be duplicates or stale).
-            return epoch != self.epoch || to_agent(line);
+            return epoch != self.epoch || self.to_agent(line);
         }
         let Some(owner_id) = frame["id"].as_str().map(str::to_string) else {
             // An answer to no request of ours (a frame the owner could not
             // parse): the agent's, as is.
-            return to_agent(line);
+            return self.to_agent(line);
         };
         let Some(mut sent) = self.pending.remove(&owner_id) else {
-            return to_agent(line);
+            return self.to_agent(line);
         };
         if sent.agent_id.is_none() {
             // The relay's own request (its replayed `initialize`).
@@ -518,7 +728,7 @@ impl Relay {
         {
             // That owner is shutting down: stop writing to it.
             if sent.epoch == self.epoch {
-                self.writer = None;
+                self.disconnect();
             }
             let resent = Sent {
                 resends: sent.resends + 1,
@@ -527,7 +737,7 @@ impl Relay {
             return self.send(owner_id, resent);
         }
         frame.insert("id".into(), sent.agent_id.take().expect("checked above"));
-        to_agent(&crate::deep_json::to_string(&frame.0).expect("Value serializes"))
+        self.to_agent(&crate::deep_json::to_string(&frame.0).expect("Value serializes"))
     }
 
     /// The owner connection of `epoch` ended: answer what it owed, then
@@ -554,15 +764,14 @@ impl Relay {
                 "outcome unknown: the background figmog exited before answering; check \
                  figmog_status or figmog_files before retrying",
             );
-            if !to_agent(&crate::deep_json::to_string(&answer.0).expect("Value serializes")) {
+            if !self.to_agent(&crate::deep_json::to_string(&answer.0).expect("Value serializes")) {
                 return false;
             }
         }
         if epoch == self.epoch {
-            self.writer = None;
-            if reconnect && let Err(error) = self.connect() {
-                // Retried on the agent's next request.
-                eprintln!("figmog: {error}");
+            self.disconnect();
+            if reconnect {
+                self.begin_connect();
             }
         }
         true
@@ -573,6 +782,116 @@ impl Relay {
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    #[test]
+    fn not_accepted_reconnect_during_eof_keeps_the_original_deadline() {
+        use std::time::Duration;
+        let (_dir, mut relay, _old_peer) = configured_relay();
+        let _lock = owner::OwnerLock::try_acquire(&relay.paths)
+            .unwrap()
+            .unwrap();
+        let listener = owner::bind_socket(&relay.paths.socket()).unwrap();
+        owner::write_discovery(
+            &relay.paths,
+            &owner::Discovery {
+                socket: relay.paths.socket(),
+                pid: 42,
+                generation: "stalled-replacement".into(),
+                version: owner::version().into(),
+                protocol: owner::PROTOCOL,
+            },
+        )
+        .unwrap();
+        let (hello, entered) = mpsc::channel();
+        let (closed, finished) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains(owner::HELLO));
+            hello.send(()).unwrap();
+            // The replacement never answers HELLO. Cancellation must
+            // close it rather than waiting its normal sixty seconds.
+            closed
+                .send(reader.read_line(&mut String::new()).unwrap())
+                .unwrap();
+        });
+        let (tx, rx) = mpsc::channel();
+        relay.tx = tx.clone();
+        relay.pending.insert(
+            "rejected".into(),
+            Sent {
+                agent_id: Some(OwnedValue(json!(7))),
+                method: "tools/list".into(),
+                frame: json!({"jsonrpc":"2.0", "id":"rejected", "method":"tools/list"}).to_string(),
+                epoch: relay.epoch,
+                resends: 0,
+            },
+        );
+        tx.send(Msg::StdinEof).unwrap();
+        tx.send(Msg::Owner(relay.epoch, json!({"jsonrpc":"2.0", "id":"rejected", "error":{"code":owner::NOT_ACCEPTED,"message":"closing"}}).to_string())).unwrap();
+        let started = Instant::now();
+        let deadline = relay
+            .run_with_drain(&rx, Duration::from_millis(500))
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(deadline <= started + Duration::from_secs(1));
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(finished.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
+        assert!(relay.connecting.is_none());
+        assert!(relay.writer.is_none());
+        assert!(
+            !relay.paths.log().exists(),
+            "no owner launched after cancellation"
+        );
+        peer.join().unwrap();
+        std::fs::remove_file(relay.paths.socket()).unwrap();
+    }
+
+    #[test]
+    fn a_late_connection_cannot_replay_or_resend_after_eof_deadline() {
+        use std::time::Duration;
+        let (_dir, mut relay, _old_peer) = configured_relay();
+        relay.initialize =
+            Some(json!({"jsonrpc":"2.0", "id":1, "method":"initialize"}).to_string());
+        relay.drain_until = Some(Instant::now() - Duration::from_millis(1));
+        relay.connecting = Some(Connecting {
+            id: 1,
+            cancel: Arc::default(),
+        });
+        let (writer, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let connection = OwnerConn {
+            reader: BufReader::new(writer.try_clone().unwrap()),
+            writer,
+            info: owner::OwnerInfo {
+                pid: 42,
+                generation: "late".into(),
+                settings: None,
+                attach_errors: vec![],
+            },
+        };
+        assert!(!relay.connected(1, Ok(connection)));
+        assert_eq!(relay.epoch, 1);
+        let mut reader = BufReader::new(peer);
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+    }
 
     fn configured_relay() -> (tempfile::TempDir, Relay, UnixStream) {
         let dir = tempfile::tempdir().unwrap();
@@ -592,7 +911,22 @@ mod tests {
             default_key: Some("ABC1234567890".into()),
             referenced: BTreeSet::new(),
             initialize: None,
-            writer: Some(writer),
+            writer: Some(writer.try_clone().unwrap()),
+            owner_output: Some({
+                let (tx, rx) = mpsc::channel::<String>();
+                let mut writer = writer;
+                std::thread::spawn(move || {
+                    for frame in rx {
+                        writeln!(writer, "{frame}").unwrap();
+                    }
+                });
+                tx
+            }),
+            connecting: None,
+            next_connect: 0,
+            outgoing: VecDeque::new(),
+            drain_until: None,
+            stdout: Some(super::super::output::StdioWriter::spawn(|_| true)),
             epoch: 1,
             pending: BTreeMap::new(),
             tx,
@@ -617,6 +951,40 @@ mod tests {
     }
 
     #[test]
+    fn stalled_agent_output_does_not_block_eof_or_extend_the_flush_deadline() {
+        use std::time::Duration;
+
+        let (_dir, mut relay, _reader) = configured_relay();
+        let (entered, writing) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        relay.stdout.take().unwrap().finish(Instant::now());
+        relay.stdout = Some(super::super::output::StdioWriter::spawn(move |_| {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+            done.send(()).unwrap();
+            true
+        }));
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Stdin("{\n".into())).unwrap();
+        tx.send(Msg::StdinEof).unwrap();
+        let started = Instant::now();
+        let deadline = relay.run(&rx).expect("EOF establishes the drain deadline");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(deadline > started);
+        writing.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        relay
+            .stdout
+            .take()
+            .unwrap()
+            .finish(started + Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
     fn valid_json_with_a_null_id_remains_a_tracked_request() {
         let (_dir, mut relay, reader) = configured_relay();
         assert!(relay.on_agent(json!({"jsonrpc": "2.0", "id": null}).to_string()));
@@ -638,7 +1006,7 @@ mod tests {
         let (_dir, mut relay, reader) = configured_relay();
         let value = format!("{}0{}", "[".repeat(512), "]".repeat(512));
         let request = format!(
-            r#"{{"jsonrpc":"2.0","id":"agent","method":"tools/call","params":{{"name":"figmog_search","arguments":{{"equals":{value}}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":"agent","method":"tools/call","params":{{"name":"figmog_search","arguments":{{"query":"deep","equals":{value}}}}}}}"#
         );
         assert!(relay.on_agent(request));
         let mut line = String::new();

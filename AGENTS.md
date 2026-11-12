@@ -51,6 +51,13 @@ removed) verbatim, for provenance only — don't treat them as current.
   wording change upstream would silently turn every "store is locked"
   case into `internal panic: ...` + exit 101 instead of the intended
   clean exit-1 message.
+- **Pin-bump checklist: migration exclusion.** Migration keeps older raw
+  fjall openers excluded while copying and retiring a closed store by
+  retaining `std::fs::File::try_lock` on fjall 3.1.9's `<db>/lock`.
+  On any fjall or `fold` bump, re-check `locked_file.rs`, the lock filename,
+  and database open/close ordering (writers quiesce before unlocking), then
+  run `cargo test --lib cli::migrate`
+  including the synchronized late-opener and resumed-cleanup regressions.
 - **Pin-bump checklist: store compaction.** `src/compact.rs` (NWS-2941)
   drives fjall directly: `SingleWriterTxKeyspace::inner()` and
   `Keyspace::rotate_memtable()` / `Keyspace::sealed_memtable_count()` are `#[doc(hidden)]` in fjall
