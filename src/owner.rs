@@ -14,15 +14,14 @@
 //!   from before it probes or removes a stale socket until after it has
 //!   closed its stores and removed its socket. Whoever holds it is *the*
 //!   owner; a process that cannot take it exits without touching anything.
-//! * **Socket:** `/tmp/figmog-<uid>/<16 hex>.sock`, the hex being a 64-bit
-//!   FNV-1a hash of the project identity. Short on every platform (well
-//!   under `sun_path`'s 104 bytes) and independent of `$TMPDIR` and
-//!   `$XDG_RUNTIME_DIR`; the directory is created 0700 and ownership-checked
-//!   ([`crate::private_dir`]), so another OS user can neither read nor
-//!   pre-plant it.
+//! * **Socket:** `$XDG_RUNTIME_DIR/figmog/<16 hex>.sock` when that runtime
+//!   directory is private and short enough; otherwise
+//!   `/tmp/figmog-<uid>/<16 hex>.sock`. The hex is an FNV-1a project hash.
+//!   Clients validate the project-specific basename, private runtime directory, socket owner
+//!   and connected peer uid before sending any protocol data.
 //! * **Discovery:** `<mirror root>/owner.json` (0600, written to a temp file
 //!   and renamed), naming the socket, pid, owner generation, binary version
-//!   and protocol version. Clients connect to the socket it names.
+//!   and protocol version. Clients independently authenticate its socket location.
 //! * **Handshake:** the first frame on every connection is a
 //!   [`HELLO`] request carrying the client's project identity, binary
 //!   version and protocol version; the owner refuses a mismatch with
@@ -31,10 +30,13 @@
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -97,17 +99,199 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The per-user runtime directory holding every owner socket.
+/// Use the session's private runtime directory when it is safe and short
+/// enough for a Unix socket and representable in discovery's UTF-8 JSON
+/// path. Invalid/missing XDG directories use /tmp.
 pub(crate) fn runtime_dir() -> PathBuf {
+    runtime_dir_for(std::env::var_os("XDG_RUNTIME_DIR").as_deref())
+}
+
+fn runtime_dir_for(xdg: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(xdg) = xdg {
+        let root = Path::new(xdg);
+        let candidate = root.join("figmog");
+        if root.is_absolute()
+            && candidate.to_str().is_some()
+            && candidate.join("0000000000000000.sock").as_os_str().len() < 104
+            && std::fs::symlink_metadata(root)
+                .is_ok_and(|m| m.is_dir() && m.uid() == euid() && m.mode() & 0o777 == 0o700)
+            && crate::private_dir::existing(root).is_ok_and(|root| root.is_some())
+        {
+            return candidate;
+        }
+    }
     PathBuf::from(format!("/tmp/figmog-{}", euid()))
+}
+
+fn check_runtime_directory(dir: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("checking owner socket directory {}: {e}", dir.display()))?;
+    if !metadata.is_dir() || metadata.uid() != euid() || metadata.mode() & 0o777 != 0o700 {
+        return Err(format!(
+            "unsafe owner socket directory {}: must be a real directory owned by the current user \
+             with mode 0700; use a private XDG_RUNTIME_DIR or ask its owner/administrator to remove it",
+            dir.display()
+        ));
+    }
+    crate::private_dir::existing(dir)?;
+    Ok(())
+}
+
+/// Authenticate the connected endpoint independently of pathname metadata.
+fn check_peer(stream: &UnixStream) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let uid = {
+        let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&credential) as libc::socklen_t;
+        // SAFETY: credential and len point to writable, correctly sized storage.
+        if unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut credential).cast(),
+                &raw mut len,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "checking owner socket peer: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        credential.uid
+    };
+    #[cfg(not(target_os = "linux"))]
+    let uid = {
+        let mut uid = 0;
+        let mut gid = 0;
+        // SAFETY: both pointers refer to writable uid/gid storage.
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) } != 0 {
+            return Err(format!(
+                "checking owner socket peer: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        uid
+    };
+    if uid != euid() {
+        return Err("refusing owner socket: peer is not the current user".into());
+    }
+    Ok(())
+}
+
+// The handler performs one lock-free atomic store; the serve loop checks it
+// on every wake (at most two seconds), then runs its ordinary drain/cleanup.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+extern "C" fn request_shutdown(_: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
+}
+
+pub(crate) struct ShutdownSignals {
+    term: libc::sigaction,
+    interrupt: libc::sigaction,
+}
+
+impl ShutdownSignals {
+    pub(crate) fn install() -> Result<Self, String> {
+        SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
+        // SAFETY: the zeroed actions are initialized before registration; the
+        // handler uses only a lock-free atomic and never touches Rust I/O.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = request_shutdown as *const () as usize;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            let mut term = std::mem::zeroed();
+            let mut interrupt = std::mem::zeroed();
+            if libc::sigaction(libc::SIGTERM, &action, &raw mut term) != 0 {
+                return Err(format!(
+                    "installing SIGTERM handler: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if libc::sigaction(libc::SIGINT, &action, &raw mut interrupt) != 0 {
+                libc::sigaction(libc::SIGTERM, &term, std::ptr::null_mut());
+                return Err(format!(
+                    "installing SIGINT handler: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self { term, interrupt })
+        }
+    }
+}
+
+impl Drop for ShutdownSignals {
+    fn drop(&mut self) {
+        // SAFETY: restoring the actions returned by sigaction above.
+        unsafe {
+            libc::sigaction(libc::SIGTERM, &self.term, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &self.interrupt, std::ptr::null_mut());
+        }
+    }
 }
 
 /// Where one project's owner listens.
 pub(crate) fn socket_for(project: &Path) -> PathBuf {
-    runtime_dir().join(format!(
-        "{:016x}.sock",
-        fnv1a(project.as_os_str().as_bytes())
-    ))
+    runtime_dir().join(socket_name(project))
+}
+
+fn socket_name(project: &Path) -> String {
+    format!("{:016x}.sock", fnv1a(project.as_os_str().as_bytes()))
+}
+
+/// A published address may come from another session's XDG runtime
+/// directory. Authenticate its independently checked location rather than
+/// requiring it to match this client's environment. `false` is stale/missing.
+fn validate_discovery_socket(paths: &OwnerPaths, socket: &Path) -> Result<bool, String> {
+    let expected_name = socket_name(&paths.project);
+    if !socket.is_absolute()
+        || socket.as_os_str().len() >= 104
+        || socket.file_name() != Some(std::ffi::OsStr::new(&expected_name))
+    {
+        return Err(format!(
+            "refusing owner discovery {}: socket {} does not match expected project socket {expected_name}",
+            paths.discovery().display(),
+            socket.display()
+        ));
+    }
+    let dir = socket.parent().ok_or("owner socket has no directory")?;
+    if dir != runtime_dir_for(None) {
+        if dir.file_name() != Some(std::ffi::OsStr::new("figmog")) {
+            return Err(format!(
+                "refusing owner socket {}: not a supported runtime directory",
+                socket.display()
+            ));
+        }
+        let runtime = dir
+            .parent()
+            .ok_or("owner runtime directory has no parent")?;
+        match std::fs::symlink_metadata(runtime) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            _ => check_runtime_directory(runtime)?,
+        }
+    }
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        _ => check_runtime_directory(dir)?,
+    }
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) if !meta.file_type().is_socket() || meta.uid() != euid() => Err(format!(
+            "refusing unsafe owner socket {}: must be a socket owned by the current user with mode 0600",
+            socket.display()
+        )),
+        // A successor may have bound this pathname but not chmodded it
+        // yet while a crashed owner's discovery record still names it.
+        // Never connect until mode 0600; let the lock/probe retry await it.
+        Ok(meta) if meta.mode() & 0o777 != 0o600 => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("checking owner socket {}: {e}", socket.display())),
+        Ok(_) => Ok(true),
+    }
 }
 
 /// One project's owner files.
@@ -215,8 +399,14 @@ impl OwnerLock {
 /// a connect fails and it proves to be a socket owned by this user.
 pub(crate) fn bind_socket(socket: &Path) -> Result<UnixListener, String> {
     let dir = socket.parent().ok_or("owner socket has no directory")?;
+    if let Ok(metadata) = std::fs::symlink_metadata(dir)
+        && (!metadata.is_dir() || metadata.uid() != euid())
+    {
+        check_runtime_directory(dir)?;
+    }
     crate::private_dir::ensure(dir)
-        .map_err(|e| format!("preparing the owner socket directory: {e}"))?;
+        .map_err(|e| format!("preparing the owner socket directory: {e}; use a private XDG_RUNTIME_DIR or ask the administrator to remove a foreign runtime directory"))?;
+    check_runtime_directory(dir)?;
     if let Ok(meta) = std::fs::symlink_metadata(socket) {
         if UnixStream::connect(socket).is_ok() {
             return Err(format!(
@@ -413,7 +603,7 @@ pub(crate) fn mismatch_message(owner_version: &str, owner_protocol: u64, pid: u3
         "this repository's shared background figmog (pid {pid}) runs figmog {owner_version} \
          (protocol {owner_protocol}), but this is figmog {} (protocol {PROTOCOL}); they cannot \
          share it — let it exit (it stops on its own after it has had no clients for a while), \
-         or stop it now with `kill {pid}`, then retry",
+         or close its attached `figmog serve` relays, stop it with `kill {pid}`, then retry",
         version()
     )
 }
@@ -434,7 +624,7 @@ pub(crate) fn check_hello(params: &Value, paths: &OwnerPaths) -> Result<(), Stri
             "this repository's shared background figmog (pid {}) runs figmog {} (protocol \
              {PROTOCOL}), but the client is figmog {client_version} (protocol {client_protocol}); \
              they cannot share it — let it exit (it stops on its own after it has had no \
-             clients for a while), or stop it now with `kill {}`, then retry",
+             clients for a while), or close its attached `figmog serve` relays, stop it with `kill {}`, then retry",
             std::process::id(),
             version(),
             std::process::id()
@@ -470,21 +660,198 @@ pub(crate) enum Probe {
     Closing,
 }
 
+/// Cancellation for one relay reconnect. The retained socket also covers
+/// a completed handshake waiting in the relay's event queue, so teardown
+/// can close it before its result is installed.
+#[derive(Default)]
+pub(crate) struct ConnectCancel {
+    cancelled: AtomicBool,
+    socket: Mutex<Option<UnixStream>>,
+}
+
+impl ConnectCancel {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(socket) = self.socket.lock().unwrap().take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.is_cancelled() {
+            Err("owner connection cancelled".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn track(&self, socket: &UnixStream) -> Result<(), String> {
+        let mut tracked = self.socket.lock().unwrap();
+        self.check()?;
+        *tracked = Some(socket.try_clone().map_err(|error| error.to_string())?);
+        Ok(())
+    }
+
+    pub(crate) fn release(&self) {
+        self.socket.lock().unwrap().take();
+    }
+}
+
 /// Look for `paths`' owner and handshake with it. `Err` is final: the
 /// owner refused this client (or is a different figmog build).
 pub(crate) fn probe(
     paths: &OwnerPaths,
     relay: Option<(&Settings, &[String])>,
 ) -> Result<Probe, String> {
+    probe_cancellable(paths, relay, None)
+}
+
+fn probe_cancellable(
+    paths: &OwnerPaths,
+    relay: Option<(&Settings, &[String])>,
+    cancel: Option<&ConnectCancel>,
+) -> Result<Probe, String> {
+    if let Some(cancel) = cancel {
+        cancel.check()?;
+    }
     let Some(discovery) = read_discovery(paths) else {
         return Ok(Probe::Absent);
     };
-    let Ok(stream) = UnixStream::connect(&discovery.socket) else {
+    if !validate_discovery_socket(paths, &discovery.socket)? {
         return Ok(Probe::Absent);
+    }
+    let stream = if let Some(cancel) = cancel {
+        let Some(stream) = connect_socket_cancelled(&discovery.socket, cancel)? else {
+            cancel.release();
+            return Ok(Probe::Absent);
+        };
+        stream
+    } else {
+        let Ok(stream) = UnixStream::connect(&discovery.socket) else {
+            return Ok(Probe::Absent);
+        };
+        stream
     };
+    check_peer(&stream)?;
+    let result = probe_connected(paths, relay, &discovery, stream);
+    if let Some(cancel) = cancel {
+        cancel.check()?;
+        if !matches!(&result, Ok(Probe::Ready(_))) {
+            cancel.release();
+        }
+    }
+    result
+}
+
+/// A full AF_UNIX listener backlog may block `UnixStream::connect` too.
+/// Create and track the socket first, and keep connect nonblocking until
+/// it has completed. All waits can then observe relay cancellation.
+fn connect_socket_cancelled(
+    path: &Path,
+    cancel: &ConnectCancel,
+) -> Result<Option<UnixStream>, String> {
+    use std::os::fd::FromRawFd;
+    cancel.check()?;
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: socket creates an owned fd, transferred immediately below.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if fd == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: fd is a new, owned Unix socket.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    // SAFETY: fcntl operates on this live fd; retain no inherited handles.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let enabled: libc::c_int = 1;
+        // SAFETY: the option points to an initialized int of the stated size.
+        if unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw const enabled).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        } == -1
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    cancel.track(&stream)?;
+    // SAFETY: sockaddr_un is a plain C structure; zero fills the path terminator.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err("invalid owner socket path".into());
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (destination, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *destination = *byte as libc::c_char;
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = length as u8;
+    }
+    let deadline = std::time::Instant::now() + HELLO_TIMEOUT;
+    loop {
+        cancel.check()?;
+        // SAFETY: address and its initialized pathname live through the call.
+        let connected =
+            unsafe { libc::connect(fd, (&raw const address).cast(), length as libc::socklen_t) };
+        let error = std::io::Error::last_os_error();
+        if connected == 0 || error.raw_os_error() == Some(libc::EISCONN) {
+            stream
+                .set_nonblocking(false)
+                .map_err(|error| error.to_string())?;
+            cancel.check()?;
+            return Ok(Some(stream));
+        }
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINPROGRESS | libc::EALREADY | libc::EAGAIN | libc::EINTR)
+        ) {
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Handshake on a connection whose address and peer have been validated.
+fn probe_connected(
+    paths: &OwnerPaths,
+    relay: Option<(&Settings, &[String])>,
+    discovery: &Discovery,
+    stream: UnixStream,
+) -> Result<Probe, String> {
     let io = |e: std::io::Error| format!("talking to the background figmog: {e}");
-    stream.set_read_timeout(Some(HELLO_TIMEOUT)).map_err(io)?;
-    stream.set_write_timeout(Some(HELLO_TIMEOUT)).map_err(io)?;
+    // On macOS, setting socket timeouts can fail with EINVAL after the
+    // peer closes. This is the same idle-exit race as a failed HELLO read
+    // or write: reconnect instead of making startup fail permanently.
+    if stream
+        .set_read_timeout(Some(HELLO_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(HELLO_TIMEOUT)))
+        .is_err()
+    {
+        return Ok(Probe::Closing);
+    }
     let mut writer = stream.try_clone().map_err(io)?;
     let mut reader = BufReader::new(stream);
     let hello = hello_request(paths, relay);
@@ -561,8 +928,13 @@ pub(crate) fn probe(
         attach_errors,
     };
     let stream = reader.get_ref();
-    stream.set_read_timeout(None).map_err(io)?;
-    stream.set_write_timeout(None).map_err(io)?;
+    if stream
+        .set_read_timeout(None)
+        .and_then(|()| stream.set_write_timeout(None))
+        .is_err()
+    {
+        return Ok(Probe::Closing);
+    }
     Ok(Probe::Ready(OwnerConn {
         reader,
         writer,
@@ -612,13 +984,6 @@ fn open_log(paths: &OwnerPaths) -> Result<File, String> {
     Ok(file)
 }
 
-/// The tail of the owner log, for a launch that failed.
-pub(crate) fn log_tail(paths: &OwnerPaths) -> String {
-    let text = std::fs::read_to_string(paths.log()).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().rev().take(5).collect();
-    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
-}
-
 /// Start `figmog serve --background <args>` detached: its own session (so
 /// closing the agent's terminal or process group never signals it), stdin
 /// and stdout on `/dev/null`, stderr appended to the owner log, working
@@ -629,11 +994,46 @@ pub(crate) fn launch(
     cwd: &Path,
     args: &[String],
 ) -> Result<std::sync::mpsc::Receiver<std::process::ExitStatus>, String> {
+    launch_cancellable(paths, cwd, args, None)
+}
+
+fn launch_cancellable(
+    paths: &OwnerPaths,
+    cwd: &Path,
+    args: &[String],
+    cancel: Option<&ConnectCancel>,
+) -> Result<std::sync::mpsc::Receiver<std::process::ExitStatus>, String> {
+    if let Some(cancel) = cancel {
+        cancel.check()?;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(addchdir) = macos_spawn::addchdir() {
+        return macos_spawn::launch(paths, cwd, args, addchdir, cancel)
+            .map_err(|e| format!("starting the background figmog: {e}"));
+    }
+    launch_command(paths, cwd, args, cancel)
+}
+
+// Linux uses close_range(CLOEXEC); older platforms without an atomic
+// close-on-exec spawn facility retain the bounded descriptor-limit scan.
+fn launch_command(
+    paths: &OwnerPaths,
+    cwd: &Path,
+    args: &[String],
+    cancel: Option<&ConnectCancel>,
+) -> Result<std::sync::mpsc::Receiver<std::process::ExitStatus>, String> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let exe =
         std::env::current_exe().map_err(|e| format!("locating the figmog executable: {e}"))?;
     let log = open_log(paths)?;
+    // Compute the bound before fork; only async-signal-safe fcntl calls run
+    // in pre_exec. CLOEXEC preserves Rust's exec-error pipe until exec itself.
+    let fd_limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    if fd_limit < 0 || fd_limit > i64::from(libc::c_int::MAX) {
+        return Err("cannot determine the inherited descriptor limit".into());
+    }
+    let fd_limit = fd_limit as libc::c_int;
     let mut command = Command::new(exe);
     command
         .args(["serve", "--background"])
@@ -642,15 +1042,31 @@ pub(crate) fn launch(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    // SAFETY: setsid is async-signal-safe and only detaches the child
-    // from the relay's session and controlling terminal.
+    // SAFETY: setsid and fcntl are async-signal-safe. The child detaches
+    // from the relay's session and marks inherited fds close-on-exec;
+    // stdio remains and Rust's error pipe stays usable if exec fails.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
+            #[cfg(target_os = "linux")]
+            // CLOSE_RANGE_CLOEXEC (4) marks without closing the exec-error
+            // pipe. An old kernel can fall back to the portable fcntl loop.
+            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) == 0 {
+                return Ok(());
+            }
+            for fd in 3..fd_limit {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
+    }
+    if let Some(cancel) = cancel {
+        cancel.check()?;
     }
     let mut child = command
         .spawn()
@@ -662,6 +1078,222 @@ pub(crate) fn launch(
         }
     });
     Ok(rx)
+}
+
+// Darwin's documented spawn flags perform descriptor isolation atomically,
+// avoiding SC_OPEN_MAX fcntl calls (commonly a million) for every owner.
+#[cfg(target_os = "macos")]
+mod macos_spawn {
+    use super::*;
+    use std::ffi::CString;
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::ExitStatusExt;
+
+    pub(super) type AddChdir = unsafe extern "C" fn(
+        *mut libc::posix_spawn_file_actions_t,
+        *const libc::c_char,
+    ) -> libc::c_int;
+
+    pub(super) fn addchdir() -> Option<AddChdir> {
+        // The public _np entry point exists since macOS 10.15. Resolve it
+        // dynamically so older systems can use the portable launcher.
+        // SAFETY: dlsym returns the documented C function with this signature.
+        unsafe {
+            let symbol = libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"posix_spawn_file_actions_addchdir_np".as_ptr(),
+            );
+            if symbol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut libc::c_void, AddChdir>(symbol))
+            }
+        }
+    }
+
+    fn check(code: libc::c_int) -> io::Result<()> {
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(code))
+        }
+    }
+
+    fn cstring(bytes: impl Into<Vec<u8>>) -> io::Result<CString> {
+        CString::new(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NUL in owner launch path, argument or environment",
+            )
+        })
+    }
+
+    struct Spawn {
+        attrs: libc::posix_spawnattr_t,
+        actions: libc::posix_spawn_file_actions_t,
+    }
+
+    impl Spawn {
+        fn new() -> io::Result<Self> {
+            // SAFETY: init initializes each object before use; partial
+            // initialization is destroyed explicitly before returning.
+            unsafe {
+                let mut attrs = MaybeUninit::uninit();
+                check(libc::posix_spawnattr_init(attrs.as_mut_ptr()))?;
+                let mut attrs = attrs.assume_init();
+                let mut actions = MaybeUninit::uninit();
+                if let Err(error) = check(libc::posix_spawn_file_actions_init(actions.as_mut_ptr()))
+                {
+                    libc::posix_spawnattr_destroy(&raw mut attrs);
+                    return Err(error);
+                }
+                Ok(Self {
+                    attrs,
+                    actions: actions.assume_init(),
+                })
+            }
+        }
+    }
+
+    impl Drop for Spawn {
+        fn drop(&mut self) {
+            // SAFETY: both objects were initialized by Spawn::new.
+            unsafe {
+                libc::posix_spawn_file_actions_destroy(&raw mut self.actions);
+                libc::posix_spawnattr_destroy(&raw mut self.attrs);
+            }
+        }
+    }
+
+    pub(super) fn launch(
+        paths: &OwnerPaths,
+        cwd: &Path,
+        args: &[String],
+        addchdir: AddChdir,
+        cancel: Option<&ConnectCancel>,
+    ) -> io::Result<std::sync::mpsc::Receiver<std::process::ExitStatus>> {
+        let exe = std::env::current_exe()?;
+        let exe = cstring(exe.as_os_str().as_bytes())?;
+        let cwd = cstring(cwd.as_os_str().as_bytes())?;
+        let mut argv = vec![exe.clone(), c"serve".into(), c"--background".into()];
+        for arg in args {
+            argv.push(cstring(arg.as_bytes())?);
+        }
+        // Snapshot through std's environment lock; never pass a racing
+        // process-global environ pointer to libc. Keep all backing strings
+        // alive until posix_spawn returns.
+        let environment: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+        let envp: Vec<CString> = environment
+            .into_iter()
+            .map(|(key, value)| {
+                let mut bytes = key.as_bytes().to_vec();
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_bytes());
+                cstring(bytes)
+            })
+            .collect::<io::Result<_>>()?;
+        let pointers = |strings: &[CString]| {
+            strings
+                .iter()
+                .map(|s| s.as_ptr().cast_mut())
+                .chain(std::iter::once(std::ptr::null_mut()))
+                .collect::<Vec<_>>()
+        };
+        let argv_ptrs = pointers(&argv);
+        let envp_ptrs = pointers(&envp);
+        let log = super::open_log(paths).map_err(io::Error::other)?;
+        let log = if log.as_raw_fd() < 3 {
+            // A relay may have inherited a closed standard descriptor.
+            // Do not let the /dev/null actions overwrite the log source.
+            // SAFETY: duplicate a live File, then transfer the new fd to File.
+            let fd = unsafe { libc::fcntl(log.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if fd == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { File::from_raw_fd(fd) }
+        } else {
+            log
+        };
+        let mut spawn = Spawn::new()?;
+        let mut pid = 0;
+        // SAFETY: the initialized spawn objects and NUL-terminated vectors
+        // outlive this call. File actions explicitly preserve only 0/1/2;
+        // CLOEXEC_DEFAULT closes all other descriptors atomically, including
+        // concurrent opens. posix_spawn returns exec/setup errors directly.
+        unsafe {
+            // POSIX_SPAWN_SETSID is 0x0400 in Darwin's public sys/spawn.h;
+            // libc exposes CLOEXEC_DEFAULT but does not name SETSID there.
+            const SETSID: libc::c_int = 0x0400;
+            check(libc::posix_spawnattr_setflags(
+                &raw mut spawn.attrs,
+                (libc::POSIX_SPAWN_CLOEXEC_DEFAULT | SETSID | libc::POSIX_SPAWN_SETSIGDEF)
+                    as libc::c_short,
+            ))?;
+            let mut defaults = std::mem::zeroed();
+            if libc::sigemptyset(&raw mut defaults) != 0
+                || libc::sigaddset(&raw mut defaults, libc::SIGPIPE) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            check(libc::posix_spawnattr_setsigdefault(
+                &raw mut spawn.attrs,
+                &defaults,
+            ))?;
+            check(libc::posix_spawn_file_actions_addopen(
+                &raw mut spawn.actions,
+                0,
+                c"/dev/null".as_ptr(),
+                libc::O_RDONLY,
+                0,
+            ))?;
+            check(libc::posix_spawn_file_actions_addopen(
+                &raw mut spawn.actions,
+                1,
+                c"/dev/null".as_ptr(),
+                libc::O_WRONLY,
+                0,
+            ))?;
+            check(libc::posix_spawn_file_actions_adddup2(
+                &raw mut spawn.actions,
+                log.as_raw_fd(),
+                2,
+            ))?;
+            check(libc::posix_spawn_file_actions_addclose(
+                &raw mut spawn.actions,
+                log.as_raw_fd(),
+            ))?;
+            check(addchdir(&raw mut spawn.actions, cwd.as_ptr()))?;
+            if let Some(cancel) = cancel {
+                cancel.check().map_err(io::Error::other)?;
+            }
+            check(libc::posix_spawn(
+                &raw mut pid,
+                exe.as_ptr(),
+                &spawn.actions,
+                &spawn.attrs,
+                argv_ptrs.as_ptr(),
+                envp_ptrs.as_ptr(),
+            ))?;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut status = 0;
+            loop {
+                // SAFETY: pid is the child returned by posix_spawn; status
+                // points to writable storage and this thread alone reaps it.
+                if unsafe { libc::waitpid(pid, &raw mut status, 0) } != -1 {
+                    let _ = tx.send(std::process::ExitStatus::from_raw(status));
+                    break;
+                }
+                if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
+    }
 }
 
 /// How long a relay waits for an owner to become ready, including an old
@@ -677,13 +1309,69 @@ pub(crate) fn connect_or_launch(
     settings: &Settings,
     attach: &[String],
 ) -> Result<OwnerConn, String> {
-    let deadline = std::time::Instant::now() + START_TIMEOUT;
+    connect_or_launch_with_timeout(paths, cwd, settings, attach, START_TIMEOUT)
+}
+
+/// A runtime relay reconnect. Cancellation closes a HELLO in progress and
+/// prevents another launch after an interrupted probe or preparation.
+pub(crate) fn connect_or_launch_cancelled(
+    paths: &OwnerPaths,
+    cwd: &Path,
+    settings: &Settings,
+    attach: &[String],
+    cancel: &ConnectCancel,
+) -> Result<OwnerConn, String> {
+    connect_or_launch_inner(paths, cwd, settings, attach, START_TIMEOUT, Some(cancel))
+}
+
+fn connect_or_launch_with_timeout(
+    paths: &OwnerPaths,
+    cwd: &Path,
+    settings: &Settings,
+    attach: &[String],
+    timeout: Duration,
+) -> Result<OwnerConn, String> {
+    connect_or_launch_inner(paths, cwd, settings, attach, timeout, None)
+}
+
+fn connect_or_launch_inner(
+    paths: &OwnerPaths,
+    cwd: &Path,
+    settings: &Settings,
+    attach: &[String],
+    timeout: Duration,
+    cancel: Option<&ConnectCancel>,
+) -> Result<OwnerConn, String> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut launched: Option<std::sync::mpsc::Receiver<std::process::ExitStatus>> = None;
+    let mut delay = Duration::from_millis(25);
     loop {
-        match probe(paths, Some((settings, attach)))? {
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
+        let mut unreachable_lock_holder = false;
+        match probe_cancellable(paths, Some((settings, attach)), cancel)? {
             Probe::Ready(conn) => return Ok(conn),
             Probe::Absent if launched.is_none() => {
-                launched = Some(launch(paths, cwd, &settings.args())?);
+                // Do not spawn a losing process every time an owner holds
+                // the election lock but cannot yet publish/reach its socket.
+                match OwnerLock::try_acquire(paths)? {
+                    Some(lock) => {
+                        drop(lock);
+                        launched = Some(match cancel {
+                            Some(cancel) => {
+                                launch_cancellable(paths, cwd, &settings.args(), Some(cancel))?
+                            }
+                            None => launch(paths, cwd, &settings.args())?,
+                        });
+                    }
+                    None => {
+                        // Desktop initialization happens before discovery
+                        // is published. Give this owner the full startup
+                        // budget, just like one launched by this relay.
+                        unreachable_lock_holder = true;
+                    }
+                }
             }
             Probe::Absent | Probe::Closing => {}
         }
@@ -694,33 +1382,162 @@ pub(crate) fn connect_or_launch(
             && let Ok(status) = rx.try_recv()
         {
             if !status.success() {
-                let tail = log_tail(paths);
+                // The shared log can contain other concurrent launches;
+                // never attribute an arbitrary tail to this child.
                 return Err(format!(
-                    "the background figmog failed to start ({status}); see {}{}",
-                    paths.log().display(),
-                    if tail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(":\n{tail}")
-                    }
+                    "the background figmog failed to start ({status}); see {}",
+                    paths.log().display()
                 ));
             }
             launched = None;
         }
         if std::time::Instant::now() >= deadline {
+            if unreachable_lock_holder {
+                return Err(format!(
+                    "background figmog owner lock is held but its socket is unreachable; \
+                     wait for startup or shutdown, and check whether the processes use \
+                     different /tmp namespaces or XDG_RUNTIME_DIR values; see {}",
+                    paths.log().display()
+                ));
+            }
             return Err(format!(
                 "the background figmog did not become ready within {}s; see {}",
-                START_TIMEOUT.as_secs(),
+                timeout.as_secs(),
                 paths.log().display()
             ));
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(250));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelling_a_reconnect_interrupts_an_unanswered_hello() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let _lock = OwnerLock::try_acquire(&paths).unwrap().unwrap();
+        let listener = bind_socket(&paths.socket()).unwrap();
+        write_discovery(
+            &paths,
+            &Discovery {
+                socket: paths.socket(),
+                pid: 42,
+                generation: "unanswered-hello".into(),
+                version: version().into(),
+                protocol: PROTOCOL,
+            },
+        )
+        .unwrap();
+        let cancel = std::sync::Arc::new(ConnectCancel::default());
+        let (done, result) = std::sync::mpsc::channel();
+        let worker_cancel = cancel.clone();
+        let worker_paths = paths.clone();
+        let cwd = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let result = connect_or_launch_cancelled(
+                &worker_paths,
+                &cwd,
+                &Settings {
+                    watch: false,
+                    interval: 10,
+                    upstream: None,
+                },
+                &[],
+                &worker_cancel,
+            );
+            done.send(result.map(|_| ())).unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        assert!(hello.contains(HELLO), "{hello}");
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+        assert!(
+            !paths.log().exists(),
+            "cancellation must not launch a replacement"
+        );
+        drop(listener);
+        std::fs::remove_file(paths.socket()).unwrap();
+    }
+
+    #[test]
+    fn an_already_cancelled_attempt_cannot_launch_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let cancel = ConnectCancel::default();
+        cancel.cancel();
+        assert!(
+            connect_or_launch_cancelled(
+                &paths,
+                dir.path(),
+                &Settings {
+                    watch: false,
+                    interval: 10,
+                    upstream: None
+                },
+                &[],
+                &cancel,
+            )
+            .is_err()
+        );
+        assert!(!paths.log().exists());
+        assert!(!paths.discovery().exists());
+    }
+
+    #[test]
+    fn cancelling_connect_does_not_wait_for_a_full_unix_socket_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let listener = bind_socket(&paths.socket()).unwrap();
+        // SAFETY: listener is a live AF_UNIX listening socket. A small
+        // backlog lets this test fill it without depending on OS defaults.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let mut queued = Vec::new();
+        let mut filled = false;
+        for _ in 0..32 {
+            let cancel = std::sync::Arc::new(ConnectCancel::default());
+            let timer_cancel = cancel.clone();
+            let timer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                timer_cancel.cancel();
+            });
+            match connect_socket_cancelled(&paths.socket(), &cancel) {
+                Ok(Some(stream)) => {
+                    cancel.release();
+                    queued.push(stream);
+                }
+                // Some Unix kernels reject a full nonblocking backlog
+                // immediately instead of leaving the connect pending.
+                Err(_) | Ok(None) => filled = true,
+            }
+            timer.join().unwrap();
+            if filled {
+                break;
+            }
+        }
+        assert!(filled, "the listener's unaccepted queue must fill");
+        assert!(!queued.is_empty());
+        drop(queued);
+        drop(listener);
+        std::fs::remove_file(paths.socket()).unwrap();
+    }
 
     #[test]
     fn socket_addresses_are_short_stable_and_per_project() {
@@ -733,6 +1550,323 @@ mod tests {
         assert!(a.starts_with(runtime_dir()));
         assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn xdg_runtime_requires_private_real_short_directory() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("run");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(runtime_dir_for(Some(root.as_os_str())), root.join("figmog"));
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            runtime_dir_for(Some(root.as_os_str())),
+            runtime_dir_for(None)
+        );
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+        assert_eq!(
+            runtime_dir_for(Some(linked.as_os_str())),
+            runtime_dir_for(None)
+        );
+        let long = dir.path().join("x".repeat(110));
+        std::fs::create_dir(&long).unwrap();
+        std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            runtime_dir_for(Some(long.as_os_str())),
+            runtime_dir_for(None)
+        );
+        let non_utf8 = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"run-\xff".to_vec()));
+        assert_eq!(
+            runtime_dir_for(Some(non_utf8.as_os_str())),
+            runtime_dir_for(None)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_runtime_directory_keeps_owner_discovery_reachable() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("figmog-runtime-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let runtime = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"run-\xff".to_vec()));
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(runtime.to_str().is_none());
+        let paths = OwnerPaths::ensure(&dir.path().join("project")).unwrap();
+        let selected = runtime_dir_for(Some(runtime.as_os_str()));
+        let socket = selected.join(socket_name(&paths.project));
+        let listener = bind_socket(&socket).unwrap();
+        let discovery = Discovery {
+            socket: socket.clone(),
+            pid: 42,
+            generation: "non-utf8-runtime".into(),
+            version: version().into(),
+            protocol: PROTOCOL,
+        };
+        write_discovery(&paths, &discovery).unwrap();
+        let restored = read_discovery(&paths).unwrap();
+        let validated = validate_discovery_socket(&paths, &restored.socket).unwrap();
+        let connected = UnixStream::connect(&restored.socket).is_ok();
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+
+        assert_eq!(restored, discovery);
+        assert!(
+            validated,
+            "the published socket must pass discovery validation"
+        );
+        assert!(
+            connected,
+            "the published socket must reach the bound listener"
+        );
+        assert_eq!(selected, runtime_dir_for(None));
+    }
+
+    #[test]
+    fn a_client_refuses_discovery_pointing_elsewhere_before_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let socket = dir.path().join("impostor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        write_discovery(
+            &paths,
+            &Discovery {
+                socket,
+                pid: 1,
+                generation: "evil".into(),
+                version: version().into(),
+                protocol: PROTOCOL,
+            },
+        )
+        .unwrap();
+        let error = match probe(&paths, None) {
+            Err(error) => error,
+            _ => panic!("untrusted discovery was accepted"),
+        };
+        assert!(error.contains("does not match expected"), "{error}");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn a_client_reaches_an_owner_started_with_a_different_runtime_environment() {
+        let project = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(project.path()).unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket =
+            runtime_dir_for(Some(runtime.path().as_os_str())).join(socket_name(&paths.project));
+        assert_ne!(
+            socket,
+            paths.socket(),
+            "the owner and client must select different runtime roots"
+        );
+        let listener = bind_socket(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        write_discovery(
+            &paths,
+            &Discovery {
+                socket: socket.clone(),
+                pid: 42,
+                generation: "other-runtime".into(),
+                version: version().into(),
+                protocol: PROTOCOL,
+            },
+        )
+        .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let identity = paths.identity();
+        let owner =
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("waiting for owner hello: {error}"),
+                    }
+                };
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let hello: Value = serde_json::from_str(&request).unwrap();
+                assert_eq!(hello["params"]["project"], identity);
+                writeln!(stream, "{}", json!({
+                "jsonrpc": "2.0", "id": HELLO_ID, "result": {
+                    "pid": 42, "project": identity, "protocol": PROTOCOL,
+                    "version": version(), "generation": "other-runtime", "attach_errors": {},
+                }
+            })).unwrap();
+                stream.flush().unwrap();
+                let _ = release_rx.recv();
+            });
+        // The probe authenticates the published address independently of
+        // this process's fallback or differently configured XDG selection.
+        let result = probe(&paths, None);
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        match result {
+            Ok(Probe::Ready(conn)) => assert_eq!(conn.info.generation, "other-runtime"),
+            Err(error) => panic!("a safe owner in another runtime root was rejected: {error}"),
+            _ => panic!("a safe owner in another runtime root was not reached"),
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_unsafe_runtime_roots_even_with_the_correct_project_basename() {
+        let project = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(project.path()).unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let name = socket_name(&paths.project);
+        let arbitrary = runtime.path().join(&name);
+        assert!(
+            validate_discovery_socket(&paths, &arbitrary)
+                .unwrap_err()
+                .contains("not a supported runtime directory")
+        );
+        let socket = runtime.path().join("figmog").join(&name);
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            validate_discovery_socket(&paths, &socket)
+                .unwrap_err()
+                .contains("mode 0700")
+        );
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(other.path(), runtime.path().join("figmog")).unwrap();
+        assert!(validate_discovery_socket(&paths, &socket).is_err());
+    }
+
+    #[test]
+    fn a_socket_not_yet_protected_is_not_contacted_and_can_be_probed_again() {
+        let project = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(project.path()).unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = runtime.path().join("figmog");
+        crate::private_dir::ensure(&dir).unwrap();
+        let socket = dir.join(socket_name(&paths.project));
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_discovery(
+            &paths,
+            &Discovery {
+                socket: socket.clone(),
+                pid: 1,
+                generation: "stale".into(),
+                version: version().into(),
+                protocol: PROTOCOL,
+            },
+        )
+        .unwrap();
+        assert!(matches!(probe(&paths, None), Ok(Probe::Absent)));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_discovery_socket(&paths, &socket).unwrap());
+    }
+
+    #[test]
+    fn runtime_directory_rejects_symlinks_and_broad_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("run");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            check_runtime_directory(&root)
+                .unwrap_err()
+                .contains("mode 0700")
+        );
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(dir.path(), &linked).unwrap();
+        assert!(check_runtime_directory(&linked).is_err());
+        let (one, _two) = UnixStream::pair().unwrap();
+        check_peer(&one).unwrap();
+    }
+
+    #[test]
+    fn an_unreachable_lock_holder_is_not_spawned_over_and_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let _held = OwnerLock::try_acquire(&paths).unwrap().unwrap();
+        let settings = Settings {
+            watch: false,
+            interval: 10,
+            upstream: None,
+        };
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(100);
+        let error =
+            match connect_or_launch_with_timeout(&paths, dir.path(), &settings, &[], timeout) {
+                Err(error) => error,
+                _ => panic!("unreachable lock holder unexpectedly connected"),
+            };
+        assert!(
+            error.contains("lock is held but its socket is unreachable"),
+            "{error}"
+        );
+        assert!(start.elapsed() >= timeout);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("XDG_RUNTIME_DIR"), "{error}");
+        assert!(!paths.log().exists(), "no child should have been launched");
+    }
+
+    #[test]
+    fn a_peer_closing_before_the_handshake_is_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let discovery = Discovery {
+            socket: paths.socket(),
+            pid: 42,
+            generation: "closing".into(),
+            version: version().into(),
+            protocol: PROTOCOL,
+        };
+        let (client, owner) = UnixStream::pair().unwrap();
+        drop(owner);
+        assert!(
+            matches!(
+                probe_connected(&paths, None, &discovery, client),
+                Ok(Probe::Closing)
+            ),
+            "a peer closing before HELLO must allow reconnecting"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_spawn_reports_setup_errors_without_a_child_status_timeout() {
+        let Some(addchdir) = macos_spawn::addchdir() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let error = macos_spawn::launch(&paths, &dir.path().join("missing"), &[], addchdir, None)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
     }
 
     #[test]

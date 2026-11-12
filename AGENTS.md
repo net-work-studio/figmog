@@ -16,7 +16,8 @@ removed) verbatim, for provenance only — don't treat them as current.
   `text`, `instances_of`, `styled_by`, `bound_to`, `by_type`,
   `components`, `component_sets`, `styles`, `variables`,
   `variable_collections`, `meta`, `proxy_cache`, `mirror_config`,
-  `images`, `image_pins`, `variable_snapshot`) are on-disk schema — renaming one changes what store
+  `images`, `image_pins`, `variable_snapshot`; maintenance keyspace
+  `figmog_maintenance`) are on-disk schema — renaming one changes what store
   directory an unmodified binary can open. `Id`/`Rec` are append-only
   enums: postcard encodes variant indices positionally, so a new variant
   goes at the end of each enum, never inserted or reordered.
@@ -50,9 +51,16 @@ removed) verbatim, for provenance only — don't treat them as current.
   wording change upstream would silently turn every "store is locked"
   case into `internal panic: ...` + exit 101 instead of the intended
   clean exit-1 message.
+- **Pin-bump checklist: migration exclusion.** Migration keeps older raw
+  fjall openers excluded while copying and retiring a closed store by
+  retaining `std::fs::File::try_lock` on fjall 3.1.9's `<db>/lock`.
+  On any fjall or `fold` bump, re-check `locked_file.rs`, the lock filename,
+  and database open/close ordering (writers quiesce before unlocking), then
+  run `cargo test --lib cli::migrate`
+  including the synchronized late-opener and resumed-cleanup regressions.
 - **Pin-bump checklist: store compaction.** `src/compact.rs` (NWS-2941)
   drives fjall directly: `SingleWriterTxKeyspace::inner()` and
-  `Keyspace::rotate_memtable_and_wait()` are `#[doc(hidden)]` in fjall
+  `Keyspace::rotate_memtable()` / `Keyspace::sealed_memtable_count()` are `#[doc(hidden)]` in fjall
   3.1.9 (public, undocumented), and the journal retirement it relies on
   — fjall seals the active journal during a flush only once the journal
   writer's position passes 64,000,000 bytes, then deletes it once every

@@ -8,10 +8,14 @@
 //!   below it); else the Git top level; else the working directory.
 //! * **Mirror root:** inside Git, `<git-common-dir>/figmog`, shared by every
 //!   worktree of the repository; outside Git, `<project root>/.figmog`.
+//!   A group-shared Git common directory uses the per-checkout location
+//!   instead, preserving the private mirror ancestor checks.
 //! * **Local root:** `<project root>/.figmog`, per checkout. It holds the
 //!   `current` pointer (and an in-process `--figmog-root` serve's socket),
 //!   and was where every mirror lived before the shared root existed (the
-//!   "legacy" location [`Layout::active_store`] still honors). The shared
+//!   "legacy" location [`Layout::active_store`] still honors). Existing
+//!   `.figmog` roots from the working directory up to the project root are
+//!   also honored, because older binaries wrote relative to the cwd. The shared
 //!   background owner's lock, discovery record and log live in the mirror
 //!   root ([`crate::owner`]).
 //!
@@ -31,6 +35,7 @@
 //! malformed `[files]` line.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -121,17 +126,23 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
     // Inside content this parser skips (other tables, top-level keys and
     // their possibly multi-line values), a `[`-led line may be a value
     // continuation rather than a header, so a malformed one is skipped too.
-    let mut skipping = false;
+    let mut at_root = true;
+    let mut skipped_depth = 0usize;
     // Inside a skipped multi-line string (and the line it opened on): its
     // lines are content, never headers or keys.
     let mut multiline: Option<(Multiline, usize)> = None;
     // Inside an unknown settings key's value that spans lines (an array,
     // inline table or multi-line string), and the line it started on.
     let mut unknown_value: Option<(ValueScan, usize)> = None;
-    for (index, raw) in text.lines().enumerate() {
+    for (index, raw) in text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
+        .enumerate()
+    {
         let err = |message: String| format!("{name}:{}: {message}", index + 1);
         if let Some((open, line)) = multiline {
-            multiline = skip_strings(raw, Some(open)).map(|open| (open, line));
+            multiline = skip_strings(raw, Some(open), &mut skipped_depth).map(|open| (open, line));
             continue;
         }
         if let Some((scan, line)) = unknown_value {
@@ -142,34 +153,33 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.starts_with("[[") {
-            // Array of tables: never a known table, so always skipped.
-            table = Table::Skipped;
-            skipping = true;
+        if skipped_depth > 0 {
+            multiline = skip_strings(raw, None, &mut skipped_depth).map(|open| (open, index));
             continue;
         }
         if line.starts_with('[') {
-            let header = match parse_header(line) {
-                Ok(header) => header,
-                Err(_) if skipping => {
-                    // A value continuation (e.g. inside an array), which
-                    // may open a multi-line string.
-                    multiline = skip_strings(raw, None).map(|open| (open, index));
-                    continue;
+            at_root = false;
+            let (names, array) = parse_header(line).map_err(err)?;
+            let header = names.join(".");
+            if names.first().is_some_and(|name| name == "files") && (array || names.len() != 1) {
+                return Err(err(
+                    "use a [files] table; arrays and nested files tables are unsupported".into(),
+                ));
+            }
+            table = if array {
+                Table::Skipped
+            } else {
+                match header.as_str() {
+                    "files" => Table::Files,
+                    TOKEN_MODES_TABLE => Table::Modes,
+                    TOKENS_TABLE => Table::Settings(TOKENS_TABLE),
+                    ASSETS_TABLE => Table::Settings(ASSETS_TABLE),
+                    other => match SETTINGS_TABLES.iter().find(|t| **t == other) {
+                        Some(known) => Table::Settings(known),
+                        None => Table::Skipped,
+                    },
                 }
-                Err(message) => return Err(err(message)),
             };
-            table = match header {
-                "files" => Table::Files,
-                TOKEN_MODES_TABLE => Table::Modes,
-                TOKENS_TABLE => Table::Settings(TOKENS_TABLE),
-                ASSETS_TABLE => Table::Settings(ASSETS_TABLE),
-                other => match SETTINGS_TABLES.iter().find(|t| **t == other) {
-                    Some(known) => Table::Settings(known),
-                    None => Table::Skipped,
-                },
-            };
-            skipping = table == Table::Skipped;
             let known = match table {
                 Table::Files => Some("files"),
                 Table::Settings(known) => Some(known),
@@ -189,8 +199,13 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
                 // skipped unparsed, including multi-line values — but a
                 // multi-line string's lines are tracked so a header inside
                 // one is never taken for a table.
-                skipping = true;
-                multiline = skip_strings(raw, None).map(|open| (open, index));
+                if at_root && parse_simple_key(line).is_ok_and(|(key, _)| key == "files") {
+                    return Err(err(
+                        "use a [files] table; dotted keys and inline files tables are unsupported"
+                            .into(),
+                    ));
+                }
+                multiline = skip_strings(raw, None, &mut skipped_depth).map(|open| (open, index));
                 continue;
             }
             Table::Files => "files",
@@ -284,6 +299,12 @@ pub(crate) fn parse_config(text: &str, name: &str) -> Result<ProjectConfig, Stri
             line + 1
         ));
     }
+    if skipped_depth > 0 {
+        return Err(format!(
+            "{name}:{}: unterminated array or inline table",
+            text.lines().count().max(1)
+        ));
+    }
     if let Some((_, line)) = unknown_value {
         return Err(format!("{name}:{}: unterminated value", line + 1));
     }
@@ -302,7 +323,7 @@ enum Multiline {
 /// Scan one skipped line for strings, starting inside `open` (if any), and
 /// return the multi-line string still open at its end. Single-line strings
 /// and a trailing `#` comment are passed over, so their quotes never count.
-fn skip_strings(line: &str, mut open: Option<Multiline>) -> Option<Multiline> {
+fn skip_strings(line: &str, mut open: Option<Multiline>, depth: &mut usize) -> Option<Multiline> {
     let bytes = line.as_bytes();
     let mut i = 0;
     // A closing delimiter may be followed by up to two more quotes that
@@ -333,6 +354,14 @@ fn skip_strings(line: &str, mut open: Option<Multiline>) -> Option<Multiline> {
                 }
             }
             None => match bytes[i] {
+                b'[' | b'{' => {
+                    *depth += 1;
+                    i += 1;
+                }
+                b']' | b'}' => {
+                    *depth = depth.saturating_sub(1);
+                    i += 1;
+                }
                 b'#' => return None,
                 b'"' if bytes[i..].starts_with(b"\"\"\"") => {
                     open = Some(Multiline::Basic);
@@ -449,21 +478,31 @@ impl ValueScan {
     }
 }
 
-/// `[name]` (optionally followed by a comment) → `name`.
-fn parse_header(line: &str) -> Result<&str, String> {
-    let rest = &line[1..];
-    let close = rest
-        .find(']')
-        .ok_or_else(|| "unterminated table header".to_string())?;
-    let header = rest[..close].trim();
-    let trailing = rest[close + 1..].trim();
-    if !(trailing.is_empty() || trailing.starts_with('#')) {
-        return Err(format!("unexpected text after [{header}]"));
+/// Parse dotted table names without treating a quoted `]` as the end.
+fn parse_header(line: &str) -> Result<(Vec<String>, bool), String> {
+    let array = line.starts_with("[[");
+    let mut rest = &line[if array { 2 } else { 1 }..];
+    let mut names = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        let (name, tail) = parse_simple_key(rest)
+            .map_err(|_| "unterminated or malformed table header".to_string())?;
+        names.push(name);
+        rest = tail.trim_start();
+        if let Some(tail) = rest.strip_prefix('.') {
+            rest = tail;
+            continue;
+        }
+        let end = if array { "]]" } else { "]" };
+        let tail = rest
+            .strip_prefix(end)
+            .ok_or_else(|| "unterminated table header".to_string())?
+            .trim();
+        if !(tail.is_empty() || tail.starts_with('#')) {
+            return Err("unexpected text after table header".into());
+        }
+        return Ok((names, array));
     }
-    if header.is_empty() {
-        return Err("empty table header".into());
-    }
-    Ok(header)
 }
 
 /// A bare (`A-Za-z0-9_-`) or quoted key, and the text after it.
@@ -483,6 +522,23 @@ fn parse_key<'a>(line: &'a str, table: &str) -> Result<(String, &'a str), String
     }
     if line[end..].trim_start().starts_with('.') {
         return Err(format!("dotted keys are not supported in [{table}]"));
+    }
+    Ok((line[..end].to_string(), &line[end..]))
+}
+
+fn parse_simple_key(line: &str) -> Result<(String, &str), String> {
+    if line.starts_with('"') || line.starts_with('\'') {
+        let (key, rest) = parse_string(line, "table header")?;
+        if key.is_empty() {
+            return Err("empty key".into());
+        }
+        return Ok((key, rest));
+    }
+    let end = line
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .unwrap_or(line.len());
+    if end == 0 {
+        return Err("expected a key".into());
     }
     Ok((line[..end].to_string(), &line[end..]))
 }
@@ -1236,6 +1292,9 @@ pub(crate) struct Layout {
     pub(crate) mirror_root: PathBuf,
     /// `<project root>/.figmog`: `current`, legacy mirrors.
     pub(crate) local_root: PathBuf,
+    /// Existing legacy roots, nearest working directory first. Empty in
+    /// synthetic layouts means just `local_root`.
+    pub(crate) legacy_roots: Vec<PathBuf>,
 }
 
 /// Where one file's mirror is right now.
@@ -1249,10 +1308,10 @@ pub(crate) struct ActiveStore {
 
 impl Layout {
     /// Discover the layout for `cwd` (absolute). Fails only on an
-    /// unreadable or malformed config file; a missing or failing `git`
-    /// silently means "not in a repository".
+    /// unreadable or malformed config, or failed Git discovery inside a
+    /// repository. Git failures never select a second mirror location.
     pub(crate) fn discover(cwd: &Path) -> Result<Self, String> {
-        let git = git_paths(cwd);
+        let git = git_paths(cwd)?;
         let boundary = git.as_ref().map(|g| g.toplevel.as_path());
         let config_dir = find_config_dir(cwd, boundary);
         let project_root = config_dir
@@ -1264,15 +1323,22 @@ impl Layout {
             None => ProjectConfig::default(),
         };
         let local_root = project_root.join(LOCAL_DIR);
+        let legacy_roots = cwd
+            .ancestors()
+            .take_while(|dir| dir.starts_with(&project_root))
+            .map(|dir| dir.join(LOCAL_DIR))
+            .filter(|root| exists(root))
+            .collect();
         let mirror_root = match git {
-            Some(g) => g.common_dir.join("figmog"),
-            None => local_root.clone(),
+            Some(g) if !g.group_shared => g.common_dir.join("figmog"),
+            _ => local_root.clone(),
         };
         Ok(Self {
             project_root,
             config,
             mirror_root,
             local_root,
+            legacy_roots,
         })
     }
 
@@ -1293,7 +1359,12 @@ impl Layout {
         } else {
             local_root.clone()
         };
+        let mut legacy_roots = self.legacy_roots.clone();
+        if !legacy_roots.contains(&local_root) {
+            legacy_roots.push(local_root.clone());
+        }
         Layout {
+            legacy_roots,
             project_root: root,
             config: ProjectConfig::default(),
             mirror_root,
@@ -1316,24 +1387,54 @@ impl Layout {
         self.mirror_root.join(key)
     }
 
-    /// `<local root>/<key>` — the old per-checkout store directory.
+    /// The existing old per-checkout store directory nearest the cwd,
+    /// falling back to `<local root>/<key>` when none exists.
     pub(crate) fn legacy_dir(&self, key: &str) -> PathBuf {
-        self.local_root.join(key)
+        self.legacy_roots()
+            .into_iter()
+            .map(|root| root.join(key))
+            .find(|dir| {
+                exists(&dir.join("db")) || exists(&dir.with_file_name(format!(".{key}.deleting")))
+            })
+            .unwrap_or_else(|| self.local_root.join(key))
     }
 
-    /// Whether old per-checkout mirrors can differ from shared ones at all
-    /// (outside Git both are `<project root>/.figmog`).
+    pub(crate) fn legacy_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.legacy_roots.clone();
+        if !roots.contains(&self.local_root) {
+            roots.push(self.local_root.clone());
+        }
+        roots
+    }
+
+    pub(crate) fn legacy_stores(&self, key: &str) -> Vec<PathBuf> {
+        let mut stores: Vec<_> = self
+            .legacy_roots()
+            .into_iter()
+            .map(|root| root.join(key))
+            .filter(|dir| dir != &self.shared_dir(key) && exists(&dir.join("db")))
+            .collect();
+        stores.sort();
+        stores.dedup();
+        stores
+    }
+
+    /// Whether any old cwd-relative root differs from the selected mirror
+    /// root (usually only inside Git, or below an explicit project config).
     pub(crate) fn has_legacy_root(&self) -> bool {
-        self.mirror_root != self.local_root
+        self.legacy_roots()
+            .iter()
+            .any(|root| root != &self.mirror_root)
     }
 
     /// The `current` pointer file (fallback default file).
+    #[cfg(test)]
     pub(crate) fn current_file(&self) -> PathBuf {
         self.local_root.join("current")
     }
 
     /// The project's default file: `figmog.toml`'s `[files] default`, else
-    /// `.figmog/current` (migration fallback). Nonempty malformed
+    /// the nearest legacy `.figmog/current` (migration fallback). Nonempty malformed
     /// `current` contents are an error, never silently skipped.
     pub(crate) fn default_key(&self) -> Result<Option<String>, String> {
         if let Some(key) = self.config.default_key() {
@@ -1344,7 +1445,44 @@ impl Layout {
 
     /// `.figmog/current` alone (no config): the last file pulled here.
     pub(crate) fn current_key(&self) -> Result<Option<String>, String> {
-        read_current(&self.current_file())
+        for root in self.legacy_roots() {
+            if let Some(key) = read_current(&root.join("current"))? {
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Publish the fallback default and retire older nested pointers that
+    /// would otherwise mask it. Before the first publication, discovery
+    /// still honors those legacy pointers in nearest-directory order.
+    pub(crate) fn write_current(&self, key: &str) -> Result<(), String> {
+        write_current(&self.local_root, key)?;
+        let local = std::fs::canonicalize(&self.local_root)
+            .map_err(|error| format!("resolving {}: {error}", self.local_root.display()))?;
+        for root in self
+            .legacy_roots()
+            .into_iter()
+            .take_while(|root| root != &self.local_root)
+        {
+            // A discovered directory alias must not unlink the pointer we
+            // just published through its other spelling.
+            if std::fs::canonicalize(&root).ok().as_ref() == Some(&local) {
+                continue;
+            }
+            let pointer = root.join("current");
+            match std::fs::remove_file(&pointer) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "retiring legacy current pointer {}: {error}",
+                        pointer.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve where `key`'s mirror is right now:
@@ -1364,8 +1502,19 @@ impl Layout {
                 migration_pending: false,
             });
         }
+        let stores = self.legacy_stores(key);
+        if stores.len() > 1 {
+            return Err(format!(
+                "multiple legacy mirrors exist for {key}: {}; move or remove redundant copies before continuing",
+                stores
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         let legacy_db = self.legacy_dir(key).join("db");
-        let legacy = exists(&legacy_db);
+        let legacy = !stores.is_empty();
         match (legacy, exists(&shared_db)) {
             (true, true) if exists(&shared.join(MIGRATED_MARKER)) => Err(format!(
                 "an interrupted `figmog migrate` left two mirrors for {key}: {} (old) and {} \
@@ -1399,14 +1548,23 @@ impl Layout {
 pub(crate) struct LegacyStore {
     layout: Layout,
     key: String,
+    path: PathBuf,
 }
 
 impl Layout {
-    /// `Some` exactly when `path` is `key`'s old per-checkout store.
+    /// `Some` when `path` belongs to a discovered old per-checkout root.
+    /// Keep that classification after migration removes the database:
+    /// callers may have resolved it before reading or fetching input.
     pub(crate) fn legacy_store(&self, key: &str, path: &Path) -> Option<LegacyStore> {
-        (self.has_legacy_root() && path == self.legacy_dir(key).join("db")).then(|| LegacyStore {
+        (path != self.shared_dir(key).join("db")
+            && self
+                .legacy_roots()
+                .into_iter()
+                .any(|root| path == root.join(key).join("db")))
+        .then(|| LegacyStore {
             layout: self.clone(),
             key: key.to_string(),
+            path: path.to_path_buf(),
         })
     }
 }
@@ -1424,7 +1582,7 @@ impl LegacyStore {
     /// Under the store's lock: the old store is still the active one.
     pub(crate) fn still_active(&self) -> Result<(), String> {
         let store = self.layout.active_store(&self.key)?;
-        if store.path == self.layout.legacy_dir(&self.key).join("db") {
+        if store.path == self.path {
             Ok(())
         } else {
             Err(self.moved_msg())
@@ -1446,6 +1604,13 @@ pub(crate) fn migration_pending_warning(key: &str, store: &ActiveStore) -> Strin
 
 fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Record a fallback default in one explicitly selected local root.
+/// Project-aware callers should use [`Layout::write_current`] instead.
+pub(crate) fn write_current(local_root: &Path, key: &str) -> Result<(), String> {
+    let root = crate::private_dir::ensure(local_root)?;
+    std::fs::write(root.join("current"), key).map_err(|error| error.to_string())
 }
 
 /// `.figmog/current` contents: trimmed bare key, `None` when absent/empty.
@@ -1503,17 +1668,27 @@ fn read_config_file(path: &Path, name: &str) -> Result<Option<ProjectConfig>, St
 struct GitPaths {
     toplevel: PathBuf,
     common_dir: PathBuf,
+    group_shared: bool,
 }
 
 /// `git rev-parse --path-format=absolute --show-toplevel --git-common-dir`
-/// run in `cwd`. `None` when Git is missing or `cwd` isn't in a work tree.
+/// run in `cwd`. `None` only when no ancestor has a `.git` marker.
 ///
 /// Git older than 2.31 doesn't know `--path-format` and echoes it back as
 /// an output line, then prints `--git-common-dir` relative to `cwd`; that
 /// echo is dropped and any relative common dir is resolved against `cwd`
 /// here, so older Git still yields the same absolute path.
-fn git_paths(cwd: &Path) -> Option<GitPaths> {
-    let output = Command::new("git")
+fn git_paths(cwd: &Path) -> Result<Option<GitPaths>, String> {
+    git_paths_using(cwd, std::ffi::OsStr::new("git"))
+}
+
+fn git_paths_using(cwd: &Path, program: &std::ffi::OsStr) -> Result<Option<GitPaths>, String> {
+    // A repository marker is authoritative even when Git is missing,
+    // rejects ownership, or cannot decode a damaged gitdir file.
+    if !cwd.ancestors().any(|dir| exists(&dir.join(".git"))) {
+        return Ok(None);
+    }
+    let output = Command::new(program)
         .args([
             "rev-parse",
             "--path-format=absolute",
@@ -1522,28 +1697,58 @@ fn git_paths(cwd: &Path) -> Option<GitPaths> {
         ])
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
         .output()
-        .ok()?;
+        .map_err(|e| {
+            format!("discovering Git repository (refusing a local mirror fallback): {e}")
+        })?;
     if !output.status.success() {
-        return None;
+        return Err(format!(
+            "discovering Git repository (refusing a local mirror fallback): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let mut lines = stdout
-        .lines()
-        .filter(|line| !line.is_empty() && *line != "--path-format=absolute");
-    let toplevel = PathBuf::from(lines.next()?);
-    let common_dir = PathBuf::from(lines.next()?);
+    let mut lines = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty() && *line != b"--path-format=absolute");
+    let mut path = || {
+        lines
+            .next()
+            .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+            .ok_or_else(|| "Git returned incomplete repository paths".to_string())
+    };
+    let toplevel = path()?;
+    let common_dir = path()?;
     let common_dir = if common_dir.is_absolute() {
         common_dir
     } else {
         cwd.join(common_dir)
     };
     let canonical = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
-    Some(GitPaths {
+    let common_dir = canonical(common_dir);
+    use std::os::unix::fs::MetadataExt;
+    let writable_group = std::fs::metadata(&common_dir)
+        .map_err(|e| format!("reading Git common directory {}: {e}", common_dir.display()))?
+        .mode()
+        & 0o020
+        != 0;
+    let group_shared = if writable_group {
+        let output = Command::new(program)
+            .args(["config", "--get", "core.sharedRepository"])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("reading core.sharedRepository: {e}"))?;
+        let setting = String::from_utf8_lossy(&output.stdout);
+        output.status.success() && !matches!(setting.trim(), "" | "0" | "false" | "umask")
+    } else {
+        false
+    };
+    Ok(Some(GitPaths {
         toplevel: canonical(toplevel),
-        common_dir: canonical(common_dir),
-    })
+        common_dir,
+        group_shared,
+    }))
 }
 
 #[cfg(test)]
@@ -2182,6 +2387,7 @@ mod tests {
             config: ProjectConfig::default(),
             mirror_root: dir.join(".git/figmog"),
             local_root: dir.join(".figmog"),
+            legacy_roots: Vec::new(),
         }
     }
 
@@ -2252,6 +2458,185 @@ mod tests {
                 .default_key()
                 .unwrap_err()
                 .contains(".figmog/current")
+        );
+    }
+    #[test]
+    fn publishing_current_retires_every_preceding_legacy_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout_with_legacy(dir.path());
+        let deep = dir.path().join("packages/app/.figmog");
+        let parent = dir.path().join("packages/.figmog");
+        for root in [&deep, &parent] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("current"), KEY).unwrap();
+        }
+        layout.legacy_roots = vec![deep.clone(), parent.clone()];
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(KEY));
+        layout.write_current(OTHER).unwrap();
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(OTHER));
+        assert!(!deep.join("current").exists());
+        assert!(!parent.join("current").exists());
+        layout.config.files.insert("default".into(), KEY.into());
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(KEY));
+    }
+
+    #[test]
+    fn publishing_current_preserves_a_directory_alias_of_the_root_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout_with_legacy(dir.path());
+        std::fs::create_dir(&layout.local_root).unwrap();
+        let alias = dir.path().join("legacy-alias");
+        std::os::unix::fs::symlink(&layout.local_root, &alias).unwrap();
+        layout.legacy_roots = vec![alias];
+        layout.write_current(OTHER).unwrap();
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(OTHER));
+        assert_eq!(
+            std::fs::read_to_string(layout.current_file()).unwrap(),
+            OTHER
+        );
+    }
+
+    #[test]
+    fn publishing_current_reports_a_legacy_pointer_that_cannot_be_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout_with_legacy(dir.path());
+        let legacy = dir.path().join("packages/app/.figmog");
+        std::fs::create_dir_all(legacy.join("current")).unwrap();
+        layout.legacy_roots = vec![legacy.clone()];
+        let error = layout.write_current(OTHER).unwrap_err();
+        assert!(error.contains("retiring legacy current pointer"), "{error}");
+        assert!(error.contains(&legacy.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn config_files_spellings_never_silently_fall_back() {
+        for text in [
+            "name = 'x'\n[files\n",
+            "files.default = 'SyntheticKey0001'\n",
+            "files = { default = 'SyntheticKey0001' }\n",
+            "'files'.default = 'SyntheticKey0001'\n",
+            "[[files]]\ndefault = 'SyntheticKey0001'\n",
+            "[files.nested]\ndefault = 'SyntheticKey0001'\n",
+        ] {
+            assert!(parse_config(text, CONFIG_FILE).is_err(), "{text}");
+        }
+        let config = parse_config(
+            "\u{feff}[\"files\"]\ndefault = 'SyntheticKey0001'\n[tool.\"a]b\"]\nx = 2\n",
+            CONFIG_FILE,
+        )
+        .unwrap();
+        assert_eq!(config.default_key(), Some(KEY));
+        let config = parse_config(
+            "[tool]\nfiles = [\n  [1, 2],\n  [3, 4],\n]\n[files]\ndefault = 'SyntheticKey0001'\n",
+            CONFIG_FILE,
+        )
+        .unwrap();
+        assert_eq!(config.default_key(), Some(KEY));
+    }
+
+    #[test]
+    fn repository_discovery_failures_do_not_select_a_local_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = std::ffi::OsStr::new("/nonexistent/figmog-test-git");
+        assert!(git_paths_using(dir.path(), missing).unwrap().is_none());
+        git(dir.path(), &["init", "--quiet"]);
+        let error = git_paths_using(dir.path(), missing).err().unwrap();
+        assert!(
+            error.contains("refusing a local mirror fallback"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /nonexistent/figmog-gitdir",
+        )
+        .unwrap();
+        let error = Layout::discover(dir.path()).unwrap_err();
+        assert!(error.contains("not a git repository"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")] // APFS rejects non-UTF-8 directory names.
+    #[test]
+    fn repository_discovery_preserves_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"repo-\xff".to_vec()));
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "--quiet"]);
+        let layout = Layout::discover(&root).unwrap();
+        assert_eq!(layout.mirror_root, canonical(&root).join(".git/figmog"));
+    }
+
+    #[test]
+    fn group_shared_git_uses_private_per_checkout_mirrors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--quiet", "--shared=group"]);
+        std::fs::set_permissions(
+            dir.path().join(".git"),
+            std::fs::Permissions::from_mode(0o2775),
+        )
+        .unwrap();
+        let layout = Layout::discover(dir.path()).unwrap();
+        assert_eq!(layout.mirror_root, layout.local_root);
+        assert!(!layout.has_legacy_root());
+        crate::private_dir::ensure(&layout.shared_dir(KEY).join("db")).unwrap();
+    }
+
+    #[test]
+    fn nested_legacy_roots_supply_current_and_detect_duplicate_mirrors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path());
+        git(&root, &["init", "--quiet"]);
+        let app = root.join("packages/app");
+        let nested = app.join("nested");
+        let old = app.join(".figmog");
+        std::fs::create_dir_all(old.join(KEY).join("db")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(old.join("current"), KEY).unwrap();
+        let layout = Layout::discover(&nested).unwrap();
+        assert_eq!(layout.default_key().unwrap().as_deref(), Some(KEY));
+        assert_eq!(
+            layout.active_store(KEY).unwrap().path,
+            old.join(KEY).join("db")
+        );
+        assert!(layout.active_store(KEY).unwrap().migration_pending);
+        std::fs::create_dir_all(layout.local_root.join(KEY).join("db")).unwrap();
+        let error = layout.active_store(KEY).unwrap_err();
+        assert!(error.contains("multiple legacy mirrors"), "{error}");
+        assert!(error.contains(&old.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn selected_per_checkout_store_is_never_classified_as_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = layout_with_legacy(dir.path());
+        // Non-Git and group-shared Git select this mirror root. An older
+        // cwd-relative root may still exist below the project directory.
+        layout.mirror_root = layout.local_root.clone();
+        let nested_root = layout.project_root.join("packages/app/.figmog");
+        std::fs::create_dir_all(&nested_root).unwrap();
+        layout.legacy_roots = vec![nested_root.clone()];
+        assert!(layout.has_legacy_root());
+
+        let selected = layout.shared_dir(KEY).join("db");
+        std::fs::create_dir_all(&selected).unwrap();
+        assert_eq!(layout.legacy_dir(KEY).join("db"), selected);
+        let active = layout.active_store(KEY).unwrap();
+        assert_eq!(active.path, selected);
+        assert!(!active.migration_pending);
+        assert!(layout.legacy_store(KEY, &selected).is_none());
+
+        // An actual legacy store for another key retains its guard.
+        let legacy = nested_root.join(OTHER).join("db");
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert!(layout.legacy_store(OTHER, &legacy).is_some());
+        assert!(
+            layout
+                .legacy_store(OTHER, &layout.shared_dir(OTHER).join("db"))
+                .is_none()
         );
     }
 }

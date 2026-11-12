@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::deep_json::OwnedValue;
 use crate::owner::{self, OwnerPaths, Probe};
 use crate::project::Layout;
 
@@ -173,7 +174,15 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 /// stdout, same error shapes"). See this module's doc comment for the
 /// `None` vs `Some` contract.
 pub(super) fn try_call(route: &Route, tool: &str, args: Value) -> Option<Result<Value, String>> {
-    with_client(route, |client| call_over(client, tool, args.clone()))
+    let args = OwnedValue(args);
+    let serialized = match crate::deep_json::to_string(&args.0) {
+        Ok(serialized) => serialized,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    with_client(route, |client| {
+        let args = crate::deep_json::from_str(&serialized).map_err(|e| e.to_string())?;
+        call_over(client, tool, args)
+    })
 }
 
 /// Like [`try_call`], but for `tools/list` — used by `figmog tools`'s own
@@ -259,18 +268,17 @@ pub(crate) fn write_over(
     tool: &str,
     args: Value,
 ) -> Result<Value, String> {
-    let frame = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool, "arguments": args},
-    })
-    .to_string();
-    if frame.len() >= crate::serve::MAX_FRAME_BYTES {
+    let args = OwnedValue(args);
+    let mut params = OwnedValue(json!({"name": tool}));
+    params.insert("arguments".into(), args);
+    let mut frame = OwnedValue(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call"}));
+    frame.insert("params".into(), params);
+    let frame = crate::deep_json::to_string(&frame.0).map_err(|e| e.to_string())?;
+    if frame.len() >= crate::serve::MAX_WRITE_FRAME_BYTES {
         return Err(format!(
             "this write is too large to send to the running figmog serve ({} bytes; limit {} MiB) — stop it and run the command again to apply it directly",
             frame.len(),
-            crate::serve::MAX_FRAME_BYTES / (1024 * 1024)
+            crate::serve::MAX_WRITE_FRAME_BYTES / (1024 * 1024)
         ));
     }
     const NOT_APPLIED: &str = "figmog serve shut down before accepting this write; nothing was applied — rerun the command";
@@ -341,6 +349,14 @@ fn write_once(client: Client, tool: &str, frame: &str) -> Result<Value, Failure>
         .set_read_timeout(Some(WRITE_TIMEOUT))
         .map_err(|e| e.to_string())?;
     // A request serve never fully received cannot have been applied.
+    if frame.len() > 8 * 1024 * 1024 {
+        writeln!(
+            writer,
+            "{}",
+            json!({"jsonrpc":"2.0", "method":crate::serve::WRITE_FRAME_NOTICE})
+        )
+        .map_err(|e| format!("writing to serve socket: {e}"))?;
+    }
     writeln!(writer, "{frame}").map_err(|e| format!("writing to serve socket: {e}"))?;
     writer
         .flush()
@@ -367,7 +383,7 @@ fn write_once(client: Client, tool: &str, frame: &str) -> Result<Value, Failure>
             }
             Err(e) => return Err(Failure::Error(unknown(e, &operation))),
         };
-        let resp: Value = serde_json::from_str(&line)
+        let resp = crate::deep_json::from_str(&line)
             .map_err(|e| unknown(format!("invalid JSON: {e}"), &operation))?;
         if resp.get("method").and_then(Value::as_str)
             == Some(crate::serve::writes::OPERATION_NOTIFICATION)
@@ -382,7 +398,7 @@ fn write_once(client: Client, tool: &str, frame: &str) -> Result<Value, Failure>
             if not_accepted(&resp) {
                 return Err(Failure::NotAccepted);
             }
-            return Ok(interpret_call_response(tool, resp)?);
+            return Ok(interpret_call_response(tool, resp.into_inner())?);
         }
     }
 }
@@ -392,17 +408,15 @@ fn not_accepted(resp: &Value) -> bool {
     resp["error"]["code"].as_i64() == Some(owner::NOT_ACCEPTED)
 }
 
-fn call_over(client: Client, tool: &str, args: Value) -> Result<Value, Failure> {
-    let resp = send_and_recv(
-        client,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": args},
-        }),
-    )?;
-    Ok(interpret_call_response(tool, resp)?)
+fn call_over(client: Client, tool: &str, args: OwnedValue) -> Result<Value, Failure> {
+    let mut params = OwnedValue(json!({"name": tool}));
+    params.insert("arguments".to_string(), args);
+    let mut frame = OwnedValue(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call"}));
+    frame.insert("params".to_string(), params);
+    Ok(interpret_call_response(
+        tool,
+        send_and_recv(client, &frame)?,
+    )?)
 }
 
 fn tools_list_over(client: Client) -> Result<Vec<Value>, Failure> {
@@ -443,7 +457,8 @@ fn send_and_recv(client: Client, frame: &Value) -> Result<Value, Failure> {
     writer
         .set_write_timeout(Some(SOCKET_TIMEOUT))
         .map_err(|e| e.to_string())?;
-    writeln!(writer, "{frame}").map_err(|e| format!("writing to serve socket: {e}"))?;
+    let request = crate::deep_json::to_string(frame).map_err(|e| e.to_string())?;
+    writeln!(writer, "{request}").map_err(|e| format!("writing to serve socket: {e}"))?;
     writer
         .flush()
         .map_err(|e| format!("writing to serve socket: {e}"))?;
@@ -451,13 +466,13 @@ fn send_and_recv(client: Client, frame: &Value) -> Result<Value, Failure> {
     let id = frame.get("id").cloned().unwrap_or(Value::Null);
     loop {
         let line = read_frame(&mut reader)?;
-        let resp: Value = serde_json::from_str(&line)
+        let resp = crate::deep_json::from_str(&line)
             .map_err(|e| format!("serve socket sent invalid JSON: {e}"))?;
         if is_response_to(&resp, &id) {
             if not_accepted(&resp) {
                 return Err(Failure::NotAccepted);
             }
-            return Ok(resp);
+            return Ok(resp.into_inner());
         }
     }
 }
@@ -500,6 +515,9 @@ fn read_frame(reader: &mut BufReader<UnixStream>) -> Result<String, String> {
     if n == 0 {
         return Err("serve socket closed before responding".to_string());
     }
+    if !line.ends_with('\n') {
+        return Err("serve socket closed during a response".to_string());
+    }
     Ok(line)
 }
 
@@ -516,15 +534,21 @@ fn protocol_error_message(err: &Value) -> String {
 /// hand-built response `Value`s. Only local single-JSON tools are
 /// unwrapped; desktop results and `figmog_images` retain their MCP envelope.
 fn interpret_call_response(tool: &str, resp: Value) -> Result<Value, String> {
+    let mut resp = crate::deep_json::OwnedValue(resp);
     if let Some(err) = resp.get("error") {
         return Err(protocol_error_message(err));
     }
-    let result = resp.get("result").cloned().unwrap_or(Value::Null);
+    let mut result = crate::deep_json::OwnedValue(
+        resp.0
+            .get_mut("result")
+            .map(std::mem::take)
+            .unwrap_or(Value::Null),
+    );
     if !crate::proxy::is_local_tool(tool) {
         // Socket dispatch reports serve-generated failures as JSON-RPC
         // errors above. Only genuine desktop results reach this branch,
         // including the desktop's own tool-level `isError` responses.
-        return Ok(result);
+        return Ok(std::mem::take(&mut result.0));
     }
     let is_error = result
         .get("isError")
@@ -536,17 +560,18 @@ fn interpret_call_response(tool: &str, resp: Value) -> Result<Value, String> {
         return Err(text.unwrap_or_else(|| "unknown error from serve".to_string()));
     }
     if tool == "figmog_images" {
-        return Ok(result);
+        return Ok(std::mem::take(&mut result.0));
     }
 
     match text {
         // Local single-JSON tools answer as `ToolOutput::Json`, i.e. one
         // text block holding figmog's own JSON (see `mcp::ToolOutput`).
         // Parse it back out for the CLI's established local read shape.
-        Some(t) => serde_json::from_str(&t)
+        Some(t) => crate::deep_json::from_str(&t)
+            .map(crate::deep_json::OwnedValue::into_inner)
             .map_err(|e| format!("serve returned non-JSON tool content: {e}")),
         // Preserve the existing fallback for a local result without text.
-        None => Ok(result),
+        None => Ok(std::mem::take(&mut result.0)),
     }
 }
 
@@ -677,8 +702,8 @@ mod tests {
             .tempdir_in("/tmp")
             .unwrap();
         let paths = OwnerPaths::ensure(dir.path()).unwrap();
-        let socket = dir.path().join("o.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let socket = paths.socket();
+        let listener = owner::bind_socket(&socket).unwrap();
         owner::write_discovery(
             &paths,
             &owner::Discovery {

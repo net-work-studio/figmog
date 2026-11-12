@@ -520,8 +520,11 @@
     "state": "current",
     "theme": {
       "collection": "Theme",
+      "collection_id": "VariableCollectionId:2:0",
       "dark_mode": "Dark",
-      "light_mode": "Light"
+      "dark_mode_id": "2:1",
+      "light_mode": "Light",
+      "light_mode_id": "2:0"
     },
     "variables": 17
   },

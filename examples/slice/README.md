@@ -95,6 +95,10 @@ sizes, line height and stroke width, exported in px, and the unitless font
 weight) are used through their CSS variables, e.g.
 `text-[length:var(--font-size-title)]`.
 
+Tailwind's automatic source discovery is disabled. It scans only `src/` and
+`index.html`, which the build identity hashes and the temporary app copies.
+Files outside that scope and previous `dist/` output cannot add utilities.
+
 Values the spec flags `untokenized` (horizontal padding 24, width 320, title
 line height 28, body fill and weight, badge size and radius, letter spacing)
 have no token, so they are written as arbitrary values and marked

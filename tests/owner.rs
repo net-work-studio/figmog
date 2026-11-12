@@ -318,6 +318,213 @@ impl Relay {
     }
 }
 
+/// EOF must not discard the response owed for a malformed input frame.
+#[test]
+fn a_one_shot_malformed_frame_receives_a_parse_error_before_relay_exit() {
+    let repo = repo();
+    let mut relay = spawn_relay(&mut relay_command(
+        repo.path(),
+        &["--no-watch", "--no-upstream"],
+    ));
+    relay.stdin.as_mut().unwrap().write_all(b"{\n").unwrap();
+    drop(relay.stdin.take());
+    let line = relay.rx.recv_timeout(TIMEOUT).unwrap_or_else(|error| {
+        panic!("no parse-error response: {error}; {}", relay.stderr_text())
+    });
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        response,
+        json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}})
+    );
+    relay.finish();
+    wait_owner_gone(repo.path());
+}
+
+/// A client that keeps stdout open without reading cannot prevent EOF
+/// shutdown. The production drain budget is fifteen seconds.
+#[test]
+fn an_unread_relay_stdout_cannot_extend_the_eof_shutdown_budget() {
+    struct UnreadRelay(Child);
+    impl Drop for UnreadRelay {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let repo = repo();
+    let child = relay_command(repo.path(), &["--no-watch", "--no-upstream"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut relay = UnreadRelay(child);
+    let mut stdout = relay.0.stdout.take().unwrap();
+    let mut stdin = relay.0.stdin.take().unwrap();
+    // Each tools/list answer is much larger than its request. The total
+    // responses exceed the OS pipe capacity while these requests fit the
+    // input pipe, which the relay's reader also drains independently.
+    for id in 0..128 {
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc":"2.0", "id":id, "method":"tools/list"})
+        )
+        .unwrap();
+    }
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = relay.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "relay stayed blocked on unread stdout beyond its EOF drain budget"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status}");
+    let mut output = String::new();
+    stdout.read_to_string(&mut output).unwrap();
+    assert!(!output.is_empty(), "no response reached the stdout pipe");
+    assert!(
+        output.lines().count() < 128,
+        "the response burst must exceed the unread pipe's capacity"
+    );
+    wait_owner_gone(repo.path());
+}
+
+/// A rejected request followed by EOF must not wait for a replacement's
+/// full sixty-second handshake budget.
+#[test]
+fn eof_during_a_rejected_requests_reconnect_keeps_the_drain_budget() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo();
+    let root = repo.path().join(".git/figmog");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(root.join("owner.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let runtime = tempfile::Builder::new()
+        .prefix("fr-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let address_dir = runtime.path().join("figmog");
+    std::fs::create_dir(&address_dir).unwrap();
+    std::fs::set_permissions(&address_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hash = root
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let socket = address_dir.join(format!("{hash:016x}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let record = json!({"generation":"drain-test", "pid":std::process::id(),
+        "project":root, "protocol":1, "socket":socket, "version":env!("CARGO_PKG_VERSION")});
+    std::fs::write(root.join("owner.json"), record.to_string()).unwrap();
+    let (ready, initialized) = mpsc::channel();
+    let (hello, reconnecting) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let accept = || {
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                        break stream;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "relay never connected");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        };
+        let stream = accept();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        let first: Value = serde_json::from_str(&first).unwrap();
+        let mut writer = stream;
+        let response = json!({"jsonrpc":"2.0", "id":first["id"], "result":{
+            "attach_errors":{}, "generation":"drain-test", "pid":std::process::id(),
+            "project":record["project"], "protocol":1, "version":env!("CARGO_PKG_VERSION"),
+            "settings":{"watch":false,"interval":10,"upstream":null}}});
+        writeln!(writer, "{response}").unwrap();
+        ready.send(()).unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "tools/list");
+        writeln!(
+            writer,
+            "{}",
+            json!({"jsonrpc":"2.0", "id":request["id"],
+            "error":{"code":-32001,"message":"not accepted: closing"}})
+        )
+        .unwrap();
+        drop(reader);
+        drop(writer);
+        let stream = accept();
+        let mut reader = BufReader::new(stream);
+        let mut frame = String::new();
+        reader.read_line(&mut frame).unwrap();
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["method"], "figmog/hello");
+        hello.send(()).unwrap();
+        // Never answer the replacement HELLO. The relay must cancel it.
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+    });
+    let mut relay = spawn_relay(
+        relay_command(repo.path(), &["--no-watch", "--no-upstream"])
+            .env("XDG_RUNTIME_DIR", runtime.path()),
+    );
+    initialized.recv_timeout(TIMEOUT).unwrap();
+    relay.send(&json!({"jsonrpc":"2.0", "id":7, "method":"tools/list"}));
+    drop(relay.stdin.take());
+    reconnecting.recv_timeout(TIMEOUT).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = relay.child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = relay.child.kill();
+            let _ = relay.child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    peer.join().unwrap();
+    std::fs::remove_file(socket).unwrap();
+    std::fs::remove_file(root.join("owner.json")).unwrap();
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "relay exceeded EOF drain: {}",
+        relay.stderr_text()
+    );
+    assert!(
+        owners_in(repo.path()).is_empty(),
+        "cancelled reconnect must not launch a later owner"
+    );
+}
+
 /// Pull a synthetic fixture into `cwd`'s project as `key` (direct: no owner
 /// is running), landing in the shared mirror root.
 fn seed(cwd: &Path, key: &str, fixture: &Value) {
@@ -374,7 +581,7 @@ fn concurrent_relays_elect_exactly_one_owner() {
         );
         let socket = PathBuf::from(record["socket"].as_str().unwrap());
         assert!(socket.as_os_str().len() < 104, "{}", socket.display());
-        assert!(socket.starts_with("/tmp"), "{}", socket.display());
+        assert!(socket.is_absolute(), "{}", socket.display());
         for relay in relays {
             relay.finish();
         }
@@ -383,6 +590,90 @@ fn concurrent_relays_elect_exactly_one_owner() {
         assert!(!socket.exists(), "the owner removed its socket");
         assert!(mirror_root(repo.path()).join("owner.lock").exists());
     }
+}
+
+/// An owner probes desktop before publishing discovery. A second relay
+/// must give that owner the same startup budget as the relay launching it.
+#[test]
+fn concurrent_relays_wait_for_a_slow_desktop_startup() {
+    let repo = repo();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let upstream = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let (initializing_tx, initializing_rx) = mpsc::channel();
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let desktop = std::thread::spawn(move || {
+        for method in ["initialize", "notifications/initialized", "tools/list"] {
+            let deadline = Instant::now() + TIMEOUT;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "desktop never received {method}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("desktop accept: {error}"),
+                }
+            };
+            // Accepted sockets inherit the listener's nonblocking mode
+            // on macOS. Header reads should wait for the client's bytes.
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0;
+            loop {
+                let mut header = String::new();
+                assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(length) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = length.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["method"], method);
+            if method == "initialize" {
+                initializing_tx.send(()).unwrap();
+                continue_rx.recv_timeout(TIMEOUT).unwrap();
+                // Longer than the former five-second relay cutoff, but
+                // within HttpUpstream's ten-second per-request timeout.
+                std::thread::sleep(Duration::from_millis(6250));
+            }
+            let (status, body) = if method == "notifications/initialized" {
+                ("202 Accepted", String::new())
+            } else {
+                let result = if method == "initialize" {
+                    json!({"protocolVersion": "2025-06-18", "capabilities": {},
+                        "serverInfo": {"name": "slow-desktop", "version": "1.0"}})
+                } else {
+                    json!({"tools": []})
+                };
+                (
+                    "200 OK",
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result}).to_string(),
+                )
+            };
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            stream.flush().unwrap();
+        }
+    });
+    let args = ["--no-watch", "--upstream", upstream.as_str()];
+    let mut first = spawn_relay(&mut relay_command(repo.path(), &args));
+    initializing_rx.recv_timeout(TIMEOUT).unwrap();
+    assert!(discovery(repo.path()).is_none(), "owner is still starting");
+    let mut second = spawn_relay(&mut relay_command(repo.path(), &args));
+    continue_tx.send(()).unwrap();
+    first.initialize();
+    second.initialize();
+    desktop.join().unwrap();
+    assert_eq!(first.owner_pid(), second.owner_pid());
+    assert_eq!(owners_in(repo.path()), vec![first.owner_pid() as u32]);
+    first.finish();
+    second.finish();
+    wait_owner_gone(repo.path());
 }
 
 /// Ten owners launched at once: one wins the lock, the rest exit at once,
@@ -533,8 +824,23 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
     let root = repo.path().join(".git/figmog");
     std::fs::create_dir_all(&root).unwrap();
     let root = std::fs::canonicalize(&root).unwrap();
-    let socket = repo.path().join("old.sock");
+    let runtime = tempfile::tempdir().unwrap();
+    let runtime_path = runtime.path().join("figmog");
+    std::fs::create_dir(&runtime_path).unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&runtime_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hash = root
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let socket = runtime_path.join(format!("{hash:016x}.sock"));
     let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let record = json!({"generation": "old", "pid": 4_000_000u64, "project": root.display().to_string(),
         "protocol": 1, "socket": socket.display().to_string(), "version": "0.0.1"});
     std::fs::write(root.join("owner.json"), record.to_string()).unwrap();
@@ -562,6 +868,7 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
         });
     }
     let output = relay_command(repo.path(), &["--no-watch", "--no-upstream"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -581,6 +888,7 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
 
     let out = common::command()
         .args(["call", "figmog_files"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
         .current_dir(repo.path())
         .output()
         .unwrap();
@@ -1432,5 +1740,130 @@ fn assets_export_routes_through_the_owner_and_the_relay_passes_the_manifest() {
         "{spec}"
     );
     relay.finish();
+}
+
+/// The detached owner must not keep a harness's inherited stream alive.
+#[test]
+fn detached_owner_closes_inherited_non_cloexec_descriptors() {
+    use std::os::fd::AsRawFd;
+    let repo = repo();
+    let (mut reader, inherited) = std::os::unix::net::UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    use std::os::unix::process::CommandExt;
+    let mut command = relay_command(repo.path(), &["--no-watch", "--no-upstream"]);
+    command.env("FIGMOG_OWNER_IDLE_MS", "60000");
+    let fd = inherited.as_raw_fd();
+    // SAFETY: only async-signal-safe fcntl runs in the child. Clear CLOEXEC
+    // there, leaving the test process unable to leak this fd to parallel tests.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut relay = spawn_relay(&mut command);
+    drop(inherited);
+    relay.initialize();
+    let pid = relay.owner_pid();
+    // SAFETY: querying the session of the live owner launched above.
+    assert_eq!(
+        unsafe { libc::getsid(pid as libc::pid_t) },
+        pid as libc::pid_t
+    );
+    relay.finish();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let result = loop {
+        match reader.read(&mut [0]) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => break result,
+        }
+    };
+    // SAFETY: this pid is the owner the test launched and kept alive above.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    wait_owner_gone(repo.path());
+    assert_eq!(
+        result.unwrap(),
+        0,
+        "the owner inherited a harness descriptor"
+    );
+}
+
+#[test]
+fn termination_signals_run_owner_cleanup() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let repo = repo();
+        let mut child = Command::new(assert_cmd::cargo::cargo_bin!("figmog"))
+            .args(["serve", "--background", "--no-watch", "--no-upstream"])
+            .current_dir(repo.path())
+            .env("FIGMA_TOKEN", "")
+            .env("FIGMOG_OWNER_IDLE_MS", "60000")
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_until("owner discovery", || discovery(repo.path()).is_some());
+        let socket = PathBuf::from(discovery(repo.path()).unwrap()["socket"].as_str().unwrap());
+        // SAFETY: the signal targets this test's live child only.
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("signal {signal} did not stop the owner");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "{status}");
+        assert!(discovery(repo.path()).is_none());
+        assert!(!socket.exists());
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(stderr.contains("exited"), "{stderr}");
+    }
+}
+
+#[test]
+fn clients_with_different_runtime_environments_share_the_existing_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo();
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut first = spawn_relay(
+        relay_command(repo.path(), &["--no-watch", "--no-upstream"])
+            .env("XDG_RUNTIME_DIR", runtime.path()),
+    );
+    first.initialize();
+    let owner = first.owner_pid();
+    let socket = PathBuf::from(discovery(repo.path()).unwrap()["socket"].as_str().unwrap());
+    assert!(socket.starts_with(runtime.path()));
+    let mut second = spawn_relay(
+        relay_command(repo.path(), &["--no-watch", "--no-upstream"]).env_remove("XDG_RUNTIME_DIR"),
+    );
+    second.initialize();
+    assert_eq!(second.owner_pid(), owner);
+    let output = common::command()
+        .args(["call", "figmog_files"])
+        .env_remove("XDG_RUNTIME_DIR")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    first.finish();
+    second.finish();
     wait_owner_gone(repo.path());
 }

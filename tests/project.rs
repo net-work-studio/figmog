@@ -190,9 +190,61 @@ fn an_old_mirror_is_used_until_migrated_and_two_copies_are_refused() {
         .assert()
         .success();
     let out = figmog(&main).args(["migrate", KEY]).assert().failure();
-    let error = json(&out.get_output().stderr)["error"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let report = json(&out.get_output().stdout);
+    assert_eq!(report["failed"][0]["file"], KEY);
+    let error = report["failed"][0]["error"].as_str().unwrap();
     assert!(error.contains("refusing to migrate"), "{error}");
+}
+
+/// A linked checkout's read must not create an empty shared mirror beside
+/// another checkout's real legacy mirror.
+#[test]
+fn missing_mirror_reads_do_not_initialize_a_shared_store() {
+    let (dir, main) = repository();
+    fs::write(
+        main.join("figmog.toml"),
+        format!("[files]\ndefault = \"{KEY}\"\n"),
+    )
+    .unwrap();
+    git(&main, &["add", "figmog.toml"]);
+    git(&main, &["commit", "--quiet", "-m", "init"]);
+    let linked = dir.path().join("linked");
+    git(
+        &main,
+        &["worktree", "add", "--quiet", linked.to_str().unwrap()],
+    );
+    let legacy = main.join(".figmog").join(KEY).join("db");
+    figmog(&main)
+        .args(["pull", "--from-file"])
+        .arg(response(dir.path()))
+        .arg("--db")
+        .arg(&legacy)
+        .assert()
+        .success();
+    for args in [
+        vec!["status"],
+        vec!["pages"],
+        vec!["call", "figmog_status", "--no-upstream"],
+        vec!["images", "0:1"],
+    ] {
+        let output = figmog(&linked)
+            .arg("--no-socket")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(
+            json(&output.stderr)["error"]
+                .as_str()
+                .unwrap()
+                .contains("no mirror here"),
+            "{args:?}: {output:?}"
+        );
+        assert!(
+            !main.join(".git/figmog").join(KEY).exists(),
+            "{args:?} created a shared mirror"
+        );
+    }
+    let output = figmog(&main).arg("status").assert().success();
+    assert_eq!(json(&output.get_output().stdout)["name"], "Fixture");
 }

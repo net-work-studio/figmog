@@ -287,6 +287,16 @@ fn bindings_untokenized_values_and_unsupported_cases() {
     assert_eq!(caption["content"]["runs"][1]["css"]["font-weight"], "700");
 
     // What stays untranslatable is listed, sorted, never approximated.
+    // The fixture uses REST's nested side/corner binding maps. Their
+    // actual variables survive as bindings, rather than equal-value matches.
+    let values = &spec["node"]["values"];
+    assert_eq!(values["stroke_weight"]["variable_id"], "VariableID:1:9");
+    assert_eq!(values["stroke_weight"]["css"], "--stroke-thin");
+    for corner in ["top_left", "top_right", "bottom_right", "bottom_left"] {
+        assert_eq!(values["radius"][corner]["variable_id"], "VariableID:1:6");
+        assert_eq!(values["radius"][corner]["css"], "--radius-md");
+    }
+
     let unsupported = spec["unsupported"].as_array().unwrap();
     let has = |id: &str, prefix: &str| {
         unsupported
@@ -529,7 +539,7 @@ fn spec_follows_the_projects_token_mode_mapping() {
     assert!(without["node"].get("tailwind").is_none());
     assert_eq!(
         spec["tokens_snapshot"]["theme"],
-        json!({"collection": "Theme", "light_mode": "Light", "dark_mode": "日本"})
+        json!({"collection": "Theme", "collection_id": "VariableCollectionId:2:0", "light_mode": "Light", "light_mode_id": "2:0", "dark_mode": "日本", "dark_mode_id": "2:1"})
     );
     let mut all = Vec::new();
     entries(&spec["node"], &mut all);

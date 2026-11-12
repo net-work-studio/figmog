@@ -248,7 +248,15 @@ enum Cmd {
     },
     /// Import a variables export (REST or plugin-console shape), replacing
     /// the previous variable snapshot.
-    ImportVariables { path: PathBuf },
+    ImportVariables {
+        path: PathBuf,
+        /// Permit an empty export to replace the stored variable snapshot.
+        #[arg(long)]
+        allow_empty: bool,
+        /// Validate and report the replacement without changing the store.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Design tokens from the imported variable snapshot.
     Tokens {
         #[command(subcommand)]
@@ -291,12 +299,21 @@ enum Cmd {
         #[arg(long)]
         under: Option<String>,
     },
-    /// Nodes whose absolute bounds contain a point, sorted by area ascending.
+    /// Visible nodes on one page containing a point, sorted by area then id.
     At {
-        #[arg(long)]
+        #[arg(long, value_parser = finite_coordinate)]
         x: f64,
-        #[arg(long)]
+        #[arg(long, value_parser = finite_coordinate)]
         y: f64,
+        /// Page id or Figma page URL defining the coordinate space.
+        #[arg(long)]
+        page: String,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
+        /// Maximum number of matches after filtering and sorting.
+        #[arg(long, default_value_t = crate::query::DEFAULT_AT_LIMIT)]
+        limit: usize,
     },
     /// Code-ready spec of a subtree: per node the recorded design layout
     /// and figmog's CSS interpretation, each value as its bound token
@@ -343,6 +360,19 @@ enum Cmd {
     },
 }
 
+/// Non-finite coordinates cannot round-trip through JSON (they become
+/// `null`), so reject them consistently before direct or socket dispatch.
+fn finite_coordinate(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| "expected a finite number".to_string())?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err("expected a finite number".into())
+    }
+}
+
 /// Sentinel [`dispatch`]/[`write_json`] error string meaning "stdout
 /// closed mid-write, not a command failure" (the reader vanished — piped
 /// into `head`, a killed consumer, …). Never printed: `run` recognizes it
@@ -378,7 +408,7 @@ pub fn run() -> i32 {
 /// error.
 fn write_json(v: &Value) -> Result<(), String> {
     use std::io::Write;
-    let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+    let text = crate::deep_json::to_string_pretty(v).map_err(|e| e.to_string())?;
     let mut stdout = std::io::stdout();
     if writeln!(stdout, "{text}").is_err() || stdout.flush().is_err() {
         return Err(STDOUT_CLOSED.to_string());
@@ -521,7 +551,16 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             .as_deref()
             .map(|f| parse_file_ref(f).ok_or_else(|| format!("not a Figma file key or URL: {f}")))
             .transpose()?;
-        return write_json(&migrate::cmd_migrate(layout, key)?);
+        let report = migrate::cmd_migrate(layout, key)?;
+        write_json(&report)?;
+        return if report["failed"]
+            .as_array()
+            .is_some_and(|failed| !failed.is_empty())
+        {
+            Err("some mirrors could not be migrated; see the failed entries in the migration report".into())
+        } else {
+            Ok(())
+        };
     }
 
     // `figmog tools` never reads the store — it only needs an upstream
@@ -549,6 +588,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             return write_json(&socket::tools_rows(&tools));
         }
         return call::cmd_tools(upstream.clone(), *no_upstream);
+    }
+
+    if let Cmd::Call { tool, args, .. } = &cli.cmd {
+        let args = crate::deep_json::OwnedValue(call::parse_args(args.as_deref())?);
+        call::validate_local_args(tool, &args)?;
     }
 
     // Socket routing (spec §1): every read command plus `call` first tries
@@ -580,10 +624,10 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 parsed_args
             };
             if let Some(route) = route_for(root, layout, &parsed_args, is_per_file_local_tool(tool))
-                && let Some(result) = socket::try_call(&route, tool, parsed_args.clone())
+                && let Some(result) = socket::try_call(&route, tool, parsed_args)
             {
                 note_ignored_upstream_flags(upstream, *no_upstream);
-                return write_json(&result?);
+                return write_json(&crate::deep_json::OwnedValue(result?));
             }
         } else if let Some(read) = read_command(&cli.cmd) {
             // The file this read targets: what the socket call carries.
@@ -596,15 +640,21 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 with_project_settings(read, Some(layout), target.as_deref())?.to_tool_call();
             let tool_args = with_current_file(tool_args, layout)?;
             if let Some(route) = route_for(root, layout, &tool_args, true)
-                && let Some(result) = socket::try_call(&route, tool, tool_args.clone())
+                && let Some(result) = socket::try_call(&route, tool, tool_args)
             {
                 let result = result?;
                 // Not ready is an error, except for an import-only store
-                // (SPEC §9): its stored variable snapshot still answers.
+                // (SPEC §9) with no pull attempted. Once a pull is in
+                // progress or failed, report its lifecycle before stripping it.
                 if tool == "figmog_status"
                     && result["ready"] == false
-                    && !has_variable_state(&result)
+                    && (!has_variable_state(&result) || !result["pull"]["job"].is_null())
                 {
+                    if let Some(error) = result["pull"]["last_completed"]["error"].as_str() {
+                        return Err(format!(
+                            "mirror is not ready — pull failed: {error}; inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors"
+                        ));
+                    }
                     return Err("mirror is not ready — inspect `figmog call figmog_status` or `figmog call figmog_files` for pull progress and errors".to_string());
                 }
                 let result = if tool == "figmog_status" {
@@ -612,6 +662,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 } else {
                     result
                 };
+                let result = crate::deep_json::OwnedValue(result);
                 return write_read(&cli.cmd, &result, Some(layout));
             }
         }
@@ -648,9 +699,19 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 geometry,
                 ..
             } => pull::cmd_pull_routed(&db, key, root, client, from_file, fresh, geometry),
-            Cmd::ImportVariables { path } => {
-                call::cmd_import_variables_routed(root, client, key, path)
-            }
+            Cmd::ImportVariables {
+                path,
+                allow_empty,
+                dry_run,
+            } => call::cmd_import_variables_routed(
+                &db,
+                root,
+                client,
+                key,
+                path,
+                allow_empty,
+                dry_run,
+            ),
             _ => unreachable!("matched above"),
         };
     }
@@ -661,7 +722,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             fresh,
             geometry,
         } => pull::cmd_pull(&db, file, from_file, fresh, geometry),
-        Cmd::ImportVariables { path } => call::cmd_import_variables(&db, path),
+        Cmd::ImportVariables {
+            path,
+            allow_empty,
+            dry_run,
+        } => call::cmd_import_variables(&db, path, allow_empty, dry_run),
         Cmd::Images {
             ids,
             format,
@@ -699,8 +764,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // site; the reader tuple itself is nameable (`RootReaders`), so
             // the query runs through the same `ReadCommand::execute` arm
             // every tool adapter uses (NWS-2902).
-            let st = db.open(|path| crate::open_store!(path))?;
-            let result = st.rtx(|r| read.execute(&r))?;
+            let st = db.open_existing(|path| crate::open_store!(path))?;
+            let result = crate::deep_json::OwnedValue(st.rtx(|r| read.execute(&r))?);
             drop(st);
             write_read(&other, &result, db.layout.as_ref())
         }
@@ -809,7 +874,11 @@ fn requested_file(args: &Value) -> Result<Option<String>, String> {
 /// Management tools don't target an existing mirror, and desktop tools
 /// use the desktop's own context rather than local mirror routing.
 pub(crate) fn is_per_file_local_tool(tool: &str) -> bool {
-    crate::proxy::is_local_tool(tool) && !matches!(tool, "figmog_open" | "figmog_files")
+    crate::proxy::is_local_tool(tool)
+        && !matches!(
+            tool,
+            "figmog_open" | "figmog_files" | crate::serve::writes::OPERATION
+        )
 }
 
 /// For per-file local tools, inject the project default's key
@@ -832,27 +901,31 @@ pub(crate) fn is_per_file_local_tool(tool: &str) -> bool {
 /// in-process serve keeps its own-default behavior, while the shared
 /// background owner is not asked at all ([`route_for`]).
 ///
-/// Never applied to desktop tools or `figmog_files`, which have no mirror
-/// routing, nor to `figmog_open`: its own `file` argument names the file
-/// *to open*, not a routing hint — it's required, and direct mode's own
+/// Never applied to desktop tools, `figmog_files`, or operation receipt
+/// queries, which have no mirror routing, nor to `figmog_open`: its own
+/// `file` argument names the file *to open*, not a routing hint — it's required, and direct mode's own
 /// dispatch correctly rejects an omitted one; silently defaulting it here
 /// would let `figmog call figmog_open`
 /// (no `--args`) succeed over the socket while the exact same invocation
 /// fails direct, breaking the very byte-compatibility this routing exists
 /// to preserve (see `read_command`'s socket caller).
-fn with_current_file(mut args: Value, layout: &Layout) -> Result<Value, String> {
+fn with_current_file(args: Value, layout: &Layout) -> Result<Value, String> {
+    let mut args = crate::deep_json::OwnedValue(args);
+    if args.is_null() {
+        args.0 = json!({});
+    }
     // Preserve explicit non-null values for the local tool's own argument
     // handling, even when they cannot select a mirror.
     let has_file = args.get("file").is_some_and(|value| !value.is_null());
     let url_file = crate::dispatch::infer_file_from_node_ref(&args);
-    if let Some(obj) = args.as_object_mut()
+    if let Some(obj) = args.0.as_object_mut()
         && !has_file
         && url_file.is_none()
         && let Some(key) = layout.default_key()?
     {
         obj.insert("file".to_string(), json!(key));
     }
-    Ok(args)
+    Ok(args.into_inner())
 }
 
 /// Where a routed call may go. The shared background owner (NWS-2953)
@@ -1000,7 +1073,19 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
             page: page.clone(),
             under: under.clone(),
         },
-        Cmd::At { x, y } => ReadCommand::At { x: *x, y: *y },
+        Cmd::At {
+            x,
+            y,
+            page,
+            under,
+            limit,
+        } => ReadCommand::At {
+            x: *x,
+            y: *y,
+            page: page.clone(),
+            under: under.clone(),
+            limit: *limit,
+        },
         Cmd::Spec {
             id,
             tailwind,
@@ -1037,8 +1122,10 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
 /// `--equals <json>`: parse as JSON, falling back to treating the bare word
 /// as a JSON string (so `--equals VERTICAL` works without quoting). A
 /// literal `--equals null` is equality to null (NWS-2897).
-fn parse_equals(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+fn parse_equals(raw: &str) -> String {
+    let value = crate::deep_json::from_str(raw)
+        .unwrap_or_else(|_| crate::deep_json::OwnedValue(Value::String(raw.to_string())));
+    crate::deep_json::to_string(&*value).expect("JSON value serializes")
 }
 
 // ---- config / db resolution ----
@@ -1064,6 +1151,17 @@ impl Db {
             _ => None,
         };
         open_store_resolved(&self.path, legacy.as_ref(), open)
+    }
+    /// Open a read destination without initializing a missing mirror.
+    fn open_existing<T>(
+        &self,
+        open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
+    ) -> Result<OwnedStore<T>, String> {
+        let legacy = match (&self.layout, &self.key) {
+            (Some(layout), Some(key)) => layout.legacy_store(key, &self.path),
+            _ => None,
+        };
+        open_store_existing_resolved(&self.path, legacy.as_ref(), open)
     }
 }
 
@@ -1094,10 +1192,14 @@ fn resolve_db(cli: &Cli, layout: Option<Layout>) -> Result<Db, String> {
     let file = match &cli.cmd {
         Cmd::Pull { file: Some(f), .. } => Some(f.clone()),
         Cmd::Call { tool, args, .. } if is_per_file_local_tool(tool) => {
-            requested_file(&call::parse_args(args.as_deref())?)?
+            let args = crate::deep_json::OwnedValue(call::parse_args(args.as_deref())?);
+            requested_file(&args)?
         }
         cmd => match read_command(cmd) {
-            Some(read) => requested_file(&read.to_tool_call().1)?,
+            Some(read) => {
+                let args = crate::deep_json::OwnedValue(read.to_tool_call().1);
+                requested_file(&args)?
+            }
             None => None,
         },
     };
@@ -1269,6 +1371,20 @@ pub(crate) fn open_store_resolved<T>(
     open_store_owned(owner, open)
 }
 
+/// Read-only admission: missing stores never acquire a newly created database.
+pub(crate) fn open_store_existing_resolved<T>(
+    path: &Path,
+    legacy: Option<&crate::project::LegacyStore>,
+    open: impl FnOnce(&Path) -> T + std::panic::UnwindSafe,
+) -> Result<OwnedStore<T>, String> {
+    let owner = StoreOwner::acquire_existing(path)?
+        .ok_or_else(|| "no mirror here — run `figmog pull <file-url>` first".to_string())?;
+    if let Some(legacy) = legacy {
+        legacy.still_active()?;
+    }
+    open_store_owned(owner, open)
+}
+
 /// Open the store at `path` emptied (`pull --fresh` through a running
 /// serve, NWS-2963): like [`OwnedStore::reset`] — the first open checks
 /// fjall's own lock too — but returns the cleared store opened by `open`
@@ -1303,23 +1419,6 @@ fn open_store_owned<T>(
         }
     })?;
     Ok(OwnedStore::new(store, owner))
-}
-
-/// Whether fjall's own writer lock on the store at `owner.path` is held by
-/// someone else (an older binary's serve holds only that one): the store
-/// is opened and closed at once with its panics caught, like
-/// [`open_store_checked`] — the same `"Locked"` payload match (see the
-/// pin-bump checklist in `AGENTS.md`). Any other failure — a store left
-/// damaged, such as one an interrupted `figmog migrate` half deleted
-/// (NWS-2964) — is not lock contention and reads as `false`, never as an
-/// exit.
-fn writer_locked(owner: &StoreOwner) -> bool {
-    let path = owner.path.clone();
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(|| drop(crate::open_store!(&path)));
-    std::panic::set_hook(prev_hook);
-    result.is_err_and(|payload| panic_message(&*payload).contains("Locked"))
 }
 
 /// Best-effort text for a caught panic's payload: `&str`/`String` cover
@@ -1431,6 +1530,31 @@ mod tests {
     // ---- socket-routing helpers (review C1/C2/m1 fix round) ----
 
     #[test]
+    fn resolve_db_safely_discards_deep_equals_arguments() {
+        crate::test_support::small_stack(|| {
+            let equals = format!("{}null{}", r#"{"":["#.repeat(15_000), "]}".repeat(15_000));
+            let cli = Cli::try_parse_from([
+                "figmog",
+                "--no-socket",
+                "where",
+                "--pointer",
+                "/id",
+                "--equals",
+                &equals,
+                "--under",
+                "https://www.figma.com/file/SyntheticFileKey123/Test?node-id=0-0",
+            ])
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let layout = Layout::discover(dir.path()).unwrap();
+            let expected = layout.mirror_root.join("SyntheticFileKey123/db");
+            let db = resolve_db(&cli, Some(layout)).unwrap();
+            assert_eq!(db.key.as_deref(), Some("SyntheticFileKey123"));
+            assert_eq!(db.path, expected);
+        });
+    }
+
+    #[test]
     fn strip_routed_status_fields_removes_only_that_key() {
         let result = strip_routed_status_fields(json!({
             "name": "Fixture",
@@ -1464,6 +1588,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn at_rejects_non_finite_coordinates_before_dispatch() {
+        for coordinate in ["NaN", "inf", "-inf", "1e400"] {
+            for axis in ["--x", "--y"] {
+                let value = format!("{axis}={coordinate}");
+                let other = if axis == "--x" { "--y=1" } else { "--x=1" };
+                let error = Cli::try_parse_from(["figmog", "at", &value, other, "--page", "0:1"])
+                    .err()
+                    .unwrap();
+                assert!(
+                    error.to_string().contains("expected a finite number"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
     /// NWS-2902: every clap read command's socket form parses back to the
     /// same typed command the direct path executes, and the socket JSON
     /// keeps its pre-refactor shape (absent optionals omitted, flags and
@@ -1492,6 +1633,11 @@ mod tests {
                 &["find", "--type", "TEXT", "--under", "1:1"],
                 "figmog_find",
                 json!({"type": "TEXT", "under": "1:1"}),
+            ),
+            (
+                &["find", "--type", "TEXT", "--page", "0:1"],
+                "figmog_find",
+                json!({"type": "TEXT", "page": "0:1"}),
             ),
             (
                 &["search", "x"],
@@ -1525,9 +1671,27 @@ mod tests {
                 json!({"pointer": "/a", "equals": "VERTICAL"}),
             ),
             (
-                &["at", "--x", "1.5", "--y", "2"],
+                &[
+                    "where",
+                    "--pointer",
+                    "/a",
+                    "--equals",
+                    "VERTICAL",
+                    "--page",
+                    "0:1",
+                ],
+                "figmog_where",
+                json!({"pointer": "/a", "equals": "VERTICAL", "page": "0:1"}),
+            ),
+            (
+                &["text", "--page", "0:1", "--under", "1:1"],
+                "figmog_text",
+                json!({"page": "0:1", "under": "1:1"}),
+            ),
+            (
+                &["at", "--x", "1.5", "--y", "2", "--page", "0:1"],
                 "figmog_at",
-                json!({"x": 1.5, "y": 2.0}),
+                json!({"x": 1.5, "y": 2.0, "page": "0:1", "limit": crate::query::DEFAULT_AT_LIMIT}),
             ),
             (&["spec", "1:1"], "figmog_spec", json!({"id": "1:1"})),
             (

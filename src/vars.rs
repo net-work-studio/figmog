@@ -38,23 +38,98 @@ pub fn snapshot_digest(bytes: &[u8]) -> String {
     format!("fnv1a64:{hash:016x}")
 }
 
-/// `import-variables`' stricter validation (NWS-2961): every variable and
-/// collection entry must be a JSON object, else the whole file is
-/// rejected. Deliberately not part of [`parse_variables_export`], which
-/// Enterprise pulls share and which stays lenient per entry.
+/// Validate file-import contents before replacing any stored records.
+/// Enterprise pulls share the lenient parser, not these import-only checks.
+/// Optional metadata may be absent; present metadata must have its declared
+/// type rather than silently losing code names or changing flags.
 pub fn check_import_entries(v: &Value) -> Result<(), ImportError> {
     let root = v.get("meta").unwrap_or(v);
-    for (kind, key) in [
-        ("variable", "variables"),
-        ("collection", "variableCollections"),
-    ] {
-        let Some(map) = root.get(key).and_then(Value::as_object) else {
-            continue; // shape errors are parse_variables_export's to report
-        };
-        if let Some((id, _)) = map.iter().find(|(_, e)| !e.is_object()) {
-            return Err(ImportError::Shape(format!(
-                "{kind} `{id}` is not an object"
-            )));
+    let object = |key: &str| {
+        root.get(key)
+            .and_then(Value::as_object)
+            .ok_or_else(|| ImportError::Shape(format!("missing `{key}` object")))
+    };
+    let collections = object("variableCollections")?;
+    let variables = object("variables")?;
+    let nonempty = |entry: &Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .is_some()
+    };
+    for (id, collection) in collections {
+        let invalid = |message: &str| ImportError::Shape(format!("collection `{id}` {message}"));
+        if !collection.is_object() {
+            return Err(invalid("is not an object"));
+        }
+        if !nonempty(collection, "name") {
+            return Err(invalid("requires a non-empty `name`"));
+        }
+        let modes = collection
+            .get("modes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("requires a `modes` array"))?;
+        let mut mode_ids = std::collections::BTreeSet::new();
+        for mode in modes {
+            let mode_id = mode
+                .get("modeId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| invalid("has a mode without a non-empty `modeId`"))?;
+            if !mode_ids.insert(mode_id) {
+                return Err(invalid("has duplicate mode ids"));
+            }
+        }
+        let default = collection.get("defaultModeId").and_then(Value::as_str);
+        if !default.is_some_and(|mode| mode_ids.contains(mode)) {
+            return Err(invalid("requires `defaultModeId` to name one of its modes"));
+        }
+    }
+    for (id, variable) in variables {
+        let invalid = |message: &str| ImportError::Shape(format!("variable `{id}` {message}"));
+        if !variable.is_object() {
+            return Err(invalid("is not an object"));
+        }
+        for key in ["name", "resolvedType"] {
+            if !nonempty(variable, key) {
+                return Err(invalid(&format!("requires a non-empty `{key}`")));
+            }
+        }
+        let collection = variable
+            .get("variableCollectionId")
+            .and_then(Value::as_str)
+            .and_then(|id| collections.get(id))
+            .ok_or_else(|| invalid("has an unknown `variableCollectionId`"))?;
+        let modes: std::collections::BTreeSet<_> = collection["modes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|mode| mode["modeId"].as_str())
+            .collect();
+        let values = variable
+            .get("valuesByMode")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid("requires a `valuesByMode` object"))?;
+        if values.keys().any(|mode| !modes.contains(mode.as_str())) {
+            return Err(invalid(
+                "has a `valuesByMode` key outside its collection's modes",
+            ));
+        }
+        if let Some(codes) = variable.get("codeSyntax") {
+            let codes = codes
+                .as_object()
+                .ok_or_else(|| invalid("requires `codeSyntax` to be an object"))?;
+            if codes.values().any(|code| !code.is_string()) {
+                return Err(invalid("requires every `codeSyntax` value to be a string"));
+            }
+        }
+        for flag in ["hiddenFromPublishing", "remote"] {
+            if variable.get(flag).is_some_and(|value| !value.is_boolean()) {
+                return Err(invalid(&format!(
+                    "requires `{flag}` to be a boolean when present"
+                )));
+            }
         }
     }
     Ok(())
@@ -195,7 +270,7 @@ pub fn parse_variables_export(v: &Value) -> Result<Vec<(Id, Rec)>, ImportError> 
                     .map(|(mode, val)| {
                         (
                             mode.clone(),
-                            serde_json::to_string(val).expect("Value serializes"),
+                            crate::deep_json::to_string(val).expect("Value serializes"),
                         )
                     })
                     .collect()
@@ -251,7 +326,7 @@ pub fn infer_from_nodes<'a>(nodes: impl Iterator<Item = &'a NodeRec>) -> Vec<Var
         if node.bound_variables.is_empty() {
             continue;
         }
-        let raw: serde_json::Value = match serde_json::from_str(&node.raw) {
+        let raw = match crate::deep_json::from_str(&node.raw) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -261,7 +336,7 @@ pub fn infer_from_nodes<'a>(nodes: impl Iterator<Item = &'a NodeRec>) -> Vec<Var
             if let Some(v) = raw.pointer(pointer) {
                 entry
                     .1
-                    .push(serde_json::to_string(v).expect("Value serializes"));
+                    .push(crate::deep_json::to_string(v).expect("Value serializes"));
             }
         }
     }
@@ -299,7 +374,7 @@ pub fn style_value_pointer(style_type: &str) -> Option<&'static str> {
 /// Style definitions are not in the file JSON; consumers carry the
 /// resolved properties.
 pub fn style_value_from_consumer(style_type: &str, consumer_raw: &str) -> Option<Value> {
-    let raw: Value = serde_json::from_str(consumer_raw).ok()?;
+    let mut raw = crate::deep_json::from_str(consumer_raw).ok()?;
     let pointer = style_value_pointer(style_type)?;
-    raw.pointer(pointer).cloned()
+    raw.0.pointer_mut(pointer).map(std::mem::take)
 }

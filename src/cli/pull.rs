@@ -3,6 +3,7 @@
 //! pointer every other command's [`super::resolve_db`] reads).
 
 use std::collections::BTreeSet;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,7 +12,7 @@ use serde_json::Value;
 use crate::api::{ApiError, FigmaApi, UreqApi};
 use crate::flatten::flatten_file;
 use crate::ident::parse_file_ref;
-use crate::store::{self, Churn, collect_sweepable, collect_variable_ids, sync};
+use crate::store::{self, Churn, collect_sweepable, collect_variable_ids};
 use crate::watch::BACKOFF_CAP;
 
 use super::{Db, write_json};
@@ -41,8 +42,12 @@ pub(super) fn cmd_pull(
     fresh: bool,
     geometry: bool,
 ) -> Result<(), String> {
-    let churn = pull_direct(db, file, from_file, fresh, geometry)?;
-    finish_pull(db, &churn)
+    let (churn, compaction) = pull_direct(db, file, from_file, fresh, geometry)?;
+    let result = finish_pull(db, &churn);
+    if let Some(compaction) = compaction {
+        compaction.run();
+    }
+    result
 }
 
 /// [`do_pull`] with `cmd_pull`'s error wording; the churn as JSON.
@@ -52,31 +57,35 @@ fn pull_direct(
     from_file: Option<PathBuf>,
     fresh: bool,
     geometry: bool,
-) -> Result<Value, String> {
-    let (churn, _name, _version) = do_pull(db, file, from_file, fresh, geometry).map_err(|e| {
-        let message = e.to_string();
-        // A reachable serve already took this pull (NWS-2963,
-        // `cmd_pull_routed`); this direct path meets a held store only via
-        // `--db`/`--no-socket` or an owner without a socket. A serve owner
-        // is named by the lock error itself; for an unnamed one, point at
-        // the escape hatch that reaches a serve (`figmog call
-        // figmog_sync`) rather than leaving the generic message alone.
-        // Scoped to exactly this message (not every `do_pull` failure) so
-        // an unrelated error (bad JSON, a real network failure, ...) isn't
-        // given a hint that doesn't apply to it.
-        if message == super::STORE_LOCKED_MSG {
-            format!("{message} — or ask the running serve: figmog call figmog_sync")
-        } else {
-            message
-        }
-    })?;
-    serde_json::to_value(&churn).map_err(|e| e.to_string())
+) -> Result<(Value, Option<super::store_lock::Compaction>), String> {
+    let (churn, _name, _version, compaction) = do_pull(db, file, from_file, fresh, geometry)
+        .map_err(|e| {
+            let message = e.to_string();
+            // A reachable serve already took this pull (NWS-2963,
+            // `cmd_pull_routed`); this direct path meets a held store only via
+            // `--db`/`--no-socket` or an owner without a socket. A serve owner
+            // is named by the lock error itself; for an unnamed one, point at
+            // the escape hatch that reaches a serve (`figmog call
+            // figmog_sync`) rather than leaving the generic message alone.
+            // Scoped to exactly this message (not every `do_pull` failure) so
+            // an unrelated error (bad JSON, a real network failure, ...) isn't
+            // given a hint that doesn't apply to it.
+            if message == super::STORE_LOCKED_MSG {
+                format!("{message} — or ask the running serve: figmog call figmog_sync")
+            } else {
+                message
+            }
+        })?;
+    Ok((
+        serde_json::to_value(&churn).map_err(|e| e.to_string())?,
+        compaction,
+    ))
 }
 
 /// `figmog pull` through the running serve that owns the store (NWS-2963):
-/// a saved response is read and parsed here, in the invoking worktree, with
-/// the direct path's errors, and sent as content; serve validates it before
-/// touching the store, applies it on the file's worker (`--fresh` behind
+/// a saved response is read, parsed and structurally validated here, in
+/// the invoking worktree, before the server can open a destination session.
+/// Serve applies it on the file's worker (`--fresh` behind
 /// the per-store reset barrier) and answers once the pull committed and was
 /// published. The output is the direct path's.
 pub(super) fn cmd_pull_routed(
@@ -102,13 +111,17 @@ fn pull_routed(
     fresh: bool,
     geometry: bool,
 ) -> Result<Value, String> {
-    let mut args = serde_json::json!({"file": key, "fresh": fresh, "geometry": geometry});
+    let mut args = serde_json::json!({"file": key, "db_bytes": db.path.as_os_str().as_bytes(), "fresh": fresh, "geometry": geometry});
     if let Some(path) = from_file {
-        args["from_file"] = read_saved_response(&path)?;
+        let response = crate::deep_json::OwnedValue(read_saved_response(&path)?);
+        // Match the direct path's validation before a missing destination
+        // can be initialized. This work stays in the invoking CLI process.
+        flatten_file(&response).map_err(|error| error.to_string())?;
+        args["from_file"] = response.into_inner();
     }
     let done = super::socket::write_over(route, client, crate::serve::writes::PULL, args)?;
     if let Some(layout) = &db.layout {
-        write_current(&layout.local_root, key)?;
+        layout.write_current(key)?;
     }
     Ok(done["result"].clone())
 }
@@ -141,7 +154,11 @@ pub(super) fn pull_for_init(
             return pull_routed(&db, key, &route, client?, from_file, false, false);
         }
     }
-    pull_direct(&db, None, from_file, false, false)
+    let (churn, compaction) = pull_direct(&db, None, from_file, false, false)?;
+    if let Some(compaction) = compaction {
+        compaction.run();
+    }
+    Ok(churn)
 }
 
 /// After a successful pull (either path): keep `.figmog/` ignored, then
@@ -173,7 +190,9 @@ fn finish_pull(db: &Db, churn: &Value) -> Result<(), String> {
 fn read_saved_response(path: &std::path::Path) -> Result<Value, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    serde_json::from_str(&content).map_err(|e| format!("parsing {}: {e}", path.display()))
+    crate::deep_json::from_str(&content)
+        .map(crate::deep_json::OwnedValue::into_inner)
+        .map_err(|e| format!("parsing {}: {e}", path.display()))
 }
 
 /// The pull mechanics without any printing. `.figmog/current` is written
@@ -194,12 +213,15 @@ pub(super) fn do_pull(
     from_file: Option<PathBuf>,
     fresh: bool,
     geometry: bool,
-) -> Result<(Churn, String, String), PullError> {
+) -> Result<(Churn, String, String, Option<super::store_lock::Compaction>), PullError> {
     // `vars_resp` is only ever `Some` on the network path — `--from-file`
     // ingests a saved `GET /v1/files/:key` response and never touches the
     // network at all, so it never calls `variables_local` either.
-    let (resp, vars_resp): (Value, Option<Value>) = match from_file {
-        Some(path) => (read_saved_response(&path)?, None),
+    let (resp, vars_resp): (crate::deep_json::OwnedValue, Option<Value>) = match from_file {
+        Some(path) => (
+            crate::deep_json::OwnedValue(read_saved_response(&path)?),
+            None,
+        ),
         None => {
             let key = db
                 .key
@@ -233,7 +255,7 @@ pub(super) fn do_pull(
             };
             let request_geometry = store::effective_geometry(geometry, stored_geometry);
             let api = UreqApi::new(token);
-            let resp = api.file(&key, request_geometry)?;
+            let resp = crate::deep_json::OwnedValue(api.file(&key, request_geometry)?);
             // Opportunistic Enterprise variables sync (spec §12): `Ok(None)`
             // on non-Enterprise plans is not an error — v1 behavior
             // (import/inference, sweep-exempt) holds unchanged below.
@@ -272,7 +294,7 @@ fn apply_pull(
     vars_resp: Option<&Value>,
     fresh: bool,
     geometry: bool,
-) -> Result<(Churn, String, String), PullError> {
+) -> Result<(Churn, String, String, Option<super::store_lock::Compaction>), PullError> {
     let mut flattened = flatten_file(resp).map_err(|e| e.to_string())?;
     if let Some(v) = vars_resp {
         flattened
@@ -296,34 +318,36 @@ fn apply_pull(
         );
         prior.extend(stored_var_ids);
     }
-    let prior_version = st.rtx(|(_, _, _, _, _, _, meta, _, _, _, _, _, _, _)| {
-        meta.get(&0).map(|m| m.version.clone())
-    });
-    let churn = sync(&mut st, &prior, &flattened, now_ms());
-
-    // Every caller of `do_pull` (`pull` and `figmog call figmog_sync`) goes
-    // through here, so eviction lives here rather than duplicated at each
-    // call site (build design §12: a
-    // version-changing pull sweeps stale `proxy_cache` rows; v0.0.2 spec §5
-    // extends this to stale `images` rows the same way). `figmog serve`'s
-    // own pull paths don't call `do_pull` — they keep their own inline
-    // eviction blocks, since they already hold `st` open and re-opening it
-    // here would hit the same single-open-per-process wall `figmog call
-    // figmog_sync` used to.
-    if prior_version.as_deref() != Some(flattened.file.version.as_str()) {
-        let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images, _, _, _, _)| {
-            let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
-            stale.extend(crate::store::stale_image_ids(
-                &images,
-                &flattened.file.version,
-            ));
-            stale
+    let prior_meta = st.rtx(|(_, _, _, _, _, _, meta, ..)| meta.get(&0));
+    let version_changed = prior_meta.as_ref().map(|meta| meta.version.as_str())
+        != Some(flattened.file.version.as_str());
+    // Cache invalidation shares the sync transaction: interruption must not
+    // commit new same-version nodes with their old cached image rows.
+    let churn =
+        store::sync_with_cache_eviction(&mut st, &prior, &flattened, now_ms(), |tx, churn| {
+            let snapshot_changed = prior_meta
+                .as_ref()
+                .is_some_and(|meta| meta.last_modified != flattened.file.last_modified)
+                || churn.added > 0
+                || churn.changed > 0
+                || churn.removed > 0;
+            if !version_changed && !snapshot_changed {
+                return Vec::new();
+            }
+            tx.rtx(|(_, _, _, _, _, _, _, cache, _, images, pins, ..)| {
+                if version_changed {
+                    let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
+                    stale.extend(crate::store::stale_image_ids(
+                        &images,
+                        &pins,
+                        &flattened.file.version,
+                    ));
+                    stale
+                } else {
+                    crate::store::all_image_ids(&images, &pins)
+                }
+            })
         });
-        if !stale.is_empty() {
-            stale.sort();
-            crate::store::evict_stale_cache(&mut st, &stale);
-        }
-    }
 
     // Persist the sticky geometry flag (spec §4): this call's own flag OR
     // whatever's already stored in *this* handle (re-read here rather than
@@ -339,20 +363,23 @@ fn apply_pull(
     store::upsert_mirror_config(&mut st, store::effective_geometry(geometry, stored_now));
 
     if let (Some(key), Some(layout)) = (&db.key, &db.layout) {
-        write_current(&layout.local_root, key)?;
+        layout.write_current(key)?;
     }
 
     // Move what this pull wrote out of fjall's journal (NWS-2941), so the
     // next cold open doesn't replay it. A zero-churn pull wrote nothing
     // worth it (just its meta/config rows).
-    if fresh || churn.wrote() {
-        st.close_and_compact();
-    }
+    let compaction = if fresh || churn.wrote() {
+        Some(st.close_for_compaction())
+    } else {
+        None
+    };
 
     Ok((
         churn,
         flattened.file.name.clone(),
         flattened.file.version.clone(),
+        compaction,
     ))
 }
 
@@ -386,8 +413,7 @@ pub(crate) fn now_ms() -> u64 {
 /// Record `key` in `<local_root>/current` (the project's per-checkout
 /// `.figmog`), the fallback default file when `figmog.toml` names none.
 pub(crate) fn write_current(local_root: &std::path::Path, key: &str) -> Result<(), String> {
-    let root = crate::private_dir::ensure(local_root)?;
-    std::fs::write(root.join("current"), key).map_err(|e| e.to_string())
+    crate::project::write_current(local_root, key)
 }
 
 #[cfg(test)]
@@ -430,6 +456,108 @@ mod tests {
             "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
             "document": {"id": "0:0", "name": "Document", "type": "DOCUMENT"}
         })
+    }
+
+    #[test]
+    fn same_version_pulls_evict_images_when_metadata_or_records_change() {
+        use crate::model::{Id, ImageBlobRec, ImagePinRec, Rec};
+
+        for change in ["record", "metadata", "add_last_child", "remove_last_child"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db {
+                path: dir.path().join("db"),
+                key: None,
+                layout: None,
+            };
+            let mut file = synthetic_file();
+            file["document"]["children"] = serde_json::json!([
+                {"id":"1:0", "type":"CANVAS", "name":"Page", "children":[
+                    {"id":"1:2", "type":"FRAME", "name":"Synthetic frame",
+                    "fills":[{"type":"SOLID", "color":{"r":1,"g":0,"b":0,"a":1}}]}
+                ]}
+            ]);
+            let child = serde_json::json!({"id":"1:3", "type":"RECTANGLE", "name":"Last child"});
+            file["document"]["children"][0]["children"][0]["children"] =
+                if change == "remove_last_child" {
+                    serde_json::json!([child.clone()])
+                } else {
+                    serde_json::json!([])
+                };
+            let before = flatten_file(&file).unwrap();
+            let render_key = crate::images::image_key("render", "1:2", "png", 1000);
+            let fill_key = crate::images::image_key("fill", "synthetic-fill", "", 1000);
+            apply_pull(&db, &file, None, false, false).unwrap();
+            {
+                let mut st = crate::open_store!(&db.path);
+                st.wtx(|tx| {
+                    for (kind, key, subject) in [
+                        ("render", &render_key, "1:2"),
+                        ("fill", &fill_key, "synthetic-fill"),
+                    ] {
+                        tx.upsert(
+                            &Id::ImageBlob(key.clone()),
+                            &Rec::ImageBlob(ImageBlobRec {
+                                key_hash: key.clone(),
+                                kind: kind.into(),
+                                subject: subject.into(),
+                                format: "png".into(),
+                                scale_milli: 1000,
+                                file_version: "1".into(),
+                                bytes: vec![1],
+                            }),
+                        );
+                    }
+                    for key in [render_key.as_str(), "orphan"] {
+                        tx.upsert(
+                            &Id::ImagePin(key.into()),
+                            &Rec::ImagePin(ImagePinRec {
+                                generation: crate::images::RENDER_PIN_GENERATION,
+                                file_version: "1".into(),
+                            }),
+                        );
+                    }
+                });
+            }
+            match change {
+                "metadata" => file["lastModified"] = serde_json::json!("2026-01-01T00:01:00Z"),
+                "record" => {
+                    file["document"]["children"][0]["children"][0]["fills"][0]["color"] =
+                        serde_json::json!({"r":0,"g":0,"b":1,"a":1})
+                }
+                "add_last_child" => file["document"]["children"][0]["children"][0]["children"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(child),
+                "remove_last_child" => {
+                    file["document"]["children"][0]["children"][0]["children"]
+                        .as_array_mut()
+                        .unwrap()
+                        .pop();
+                }
+                _ => unreachable!(),
+            }
+            if matches!(change, "add_last_child" | "remove_last_child") {
+                let after = flatten_file(&file).unwrap();
+                for (id, previous) in &before.recs {
+                    if let Some((_, current)) = after.recs.iter().find(|(key, _)| key == id) {
+                        assert_eq!(previous, current, "surviving record changed: {id:?}");
+                    }
+                }
+            }
+            let (churn, ..) = apply_pull(&db, &file, None, false, false).unwrap();
+            assert_eq!(churn.changed, usize::from(change == "record"));
+            assert_eq!(churn.added, usize::from(change == "add_last_child"));
+            assert_eq!(churn.removed, usize::from(change == "remove_last_child"));
+            let st = crate::open_store!(&db.path);
+            for id in [
+                Id::ImageBlob(render_key.clone()),
+                Id::ImageBlob(fill_key),
+                Id::ImagePin(render_key),
+                Id::ImagePin("orphan".into()),
+            ] {
+                assert!(st.get(&id).is_none(), "stale image state survived: {id:?}");
+            }
+        }
     }
 
     fn variables_export() -> Value {
@@ -480,6 +608,96 @@ mod tests {
             },
             "identical Enterprise re-pull must report zero churn"
         );
+    }
+
+    #[test]
+    fn enterprise_code_metadata_edits_count_but_provenance_only_edits_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+            layout: None,
+        };
+        let file = synthetic_file();
+        let mut vars = variables_export();
+        apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        for (key, value) in [
+            ("codeSyntax", serde_json::json!({"WEB": "--renamed"})),
+            ("hiddenFromPublishing", serde_json::json!(true)),
+            ("remote", serde_json::json!(true)),
+        ] {
+            vars["meta"]["variables"]["VariableID:100"][key] = value;
+            let (churn, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+            assert_eq!(
+                churn.changed, 1,
+                "code metadata edit to {key} must be observable"
+            );
+            assert_eq!(churn.added, 0);
+        }
+        vars["exportedAt"] = serde_json::json!("2026-11-01T12:00:00Z");
+        let (churn, ..) = apply_pull(&db, &file, Some(&vars), false, false).unwrap();
+        assert_eq!(churn.changed, 0, "provenance alone must not cause churn");
+    }
+
+    #[test]
+    fn import_enterprise_plain_pull_and_reimport_replace_whole_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db {
+            path: dir.path().join("db"),
+            key: None,
+            layout: None,
+        };
+        let path = dir.path().join("variables.json");
+        let imported = variables_export();
+        std::fs::write(&path, serde_json::to_vec(&imported).unwrap()).unwrap();
+        super::super::call::cmd_import_variables(&db, path.clone(), false, false).unwrap();
+        assert_eq!(snapshot_source(&db).as_deref(), Some("file"));
+        let mut enterprise = imported.clone();
+        enterprise["meta"]["variables"]
+            .as_object_mut()
+            .unwrap()
+            .remove("VariableID:200");
+        enterprise["meta"]["variableCollections"]
+            .as_object_mut()
+            .unwrap()
+            .remove("VariableCollectionId:2");
+        let (churn, ..) =
+            apply_pull(&db, &synthetic_file(), Some(&enterprise), false, false).unwrap();
+        assert_eq!(churn.removed, 2);
+        assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
+        let stored = {
+            let st = db.open(|path| crate::open_store!(path)).unwrap();
+            assert!(
+                st.get(&crate::model::Id::Variable("VariableID:200".into()))
+                    .is_none()
+            );
+            st.get(&crate::model::Id::VariableSnapshot)
+        };
+        apply_pull(&db, &synthetic_file(), None, false, false).unwrap();
+        {
+            let st = db.open(|path| crate::open_store!(path)).unwrap();
+            assert_eq!(st.get(&crate::model::Id::VariableSnapshot), stored);
+            assert!(
+                st.get(&crate::model::Id::Variable("VariableID:200".into()))
+                    .is_none()
+            );
+        }
+        // Reverse direction: a file import replaces the Enterprise snapshot.
+        super::super::call::cmd_import_variables(&db, path.clone(), false, false).unwrap();
+        assert_eq!(snapshot_source(&db).as_deref(), Some("file"));
+        {
+            let st = db.open(|path| crate::open_store!(path)).unwrap();
+            assert!(
+                st.get(&crate::model::Id::Variable("VariableID:200".into()))
+                    .is_some()
+            );
+        }
+        std::fs::write(&path, br#"{"variables":{},"variableCollections":{}}"#).unwrap();
+        super::super::call::cmd_import_variables(&db, path, true, false).unwrap();
+        let st = db.open(|path| crate::open_store!(path)).unwrap();
+        st.rtx(|(_, _, _, _, variables, collections, ..)| {
+            assert!(collect_variable_ids(&variables, &collections).is_empty());
+        });
     }
 
     /// The first Enterprise pull after upgrading, onto a store that already

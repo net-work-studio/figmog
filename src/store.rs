@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use fold::pipeline::{Keyed, Push};
-use fold::stream::KeyedStream;
+use fold::stream::{KeyedStream, KeyedTx};
 use serde::Serialize;
 
 use crate::flatten::Flattened;
@@ -320,12 +320,29 @@ pub fn flattened_node_count(flattened: &Flattened) -> usize {
 /// (`collect_variable_ids`, spec §12 — an Enterprise `variables_local`
 /// pull makes them file state for that cycle).
 /// A [`Id::VariableSnapshot`] row in `flattened.recs` is written but
-/// excluded from the returned [`Churn`] (NWS-2961).
+/// excluded from added/unchanged counts. A change to its per-variable code
+/// metadata increments `changed` once; provenance-only changes do not.
 pub fn sync<P: Push<Keyed<Id, Rec>>>(
     st: &mut KeyedStream<Id, Rec, P>,
     prior_sweepable: &BTreeSet<Id>,
     flattened: &Flattened,
     synced_at_unix_ms: u64,
+) -> Churn {
+    sync_with_cache_eviction(st, prior_sweepable, flattened, synced_at_unix_ms, |_, _| {
+        Vec::new()
+    })
+}
+
+/// Sync file records and evict the returned cache ids in one transaction.
+/// `collect_stale` reads the transaction's updated sinks after all upserts
+/// and removals, so it can use the final churn without committing first.
+/// A panic in collection or eviction rolls back the file and cache together.
+pub(crate) fn sync_with_cache_eviction<P: Push<Keyed<Id, Rec>>>(
+    st: &mut KeyedStream<Id, Rec, P>,
+    prior_sweepable: &BTreeSet<Id>,
+    flattened: &Flattened,
+    synced_at_unix_ms: u64,
+    collect_stale: impl FnOnce(&mut KeyedTx<'_, '_, '_, Id, Rec, P>, &Churn) -> Vec<Id>,
 ) -> Churn {
     let meta = FileMeta {
         name: flattened.file.name.clone(),
@@ -339,12 +356,15 @@ pub fn sync<P: Push<Keyed<Id, Rec>>>(
     st.wtx(|tx| {
         for (id, rec) in &flattened.recs {
             let previous = tx.upsert(id, rec);
-            // The variable-snapshot provenance row (NWS-2961) is written in
-            // this same transaction but, like the meta row, is bookkeeping
-            // about the records rather than one of them: it never counts in
-            // churn, so an Enterprise pull's numbers mean what they did
-            // before the row existed.
-            if matches!(id, Id::VariableSnapshot) {
+            // Code names and publishing flags are user-visible variable state.
+            // Count a metadata edit once while excluding provenance-only changes
+            // and the first snapshot row (including upgrades) from churn.
+            if let Rec::VariableSnapshot(new) = rec {
+                if let Some(Rec::VariableSnapshot(old)) = previous
+                    && old.variables != new.variables
+                {
+                    churn.changed += 1;
+                }
                 continue;
             }
             match previous {
@@ -366,6 +386,10 @@ pub fn sync<P: Push<Keyed<Id, Rec>>>(
                 }
             }
         }
+        let mut stale = collect_stale(tx, &churn);
+        stale.sort();
+        stale.dedup();
+        evict_cache_tx(tx, &stale);
     });
     churn
 }
@@ -453,13 +477,10 @@ pub fn replace_variable_snapshot<P: Push<Keyed<Id, Rec>>>(
 
 // ---- proxy cache eviction (spec §12) ----
 //
-// Cache eviction is deliberately NOT folded into `sync`'s sweep: the sweep
-// removes ids that vanished from the *newly flattened file*, whereas cache
-// rows go stale only because the file *version* moved, independent of
-// which nodes/components/styles are still live. Keeping it a separate
-// pass means `sync`'s churn accounting (and every test that pins its
-// numbers) is untouched by this feature. Callers run a version-changing
-// pull, then `stale_cache_ids` + `evict_stale_cache` in a follow-up step.
+// Cache ids are selected separately from the file-record sweep and do not
+// contribute to churn. Production pulls use `sync_with_cache_eviction` to
+// commit both in one transaction; standalone cache maintenance can use
+// `evict_stale_cache` without changing file records.
 
 // Test-only observation of the performance contract: retaining cache rows
 // alone cannot distinguish skipping a scan from scanning without eviction.
@@ -497,6 +518,8 @@ pub fn stale_cache_ids<R: fold::stream::Readable>(
 /// Each stale key yields both its `ImageBlob` row and its `ImagePin`
 /// marker id (NWS-2960) so markers never outlive the row they mark;
 /// removing an absent marker (fill rows, legacy renders) is a no-op.
+/// Also collects orphaned markers and markers whose version differs from
+/// their image row, which older binaries can leave behind.
 ///
 /// Fingerprint-indexed renders (NWS-2958) live in the separate
 /// `render_index`/`render_blobs` tables, which this never reads: they are
@@ -504,6 +527,7 @@ pub fn stale_cache_ids<R: fold::stream::Readable>(
 /// `images`'s orphan cleanup and byte quota.
 pub fn stale_image_ids<R: fold::stream::Readable>(
     images: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImageBlobRec>,
+    pins: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImagePinRec>,
     current_version: &str,
 ) -> Vec<Id> {
     #[cfg(test)]
@@ -511,28 +535,57 @@ pub fn stale_image_ids<R: fold::stream::Readable>(
         let (cache, images) = counts.get();
         counts.set((cache, images + 1));
     });
-    images
+    let mut stale: BTreeSet<Id> = images
         .iter()
         .filter(|(_, rec)| rec.file_version != current_version)
         .flat_map(|(k, _)| [Id::ImageBlob(k.clone()), Id::ImagePin(k)])
-        .collect()
+        .collect();
+    // An older binary can evict/rewrite image rows without maintaining pins.
+    // Remove their orphaned or mismatched markers on the next version sweep.
+    stale.extend(pins.iter().filter_map(|(key, pin)| match images.get(&key) {
+        Some(image) if image.file_version == pin.file_version => None,
+        _ => Some(Id::ImagePin(key)),
+    }));
+    stale.into_iter().collect()
+}
+
+/// Every image row and pin, including orphan pins, in deterministic order.
+/// A changed pull with the same Figma version cannot distinguish old rows
+/// by their version label, so it invalidates the entire image cache.
+pub fn all_image_ids<R: fold::stream::Readable>(
+    images: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImageBlobRec>,
+    pins: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImagePinRec>,
+) -> Vec<Id> {
+    #[cfg(test)]
+    STALE_SCAN_COUNTS.with(|counts| {
+        let (cache, images) = counts.get();
+        counts.set((cache, images + 1));
+    });
+    let mut ids: Vec<_> = images
+        .iter()
+        .map(|(key, _)| Id::ImageBlob(key))
+        .chain(pins.iter().map(|(key, _)| Id::ImagePin(key)))
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// Remove `stale` rows in one write transaction. Never touches variables,
 /// collections, or the meta row — pass only ids gathered by
-/// [`stale_cache_ids`] and/or [`stale_image_ids`], the only two sources
-/// that feed this (both version-triggered, not file-sweep-triggered — see
-/// this section's own note above).
+/// [`stale_cache_ids`], [`stale_image_ids`] or [`all_image_ids`]. Cache
+/// eviction is separate from the file-record sweep and its churn counts.
 pub fn evict_stale_cache<P: Push<Keyed<Id, Rec>>>(st: &mut KeyedStream<Id, Rec, P>, stale: &[Id]) {
-    st.wtx(|tx| {
-        for id in stale {
-            debug_assert!(matches!(
-                id,
-                Id::ProxyCache(_) | Id::ImageBlob(_) | Id::ImagePin(_)
-            ));
-            tx.remove(id);
-        }
-    });
+    st.wtx(|tx| evict_cache_tx(tx, stale));
+}
+
+fn evict_cache_tx<P: Push<Keyed<Id, Rec>>>(tx: &mut KeyedTx<'_, '_, '_, Id, Rec, P>, stale: &[Id]) {
+    for id in stale {
+        debug_assert!(matches!(
+            id,
+            Id::ProxyCache(_) | Id::ImageBlob(_) | Id::ImagePin(_)
+        ));
+        tx.remove(id);
+    }
 }
 
 // ---- sticky vector geometry (v0.0.2 spec §4) ----
@@ -588,6 +641,112 @@ pub fn effective_geometry(flag: bool, stored: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_sync_and_image_eviction_roll_back_and_retry_together() {
+        for partial_eviction in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut file = serde_json::json!({
+                "name":"Synthetic", "version":"same", "lastModified":"before",
+                "document":{"id":"0:0", "type":"DOCUMENT", "name":"Document", "children":[
+                    {"id":"1:0", "type":"CANVAS", "name":"Page", "children":[
+                        {"id":"1:2", "type":"FRAME", "name":"Before"}
+                    ]}
+                ]}
+            });
+            let mut st = crate::open_store!(&path);
+            sync(
+                &mut st,
+                &BTreeSet::new(),
+                &crate::flatten::flatten_file(&file).unwrap(),
+                0,
+            );
+            let key = crate::images::image_key("render", "1:2", "png", 1000);
+            st.wtx(|tx| {
+                tx.upsert(
+                    &Id::ImageBlob(key.clone()),
+                    &Rec::ImageBlob(ImageBlobRec {
+                        key_hash: key.clone(),
+                        kind: "render".into(),
+                        subject: "1:2".into(),
+                        format: "png".into(),
+                        scale_milli: 1000,
+                        file_version: "same".into(),
+                        bytes: vec![1, 2, 3],
+                    }),
+                );
+                tx.upsert(
+                    &Id::ImagePin(key.clone()),
+                    &Rec::ImagePin(ImagePinRec {
+                        generation: crate::images::RENDER_PIN_GENERATION,
+                        file_version: "same".into(),
+                    }),
+                );
+            });
+            let original: Vec<_> = [
+                Id::Meta,
+                Id::Node("1:2".into()),
+                Id::ImageBlob(key.clone()),
+                Id::ImagePin(key.clone()),
+            ]
+            .into_iter()
+            .map(|id| {
+                let rec = st.get(&id).unwrap();
+                (id, rec)
+            })
+            .collect();
+            let prior = st.rtx(|((nodes, ..), components, sets, styles, ..)| {
+                collect_sweepable(&nodes, &components, &sets, &styles)
+            });
+            file["lastModified"] = serde_json::json!("after");
+            file["document"]["children"][0]["children"][0]["name"] = serde_json::json!("After");
+            let incoming = crate::flatten::flatten_file(&file).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sync_with_cache_eviction(&mut st, &prior, &incoming, 1, |tx, churn| {
+                    assert_eq!(churn.changed, 1);
+                    assert_ne!(tx.get(&Id::Meta), Some(original[0].1.clone()));
+                    let stale = tx.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, ..)| {
+                        all_image_ids(&images, &pins)
+                    });
+                    if partial_eviction {
+                        evict_cache_tx(tx, &stale[..1]);
+                        assert!(tx.get(&Id::ImageBlob(key.clone())).is_none());
+                    }
+                    panic!("interrupt before cache eviction completes");
+                });
+            }));
+            let panic = result.expect_err("injected interruption must abort the sync");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"interrupt before cache eviction completes")
+            );
+            drop(st);
+
+            // Reopening must see either the old snapshot and cache or all of
+            // the new state. The interrupted transaction committed neither.
+            let mut st = crate::open_store!(&path);
+            for (id, rec) in &original {
+                assert_eq!(st.get(id), Some(rec.clone()), "partial commit: {id:?}");
+            }
+            let churn = sync_with_cache_eviction(&mut st, &prior, &incoming, 1, |tx, _| {
+                tx.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, ..)| {
+                    all_image_ids(&images, &pins)
+                })
+            });
+            assert_eq!(churn.changed, 1, "retry must apply the interrupted edit");
+            drop(st);
+            let st = crate::open_store!(&path);
+            assert!(
+                matches!(st.get(&Id::Meta), Some(Rec::Meta(meta)) if meta.last_modified == "after")
+            );
+            assert!(
+                matches!(st.get(&Id::Node("1:2".into())), Some(Rec::Node(node)) if node.name == "After")
+            );
+            assert!(st.get(&Id::ImageBlob(key.clone())).is_none());
+            assert!(st.get(&Id::ImagePin(key)).is_none());
+        }
+    }
 
     #[test]
     fn effective_geometry_is_sticky_once_either_side_is_true() {

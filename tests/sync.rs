@@ -471,8 +471,8 @@ fn image_blob_survives_same_version_and_is_evicted_on_version_change() {
     pull_with_sweep(&mut st, &common::fixture_v2(), prior, 2_000);
 
     // The row is now stale (its file_version is still "100").
-    let stale = st.rtx(|(_, _, _, _, _, _, _, _, _, images, _, _, _, _)| {
-        figmog::store::stale_image_ids(&images, "101")
+    let stale = st.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, ..)| {
+        figmog::store::stale_image_ids(&images, &pins, "101")
     });
     // NWS-2960: the row's pin marker is evicted with it, never leaked.
     assert_eq!(
@@ -491,4 +491,46 @@ fn image_blob_survives_same_version_and_is_evicted_on_version_change() {
             "stale image row's pin marker must be gone after eviction"
         );
     });
+}
+
+#[test]
+fn version_sweep_removes_orphan_and_mismatched_image_pins() {
+    use figmog::model::{ImageBlobRec, ImagePinRec};
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = figmog::open_store!(dir.path().join("db"));
+    st.wtx(|tx| {
+        for key in ["orphan", "mismatch", "valid"] {
+            tx.upsert(
+                &Id::ImagePin(key.into()),
+                &Rec::ImagePin(ImagePinRec {
+                    generation: figmog::images::RENDER_PIN_GENERATION,
+                    file_version: "101".into(),
+                }),
+            );
+        }
+        for (key, version) in [("mismatch", "102"), ("valid", "101")] {
+            tx.upsert(
+                &Id::ImageBlob(key.into()),
+                &Rec::ImageBlob(ImageBlobRec {
+                    key_hash: key.into(),
+                    kind: "render".into(),
+                    subject: "1:1".into(),
+                    format: "png".into(),
+                    scale_milli: 1000,
+                    file_version: version.into(),
+                    bytes: vec![1],
+                }),
+            );
+        }
+    });
+    let stale = st.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, ..)| {
+        figmog::store::stale_image_ids(&images, &pins, "102")
+    });
+    assert!(stale.contains(&Id::ImagePin("orphan".into())));
+    assert!(stale.contains(&Id::ImagePin("mismatch".into())));
+    assert!(!stale.contains(&Id::ImageBlob("mismatch".into())));
+    figmog::store::evict_stale_cache(&mut st, &stale);
+    assert!(st.get(&Id::ImagePin("orphan".into())).is_none());
+    assert!(st.get(&Id::ImagePin("mismatch".into())).is_none());
+    assert!(st.get(&Id::ImageBlob("mismatch".into())).is_some());
 }

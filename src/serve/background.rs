@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::deep_json::OwnedValue;
 use serde_json::{Value, json};
 
 use crate::owner::{self, OwnerLock, OwnerPaths, Settings};
@@ -112,17 +113,17 @@ impl OwnerState {
     /// watching. Returns the response and whether the client is a relay.
     pub(crate) fn hello(
         &self,
-        id: Value,
+        id: OwnedValue,
         params: &Value,
         manager: &mut SessionManager,
         interval: Duration,
-    ) -> (Value, bool) {
+    ) -> (OwnedValue, bool) {
         if let Err(message) = owner::check_hello(params, &self.paths) {
-            return (
-                json!({"jsonrpc": "2.0", "id": id,
-                       "error": {"code": owner::HANDSHAKE_REFUSED, "message": message}}),
-                false,
+            let mut response = OwnedValue(
+                json!({"jsonrpc": "2.0", "error": {"code": owner::HANDSHAKE_REFUSED, "message": message}}),
             );
+            response.insert("id".into(), id);
+            return (response, false);
         }
         let mut attach_errors = serde_json::Map::new();
         for file in params["attach"].as_array().into_iter().flatten() {
@@ -138,7 +139,7 @@ impl OwnerState {
                 }
             }
         }
-        let response = json!({"jsonrpc": "2.0", "id": id, "result": {
+        let mut response = OwnedValue(json!({"jsonrpc": "2.0", "result": {
             "attach_errors": attach_errors,
             "generation": self.generation,
             "pid": std::process::id(),
@@ -146,25 +147,34 @@ impl OwnerState {
             "protocol": owner::PROTOCOL,
             "settings": self.settings.to_json(),
             "version": owner::version(),
-        }});
+        }}));
+        response.insert("id".into(), id);
         (response, params["client"] == "relay")
     }
 }
 
 /// The answer to every request an owner receives once it is closing.
-pub(crate) fn not_accepted(id: Value) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {
+pub(crate) fn not_accepted(id: OwnedValue) -> OwnedValue {
+    let mut response = OwnedValue(json!({"jsonrpc": "2.0", "error": {
         "code": owner::NOT_ACCEPTED,
         "message": "not accepted: this background figmog is shutting down; reconnect and retry",
-    }})
+    }}));
+    response.insert("id".into(), id);
+    response
 }
 
-/// A request frame's id and method, if it is a request (has both).
-pub(crate) fn request_parts(line: &str) -> Option<(Value, String, Value)> {
-    let value: Value = serde_json::from_str(line).ok()?;
-    let id = value.get("id")?.clone();
+/// Parse without a depth cutoff and retain iterative owners for unbounded ids/params.
+pub(crate) fn request_parts(line: &str) -> Option<(OwnedValue, String, OwnedValue)> {
+    let mut value = crate::deep_json::from_str(line).ok()?;
     let method = value.get("method")?.as_str()?.to_string();
-    let params = value.get("params").cloned().unwrap_or(Value::Null);
+    let id = OwnedValue(std::mem::take(value.0.get_mut("id")?));
+    let params = OwnedValue(
+        value
+            .0
+            .get_mut("params")
+            .map(std::mem::take)
+            .unwrap_or(Value::Null),
+    );
     Some((id, method, params))
 }
 
@@ -209,12 +219,12 @@ mod tests {
 
     #[test]
     fn not_accepted_is_a_distinct_error_for_any_request() {
-        let answer = not_accepted(json!(7));
+        let answer = not_accepted(OwnedValue(json!(7)));
         assert_eq!(answer["id"], 7);
         assert_eq!(answer["error"]["code"], owner::NOT_ACCEPTED);
         assert_eq!(
             request_parts(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
-                .map(|(id, method, _)| (id, method)),
+                .map(|(id, method, _)| (id.into_inner(), method)),
             Some((json!(1), "tools/list".to_string()))
         );
         assert!(request_parts(r#"{"jsonrpc":"2.0","method":"notifications/x"}"#).is_none());

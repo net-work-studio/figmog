@@ -207,6 +207,9 @@ pub struct ReportEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Theme {
     pub collection: String,
+    pub collection_id: String,
+    pub light_mode_id: String,
+    pub dark_mode_id: String,
     pub light_mode: String,
     pub dark_mode: String,
 }
@@ -215,6 +218,8 @@ pub struct Theme {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModeMapping {
     pub collection: String,
+    pub collection_id: String,
+    pub mode_id: String,
     pub mode: String,
     pub selector: Option<String>,
 }
@@ -253,7 +258,7 @@ pub struct Export {
 }
 
 /// One authoritative variable row of `figmog vars --snapshot`.
-struct Var {
+struct Var<'a> {
     id: String,
     name: String,
     resolved_type: String,
@@ -261,10 +266,11 @@ struct Var {
     /// The collection's id (its name from a serve older than the field).
     collection_key: String,
     default_mode: String,
+    mode_names: BTreeMap<String, String>,
     scopes: Vec<String>,
     web: Option<String>,
     /// Mode name → raw value.
-    values: BTreeMap<String, Value>,
+    values: BTreeMap<String, &'a Value>,
 }
 
 /// How a FLOAT is emitted, from its scopes.
@@ -328,6 +334,8 @@ impl Val {
 /// One collection's modes and their selectors.
 struct ColModes {
     name: String,
+    id: String,
+    labels: BTreeMap<String, String>,
     root: String,
     /// Non-root mode → selector.
     sels: BTreeMap<String, String>,
@@ -336,6 +344,9 @@ struct ColModes {
 }
 
 impl ColModes {
+    fn label<'a>(&'a self, id: &'a str) -> &'a str {
+        self.labels.get(id).map(String::as_str).unwrap_or(id)
+    }
     /// `(mode, selector)` for every exported mode, the root first.
     fn emitted(&self) -> impl Iterator<Item = (&str, &str)> {
         std::iter::once((self.root.as_str(), ROOT))
@@ -375,9 +386,12 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         });
     }
     let mut report = BTreeSet::new();
-    let rows = vars["variables"].as_array().cloned().unwrap_or_default();
+    let rows = vars["variables"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let mut all: BTreeMap<String, Var> = BTreeMap::new();
-    for row in &rows {
+    for row in rows {
         let id = row["variable_id"].as_str().unwrap_or_default().to_string();
         if row["source"] != "imported" {
             report.insert(entry(
@@ -387,9 +401,10 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             ));
             continue;
         }
-        let Some(default_mode) = row["default_mode"].as_str() else {
-            return Err("the variables read carries no `default_mode` — the figmog serving this mirror is older than this CLI; restart it (kill the pid in owner.json) and retry".into());
-        };
+        let collection_key = row["collection_id"].as_str().ok_or("the variables read carries no `collection_id` — restart the figmog serving this mirror and retry")?;
+        let default_id = row["default_mode_id"].as_str().ok_or("the variables read carries no `default_mode_id` — restart the figmog serving this mirror and retry")?;
+        let names = row["mode_names"].as_object().ok_or("the variables read carries no `mode_names` — restart the figmog serving this mirror and retry")?;
+        let values = row["values_by_mode_id"].as_object().ok_or("the variables read carries no `values_by_mode_id` — restart the figmog serving this mirror and retry")?;
         let text = |k: &str| row[k].as_str().unwrap_or_default().to_string();
         let collection = text("collection");
         all.insert(
@@ -398,12 +413,13 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
                 id,
                 name: text("name"),
                 resolved_type: text("resolved_type"),
-                collection_key: row["collection_id"]
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| collection.clone()),
+                collection_key: collection_key.to_string(),
                 collection,
-                default_mode: default_mode.to_string(),
+                default_mode: default_id.to_string(),
+                mode_names: names
+                    .iter()
+                    .filter_map(|(id, name)| Some((id.clone(), name.as_str()?.to_string())))
+                    .collect(),
                 scopes: row["scopes"]
                     .as_array()
                     .map(|xs| {
@@ -414,10 +430,10 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
                     })
                     .unwrap_or_default(),
                 web: row["code_syntax"]["WEB"].as_str().map(str::to_string),
-                values: row["values_by_mode"]
-                    .as_object()
-                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default(),
+                values: values
+                    .iter()
+                    .map(|(id, value)| (id.clone(), value))
+                    .collect(),
             },
         );
     }
@@ -750,7 +766,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
     ));
     css.push_str(&format!(" * digest: {}\n", opt(field("digest"))));
     let mut by_name_cols: Vec<&ColModes> = cols.values().collect();
-    by_name_cols.sort_by(|a, b| a.name.cmp(&b.name));
+    by_name_cols.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
     let mut themed = false;
     for c in &by_name_cols {
         if c.sels.is_empty() && c.skipped.is_empty() {
@@ -760,7 +776,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         let mut line = format!(
             " * theme: collection \"{}\": mode \"{}\" -> :root",
             comment_safe(&c.name),
-            comment_safe(&c.root)
+            comment_safe(c.label(&c.root))
         );
         let mut others: Vec<(&str, Option<&str>)> = c
             .sels
@@ -768,11 +784,11 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             .map(|(m, s)| (m.as_str(), Some(s.as_str())))
             .chain(c.skipped.iter().map(|m| (m.as_str(), None)))
             .collect();
-        others.sort();
+        others.sort_by(|a, b| (c.label(a.0), a.0).cmp(&(c.label(b.0), b.0)));
         for (mode, selector) in others {
             line.push_str(&format!(
                 ", mode \"{}\" -> {}",
-                comment_safe(mode),
+                comment_safe(c.label(mode)),
                 selector.map_or_else(|| "(not exported)".to_string(), comment_safe)
             ));
         }
@@ -805,8 +821,11 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             .find(|(_, s)| *s == DARK_SELECTOR)
             .map(|(m, _)| Theme {
                 collection: c.name.clone(),
-                light_mode: c.root.clone(),
-                dark_mode: m.clone(),
+                collection_id: c.id.clone(),
+                light_mode_id: c.root.clone(),
+                dark_mode_id: m.clone(),
+                light_mode: c.labels.get(&c.root).unwrap_or(&c.root).clone(),
+                dark_mode: c.labels.get(m).unwrap_or(m).clone(),
             }),
         _ => None,
     };
@@ -814,7 +833,9 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
     for c in &by_name_cols {
         modes.push(ModeMapping {
             collection: c.name.clone(),
-            mode: c.root.clone(),
+            collection_id: c.id.clone(),
+            mode_id: c.root.clone(),
+            mode: c.labels.get(&c.root).unwrap_or(&c.root).clone(),
             selector: Some(ROOT.to_string()),
         });
         let mut others: Vec<ModeMapping> = c
@@ -822,16 +843,20 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             .iter()
             .map(|(m, s)| ModeMapping {
                 collection: c.name.clone(),
-                mode: m.clone(),
+                collection_id: c.id.clone(),
+                mode_id: m.clone(),
+                mode: c.labels.get(m).unwrap_or(m).clone(),
                 selector: Some(s.clone()),
             })
             .chain(c.skipped.iter().map(|m| ModeMapping {
                 collection: c.name.clone(),
-                mode: m.clone(),
+                collection_id: c.id.clone(),
+                mode_id: m.clone(),
+                mode: c.labels.get(m).unwrap_or(m).clone(),
                 selector: None,
             }))
             .collect();
-        others.sort_by(|a, b| a.mode.cmp(&b.mode));
+        others.sort_by(|a, b| (&a.mode, &a.mode_id).cmp(&(&b.mode, &b.mode_id)));
         modes.extend(others);
     }
     Ok(Export {
@@ -984,13 +1009,19 @@ fn resolve_modes(
 ) -> Result<BTreeMap<String, ColModes>, String> {
     // Collection key → (name, mode names, default modes).
     #[allow(clippy::type_complexity)]
-    let mut seen: BTreeMap<&str, (&str, BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
+    let mut seen: BTreeMap<&str, (&str, BTreeMap<&str, &str>, BTreeSet<&str>)> = BTreeMap::new();
     for v in all.values() {
         let c = seen
             .entry(&v.collection_key)
-            .or_insert_with(|| (v.collection.as_str(), BTreeSet::new(), BTreeSet::new()));
-        c.1.extend(v.values.keys().map(String::as_str));
-        c.1.insert(&v.default_mode);
+            .or_insert_with(|| (v.collection.as_str(), BTreeMap::new(), BTreeSet::new()));
+        c.1.extend(
+            v.mode_names
+                .iter()
+                .map(|(id, name)| (id.as_str(), name.as_str())),
+        );
+        for mode in v.values.keys().chain(std::iter::once(&v.default_mode)) {
+            c.1.entry(mode.as_str()).or_insert(mode.as_str());
+        }
         c.2.insert(&v.default_mode);
     }
     // Collection key → mode → configured selector.
@@ -1007,9 +1038,12 @@ fn resolve_modes(
             else {
                 continue;
             };
-            if let Some(m) = modes.get(mode) {
-                hits.push((ck, m));
-            }
+            hits.extend(
+                modes
+                    .iter()
+                    .filter(|(id, name)| **name == mode || **id == mode)
+                    .map(|(id, _)| (*ck, *id)),
+            );
         }
         match hits.as_slice() {
             [(ck, m)] => {
@@ -1018,7 +1052,11 @@ fn resolve_modes(
             [] => {
                 let known: Vec<String> = seen
                     .values()
-                    .flat_map(|(name, modes, _)| modes.iter().map(move |m| format!("{name}/{m}")))
+                    .flat_map(|(name, modes, _)| {
+                        modes
+                            .iter()
+                            .map(move |(id, mode)| format!("{name}/{mode} ({id})"))
+                    })
                     .collect();
                 return Err(format!(
                     "mode mapping {key:?} names no collection mode of the variable snapshot (modes: {})",
@@ -1027,8 +1065,12 @@ fn resolve_modes(
             }
             many => {
                 return Err(format!(
-                    "mode mapping {key:?} matches {} collection modes — rename a collection in Figma",
-                    many.len()
+                    "mode mapping {key:?} matches {} collection modes ({}) — use a unique collection/mode name or mode id",
+                    many.len(),
+                    quoted(
+                        many.iter()
+                            .map(|(collection, mode)| format!("{collection}/{mode}"))
+                    )
                 ));
             }
         }
@@ -1038,7 +1080,11 @@ fn resolve_modes(
     for (ck, (name, modes, defaults)) in &seen {
         let get = |m: &str| wanted.get(ck).and_then(|w| w.get(m)).copied();
         let unique = |word: &str| {
-            let hits: Vec<&str> = modes.iter().copied().filter(|m| like(m, word)).collect();
+            let hits: Vec<&str> = modes
+                .iter()
+                .filter(|(_, name)| like(name, word))
+                .map(|(id, _)| *id)
+                .collect();
             match hits.as_slice() {
                 [one] => Some(*one),
                 _ => None,
@@ -1046,7 +1092,7 @@ fn resolve_modes(
         };
         let dark = unique("dark");
         let roots: Vec<&str> = modes
-            .iter()
+            .keys()
             .copied()
             .filter(|m| get(m) == Some(ROOT))
             .collect();
@@ -1081,7 +1127,7 @@ fn resolve_modes(
         let mut sels = BTreeMap::new();
         let mut skipped = BTreeSet::new();
         let mut taken: BTreeMap<String, &str> = BTreeMap::new();
-        for &m in modes {
+        for (&m, &label) in modes {
             if m == root {
                 continue;
             }
@@ -1092,9 +1138,9 @@ fn resolve_modes(
                 }
                 Some(selector) => selector.to_string(),
                 None if Some(m) == dark => DARK_SELECTOR.to_string(),
-                None => default_selector(name, m).ok_or_else(|| {
+                None => default_selector(name, if modes.values().filter(|other| **other == label).count() > 1 { m } else { label }).ok_or_else(|| {
                     format!(
-                        "mode {m:?} of collection {name:?} has no ASCII letters or digits for a default selector — map it in figmog.toml [tokens.modes] (or with --mode)"
+                        "mode {label:?} ({m}) of collection {name:?} has no ASCII letters or digits for a default selector — map it in figmog.toml [tokens.modes] (or with --mode)"
                     )
                 })?,
             };
@@ -1109,6 +1155,11 @@ fn resolve_modes(
             ck.to_string(),
             ColModes {
                 name: name.to_string(),
+                id: ck.to_string(),
+                labels: modes
+                    .iter()
+                    .map(|(id, name)| (id.to_string(), name.to_string()))
+                    .collect(),
                 root: root.to_string(),
                 sels,
                 skipped,
@@ -1234,7 +1285,7 @@ fn alias_cycles(
                     .iter()
                     .map(|ck| {
                         let c = &cols[*ck];
-                        format!("{:?} mode {:?}", c.name, c.mode_of(ctx[ck]))
+                        format!("{:?} mode {:?}", c.name, c.label(c.mode_of(ctx[ck])))
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -1660,7 +1711,9 @@ mod tests {
         json!({
             "variable_id": id, "source": "imported", "name": name,
             "resolved_type": ty, "collection": "c", "default_mode": "light",
-            "scopes": scopes, "values_by_mode": values,
+            "scopes": scopes, "values_by_mode": values, "values_by_mode_id": values,
+            "collection_id": "c", "default_mode_id": "light",
+            "mode_names": values.as_object().map(|m| m.keys().map(|k| (k.clone(), json!(k))).collect::<Map<_,_>>()),
             "code_syntax": web.map(|w| json!({"WEB": w})),
         })
     }
@@ -1677,6 +1730,7 @@ mod tests {
         r["collection"] = json!(collection);
         r["collection_id"] = json!(format!("C:{collection}"));
         r["default_mode"] = json!(default_mode);
+        r["default_mode_id"] = json!(default_mode);
         r
     }
 
@@ -1694,6 +1748,32 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn older_variables_reads_request_a_restart_without_mode_identity() {
+        let variable = row(
+            "V:1",
+            "gap",
+            "FLOAT",
+            json!({"light": 8}),
+            json!(["GAP"]),
+            None,
+        );
+        for field in [
+            "collection_id",
+            "default_mode_id",
+            "mode_names",
+            "values_by_mode_id",
+        ] {
+            let mut missing = variable.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let error = export_css(&snap(vec![missing]), &ExportOptions::default()).unwrap_err();
+            assert!(
+                error.contains(field) && error.contains("restart"),
+                "{error}"
+            );
         }
     }
 
@@ -2375,6 +2455,8 @@ mod tests {
     #[test]
     fn legal_context_limit_allows_many_exclusive_or_coupled_modes() {
         let collection = |name: &str, count: usize| ColModes {
+            id: String::new(),
+            labels: BTreeMap::new(),
             name: name.into(),
             root: "M0".into(),
             sels: (1..count)
@@ -2403,6 +2485,8 @@ mod tests {
                 (
                     name.clone(),
                     ColModes {
+                        id: String::new(),
+                        labels: BTreeMap::new(),
                         name,
                         root: "Base".into(),
                         sels: BTreeMap::from([("Other".into(), format!(".c{i}"))]),
@@ -2416,6 +2500,8 @@ mod tests {
         cols.insert(
             "C12".into(),
             ColModes {
+                id: String::new(),
+                labels: BTreeMap::new(),
                 name: "C12".into(),
                 root: "Base".into(),
                 sels: BTreeMap::from([("Other".into(), ".c12".into())]),
@@ -2636,7 +2722,9 @@ mod tests {
         let sem = |id: &str, name: &str, to: &str| {
             let mut r = row(id, name, "COLOR", alias(to), json!([]), None);
             r["collection"] = json!("semantic");
+            r["collection_id"] = json!("C:semantic");
             r["default_mode"] = json!("default");
+            r["default_mode_id"] = json!("default");
             r
         };
         let v = snap(vec![
@@ -2660,7 +2748,9 @@ mod tests {
                     None,
                 );
                 r["collection"] = json!("semantic");
+                r["collection_id"] = json!("C:semantic");
                 r["default_mode"] = json!("default");
+                r["default_mode_id"] = json!("default");
                 r
             },
             sem("V:5", "plain/alias", "V:4"),
@@ -2701,7 +2791,7 @@ mod tests {
         assert!(same.added.is_empty() && same.removed.is_empty() && same.changed.is_empty());
 
         let mut next = base.clone();
-        next["variables"][0]["values_by_mode"]["light"] = json!({"r":1,"g":0,"b":0,"a":1});
+        next["variables"][0]["values_by_mode_id"]["light"] = json!({"r":1,"g":0,"b":0,"a":1});
         next["variables"][1] = row(
             "V:3",
             "c",
