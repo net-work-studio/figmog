@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 /// dropped as not reading.
 pub(crate) const MAX_QUEUED_FRAMES: usize = 32;
 
+/// Bound the reader/writer threads retained by socket clients.
+pub(crate) const MAX_CONNECTIONS: usize = 64;
+
 /// Bytes a socket connection may have queued or in flight before it is
 /// dropped. A single frame larger than this is still accepted onto an
 /// empty queue, so no response is undeliverable by size alone.
@@ -51,6 +54,8 @@ pub(crate) struct Connections {
 #[derive(Default)]
 struct ConnsState {
     conns: BTreeMap<u64, Arc<Conn>>,
+    /// Readers that ended while their writers still flush queued frames.
+    retiring: Vec<Arc<Conn>>,
     /// Shutdown started: refuse new connections.
     closed: bool,
 }
@@ -76,6 +81,7 @@ struct Conn {
     /// The connection is a `figmog serve` relay (NWS-2953): it is answered
     /// with MCP framing, like stdio, on behalf of its agent.
     relay: AtomicBool,
+    writer_done: AtomicBool,
     stream: UnixStream,
 }
 
@@ -84,6 +90,8 @@ struct Queue {
     frames: VecDeque<String>,
     /// Bytes queued plus the frame being written.
     bytes: usize,
+    /// The writer removed one frame from `frames` but has not finished it.
+    in_flight: bool,
     /// No new frames; the writer exits once the queue is empty.
     closing: bool,
 }
@@ -96,7 +104,7 @@ impl Conn {
         }
         let busy = queue.bytes > 0 || !queue.frames.is_empty();
         if busy
-            && (queue.frames.len() >= MAX_QUEUED_FRAMES
+            && (queue.frames.len() + usize::from(queue.in_flight) >= MAX_QUEUED_FRAMES
                 || queue.bytes + frame.len() > MAX_QUEUED_BYTES)
         {
             drop(queue);
@@ -132,6 +140,7 @@ impl Conn {
         let mut queue = self.queue.lock().unwrap();
         loop {
             if let Some(frame) = queue.frames.pop_front() {
+                queue.in_flight = true;
                 return Some(frame);
             }
             if queue.closing {
@@ -144,12 +153,20 @@ impl Conn {
     fn run_writer(&self) {
         while let Some(frame) = self.next_frame() {
             let written = write_within(&self.stream, frame.as_bytes(), RESPONSE_DEADLINE);
-            self.queue.lock().unwrap().bytes -= frame.len();
+            {
+                let mut queue = self.queue.lock().unwrap();
+                queue.bytes -= frame.len();
+                queue.in_flight = false;
+            }
             if !written {
                 self.abort();
                 return;
             }
         }
+        // Retiring connections remain in the registry until a later reap
+        // or shutdown. Close the socket now so their clients receive EOF
+        // immediately after the final queued frame, even while that Arc lives.
+        let _ = self.stream.shutdown(Shutdown::Write);
     }
 }
 
@@ -184,6 +201,7 @@ impl Connections {
             cancelled: Arc::default(),
             notify: AtomicBool::new(false),
             relay: AtomicBool::new(false),
+            writer_done: AtomicBool::new(false),
             stream,
         });
         {
@@ -191,21 +209,30 @@ impl Connections {
             if state.closed {
                 return Err(std::io::Error::other("figmog serve is shutting down"));
             }
+            state
+                .retiring
+                .retain(|conn| !conn.writer_done.load(Ordering::Acquire));
+            if state.conns.len() + state.retiring.len() >= MAX_CONNECTIONS {
+                return Err(std::io::Error::other("too many socket connections"));
+            }
             state.conns.insert(conn_id, conn.clone());
         }
         *self.writers.count.lock().unwrap() += 1;
         let live = self.writers.clone();
+        let worker_conn = conn.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("figmog-conn-{conn_id}"))
             .spawn(move || {
-                conn.run_writer();
-                drop(conn);
+                worker_conn.run_writer();
+                worker_conn.writer_done.store(true, Ordering::Release);
+                drop(worker_conn);
                 let mut count = live.count.lock().unwrap();
                 *count -= 1;
                 live.idle.notify_all();
             });
         if let Err(error) = spawned {
             *self.writers.count.lock().unwrap() -= 1;
+            conn.writer_done.store(true, Ordering::Release);
             self.unregister(conn_id);
             return Err(error);
         }
@@ -215,10 +242,14 @@ impl Connections {
     /// The connection's reader ended: no new responses for it, pending
     /// reads cancelled, already-queued frames still flushed.
     pub(crate) fn unregister(&self, conn_id: u64) {
-        let conn = self.state.lock().unwrap().conns.remove(&conn_id);
-        if let Some(conn) = conn {
+        let mut state = self.state.lock().unwrap();
+        if let Some(conn) = state.conns.remove(&conn_id) {
             conn.close();
+            state.retiring.push(conn);
         }
+        state
+            .retiring
+            .retain(|conn| !conn.writer_done.load(Ordering::Acquire));
     }
 
     /// Queue one newline-terminated response frame for `conn_id`. A
@@ -297,16 +328,21 @@ impl Connections {
         let conns = {
             let mut state = self.state.lock().unwrap();
             state.closed = true;
-            std::mem::take(&mut state.conns)
+            let mut conns: Vec<_> = std::mem::take(&mut state.conns).into_values().collect();
+            conns.append(&mut state.retiring);
+            conns
         };
-        for conn in conns.values() {
+        for conn in &conns {
             conn.close();
         }
-        drop(conns);
         let mut count = self.writers.count.lock().unwrap();
         while *count > 0 {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                drop(count);
+                for conn in &conns {
+                    conn.abort();
+                }
                 return;
             }
             count = self.writers.idle.wait_timeout(count, left).unwrap().0;
@@ -321,7 +357,10 @@ impl Drop for Connections {
     /// can no longer arrive.
     fn drop(&mut self) {
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        for conn in std::mem::take(&mut state.conns).into_values() {
+        for conn in std::mem::take(&mut state.conns)
+            .into_values()
+            .chain(state.retiring.drain(..))
+        {
             conn.close();
         }
     }
@@ -396,6 +435,156 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    fn bare_conn(stream: UnixStream) -> Conn {
+        Conn {
+            queue: Mutex::default(),
+            wake: Condvar::new(),
+            cancelled: Arc::default(),
+            notify: AtomicBool::new(false),
+            relay: AtomicBool::new(false),
+            writer_done: AtomicBool::new(false),
+            stream,
+        }
+    }
+
+    #[test]
+    fn the_frame_limit_counts_the_frame_already_taken_by_the_writer() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        let conn = bare_conn(server);
+        conn.enqueue("in flight\n".into());
+        assert_eq!(conn.next_frame().as_deref(), Some("in flight\n"));
+        for _ in 1..MAX_QUEUED_FRAMES {
+            conn.enqueue("queued\n".into());
+        }
+        assert!(!conn.cancelled.load(Ordering::Relaxed));
+        assert_eq!(
+            conn.queue.lock().unwrap().frames.len(),
+            MAX_QUEUED_FRAMES - 1
+        );
+        conn.enqueue("over limit\n".into());
+        assert!(conn.cancelled.load(Ordering::Relaxed));
+        assert!(conn.queue.lock().unwrap().frames.is_empty());
+    }
+
+    #[test]
+    fn connection_limit_refuses_excess_connections_and_recovers_after_close() {
+        let conns = Connections::default();
+        let mut clients = Vec::new();
+        for id in 0..MAX_CONNECTIONS as u64 {
+            let (server, client) = UnixStream::pair().unwrap();
+            conns.register(id, server).unwrap();
+            clients.push(client);
+        }
+        let (server, _client) = UnixStream::pair().unwrap();
+        assert!(conns.register(MAX_CONNECTIONS as u64, server).is_err());
+        conns.unregister(0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while *conns.writers.count.lock().unwrap() == MAX_CONNECTIONS {
+            assert!(Instant::now() < deadline, "closed writer did not exit");
+            std::thread::yield_now();
+        }
+        let (server, _client) = UnixStream::pair().unwrap();
+        conns.register(MAX_CONNECTIONS as u64, server).unwrap();
+        conns.finish(deadline);
+    }
+
+    #[test]
+    fn finish_aborts_blocked_registered_and_retiring_writers_at_the_deadline() {
+        let conns = Connections::default();
+        let mut clients = Vec::new();
+        for id in 0..2 {
+            let (server, client) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            conns.register(id, server).unwrap();
+            conns.send(id, "x".repeat(8 << 20));
+            clients.push(client);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = conns.state.lock().unwrap();
+            if state
+                .conns
+                .values()
+                .all(|conn| conn.queue.lock().unwrap().in_flight)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "writers never started");
+            drop(state);
+            std::thread::yield_now();
+        }
+        // A reader that ended may still have a blocked writer to abort.
+        conns.unregister(0);
+        let start = Instant::now();
+        conns.finish(start + Duration::from_millis(30));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        for mut client in clients {
+            let mut received = Vec::new();
+            client
+                .read_to_end(&mut received)
+                .expect("aborted writer closes the socket");
+            assert!(
+                received.len() < 8 << 20,
+                "writer should be cut off mid-frame"
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while *conns.writers.count.lock().unwrap() != 0 {
+            assert!(Instant::now() < deadline, "aborted writers did not exit");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn unregister_flushes_then_sends_eof_while_the_registry_stays_alive() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let conns = Arc::new(Connections::default());
+        conns.register(1, server.try_clone().unwrap()).unwrap();
+        let response = "x".repeat(8 << 20);
+        conns.send(1, response.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let conn = conns.state.lock().unwrap().conns[&1].clone();
+            if conn.queue.lock().unwrap().in_flight {
+                break;
+            }
+            assert!(Instant::now() < deadline, "writer never started");
+            std::thread::yield_now();
+        }
+        // The large response keeps the writer blocked while EOF on its
+        // read half retires the connection, retaining its Arc in the registry.
+        let (unregistered_tx, unregistered_rx) = mpsc::channel();
+        let reader_registry = conns.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reader = server;
+            assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+            reader_registry.unregister(1);
+            unregistered_tx.send(()).unwrap();
+        });
+        client.shutdown(Shutdown::Write).unwrap();
+        unregistered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        reader.join().unwrap();
+
+        // No further registry activity may be needed to close the writer.
+        let mut received = vec![0; response.len()];
+        client.read_exact(&mut received).unwrap();
+        assert_eq!(received, response.as_bytes());
+        assert_eq!(
+            client
+                .read(&mut [0; 1])
+                .expect("EOF after the queued response"),
+            0
+        );
+        drop(conns);
+    }
+
     /// The deadline covers the whole response: a client that keeps reading
     /// a trickle (so every individual write call makes progress) is still
     /// cut off once the response's overall deadline passes.
@@ -457,10 +646,10 @@ mod tests {
         let conns = Connections::default();
         conns.register(1, server).unwrap();
         conns.send(1, "queued\n".into());
-        drop(conns);
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
+        drop(conns);
         let mut received = String::new();
         client
             .read_to_string(&mut received)

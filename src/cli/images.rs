@@ -120,7 +120,7 @@ fn fetch_direct(
 ) -> Result<Vec<Fetched>, String> {
     let node_ids = images::normalize_ids(ids);
     let scale_m = images::scale_milli(scale);
-    let mut st = db.open(|path| crate::open_store!(path))?;
+    let mut st = db.open_existing(|path| crate::open_store!(path))?;
     let scanned = st.rtx(
         |((nodes, ..), _, _, _, _, _, meta, _, _, images_table, pins, _)| {
             images::scan(

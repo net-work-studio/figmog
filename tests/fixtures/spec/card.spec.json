@@ -797,7 +797,7 @@
       "radius": {
         "bottom_left": {
           "bound_at": [
-            "/boundVariables/bottomLeftRadius"
+            "/boundVariables/rectangleCornerRadii/RECTANGLE_BOTTOM_LEFT_CORNER_RADIUS"
           ],
           "css": "--radius-md",
           "raw": 12,
@@ -806,7 +806,7 @@
         },
         "bottom_right": {
           "bound_at": [
-            "/boundVariables/bottomRightRadius"
+            "/boundVariables/rectangleCornerRadii/RECTANGLE_BOTTOM_RIGHT_CORNER_RADIUS"
           ],
           "css": "--radius-md",
           "raw": 12,
@@ -815,7 +815,7 @@
         },
         "top_left": {
           "bound_at": [
-            "/boundVariables/topLeftRadius"
+            "/boundVariables/rectangleCornerRadii/RECTANGLE_TOP_LEFT_CORNER_RADIUS"
           ],
           "css": "--radius-md",
           "raw": 12,
@@ -824,7 +824,7 @@
         },
         "top_right": {
           "bound_at": [
-            "/boundVariables/topRightRadius"
+            "/boundVariables/rectangleCornerRadii/RECTANGLE_TOP_RIGHT_CORNER_RADIUS"
           ],
           "css": "--radius-md",
           "raw": 12,
@@ -845,7 +845,10 @@
       ],
       "stroke_weight": {
         "bound_at": [
-          "/boundVariables/strokeWeight"
+          "/boundVariables/individualStrokeWeights/bottom",
+          "/boundVariables/individualStrokeWeights/left",
+          "/boundVariables/individualStrokeWeights/right",
+          "/boundVariables/individualStrokeWeights/top"
         ],
         "css": "--stroke-thin",
         "raw": 1,
@@ -865,8 +868,11 @@
     "state": "current",
     "theme": {
       "collection": "Theme",
+      "collection_id": "VariableCollectionId:2:0",
       "dark_mode": "Dark",
-      "light_mode": "Light"
+      "dark_mode_id": "2:1",
+      "light_mode": "Light",
+      "light_mode_id": "2:0"
     },
     "variables": 17
   },

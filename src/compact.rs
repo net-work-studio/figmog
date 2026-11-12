@@ -29,7 +29,7 @@
 //! alone (no reopen beyond the size check, no flush), since its replay is
 //! proportionally cheap. `FIGMOG_NO_COMPACT=1` disables compaction.
 //!
-//! `rotate_memtable_and_wait` is `#[doc(hidden)]` in fjall 3.1.9 (public,
+//! `rotate_memtable` is `#[doc(hidden)]` in fjall 3.1.9 (public,
 //! undocumented); fjall is pinned `=3.1.9`, and the pin-bump checklist in
 //! `AGENTS.md` requires re-verifying it — `journal_shrinks_after_compaction`
 //! below fails if the journal stops being retired.
@@ -57,7 +57,8 @@ pub(crate) const DISABLE_ENV: &str = "FIGMOG_NO_COMPACT";
 const MARKER_KEY: &str = "compacted";
 
 /// How long to wait for fjall's flush worker to delete the sealed journal.
-const RETIRE_TIMEOUT: Duration = Duration::from_secs(60);
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(15);
+const STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a [`compact`] call did.
 #[derive(Debug, PartialEq, Eq)]
@@ -124,6 +125,8 @@ pub(crate) fn compact(path: &Path) -> Result<Outcome, String> {
         return Ok(Outcome::Small);
     }
 
+    let deadline = Instant::now() + RETIRE_TIMEOUT;
+
     // 1. Flush every keyspace's memtable into tables.
     let mut names: Vec<String> = db
         .list_keyspace_names()
@@ -135,10 +138,7 @@ pub(crate) fn compact(path: &Path) -> Result<Outcome, String> {
         let keyspace = db
             .keyspace(name, KeyspaceCreateOptions::default)
             .map_err(err("keyspace"))?;
-        keyspace
-            .inner()
-            .rotate_memtable_and_wait()
-            .map_err(err("flush"))?;
+        flush(&db, keyspace.inner(), deadline)?;
     }
     crash_point("flushed");
 
@@ -154,14 +154,12 @@ pub(crate) fn compact(path: &Path) -> Result<Outcome, String> {
 
     // 3. Flush again: fjall seals the old journal, then deletes it once
     //    every keyspace has persisted past it.
-    maintenance
-        .inner()
-        .rotate_memtable_and_wait()
-        .map_err(err("flush"))?;
-    let started = Instant::now();
-    while db.journal_count() > 1 && started.elapsed() < RETIRE_TIMEOUT {
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    flush(&db, maintenance.inner(), deadline)?;
+    wait_for_progress(deadline, || {
+        db.persist(PersistMode::Buffer)
+            .map_err(err("journal retirement"))?;
+        Ok(db.journal_count())
+    })?;
     crash_point("retired");
 
     // 4. Persist and close.
@@ -171,6 +169,48 @@ pub(crate) fn compact(path: &Path) -> Result<Outcome, String> {
         before,
         after: journal_bytes(path)?,
     })
+}
+
+/// Rotate without fjall's unbounded wait helper. Persist checks the public
+/// poison signal as well as reporting journal I/O errors.
+fn flush(
+    db: &SingleWriterTxDatabase,
+    keyspace: &fjall::Keyspace,
+    deadline: Instant,
+) -> Result<(), String> {
+    db.persist(PersistMode::Buffer)
+        .map_err(|e| format!("compacting store (flush): {e}"))?;
+    keyspace
+        .rotate_memtable()
+        .map_err(|e| format!("compacting store (flush): {e}"))?;
+    wait_for_progress(deadline, || {
+        db.persist(PersistMode::Buffer)
+            .map_err(|e| format!("compacting store (flush): {e}"))?;
+        // Add one so the same bounded wait also serves journal retirement.
+        Ok(keyspace.sealed_memtable_count() + 1)
+    })
+}
+
+fn wait_for_progress(
+    deadline: Instant,
+    mut remaining: impl FnMut() -> Result<usize, String>,
+) -> Result<(), String> {
+    let mut previous = usize::MAX;
+    let mut progressed = Instant::now();
+    loop {
+        let count = remaining()?;
+        if count <= 1 {
+            return Ok(());
+        }
+        if count < previous {
+            progressed = Instant::now();
+            previous = count;
+        }
+        if Instant::now() >= deadline || progressed.elapsed() >= STALL_TIMEOUT {
+            return Err("compacting store: flush did not finish within its time budget; leaving the recoverable journal in place".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Test-only: abort the process at `step` when the crash-safety test's
@@ -188,11 +228,23 @@ fn crash_point(step: &str) {
 mod tests {
     use super::*;
     use crate::model::{Id, ProxyCacheRec, Rec};
+    use std::os::unix::process::ExitStatusExt;
 
-    /// Write enough synthetic proxy-cache rows through fold that the
-    /// journal crosses fjall's sealing threshold. Returns the rows written.
-    fn large_store(path: &Path) -> Vec<(Id, Rec)> {
-        let rows: Vec<(Id, Rec)> = (0..48)
+    #[test]
+    fn failed_or_expired_flush_stops_without_waiting_out_the_budget() {
+        let started = Instant::now();
+        let error = wait_for_progress(started + Duration::from_secs(15), || Err("Poisoned".into()))
+            .unwrap_err();
+        assert_eq!(error, "Poisoned");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let error = wait_for_progress(Instant::now(), || Ok(2)).unwrap_err();
+        assert!(error.contains("time budget"));
+    }
+
+    const FIXTURE_PATH_ENV: &str = "FIGMOG_TEST_COMPACT_FIXTURE_PATH";
+
+    fn large_rows() -> Vec<(Id, Rec)> {
+        (0..48)
             .map(|i| {
                 let key = format!("synthetic-{i:03}");
                 let rec = ProxyCacheRec {
@@ -207,8 +259,60 @@ mod tests {
                 };
                 (Id::ProxyCache(key), Rec::ProxyCache(rec))
             })
-            .collect();
-        let mut st = crate::open_store!(path);
+            .collect()
+    }
+
+    /// Build the committed fixture without depending on fjall's Drop:
+    /// under load, its blocking Close send was observed stuck after the
+    /// last worker exited. Checkpoint then exit the child; the parent still
+    /// exercises the real compaction, locking and recovery assertions.
+    fn large_store(path: &Path) -> Vec<(Id, Rec)> {
+        let rows = large_rows();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "compact::tests::populate_large_store_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FIXTURE_PATH_ENV, path)
+            .env_remove("FIGMOG_TEST_COMPACT_CHILD")
+            .env_remove("FIGMOG_TEST_COMPACT_ABORT")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("start compaction fixture builder");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(
+                        status.success(),
+                        "compaction fixture builder failed: {status}"
+                    );
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                outcome => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "compaction fixture builder did not finish within its budget: {outcome:?}"
+                    );
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn populate_large_store_fixture() {
+        let Some(path) = std::env::var_os(FIXTURE_PATH_ENV) else {
+            return;
+        };
+        let rows = large_rows();
+        let mut st = crate::open_store!(Path::new(&path));
         st.wtx(|tx| {
             for (id, rec) in &rows {
                 tx.upsert(id, rec);
@@ -223,7 +327,8 @@ mod tests {
                 }),
             );
         });
-        rows
+        st.checkpoint();
+        std::process::exit(0);
     }
 
     fn manager(dir: &Path, db: &Path) -> crate::sessions::SessionManager {
@@ -249,7 +354,7 @@ mod tests {
         let rows = large_store(&db);
         let mut manager = manager(dir.path(), &db);
         manager.close_reads(Instant::now() + Duration::from_secs(5));
-        manager.close_and_compact();
+        manager.close_and_compact(Instant::now() + Duration::from_secs(30));
         assert!(manager.sessions.is_empty());
         assert!(journal_bytes(&db).unwrap() < 1_000_000);
         let expected: Vec<_> = rows.iter().map(|(_, rec)| Some(rec.clone())).collect();
@@ -266,7 +371,7 @@ mod tests {
         let mut manager = manager(dir.path(), &db);
         let lease = manager.sessions[0].lease().unwrap();
         let before = journal_bytes(&db).unwrap();
-        manager.close_and_compact();
+        manager.close_and_compact(Instant::now() + Duration::from_secs(30));
         assert_eq!(journal_bytes(&db).unwrap(), before);
         drop(lease);
         let expected: Vec<_> = rows.iter().map(|(_, rec)| Some(rec.clone())).collect();
@@ -357,7 +462,11 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .status()
                 .unwrap();
-            assert!(!status.success(), "{step}: child was not aborted");
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGABRT),
+                "{step}: child did not reach the abort point: {status}"
+            );
             let expected: Vec<_> = rows.iter().map(|(_, rec)| Some(rec.clone())).collect();
             assert_eq!(read_all(&db, &rows), expected, "after a crash at {step}");
             // And a later compaction still completes the job.

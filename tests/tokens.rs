@@ -67,7 +67,7 @@ fn fixture_exports_byte_identically_and_matches_the_golden_file() {
     assert_eq!(summary["tokens"], 14);
     assert_eq!(
         summary["theme"],
-        serde_json::json!({"collection": "Theme", "light_mode": "Light", "dark_mode": "Dark"})
+        serde_json::json!({"collection": "Theme", "collection_id": "VariableCollectionId:2:0", "light_mode": "Light", "light_mode_id": "2:0", "dark_mode": "Dark", "dark_mode_id": "2:1"})
     );
     let reported: Vec<&str> = summary["report"]
         .as_array()
@@ -247,7 +247,7 @@ fn independent_collections_combine_and_problems_are_reported() {
     // Only Theme has a mode on `[data-theme="dark"]`.
     assert_eq!(
         summary["theme"],
-        json!({"collection": "Theme", "light_mode": "Light", "dark_mode": "Dark"})
+        json!({"collection": "Theme", "collection_id": "VariableCollectionId:3:0", "light_mode": "Light", "light_mode_id": "3:0", "dark_mode": "Dark", "dark_mode_id": "3:1"})
     );
     assert_eq!(
         summary["modes"]
@@ -699,4 +699,178 @@ fn export_refuses_foreign_files_symlinks_and_paths_outside_the_project() {
         assert!(stderr.contains("resolves outside the project"), "{stderr}");
         assert!(!outside.path().join("figmog-tokens.css").exists());
     }
+}
+
+#[test]
+fn duplicate_collection_names_remain_distinct_after_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("duplicate-collections.json");
+    let export = serde_json::json!({
+        "variableCollections": {
+            "C:theme": {"name": "Same", "defaultModeId": "M:light", "modes": [
+                {"modeId": "M:light", "name": "Light"}, {"modeId": "M:dark", "name": "Dark"}]},
+            "C:other": {"name": "Same", "defaultModeId": "M:value", "modes": [
+                {"modeId": "M:value", "name": "Light"}]}
+        },
+        "variables": {
+            "V:theme": {"name": "themed", "resolvedType": "FLOAT", "variableCollectionId": "C:theme",
+                "valuesByMode": {"M:light": 16, "M:dark": 24}, "scopes": ["WIDTH_HEIGHT", "GAP"]},
+            "V:other": {"name": "other", "resolvedType": "FLOAT", "variableCollectionId": "C:other",
+                "valuesByMode": {"M:value": 8}, "scopes": ["GAP"]}
+        }
+    });
+    std::fs::write(&path, export.to_string()).unwrap();
+    let (_store, db) = imported(&path);
+    let vars = common::command()
+        .args(["--db", &db, "vars", "--snapshot"])
+        .assert()
+        .success();
+    let vars: serde_json::Value = serde_json::from_slice(&vars.get_output().stdout).unwrap();
+    let themed = vars["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["variable_id"] == "V:theme")
+        .unwrap();
+    assert_eq!(themed["collection"], "Same");
+    assert_eq!(themed["collection_id"], "C:theme");
+    assert_eq!(themed["scopes"], serde_json::json!(["GAP", "WIDTH_HEIGHT"]));
+    let css = String::from_utf8(export_stdout(&db)).unwrap();
+    assert!(css.contains("  --other: 8px;"), "{css}");
+    assert!(css.contains("  --themed: 16px;"), "{css}");
+    let error = common::command()
+        .args([
+            "--db",
+            &db,
+            "tokens",
+            "export",
+            "--mode",
+            "Same/Light=:root",
+        ])
+        .assert()
+        .failure()
+        .code(1);
+    assert!(
+        String::from_utf8_lossy(&error.get_output().stderr).contains("matches 2 collection modes")
+    );
+}
+
+#[test]
+fn duplicate_and_unnamed_modes_keep_their_ids_and_default_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mode-identities.json");
+    let export = serde_json::json!({
+        "variableCollections": {
+            "C:duplicate": {"name": "Duplicate", "defaultModeId": "M:1", "modes": [
+                {"modeId": "M:1", "name": "Value"},
+                {"modeId": "M:2", "name": "Value"},
+                {"modeId": "M:3", "name": "Dark"}]},
+            "C:unnamed": {"name": "Unnamed", "defaultModeId": "M:U1", "modes": [
+                {"modeId": "M:U1"}, {"modeId": "M:U2", "name": ""}]},
+            "C:collision": {"name": "Collision", "defaultModeId": "M:K1", "modes": [
+                {"modeId": "M:K1", "name": "M:K2"}, {"modeId": "M:K2", "name": ""}]}
+        },
+        "variables": {
+            "V:gap": {"name": "gap", "resolvedType": "FLOAT", "variableCollectionId": "C:duplicate",
+                "valuesByMode": {"M:1": 16, "M:2": 32, "M:3": 64}, "scopes": ["GAP"]},
+            "V:radius": {"name": "radius", "resolvedType": "FLOAT", "variableCollectionId": "C:unnamed",
+                "valuesByMode": {"M:U1": 8, "M:U2": 24}, "scopes": ["CORNER_RADIUS"]},
+            "V:collision": {"name": "collision", "resolvedType": "FLOAT", "variableCollectionId": "C:collision",
+                "valuesByMode": {"M:K1": 4, "M:K2": 20}, "scopes": ["GAP"]}
+        }
+    });
+    std::fs::write(&path, export.to_string()).unwrap();
+    let (_store, db) = imported(&path);
+    let out = common::command()
+        .args(["--db", &db, "vars", "--snapshot"])
+        .assert()
+        .success();
+    let vars: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let rows = vars["variables"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|r| r["variable_id"] == id).unwrap();
+    assert_eq!(row("V:gap")["default_mode_id"], "M:1");
+    assert_eq!(row("V:gap")["default_mode"], "Value");
+    assert_eq!(
+        row("V:gap")["values_by_mode_id"],
+        serde_json::json!({"M:1": 16, "M:2": 32, "M:3": 64})
+    );
+    assert_eq!(
+        row("V:gap")["values_by_mode"],
+        row("V:gap")["values_by_mode_id"]
+    );
+    assert_eq!(row("V:radius")["default_mode"], "M:U1");
+    assert_eq!(
+        row("V:radius")["mode_names"],
+        serde_json::json!({"M:U1": "M:U1", "M:U2": "M:U2"})
+    );
+    assert_eq!(
+        row("V:collision")["values_by_mode"],
+        serde_json::json!({"M:K1": 4, "M:K2": 20})
+    );
+    let css = String::from_utf8(export_stdout(&db)).unwrap();
+    let root = css
+        .split(":root {\n")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(root.contains("  --gap: 16px;"), "{css}");
+    assert!(root.contains("  --radius: 8px;"), "{css}");
+    assert!(root.contains("  --collision: 4px;"), "{css}");
+    let dark = css
+        .split("[data-theme=\"dark\"] {\n")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(dark.contains("  --gap: 64px;"), "{css}");
+    // Spec value matching must use the same default mode identity too.
+    let file = dir.path().join("nodes.json");
+    let mut nodes = common::fixture_v1();
+    nodes["document"]["children"][0]["children"][0]["itemSpacing"] = serde_json::json!(16);
+    nodes["document"]["children"][0]["children"][0]["children"][1]["type"] =
+        serde_json::json!("FRAME");
+    nodes["document"]["children"][0]["children"][0]["children"][1]["layoutMode"] =
+        serde_json::json!("VERTICAL");
+    nodes["document"]["children"][0]["children"][0]["children"][1]["itemSpacing"] =
+        serde_json::json!(32);
+    std::fs::write(&file, nodes.to_string()).unwrap();
+    common::command()
+        .args(["--db", &db, "pull", "--from-file"])
+        .arg(file)
+        .assert()
+        .success();
+    let out = common::command()
+        .args(["--db", &db, "spec", "1:1"])
+        .assert()
+        .success();
+    let spec: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        spec["node"]["layout"]["gap"]["matches"],
+        serde_json::json!([
+            {"css": "--gap", "token": "gap", "variable_id": "V:gap"}
+        ])
+    );
+    assert!(
+        spec["node"]["children"][1]["layout"]["gap"]
+            .get("matches")
+            .is_none(),
+        "{spec}"
+    );
+    let out = common::command()
+        .args([
+            "--db",
+            &db,
+            "tokens",
+            "export",
+            "--mode",
+            "Duplicate/Value=:root",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("matches 2 collection modes"), "{stderr}");
+    assert!(stderr.contains("M:1") && stderr.contains("M:2"), "{stderr}");
 }

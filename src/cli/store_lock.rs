@@ -6,13 +6,19 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub(super) const LOCK_NAME: &str = ".figmog-lock";
+/// Pinned fjall 3.1.9 takes `File::try_lock` on this file. Migration must
+/// retain the same exclusion after closing its database handle. Reverify
+/// both the filename and locking primitive on any fjall/fold pin bump.
+pub(super) const FJALL_LOCK_NAME: &str = "lock";
 
+#[derive(Debug)]
 pub(super) struct StoreOwner {
     pub(super) path: PathBuf,
     // Fresh resets preserve both this inode and its containing directory.
     // Namespaces and filesystem-equivalent spellings resolve to this same
     // anchor instead of choosing ownership from an opener-local path hash.
     lock: File,
+    directory: std::fs::Metadata,
 }
 
 /// Why [`lock_file`] could not take its lock.
@@ -93,13 +99,38 @@ impl StoreOwner {
         if path.parent().is_none() {
             return Err("the filesystem root cannot be a mirror directory".into());
         }
+        let directory = std::fs::metadata(&path).map_err(|error| error.to_string())?;
         let lock_path = path.join(LOCK_NAME);
         let lock = lock_file(&lock_path).map_err(|e| match e {
             Failure::Locked(Some(owner)) => super::store_owned_msg(&owner),
             Failure::Locked(None) => super::STORE_LOCKED_MSG.to_string(),
             Failure::Failed(e) => format!("locking {}: {e}", lock_path.display()),
         })?;
-        Ok(Self { path, lock })
+        Ok(Self {
+            path,
+            lock,
+            directory,
+        })
+    }
+
+    /// Revalidate ownership through either the original path or the
+    /// tombstone to which migration has atomically renamed the store.
+    fn validate_at(&self, path: &Path) -> Result<(), String> {
+        let valid = || -> std::io::Result<bool> {
+            let directory = std::fs::metadata(path)?;
+            let held = self.lock.metadata()?;
+            let linked = std::fs::symlink_metadata(path.join(LOCK_NAME))?;
+            Ok(directory.is_dir()
+                && same_file(&self.directory, &directory)
+                && held.nlink() == 1
+                && linked.is_file()
+                && same_file(&held, &linked))
+        };
+        if valid().unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(format!("store ownership changed at {}", path.display()))
+        }
     }
 
     pub(super) fn clear_contents(&self) -> Result<(), String> {
@@ -128,6 +159,62 @@ impl StoreOwner {
             Ok(())
         };
         clear().map_err(|e| format!("resetting {}: {e}", self.path.display()))
+    }
+}
+
+/// A quiescent database with exclusion recognized by both current figmog
+/// and unmodified fjall openers. The raw writer lock stays held across
+/// migration's copy, publication, rename, and deletion; merely keeping the
+/// figmog anchor after dropping a database would admit older binaries.
+pub(super) struct MigrationOwner {
+    writer: File,
+    owner: StoreOwner,
+}
+
+impl MigrationOwner {
+    pub(super) fn acquire(owner: StoreOwner, create_missing: bool) -> Result<Self, String> {
+        owner.validate_at(&owner.path)?;
+        let path = owner.path.join(FJALL_LOCK_NAME);
+        let writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create_missing)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .map_err(|error| format!("opening fjall writer lock {}: {error}", path.display()))?;
+        let metadata = writer.metadata().map_err(|error| error.to_string())?;
+        // SAFETY: geteuid has no preconditions or side effects.
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(format!("invalid fjall writer lock at {}", path.display()));
+        }
+        writer.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => super::STORE_LOCKED_MSG.to_string(),
+            TryLockError::Error(error) => {
+                format!("locking fjall writer lock {}: {error}", path.display())
+            }
+        })?;
+        let held = Self { writer, owner };
+        held.validate_at(&held.owner.path)?;
+        Ok(held)
+    }
+
+    pub(super) fn validate_at(&self, path: &Path) -> Result<(), String> {
+        self.owner.validate_at(path)?;
+        let valid = || -> std::io::Result<bool> {
+            let held = self.writer.metadata()?;
+            let linked = std::fs::symlink_metadata(path.join(FJALL_LOCK_NAME))?;
+            Ok(held.nlink() == 1 && linked.is_file() && same_file(&held, &linked))
+        };
+        if valid().unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(format!("fjall writer lock changed at {}", path.display()))
+        }
     }
 }
 
@@ -223,6 +310,7 @@ impl<T> OwnedStore<T> {
 /// A closed store whose ownership is kept for a pending compaction
 /// ([`OwnedStore::close_for_compaction`]). Dropping it unrun just releases
 /// the store.
+#[derive(Debug)]
 pub(crate) struct Compaction {
     owner: StoreOwner,
 }

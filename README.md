@@ -53,8 +53,8 @@ credential, so an environment override remains active. The shared
 background figmog (below) picks up a changed credential when it restarts:
 it exits on its own once no agent or command has used it for 10 minutes,
 and the next `figmog serve` starts a fresh one. To apply a change sooner,
-close every agent session in the repository and wait for it to exit, or
-stop it with `kill <pid>` (the pid is in `.git/figmog/owner.json`).
+close every agent session in the repository, then wait for it to exit or
+send `kill -TERM <pid>` for a graceful drain (the pid is in `.git/figmog/owner.json`).
 
 For a password manager or other noninteractive secret source, pipe its
 output to `figmog auth login --token-stdin`. The token is never accepted
@@ -83,7 +83,9 @@ Run one or the other, not both. figmog forwards the tools of Figma's
 running with Dev Mode MCP enabled. Open or quit the desktop app whenever
 you like: figmog re-checks for it (about every 30 seconds while it is
 missing) and tells your agent when its tools appear or go away. Only the
-desktop server's tools are forwarded — Figma's remote MCP server is not.
+desktop server's tools are forwarded by default. `--upstream-url` can
+target another HTTP MCP server, but sends no authentication for Figma's
+remote server. Tool descriptions get a `[via Figma desktop] ` prefix.
 Keep both connections and the agent sees two overlapping Figma
 servers, then picks tools badly.
 
@@ -253,6 +255,7 @@ how to let the old one exit. See `docs/SPEC.md` §6b.
 ### Reads work while the server runs
 
 The background figmog owns the stores and listens on a unix socket under
+a verified private `$XDG_RUNTIME_DIR/figmog/` when available, otherwise
 `/tmp/figmog-<uid>/`, published in `.git/figmog/owner.json`. Read commands,
 `figmog tools` and `figmog call` connect there first and answer from its
 live view; with no background figmog running they open the store directly.
@@ -283,7 +286,9 @@ needs no token up front. `figmog_open` and `figmog_files` manage the set. See
 
 `figmog dump <id>` returns a node and its descendants as nested raw JSON,
 with `--depth N` and `--fields a,b,c` to keep the payload small.
-`--under <id>` scopes `text`, `find`, `search` and `where` to one subtree,
+`figmog at --page 0:1 --x 10 --y 10 --limit 20` looks up a point on one
+page, excluding hidden branches and returning up to 100 matches by default.
+`--under <id>` scopes `text`, `find`, `search`, `where` and `at` to one subtree,
 and composes with `--page`. `--resolve-vars` annotates every
 `boundVariables` binding site with the variable's name and per-mode values
 under a `resolved_variables` key, so a generator can emit
@@ -302,8 +307,11 @@ back off. See `docs/SPEC.md` §14.
 
 `figmog images <node-id>...` downloads node renders plus the image fills
 those nodes reference, writes them to `--out` (default `./figmog-images/`),
-and prints a manifest. Bytes are cached against the file version, so asking
-again for an unedited file spends nothing. Nothing in figmog fetches images
+and prints a manifest. Bytes are cached until a pull changes the mirrored
+version, modification time or records, so asking again for an unchanged
+mirror spends nothing. Figma can reuse a version ID across live edits;
+version-pinned requests alone do not guarantee a historical render after
+upstream edits or deletion. Nothing in figmog fetches images
 on its own, because Figma's images endpoints are its most rate-limited. See
 `docs/SPEC.md` §15.
 
@@ -313,6 +321,13 @@ misses produce per-item errors. To fetch missing images, run
 `figmog pull <file-key-or-url>`, then `figmog images <node-id>...` without
 `--db`. A node URL in the images arguments selects a node within the chosen
 store; it does not supply the store's file identity.
+Renders cached by older builds without a current-generation version pin need to be fetched
+again through a file-keyed mirror before this build can export them offline.
+That first refetch requires credentials and spends API budget again. If
+credentials are unavailable, the error explains how to restore them.
+Restart any running `figmog serve` with the updated environment when
+using `FIGMA_TOKEN`, then retry the image request. The existing cached
+bytes remain on disk.
 
 ### Freshness is polling, not push
 
@@ -333,6 +348,8 @@ snapshot, so tokens deleted in Figma disappear on re-import; an invalid
 file is rejected and the last good snapshot kept. `figmog vars --snapshot`
 and `figmog status` report the snapshot's state and provenance. See
 `docs/SPEC.md` §9.
+Use `--dry-run` to preview import counts; replacing existing variables
+with an empty export requires `--allow-empty`.
 
 `figmog tokens export` turns the imported snapshot into one CSS file,
 written to `[stack] tokens` in `figmog.toml` (or `--out`, or `--stdout`):

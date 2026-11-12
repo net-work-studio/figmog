@@ -79,25 +79,41 @@
                 "type": "VARIABLE_ALIAS",
                 "id": "VariableID:1:7"
               },
-              "strokeWeight": {
-                "type": "VARIABLE_ALIAS",
-                "id": "VariableID:1:9"
+              "individualStrokeWeights": {
+                "top": {
+                  "type": "VARIABLE_ALIAS",
+                  "id": "VariableID:1:9"
+                },
+                "right": {
+                  "type": "VARIABLE_ALIAS",
+                  "id": "VariableID:1:9"
+                },
+                "bottom": {
+                  "type": "VARIABLE_ALIAS",
+                  "id": "VariableID:1:9"
+                },
+                "left": {
+                  "type": "VARIABLE_ALIAS",
+                  "id": "VariableID:1:9"
+                }
               },
-              "topLeftRadius": {
-                "type": "VARIABLE_ALIAS",
-                "id": "VariableID:1:6"
-              },
-              "topRightRadius": {
-                "type": "VARIABLE_ALIAS",
-                "id": "VariableID:1:6"
-              },
-              "bottomLeftRadius": {
-                "type": "VARIABLE_ALIAS",
-                "id": "VariableID:1:6"
-              },
-              "bottomRightRadius": {
-                "type": "VARIABLE_ALIAS",
-                "id": "VariableID:1:6"
+              "rectangleCornerRadii": {
+                "RECTANGLE_TOP_LEFT_CORNER_RADIUS": {
+                  "type": "VARIABLE_ALIAS",
+                  "id": "VariableID:1:6"
+                },
+                "RECTANGLE_TOP_RIGHT_CORNER_RADIUS": {
+                  "type": "VARIABLE_ALIAS",
+                  "id": "VariableID:1:6"
+                },
+                "RECTANGLE_BOTTOM_RIGHT_CORNER_RADIUS": {
+                  "type": "VARIABLE_ALIAS",
+                  "id": "VariableID:1:6"
+                },
+                "RECTANGLE_BOTTOM_LEFT_CORNER_RADIUS": {
+                  "type": "VARIABLE_ALIAS",
+                  "id": "VariableID:1:6"
+                }
               }
             },
             "absoluteBoundingBox": {
