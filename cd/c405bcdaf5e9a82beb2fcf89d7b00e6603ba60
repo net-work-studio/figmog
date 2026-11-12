@@ -1,0 +1,29 @@
+examples/slice/evidence/COMMENT.md
+  s_d336666e6b7163::t_4ebf584a5793be 39-41
+examples/slice/evidence/correct/1440/manifest.json
+  s_d336666e6b7163::t_4ebf584a5793be 204
+examples/slice/evidence/broken/1440/manifest.json
+  s_d336666e6b7163::t_4ebf584a5793be 204
+examples/slice/evidence/correct/390/manifest.json
+  s_d336666e6b7163::t_4ebf584a5793be 204
+examples/slice/evidence/broken/390/manifest.json
+  s_d336666e6b7163::t_4ebf584a5793be 204
+examples/slice/evidence/evidence.json
+  s_d336666e6b7163::t_4ebf584a5793be 5,14,23,216
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cdc405bcdaf5e9a82beb2fcf89d7b00e6603ba60",
+  "prompts": {},
+  "sessions": {
+    "s_d336666e6b7163": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1afa8-a0b6-7dc1-bd6e-bc0081b6f0e4",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "az3ta <24527778+az3ta@users.noreply.github.com>"
+    }
+  }
+}
