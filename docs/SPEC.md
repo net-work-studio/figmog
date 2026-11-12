@@ -1332,8 +1332,12 @@ or imported) over inference whenever one exists for a given variable id.
 Authoritative rows also carry `code_syntax` (platform → name object),
 `hidden_from_publishing` and `remote` from the snapshot row — null for a
 legacy snapshot — plus the variable's sorted, deduplicated `scopes`, its
-existing `collection_id`, and its collection's `default_mode` (by name,
-the mode id when unnamed; NWS-2967). Without
+existing `collection_id`, and its collection's `default_mode_id`.
+`values_by_mode_id` preserves every mode's value; `mode_names` maps IDs to
+display names, using the ID when unnamed. The presentation fields
+`default_mode` and `values_by_mode` retain names where unambiguous; when
+mode labels collide, `values_by_mode` uses IDs for the collection.
+Token export and spec matching select values by ID (NWS-2967). Without
 `--snapshot`/`snapshot: true` the result stays the plain row array; with
 it, `{snapshot, variables}`.
 
@@ -1348,7 +1352,7 @@ existing `figmog_vars {snapshot: true}` read (`ReadCommand::Vars`), so it
 is socket-routed to a running serve/background owner or opens the store
 directly exactly like `figmog vars --snapshot` (§10 "Socket-first
 routing"), and renders that JSON locally. A serving binary older than the
-`default_mode` or `collection_id` fields is reported as an error asking
+mode-identity or `collection_id` fields is reported as an error asking
 to restart it.
 
 **Snapshot.** Only state `current` exports; `none`, `legacy` (no
@@ -1384,7 +1388,9 @@ the theme is the one collection with a mode whose name contains "dark"
 `--collection`. The dark mode is `--dark-mode`, else the collection's one
 mode named like "dark"; the light mode is `--light-mode`, else its one mode
 named like "light", else its default mode. Unknown names, several
-matches and light = dark are errors. Other mode kinds and combining
+matches (including duplicate display names) and light = dark are errors.
+Mode display names select flags; mode IDs identify the chosen values.
+Other mode kinds and combining
 collections are out of scope.
 
 **Names.** `codeSyntax.WEB` (`--x` or `var(--x)`) when `x` is nonempty
@@ -2072,8 +2078,14 @@ and on TEXT nodes `typography`: `font_family`, `font_size`,
 `{"token": <variable name | null>, "variable_id", "css": <name | null>,
 "raw": <Figma's baked value>}`. Bindings are read from the paint's
 `boundVariables.color`, else the node's `boundVariables.fills[i]` /
-`strokes[i]`; `itemSpacing`, `paddingTop`…, `strokeWeight`,
-`topLeftRadius`…; text properties from the node's `boundVariables`, else
+`strokes[i]`; `itemSpacing`, `paddingTop`…; uniform stroke weight from
+`boundVariables.individualStrokeWeights.{top,right,bottom,left}` when
+all four sides name the same variable, with the flat `strokeWeight`
+binding also supported. Mixed or partially bound sides are unsupported.
+Corner bindings use `boundVariables.rectangleCornerRadii`'s
+`RECTANGLE_TOP_LEFT_CORNER_RADIUS` and corresponding keys, with the flat
+`topLeftRadius`… forms also supported. Text properties come from the
+node's `boundVariables`, else
 its type style's (`fontFamily`, `fontSize`, `fontWeight`, `lineHeight`,
 `letterSpacing`), an alias or an array of aliases naming one variable.
 `token` is the variable's name in the snapshot (null for a variable bound

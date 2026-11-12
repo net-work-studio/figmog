@@ -120,10 +120,11 @@ mismatched = pixelmatch mismatches inside the common area
 score      = round(100 * (1 - mismatched / (W * H)), 2 decimals)
 ```
 
-100 means pixel-identical; a size difference always lowers the score. The
-manifest reports `score.after` and `score.before` (with `mismatched` and
-`total`) and the formula text. The score is advisory and is never a pass/fail
-gate.
+A score of 100 is the rounded result under these rules. Small colour changes,
+ignored anti-aliasing differences, or rounding can leave it at 100 even when
+pixels differ. Size differences count as mismatches. The manifest reports
+`score.after` and `score.before` (with `mismatched` and `total`) and the formula
+text. The score is advisory and is never a pass/fail gate.
 
 ## Manifests
 

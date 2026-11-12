@@ -169,6 +169,16 @@ fn bindings_untokenized_values_and_unsupported_cases() {
     assert_eq!(layout["gap"]["token"], "space/4");
     assert_eq!(layout["gap"]["css"], "--spacing-4");
 
+    // The fixture uses REST's nested side/corner binding maps. Their
+    // actual variables survive as bindings, rather than equal-value matches.
+    let values = &spec["node"]["values"];
+    assert_eq!(values["stroke_weight"]["variable_id"], "VariableID:1:9");
+    assert_eq!(values["stroke_weight"]["css"], "--stroke-thin");
+    for corner in ["top_left", "top_right", "bottom_right", "bottom_left"] {
+        assert_eq!(values["radius"][corner]["variable_id"], "VariableID:1:6");
+        assert_eq!(values["radius"][corner]["css"], "--radius-md");
+    }
+
     // The grid child, the absolute ribbon and the mixed-run caption are
     // unsupported, never specified.
     let unsupported = spec["unsupported"].as_array().unwrap();

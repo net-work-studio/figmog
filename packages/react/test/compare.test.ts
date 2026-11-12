@@ -14,6 +14,17 @@ test("identical images score 100 with no mismatches", () => {
   assert.equal(result.score, 100);
 });
 
+test("a score of 100 can include different pixels below the comparison threshold", () => {
+  const a = solid(1, 1, [10, 20, 30, 255]);
+  const b = solid(1, 1, [11, 20, 30, 255]);
+  assert.notDeepEqual(a.data, b.data);
+  assert.notEqual(sha256(encodePng(a)), sha256(encodePng(b)));
+  const result = diffImages(a, b);
+  assert.equal(result.mismatched, 0);
+  assert.equal(result.total, 1);
+  assert.equal(result.score, 100);
+});
+
 test("size mismatch pads to the larger size and counts padding as mismatch", () => {
   // 4x3 vs 2x4: canvas 4x4 = 16 px, common area 2x3 = 6 px, so 10 px only one (or neither) image covers.
   const result = diffImages(solid(4, 3, [0, 0, 0, 255]), solid(2, 4, [0, 0, 0, 255]));

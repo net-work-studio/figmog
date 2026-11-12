@@ -30,7 +30,8 @@ export const SCORE_FORMULA =
   "score = round2(100 * (1 - mismatched / (W * H))), where W x H is the larger width x the larger height of " +
   "the two images, mismatched counts pixels pixelmatch (threshold 0.1, anti-aliasing ignored) finds different " +
   "inside the area both images cover, plus every pixel only one image covers (or neither does); round2 rounds " +
-  "to two decimals; 100 means pixel-identical. Advisory only.";
+  "to two decimals. A score of 100 is the rounded result under these rules; small colour changes, ignored " +
+  "anti-aliasing differences, or rounding can leave it at 100 even when pixels differ. Advisory only.";
 
 export interface DiffResult {
   /**

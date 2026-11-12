@@ -34,9 +34,9 @@ struct Var<'a> {
     name: String,
     resolved_type: String,
     collection_id: String,
-    default_mode: Option<String>,
+    default_mode_id: Option<String>,
     scopes: Vec<String>,
-    /// Mode name → raw value or alias.
+    /// Mode ID → raw value or alias.
     values: BTreeMap<String, &'a Value>,
 }
 
@@ -166,7 +166,7 @@ impl<'a> Tokens<'a> {
                     name: text("name"),
                     resolved_type: text("resolved_type"),
                     collection_id: text("collection_id"),
-                    default_mode: row["default_mode"].as_str().map(str::to_string),
+                    default_mode_id: row["default_mode_id"].as_str().map(str::to_string),
                     scopes: row["scopes"]
                         .as_array()
                         .into_iter()
@@ -174,7 +174,7 @@ impl<'a> Tokens<'a> {
                         .filter_map(Value::as_str)
                         .map(str::to_string)
                         .collect(),
-                    values: row["values_by_mode"]
+                    values: row["values_by_mode_id"]
                         .as_object()
                         .map(|m| m.iter().map(|(k, v)| (k.clone(), v)).collect())
                         .unwrap_or_default(),
@@ -261,8 +261,8 @@ fn root_value(
 ) -> Option<Lit> {
     let v = all.get(id)?;
     let mode = match theme {
-        Some(t) if t.collection_id == v.collection_id => Some(&t.light_mode),
-        _ => v.default_mode.as_ref(),
+        Some(t) if t.collection_id == v.collection_id => Some(&t.light_mode_id),
+        _ => v.default_mode_id.as_ref(),
     }?;
     let raw = v.values.get(mode)?;
     if raw["type"] == "VARIABLE_ALIAS" {
@@ -297,6 +297,52 @@ fn alias_id(v: Option<&Value>) -> Result<Option<String>, ()> {
             }
         }
         Some(a) => Ok(one(a)),
+    }
+}
+
+/// Flat bindings remain supported, while REST also nests corner bindings
+/// under rectangleCornerRadii and uniform stroke bindings under its sides.
+/// Two representations may agree; conflicting or partially bound uniform
+/// strokes cannot be represented as one binding.
+fn node_binding(n: &Value, key: &str) -> Result<Option<String>, ()> {
+    let bindings = n.get("boundVariables");
+    let flat = alias_id(bindings.and_then(|b| b.get(key)))?;
+    let nested = if key == "strokeWeight" {
+        match bindings.and_then(|b| b.get("individualStrokeWeights")) {
+            None => None,
+            Some(sides) => {
+                let mut variable = None;
+                for side in ["top", "right", "bottom", "left"] {
+                    let current = alias_id(sides.get(side))?.ok_or(())?;
+                    if variable
+                        .as_ref()
+                        .is_some_and(|previous| previous != &current)
+                    {
+                        return Err(());
+                    }
+                    variable = Some(current);
+                }
+                variable
+            }
+        }
+    } else {
+        let corner = match key {
+            "topLeftRadius" => Some("RECTANGLE_TOP_LEFT_CORNER_RADIUS"),
+            "topRightRadius" => Some("RECTANGLE_TOP_RIGHT_CORNER_RADIUS"),
+            "bottomRightRadius" => Some("RECTANGLE_BOTTOM_RIGHT_CORNER_RADIUS"),
+            "bottomLeftRadius" => Some("RECTANGLE_BOTTOM_LEFT_CORNER_RADIUS"),
+            _ => None,
+        };
+        alias_id(corner.and_then(|corner| {
+            bindings
+                .and_then(|b| b.get("rectangleCornerRadii"))
+                .and_then(|radii| radii.get(corner))
+        }))?
+    };
+    match (flat, nested) {
+        (Some(flat), Some(nested)) if flat != nested => Err(()),
+        (Some(id), _) | (_, Some(id)) => Ok(Some(id)),
+        _ => Ok(None),
     }
 }
 
@@ -344,20 +390,23 @@ impl Cx<'_, '_> {
     /// A node's binding for `key` (node `boundVariables`, then — for text
     /// properties — the type style's own), reporting a mixed binding.
     fn binding(&mut self, n: &Value, id: &str, key: &str) -> Result<Option<String>, ()> {
-        let found =
-            alias_id(n.get("boundVariables").and_then(|b| b.get(key))).and_then(|b| match b {
-                Some(b) => Ok(Some(b)),
-                None => alias_id(
-                    n.get("style")
-                        .and_then(|s| s.get("boundVariables"))
-                        .and_then(|b| b.get(key)),
-                ),
-            });
+        let found = node_binding(n, key).and_then(|b| match b {
+            Some(b) => Ok(Some(b)),
+            None => alias_id(
+                n.get("style")
+                    .and_then(|s| s.get("boundVariables"))
+                    .and_then(|b| b.get(key)),
+            ),
+        });
         if found.is_err() {
-            self.unsupported(
-                id,
-                format!("{key}: bound to several variables (mixed): not specified"),
-            );
+            let reason = if key == "strokeWeight"
+                && n["boundVariables"].get("individualStrokeWeights").is_some()
+            {
+                "strokeWeight: mixed or partially bound sides: not specified".into()
+            } else {
+                format!("{key}: bound to several variables (mixed): not specified")
+            };
+            self.unsupported(id, reason);
         }
         found
     }
@@ -655,9 +704,10 @@ impl Cx<'_, '_> {
             ("bottom_left", "bottomLeftRadius"),
         ];
         let bv = n.get("boundVariables");
-        let any_bound = CORNERS
-            .iter()
-            .any(|(_, k)| bv.and_then(|b| b.get(*k)).is_some());
+        let any_bound = bv.and_then(|b| b.get("rectangleCornerRadii")).is_some()
+            || CORNERS
+                .iter()
+                .any(|(_, k)| bv.and_then(|b| b.get(*k)).is_some());
         let per_corner = n["rectangleCornerRadii"].as_array();
         if n.get("cornerRadius").is_none() && per_corner.is_none() && !any_bound {
             return None;
@@ -889,7 +939,8 @@ mod tests {
         let vars = json!({"snapshot": {"state": "current"}, "variables": [{
             "variable_id": "V:weight", "name": "stroke/weight", "source": "imported",
             "resolved_type": "FLOAT", "collection": "Stroke", "collection_id": "C:stroke",
-            "default_mode": "Value", "scopes": ["STROKE_FLOAT"], "values_by_mode": {"Value": 1}
+            "default_mode_id": "Value", "mode_names": {"Value": "Value"},
+            "scopes": ["STROKE_FLOAT"], "values_by_mode_id": {"Value": 1}
         }]});
         let spec = build(&tree, &vars);
         assert_eq!(
@@ -935,11 +986,11 @@ mod tests {
             "itemSpacing": 8, "children": []});
         let vars = json!({"snapshot": {"state": "current"}, "variables": [
             {"variable_id": "V:theme", "name": "theme-gap", "source": "imported", "resolved_type": "FLOAT",
-                "collection": "Same", "collection_id": "C:theme", "default_mode": "Light", "scopes": ["GAP"],
-                "values_by_mode": {"Light": 16, "Dark": 24}},
+                "collection": "Same", "collection_id": "C:theme", "default_mode_id": "Light", "scopes": ["GAP"],
+                "mode_names": {"Light": "Light", "Dark": "Dark"}, "values_by_mode_id": {"Light": 16, "Dark": 24}},
             {"variable_id": "V:other", "name": "other-gap", "source": "imported", "resolved_type": "FLOAT",
-                "collection": "Same", "collection_id": "C:other", "default_mode": "Value", "scopes": ["GAP"],
-                "values_by_mode": {"Light": 99, "Value": 8}}
+                "collection": "Same", "collection_id": "C:other", "default_mode_id": "Value", "scopes": ["GAP"],
+                "mode_names": {"Light": "Light", "Value": "Value"}, "values_by_mode_id": {"Light": 99, "Value": 8}}
         ]});
         let spec = build(&tree, &vars);
         assert_eq!(spec["tokens_snapshot"]["theme"]["collection_id"], "C:theme");
@@ -947,6 +998,160 @@ mod tests {
             spec["node"]["layout"]["gap"]["matches"],
             json!([
             {"token": "other-gap", "variable_id": "V:other", "css": "--other-gap"}])
+        );
+    }
+
+    #[test]
+    fn matching_uses_the_default_mode_id_when_mode_names_repeat() {
+        let mut tree = json!({"id": "1:1", "name": "Card", "type": "FRAME",
+            "layoutMode": "VERTICAL", "itemSpacing": 16, "children": []});
+        let vars = json!({"snapshot": {"state": "current"}, "variables": [{
+            "variable_id": "V:gap", "name": "gap", "source": "imported", "resolved_type": "FLOAT",
+            "collection": "Spacing", "collection_id": "C:spacing", "default_mode_id": "M:1",
+            "scopes": ["GAP"], "mode_names": {"M:1": "Value", "M:2": "Value"},
+            "values_by_mode_id": {"M:1": 16, "M:2": 32}}]});
+        let spec = build(&tree, &vars);
+        assert_eq!(
+            spec["node"]["layout"]["gap"]["matches"],
+            json!([
+            {"token": "gap", "variable_id": "V:gap", "css": "--gap"}])
+        );
+        tree["itemSpacing"] = json!(32);
+        let spec = build(&tree, &vars);
+        assert!(spec["node"]["layout"]["gap"].get("matches").is_none());
+    }
+
+    #[test]
+    fn rest_uniform_stroke_bindings_keep_the_actual_variable() {
+        let alias = json!({"type": "VARIABLE_ALIAS", "id": "V:weight"});
+        let tree = json!({"id": "1:1", "name": "Box", "type": "RECTANGLE",
+            "strokes": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0}}],
+            "strokeWeight": 1,
+            "boundVariables": {"individualStrokeWeights": {
+                "top": alias, "right": alias, "bottom": alias, "left": alias}},
+            "children": []});
+        let vars = json!({"snapshot": {"state": "current"}, "variables": [{
+            "variable_id": "V:weight", "name": "stroke/thin", "source": "imported",
+            "resolved_type": "FLOAT", "collection": "Stroke", "collection_id": "C:stroke",
+            "default_mode_id": "M:1", "mode_names": {"M:1": "Value"},
+            "scopes": ["STROKE_FLOAT"], "values_by_mode_id": {"M:1": 1}
+        }]});
+        for explicit_weight in [true, false] {
+            let mut node = tree.clone();
+            if !explicit_weight {
+                node.as_object_mut().unwrap().remove("strokeWeight");
+            }
+            let spec = build(&node, &vars);
+            assert_eq!(
+                spec["node"]["values"]["stroke_weight"],
+                json!({
+                "raw": 1, "variable_id": "V:weight", "token": "stroke/thin", "css": "--stroke-thin"})
+            );
+            assert_eq!(spec["unsupported"], json!([]));
+        }
+
+        let mut partial = tree.clone();
+        partial["boundVariables"]["individualStrokeWeights"]
+            .as_object_mut()
+            .unwrap()
+            .remove("left");
+        let mut mixed = tree.clone();
+        mixed["boundVariables"]["individualStrokeWeights"]["left"]["id"] = json!("V:other");
+        let mut conflicting = tree;
+        conflicting["boundVariables"]["strokeWeight"] =
+            json!({"type": "VARIABLE_ALIAS", "id": "V:other"});
+        for node in [partial, mixed, conflicting] {
+            let spec = build(&node, &vars);
+            assert!(
+                spec["node"]["values"].get("stroke_weight").is_none(),
+                "{spec}"
+            );
+            assert_eq!(
+                spec["unsupported"],
+                json!([{
+                "id": "1:1", "reason": "strokeWeight: mixed or partially bound sides: not specified"}])
+            );
+        }
+    }
+
+    #[test]
+    fn rest_corner_bindings_keep_each_variable_and_report_mixed_corners() {
+        let corners = [
+            ("top_left", "RECTANGLE_TOP_LEFT_CORNER_RADIUS"),
+            ("top_right", "RECTANGLE_TOP_RIGHT_CORNER_RADIUS"),
+            ("bottom_right", "RECTANGLE_BOTTOM_RIGHT_CORNER_RADIUS"),
+            ("bottom_left", "RECTANGLE_BOTTOM_LEFT_CORNER_RADIUS"),
+        ];
+        let mut bindings = serde_json::Map::new();
+        let mut variables = Vec::new();
+        for (corner, rest) in corners {
+            let id = format!("V:{corner}");
+            bindings.insert(rest.into(), json!({"type": "VARIABLE_ALIAS", "id": id}));
+            variables.push(json!({
+                "variable_id": id, "name": format!("radius/{corner}"), "source": "imported",
+                "resolved_type": "FLOAT", "collection": "Radii", "collection_id": "C:radii",
+                "default_mode_id": "M:1", "mode_names": {"M:1": "Value"},
+                "scopes": ["CORNER_RADIUS"], "values_by_mode_id": {"M:1": 12}}));
+        }
+        let vars = json!({"snapshot": {"state": "current"}, "variables": variables});
+        let tree = json!({"id": "1:1", "type": "RECTANGLE", "name": "Box",
+            "rectangleCornerRadii": [12, 12, 12, 12],
+            "boundVariables": {"rectangleCornerRadii": bindings}, "children": []});
+        let spec = build(&tree, &vars);
+        for (corner, _) in corners {
+            let entry = &spec["node"]["values"]["radius"][corner];
+            assert_eq!(entry["variable_id"], format!("V:{corner}"));
+            assert_eq!(entry["raw"], 12);
+            assert!(entry["css"].is_string(), "{entry}");
+            assert!(entry.get("untokenized").is_none(), "{entry}");
+        }
+        assert_eq!(spec["unsupported"], json!([]));
+
+        // Nested bindings alone still establish radius presence; the REST
+        // default raw value is zero when both raw radius fields are absent.
+        let mut absent_raw = tree.clone();
+        absent_raw
+            .as_object_mut()
+            .unwrap()
+            .remove("rectangleCornerRadii");
+        let spec = build(&absent_raw, &vars);
+        assert_eq!(spec["node"]["values"]["radius"]["top_left"]["raw"], 0);
+        assert_eq!(
+            spec["node"]["values"]["radius"]["top_left"]["variable_id"],
+            "V:top_left"
+        );
+
+        let mut mixed = tree.clone();
+        mixed["boundVariables"]["rectangleCornerRadii"][corners[0].1] = json!([
+            {"type": "VARIABLE_ALIAS", "id": "V:top_left"},
+            {"type": "VARIABLE_ALIAS", "id": "V:other"}]);
+        let mut conflicting = tree.clone();
+        conflicting["boundVariables"]["topLeftRadius"] =
+            json!({"type": "VARIABLE_ALIAS", "id": "V:other"});
+        for node in [mixed, conflicting] {
+            let spec = build(&node, &vars);
+            assert!(spec["node"]["values"]["radius"].get("top_left").is_none());
+            assert_eq!(
+                spec["node"]["values"]["radius"]["top_right"]["variable_id"],
+                "V:top_right"
+            );
+            assert_eq!(
+                spec["unsupported"],
+                json!([{
+                "id": "1:1", "reason": "topLeftRadius: bound to several variables (mixed): not specified"}])
+            );
+        }
+        let mut flat = tree;
+        let nested = flat["boundVariables"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rectangleCornerRadii")
+            .unwrap();
+        flat["boundVariables"]["topLeftRadius"] = nested[corners[0].1].clone();
+        let spec = build(&flat, &vars);
+        assert_eq!(
+            spec["node"]["values"]["radius"]["top_left"]["variable_id"],
+            "V:top_left"
         );
     }
 

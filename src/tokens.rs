@@ -62,7 +62,9 @@ pub struct Theme {
     pub collection: String,
     pub collection_id: String,
     pub light_mode: String,
+    pub light_mode_id: String,
     pub dark_mode: String,
+    pub dark_mode_id: String,
 }
 
 /// A rendered export.
@@ -87,10 +89,11 @@ struct Var<'a> {
     resolved_type: String,
     collection: String,
     collection_id: String,
-    default_mode: String,
+    default_mode_id: String,
+    mode_names: BTreeMap<String, String>,
     scopes: Vec<String>,
     web: Option<String>,
-    /// Mode name → raw value.
+    /// Mode id → raw value.
     values: BTreeMap<String, &'a Value>,
 }
 
@@ -159,8 +162,8 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             ));
             continue;
         }
-        let Some(default_mode) = row["default_mode"].as_str() else {
-            return Err("the variables read carries no `default_mode` — the figmog serving this mirror is older than this CLI; restart it (kill the pid in owner.json) and retry".into());
+        let Some(default_mode_id) = row["default_mode_id"].as_str() else {
+            return Err("the variables read carries no `default_mode_id` — the figmog serving this mirror is older than this CLI; restart it (kill the pid in owner.json) and retry".into());
         };
         let Some(collection_id) = row["collection_id"].as_str() else {
             return Err("the variables read carries no `collection_id` — the figmog serving this mirror is older than this CLI; restart it (kill the pid in owner.json) and retry".into());
@@ -174,7 +177,17 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
                 resolved_type: text("resolved_type"),
                 collection: text("collection"),
                 collection_id: collection_id.to_string(),
-                default_mode: default_mode.to_string(),
+                default_mode_id: default_mode_id.to_string(),
+                mode_names: row["mode_names"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(id, name)| {
+                                name.as_str().map(|name| (id.clone(), name.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 scopes: row["scopes"]
                     .as_array()
                     .map(|xs| {
@@ -185,7 +198,7 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
                     })
                     .unwrap_or_default(),
                 web: row["code_syntax"]["WEB"].as_str().map(str::to_string),
-                values: row["values_by_mode"]
+                values: row["values_by_mode_id"]
                     .as_object()
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v)).collect())
                     .unwrap_or_default(),
@@ -200,9 +213,9 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
     let modes_of = |v: &Var<'_>| -> Vec<String> {
         match &theme {
             Some(t) if t.collection_id == v.collection_id => {
-                vec![t.light_mode.clone(), t.dark_mode.clone()]
+                vec![t.light_mode_id.clone(), t.dark_mode_id.clone()]
             }
-            _ => vec![v.default_mode.clone()],
+            _ => vec![v.default_mode_id.clone()],
         }
     };
 
@@ -265,14 +278,15 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         let mut vals = Vec::new();
         let mut failed = None;
         for mode in modes_of(v) {
+            let label = v.mode_names.get(&mode).unwrap_or(&mode);
             match v.values.get(&mode).map(|raw| value(raw, kind)) {
                 Some(Ok(val)) => vals.push(val),
                 Some(Err(why)) => {
-                    failed = Some(format!("value in mode {mode:?} {why}: skipped"));
+                    failed = Some(format!("value in mode {label:?} {why}: skipped"));
                     break;
                 }
                 None => {
-                    failed = Some(format!("no value for mode {mode:?}: skipped"));
+                    failed = Some(format!("no value for mode {label:?}: skipped"));
                     break;
                 }
             }
@@ -525,22 +539,25 @@ fn choose_theme(
 ) -> Result<Option<Theme>, String> {
     struct Collection<'a> {
         name: &'a str,
-        modes: BTreeSet<&'a str>,
+        modes: BTreeMap<&'a str, &'a str>,
         defaults: BTreeSet<&'a str>,
     }
-    // Display names need not be unique; only ids identify collections.
+    // Display names need not be unique; only ids identify collections/modes.
     let mut collections: BTreeMap<&str, Collection<'_>> = BTreeMap::new();
     for v in all.values() {
         let c = collections
             .entry(&v.collection_id)
             .or_insert_with(|| Collection {
                 name: &v.collection,
-                modes: BTreeSet::new(),
+                modes: BTreeMap::new(),
                 defaults: BTreeSet::new(),
             });
-        c.modes.extend(v.values.keys().map(String::as_str));
-        c.modes.insert(&v.default_mode);
-        c.defaults.insert(&v.default_mode);
+        c.modes.extend(
+            v.mode_names
+                .iter()
+                .map(|(id, name)| (id.as_str(), name.as_str())),
+        );
+        c.defaults.insert(&v.default_mode_id);
     }
     let names: BTreeSet<&str> = collections.values().map(|c| c.name).collect();
     let like = |mode: &str, word: &str| mode.to_ascii_lowercase().contains(word);
@@ -548,7 +565,7 @@ fn choose_theme(
         Some(name) => {
             let matches: Vec<&str> = collections
                 .iter()
-                .filter(|(_, collection)| collection.name == name)
+                .filter(|(_, c)| c.name == name)
                 .map(|(id, _)| *id)
                 .collect();
             match matches.as_slice() {
@@ -570,7 +587,7 @@ fn choose_theme(
         None => {
             let with_dark: Vec<&str> = collections
                 .iter()
-                .filter(|(_, collection)| collection.modes.iter().any(|m| like(m, "dark")))
+                .filter(|(_, c)| c.modes.values().any(|m| like(m, "dark")))
                 .map(|(id, _)| *id)
                 .collect();
             match with_dark.as_slice() {
@@ -594,36 +611,40 @@ fn choose_theme(
     let selected = &collections[collection_id];
     let collection = selected.name;
     let modes = &selected.modes;
-    let defaults = &selected.defaults;
     let pick = |flag: &Option<String>, word: &str, what: &str| -> Result<Option<String>, String> {
-        if let Some(m) = flag {
-            if !modes.contains(m.as_str()) {
-                return Err(format!(
-                    "collection {collection:?} has no mode named {m:?} (modes: {})",
-                    quoted(modes.iter())
-                ));
-            }
-            return Ok(Some(m.clone()));
-        }
-        let hits: Vec<&&str> = modes.iter().filter(|m| like(m, word)).collect();
+        let hits: Vec<&str> = modes
+            .iter()
+            .filter(|(_, name)| match flag {
+                Some(flag) => **name == flag,
+                None => like(name, word),
+            })
+            .map(|(id, _)| *id)
+            .collect();
         match hits.as_slice() {
             [one] => Ok(Some(one.to_string())),
-            [] => Ok(None),
-            _ => Err(format!(
-                "collection {collection:?} has several modes named like {word:?} ({}) — pass --{what}-mode",
-                quoted(hits.iter())
-            )),
+            [] => match flag {
+                Some(name) => Err(format!(
+                    "collection {collection:?} has no mode named {name:?} (modes: {})",
+                    quoted(modes.values())
+                )),
+                None => Ok(None),
+            },
+            many => match flag {
+                Some(name) => Err(format!(
+                    "collection {collection:?} has several modes named {name:?} (ids: {}) — rename a mode before selecting it with --{what}-mode",
+                    quoted(many.iter())
+                )),
+                None => Err(format!(
+                    "collection {collection:?} has several modes named like {word:?} (ids: {}) — pass --{what}-mode with a unique mode name",
+                    quoted(many.iter())
+                )),
+            },
         }
     };
-    let dark = pick(&opts.dark_mode, "dark", "dark")?.ok_or_else(|| {
-        format!(
-            "collection {collection:?} has no mode named like \"dark\" — pass --dark-mode (modes: {})",
-            quoted(modes.iter())
-        )
-    })?;
+    let dark = pick(&opts.dark_mode, "dark", "dark")?.ok_or_else(|| format!("collection {collection:?} has no mode named like \"dark\" — pass --dark-mode (modes: {})", quoted(modes.values())))?;
     let light = match pick(&opts.light_mode, "light", "light")? {
-        Some(m) => m,
-        None => match defaults.iter().collect::<Vec<_>>().as_slice() {
+        Some(id) => id,
+        None => match selected.defaults.iter().collect::<Vec<_>>().as_slice() {
             [one] => one.to_string(),
             _ => {
                 return Err(format!(
@@ -634,14 +655,23 @@ fn choose_theme(
     };
     if light == dark {
         return Err(format!(
-            "the light and dark modes are both {light:?} — pass --light-mode/--dark-mode"
+            "the light and dark modes are both {:?} — pass --light-mode/--dark-mode",
+            modes.get(light.as_str()).unwrap_or(&light.as_str())
         ));
     }
     Ok(Some(Theme {
         collection: collection.to_string(),
         collection_id: collection_id.to_string(),
-        light_mode: light,
-        dark_mode: dark,
+        light_mode: modes
+            .get(light.as_str())
+            .unwrap_or(&light.as_str())
+            .to_string(),
+        light_mode_id: light,
+        dark_mode: modes
+            .get(dark.as_str())
+            .unwrap_or(&dark.as_str())
+            .to_string(),
+        dark_mode_id: dark,
     }))
 }
 
@@ -755,10 +785,17 @@ mod tests {
         scopes: Value,
         web: Option<&str>,
     ) -> Value {
+        let mode_names: BTreeMap<String, String> = values
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|id| (id.clone(), id.clone()))
+            .collect();
         json!({
             "variable_id": id, "source": "imported", "name": name,
             "resolved_type": ty, "collection": "c", "collection_id": "C:c", "default_mode": "light",
-            "scopes": scopes, "values_by_mode": values,
+            "default_mode_id": "light", "mode_names": mode_names,
+            "scopes": scopes, "values_by_mode": values, "values_by_mode_id": values,
             "code_syntax": web.map(|w| json!({"WEB": w})),
         })
     }
@@ -965,7 +1002,7 @@ mod tests {
             let mut r = row(id, name, "COLOR", alias(to), json!([]), None);
             r["collection"] = json!("semantic");
             r["collection_id"] = json!("C:semantic");
-            r["default_mode"] = json!("default");
+            r["default_mode_id"] = json!("default");
             r
         };
         let v = snap(vec![
@@ -990,7 +1027,7 @@ mod tests {
                 );
                 r["collection"] = json!("semantic");
                 r["collection_id"] = json!("C:semantic");
-                r["default_mode"] = json!("default");
+                r["default_mode_id"] = json!("default");
                 r
             },
             sem("V:5", "plain/alias", "V:4"),
@@ -1017,7 +1054,7 @@ mod tests {
         );
         themed["collection"] = json!("Same");
         themed["collection_id"] = json!("C:theme");
-        themed["default_mode"] = json!("Light");
+        themed["default_mode_id"] = json!("Light");
         let mut other = row(
             "V:other",
             "other",
@@ -1028,7 +1065,7 @@ mod tests {
         );
         other["collection"] = json!("Same");
         other["collection_id"] = json!("C:other");
-        other["default_mode"] = json!("Value");
+        other["default_mode_id"] = json!("Value");
         let vars = snap(vec![themed, other]);
         let out = export_css(&vars, &ExportOptions::default()).unwrap();
         assert_eq!(out.tokens, 2);
@@ -1060,7 +1097,8 @@ mod tests {
         );
         assert!(err.contains("C:other") && err.contains("C:theme"), "{err}");
         let mut both_dark = vars.clone();
-        both_dark["variables"][1]["values_by_mode"]["Dark"] = json!(12);
+        both_dark["variables"][1]["mode_names"]["Dark"] = json!("Dark");
+        both_dark["variables"][1]["values_by_mode_id"]["Dark"] = json!(12);
         let err = export_css(&both_dark, &ExportOptions::default()).unwrap_err();
         assert!(err.contains("several collections"), "{err}");
         assert!(err.contains("C:other") && err.contains("C:theme"), "{err}");

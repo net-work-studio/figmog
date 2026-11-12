@@ -899,15 +899,47 @@ pub fn vars<R: Readable>(
 
         let row = if let Some(var) = variables.get(vid) {
             let collection = variable_collections.get(&var.collection_id);
+            let mode_names: BTreeMap<String, String> = collection
+                .as_ref()
+                .map(|c| {
+                    c.modes
+                        .iter()
+                        .map(|(id, name)| {
+                            (
+                                id.clone(),
+                                if name.is_empty() {
+                                    id.clone()
+                                } else {
+                                    name.clone()
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The presentation map keeps its historical names only when
+            // every key is unique, including modes absent from this variable.
+            // Otherwise use ids for the entire collection so no value is lost.
+            let mut labels: BTreeSet<&str> = BTreeSet::new();
+            let unique_names = mode_names.values().all(|name| labels.insert(name));
             let mut values_by_mode = OwnedValue::object();
+            let mut values_by_mode_id = OwnedValue::object();
             for (mode_id, val_str) in &var.values_by_mode {
-                let mode_name = collection
-                    .as_ref()
-                    .and_then(|c| c.modes.iter().find(|(mid, _)| mid == mode_id))
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_else(|| mode_id.clone());
-                let val = crate::deep_json::from_str(val_str).unwrap_or(OwnedValue(Value::Null));
-                values_by_mode.insert(mode_name, val);
+                let mode_name = if unique_names {
+                    mode_names.get(mode_id).unwrap_or(mode_id).clone()
+                } else {
+                    mode_id.clone()
+                };
+                // Parse each owned value separately: values may be too deep
+                // for a recursive serde_json::Value clone.
+                values_by_mode.insert(
+                    mode_name,
+                    crate::deep_json::from_str(val_str).unwrap_or(OwnedValue(Value::Null)),
+                );
+                values_by_mode_id.insert(
+                    mode_id.clone(),
+                    crate::deep_json::from_str(val_str).unwrap_or(OwnedValue(Value::Null)),
+                );
             }
             let code = code_of(vid);
             let mut scopes = var.scopes.clone();
@@ -926,22 +958,18 @@ pub fn vars<R: Readable>(
                 "resolved_type": var.resolved_type,
                 "collection": collection.as_ref().map(|c| c.name.clone()),
                 "collection_id": var.collection_id,
-                // The collection's default mode, by name (mode id when
-                // the collection doesn't name it), and the variable's
-                // Figma scopes — what `figmog tokens export` needs to
-                // pick each value and unit (NWS-2967).
+                // Names are presentation only; exporters select by id.
                 "default_mode": collection.as_ref().map(|c| {
-                    c.modes
-                        .iter()
-                        .find(|(mid, _)| *mid == c.default_mode_id)
-                        .map(|(_, name)| name.clone())
-                        .unwrap_or_else(|| c.default_mode_id.clone())
+                    mode_names.get(&c.default_mode_id).unwrap_or(&c.default_mode_id).clone()
                 }),
+                "default_mode_id": collection.as_ref().map(|c| c.default_mode_id.clone()),
+                "mode_names": mode_names,
                 "scopes": scopes,
                 "sites": sites,
                 "observed": observed,
             }));
             row.insert("values_by_mode".to_string(), values_by_mode);
+            row.insert("values_by_mode_id".to_string(), values_by_mode_id);
             row
         } else {
             OwnedValue(json!({
