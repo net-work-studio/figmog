@@ -3178,7 +3178,7 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
         .clone();
     let direct_vars_json: Value = serde_json::from_slice(&direct_vars).unwrap();
     let direct_tokens = common::command()
-        .args(["tokens", "export", "--db"])
+        .args(["tokens", "export", "--stdout", "--db"])
         .arg(&db)
         .assert()
         .success()
@@ -3222,7 +3222,7 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
     // Token export shares the vars read, but must still render CSS after
     // socket routing rather than print the variables response as JSON.
     let routed_tokens = common::command()
-        .args(["tokens", "export"])
+        .args(["tokens", "export", "--stdout"])
         .current_dir(dir.path())
         .assert()
         .success()
