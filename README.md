@@ -49,8 +49,12 @@ $ figmog auth logout       # remove the saved token
 `FIGMA_TOKEN` still overrides the saved token for CI or another account.
 Unset it to use your saved credential; an explicitly empty `FIGMA_TOKEN`
 disables saved credentials for offline use. Logout removes only the saved
-credential, so an environment override remains active. Restart a running
-MCP server after changing credentials.
+credential, so an environment override remains active. The shared
+background figmog (below) picks up a changed credential when it restarts:
+it exits on its own once no agent or command has used it for 10 minutes,
+and the next `figmog serve` starts a fresh one. To apply a change sooner,
+close every agent session in the repository, then wait for it to exit or
+send `kill -TERM <pid>` for a graceful drain (the pid is in `.git/figmog/owner.json`).
 
 For a password manager or other noninteractive secret source, pipe its
 output to `figmog auth login --token-stdin`. The token is never accepted
@@ -109,17 +113,49 @@ can drop the file argument. Read commands never touch the network and print
 JSON on stdout; failures print `{"error": ...}` on stderr and exit 1. Every
 command is documented in [`docs/SPEC.md`](docs/SPEC.md) §10.
 
-After a successful `pull` into the default `.figmog/` directory inside a
-Git repository, figmog adds `.figmog/` to the closest existing `.gitignore`
-between the current directory and the repository root, or creates the
-root `.gitignore` if none exists. Existing ignore rules are respected.
-Custom `--db` locations are left to you. A failure to update `.gitignore`
-prints a warning and keeps the successful pull result.
+### Where mirrors live, and `figmog.toml`
 
-Commit that ignore rule to keep mirrors out of future commits. Ignore
-rules do not untrack files already committed, and ignored files are not
-copied between worktrees: each worktree keeps its own mirror. Your saved
-credential is shared independently through the system credential store.
+figmog works per *project*: the nearest directory with a `figmog.toml`
+(searching up from the current directory, but not past the Git top level),
+else the Git top level, else the current directory. A project can name the
+Figma file(s) it mirrors:
+
+```toml
+# figmog.toml — commit this
+[files]
+default = "https://www.figma.com/design/<key>/<name>"   # or a bare file key
+# design-system = "<key-or-url>"                        # named entries (reserved)
+```
+
+`default` is the file every command uses when you don't pass one; without
+it, `.figmog/current` (the last pulled file) still applies. A
+`figmog.local.toml` beside it, in the same format, overrides entries for
+your machine only. Other tables and keys are ignored, so later settings
+won't break older binaries. A malformed file is an error naming the file
+and line (`figmog.toml:3: ...`).
+
+Inside Git, mirrors live in the repository's Git directory,
+`<git-common-dir>/figmog/<key>/db` (for example `.git/figmog/`), shared by
+every worktree of the repository, so a new worktree needs no re-pull. Git
+never tracks that directory. Outside Git, mirrors live in the project's
+`.figmog/<key>/db`. The per-checkout `.figmog/` still holds `current`.
+
+Mirrors that earlier versions put in a checkout's `.figmog/<key>/db` keep
+working in place, with a "migration pending" warning on stderr. Run
+`figmog migrate` to move them into the shared root. It holds both store locks
+(so it fails cleanly while `figmog serve` has the mirror open), never
+overwrites an existing mirror, and can be rerun to finish an interrupted
+move. If a file has a mirror in both places, figmog stops with an error
+naming both paths rather than picking one.
+
+After a successful `pull` inside a Git repository, figmog adds `.figmog/`
+(and, in a project with a `figmog.toml`, `figmog.local.toml`) to the
+closest existing `.gitignore` between the project root and the repository
+root, or creates the root `.gitignore` if none exists. Existing ignore
+rules are respected. Custom `--db` locations are left to you. A failure to
+update `.gitignore` prints a warning and keeps the successful pull result.
+Commit that ignore rule. Your saved credential is shared independently
+through the system credential store.
 
 ## figmog against the API
 
@@ -138,15 +174,45 @@ free.
 
 ## What the mirror gives an agent
 
+### One background figmog per repository
+
+Every agent's `figmog serve` is a thin stdio relay. The first one starts a
+detached *background figmog* for the repository, which opens the mirrors,
+watches Figma and pulls each changed file once, for every worktree and every
+agent at the same time. Each further `figmog serve`, in any worktree,
+connects to that same process, so ten agents in three worktrees cost one
+poll loop and one pull per edit, with no lock errors. Closing an agent's
+session never affects the others. The background figmog exits on its own
+after 10 minutes with no clients, and the next `figmog serve` starts it
+again, which costs one reconciliation pull per file. Agent setup stays
+`figmog serve`. Its log is `.git/figmog/owner.log` (outside Git,
+`.figmog/owner.log`).
+
+Each relay keeps its worktree's context: calls without a `file` go to that
+worktree's `figmog.toml` default (or the relay's own startup file), never
+to another worktree's. Watch, interval and desktop settings come from the
+`figmog serve` that started the background figmog; a later one asking for
+different settings prints a note on stderr saying which were not applied.
+Two repositories get two independent background processes. A relay and a
+background figmog from different figmog versions refuse to talk and say
+how to let the old one exit. See `docs/SPEC.md` §6b.
+
 ### Reads work while the server runs
 
-`figmog serve` owns the store, and it listens on a unix socket at
-`.figmog/serve.sock`. Read commands, `figmog tools` and `figmog call` connect
-there first and answer from the running server's live view; with no server
-listening they open the store directly. `--no-socket` forces direct mode on
-both sides. `pull` is a writer and always opens the store itself, so while a
-server runs its error points at `figmog call figmog_sync`, which reaches the
-process that owns the store. Open/sync on the server acknowledge a background
+The background figmog owns the stores and listens on a unix socket under
+a verified private `$XDG_RUNTIME_DIR/figmog/` when available, otherwise
+`/tmp/figmog-<uid>/`, published in `.git/figmog/owner.json`. Read commands,
+`figmog tools` and `figmog call` connect there first and answer from its
+live view; with no background figmog running they open the store directly.
+`--no-socket` forces direct mode (and makes `figmog serve` serve in its own
+process, without the shared background figmog). The writers go through the server too: `figmog pull` (with
+`--fresh`, `--from-file` or `--geometry`) and `figmog import-variables` become
+operations of the running server, and return only once the change is
+committed and visible, with the same output as without a server. Files are
+read in your checkout and sent as content; an invalid file is rejected before
+anything changes. If the server dies mid-operation the command says "outcome
+unknown" with the operation id and does not retry. For agents, open/sync on
+the server acknowledge a background
 job immediately; check `figmog call figmog_status` (or `figmog_files`) for
 `ready`, job state, last successful version/churn, and errors. Reads continue
 using the last completed mirror while a pull runs. Direct sync without a
@@ -269,6 +335,23 @@ Figma's Tier-1 budget of ~10 requests a minute, those 5,000 calls take about
 The harness itself was retired from the binary in v0.0.1's slim-down and
 lives in the repo history: `docs/history/2026-08-16-figmog-bench.md`.
 
+**Cold CLI reads** (NWS-2941). Every CLI command is a fresh process that
+opens the store. After a large pull figmog compacts the store (moves its
+writes out of fjall's journal), so that open no longer replays the whole
+journal. Synthetic 100,001-node file, best of 3 cold processes, 4-core
+Linux, `cargo test --test compact -- --ignored --nocapture`:
+
+| command | before compaction | after |
+|---|---|---|
+| `figmog path 0:1` | 1.328s | 0.004s |
+| `figmog get 500:3` | 1.327s | 0.004s |
+| `figmog status` | 1.347s | 0.084s |
+| `figmog search "copy number 7"` | 1.334s | 0.076s |
+| `figmog vars` | 1.478s | 0.220s |
+
+The journal goes from 93.2 MB to nothing; outputs are byte-identical.
+`FIGMOG_NO_COMPACT=1` turns compaction off (`docs/SPEC.md` §4).
+
 </details>
 
 ## Install
@@ -366,9 +449,10 @@ job succeeds. No custom repository secrets are required.
 - macOS and Linux only. The control plane is a unix domain socket and the
   code uses unix filesystem APIs directly, so there is no Windows build.
 - One process may open a store at a time (fjall is single-writer).
-  `figmog serve` holds that handle for its life. Other commands reach it over
-  the socket instead, but `--no-socket`, or a `--db` naming the store `serve`
-  owns, still gets the plain `store is locked` error.
+  The background figmog holds that handle for its life. Other commands, writers
+  included, reach it over the socket instead; `--no-socket`, or a `--db`
+  naming the store `serve` owns, gets a `store is locked by figmog serve (pid
+  …, socket …)` error naming the owner.
 
 ## License
 

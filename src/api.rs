@@ -197,6 +197,10 @@ pub(crate) fn error_from_status(status: u16, retry_after: Option<&str>, msg: Str
     }
 }
 
+/// Debug builds only: base URL for serve's sessions instead of
+/// `https://api.figma.com` (tests' synthetic Figma server).
+pub(crate) const API_BASE_ENV: &str = "FIGMOG_API_BASE";
+
 /// Blocking `ureq` implementation against api.figma.com.
 pub struct UreqApi {
     token: String,
@@ -209,6 +213,20 @@ impl UreqApi {
     /// personal access token (saved credential or `FIGMA_TOKEN`).
     pub fn new(token: String) -> Self {
         Self::with_base_url(token, "https://api.figma.com".into())
+    }
+    /// The client serve's sessions use: the real API, except that debug
+    /// builds honor [`API_BASE_ENV`] so end-to-end tests can point a
+    /// detached background owner (NWS-2953) at a synthetic Figma server.
+    /// Release builds ignore it: a token is never sent elsewhere by an
+    /// environment variable.
+    pub(crate) fn for_sessions(token: String) -> Self {
+        #[cfg(debug_assertions)]
+        if let Ok(base) = std::env::var(API_BASE_ENV)
+            && !base.is_empty()
+        {
+            return Self::with_base_url(token, base);
+        }
+        Self::new(token)
     }
     /// `base_url` override for tests / proxies.
     pub fn with_base_url(token: String, base_url: String) -> Self {

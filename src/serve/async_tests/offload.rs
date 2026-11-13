@@ -398,6 +398,7 @@ fn queued_images_stay_bounded_across_disconnected_requesters_and_recover() {
                 Duration::from_secs(3600),
                 name,
                 args,
+                sessions::SessionResolution::ExistingOnly,
             )
         });
         let reply = mcp::dispatch_message(

@@ -925,7 +925,9 @@ fn import_variables_output_shape_is_the_variable_count_alone() {
 /// `figmog_images`), every one `source: "local"`.
 #[test]
 fn tools_output_shape_is_name_source_cacheable_rows() {
+    let dir = tempfile::tempdir().unwrap();
     let out = common::command()
+        .current_dir(dir.path())
         .args(["tools", "--no-upstream"])
         .assert()
         .success();

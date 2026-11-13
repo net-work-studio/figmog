@@ -2,6 +2,7 @@
 //! `figmog import-variables` — every tool `figmog serve` would expose,
 //! reachable without an MCP client.
 
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
@@ -12,7 +13,7 @@ use crate::proxy;
 use crate::upstream::{HttpUpstream, UpstreamMcp};
 
 use super::pull::do_pull;
-use super::{Db, open_store_checked, write_json};
+use super::{Db, write_json};
 
 /// `figmog import-variables <export.json>`: replace the stored variable
 /// snapshot (NWS-2961). The file is read, parsed and validated before the
@@ -26,16 +27,8 @@ pub(super) fn cmd_import_variables(
     allow_empty: bool,
     dry_run: bool,
 ) -> Result<(), String> {
+    let (_, parsed) = load_import(&path)?;
     let invalid = |e: String| format!("invalid variables file {}: {e}", path.display());
-    let bytes = std::fs::read(&path).map_err(|e| invalid(e.to_string()))?;
-    let v: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
-    crate::vars::check_import_entries(&v).map_err(|e| invalid(e.to_string()))?;
-    let parsed = crate::vars::parse_variables_snapshot(
-        &v,
-        crate::vars::SOURCE_FILE,
-        crate::vars::snapshot_digest(&bytes),
-    )
-    .map_err(|e| invalid(e.to_string()))?;
 
     let imported = parsed
         .recs
@@ -55,7 +48,7 @@ pub(super) fn cmd_import_variables(
             return write_json(&json!({"imported": imported, "removed": 0, "removed_ids": []}));
         }
     }
-    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let mut st = db.open(|path| crate::open_store!(path))?;
     let prior = st.rtx(|(_, _, _, _, variables, collections, ..)| {
         crate::store::collect_variable_ids(&variables, &collections)
     });
@@ -78,8 +71,54 @@ pub(super) fn cmd_import_variables(
                 .to_string(),
         ));
     }
-    crate::store::replace_variable_snapshot(&mut st, &prior, &parsed.recs, parsed.snapshot);
-    write_json(&json!({"imported": imported, "removed": removed_ids.len()}))
+    let churn =
+        crate::store::replace_variable_snapshot(&mut st, &prior, &parsed.recs, parsed.snapshot);
+    let output = write_json(&json!({"imported": imported, "removed": removed_ids.len()}));
+    if churn.wrote() {
+        st.close_and_compact();
+    }
+    output
+}
+
+/// `import-variables` through the running serve that owns the store
+/// (NWS-2963): the file is read and fully validated here first (the direct
+/// path's errors, nothing sent for an invalid file), then its exact text is
+/// sent as content — the snapshot digest is over those bytes. Serve
+/// validates again, replaces the snapshot on the file's worker and answers
+/// once it committed and was published; the output is the direct path's.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn cmd_import_variables_routed(
+    db: &Db,
+    route: &super::socket::Route,
+    client: super::socket::Client,
+    key: &str,
+    path: PathBuf,
+    allow_empty: bool,
+    dry_run: bool,
+) -> Result<(), String> {
+    let (bytes, _) = load_import(&path)?;
+    let content = String::from_utf8(bytes)
+        .map_err(|e| format!("invalid variables file {}: {e}", path.display()))?;
+    let args = json!({"file": key, "db_bytes": db.path.as_os_str().as_bytes(), "content": content, "name": path.display().to_string(), "allow_empty": allow_empty, "dry_run": dry_run});
+    let done =
+        super::socket::write_over(route, client, crate::serve::writes::IMPORT_VARIABLES, args)?;
+    write_json(&done["result"])
+}
+
+/// Read, parse and validate a variables export before any store is opened,
+/// so an unreadable or invalid file leaves the previous snapshot untouched.
+fn load_import(path: &std::path::Path) -> Result<(Vec<u8>, crate::vars::ParsedSnapshot), String> {
+    let invalid = |e: String| format!("invalid variables file {}: {e}", path.display());
+    let bytes = std::fs::read(path).map_err(|e| invalid(e.to_string()))?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    crate::vars::check_import_entries(&v).map_err(|e| invalid(e.to_string()))?;
+    let parsed = crate::vars::parse_variables_snapshot(
+        &v,
+        crate::vars::SOURCE_FILE,
+        crate::vars::snapshot_digest(&bytes),
+    )
+    .map_err(|e| invalid(e.to_string()))?;
+    Ok((bytes, parsed))
 }
 
 /// Probe `upstream_url` unless `no_upstream`, matching `figmog serve`'s own
@@ -163,17 +202,20 @@ pub(super) fn cmd_call(
         // internally unions this with whatever's already stored (spec §4
         // stickiness), so a plain `figmog_sync` still re-requests geometry
         // for a mirror that was ever pulled with `--geometry`.
-        let result = do_pull(db, None, None, false, false)
-            .map(|(churn, _name, _version)| serde_json::to_value(&churn).unwrap_or_default())
-            .map_err(|e| e.to_string());
-        return print_call_result(result);
+        let (churn, _, _, compaction) =
+            do_pull(db, None, None, false, false).map_err(|e| e.to_string())?;
+        let output = print_call_result(serde_json::to_value(churn).map_err(|e| e.to_string()));
+        if let Some(compaction) = compaction {
+            compaction.run();
+        }
+        return output;
     }
 
     let (mut upstream, upstream_status) = attach_upstream(upstream_url, no_upstream);
-    let st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let st = db.open_existing(|path| crate::open_store!(path))?;
 
     let result: Result<Value, String> = if proxy::is_local_tool(&tool) {
-        match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, &r)) {
+        match st.rtx(|r| dispatch::dispatch_read_tool(&tool, &args, upstream_status, &r, None)) {
             Some(r) => r,
             None => Err(format!("unknown tool: {tool}")),
         }
