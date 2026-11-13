@@ -26,6 +26,7 @@ mod migrate;
 mod pull;
 mod socket;
 mod store_lock;
+mod tokens;
 
 pub(crate) use store_lock::Compaction;
 use store_lock::{OwnedStore, StoreOwner};
@@ -236,6 +237,11 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Design tokens from the imported variable snapshot.
+    Tokens {
+        #[command(subcommand)]
+        command: tokens::TokensCommand,
+    },
     /// Node counts by type and page, table totals, text-node count, max tree depth.
     Stats,
     /// Ancestor chain root→node for one id.
@@ -278,6 +284,10 @@ enum Cmd {
         #[arg(long, default_value_t = crate::query::DEFAULT_AT_LIMIT)]
         limit: usize,
     },
+    /// Binding-aware spec of an auto-layout subtree: layout and values,
+    /// each value as its bound token (with the `tokens export` CSS name)
+    /// or flagged untokenized; out-of-scope cases listed as unsupported.
+    Spec { id: String },
     /// Download node renders and/or fill images to --out, caching by file version.
     ///
     /// With --db, export cached images only: stores do not record a file key.
@@ -542,7 +552,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 } else {
                     result
                 };
-                return write_json(&crate::deep_json::OwnedValue(result));
+                let result = crate::deep_json::OwnedValue(result);
+                return write_read(&cli.cmd, &result);
             }
         }
     }
@@ -628,8 +639,19 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // the query runs through the same `ReadCommand::execute` arm
             // every tool adapter uses (NWS-2902).
             let st = db.open_existing(|path| crate::open_store!(path))?;
-            write_json(&crate::deep_json::OwnedValue(st.rtx(|r| read.execute(&r))?))
+            let result = crate::deep_json::OwnedValue(st.rtx(|r| read.execute(&r))?);
+            drop(st);
+            write_read(&other, &result)
         }
+    }
+}
+
+/// Print a read command's result: JSON for every read, except `tokens`,
+/// which renders its `figmog_vars` read as CSS (NWS-2967).
+fn write_read(cmd: &Cmd, result: &Value) -> Result<(), String> {
+    match cmd {
+        Cmd::Tokens { command } => tokens::write_export(command, result),
+        _ => write_json(result),
     }
 }
 
@@ -878,6 +900,8 @@ fn read_command(cmd: &Cmd) -> Option<ReadCommand> {
             under: under.clone(),
             limit: *limit,
         },
+        Cmd::Spec { id } => ReadCommand::Spec { id: id.clone() },
+        Cmd::Tokens { .. } => tokens::read(),
         Cmd::Version
         | Cmd::Auth { .. }
         | Cmd::Pull { .. }
@@ -1464,6 +1488,7 @@ mod tests {
                 "figmog_at",
                 json!({"x": 1.5, "y": 2.0, "page": "0:1", "limit": crate::query::DEFAULT_AT_LIMIT}),
             ),
+            (&["spec", "1:1"], "figmog_spec", json!({"id": "1:1"})),
         ];
         for (argv, tool, want) in cases {
             let cli =

@@ -374,7 +374,7 @@ fn desktop_tools_appear_and_disappear_with_notifications_only_to_initialized_cli
     assert_eq!(server.next_stdio(), list_changed());
     assert_eq!(server.next_socket(0), list_changed());
     let names = server.tool_names(4);
-    assert_eq!(names.len(), 22);
+    assert_eq!(names.len(), 23);
     assert_eq!(names.last().unwrap(), "get_code");
     assert_eq!(server.upstream_status(5), "connected");
     let response = server.stdio(call(json!(6), "get_code"));
@@ -400,7 +400,7 @@ fn desktop_tools_appear_and_disappear_with_notifications_only_to_initialized_cli
     server.assert_socket_silent(1);
     let response = server.socket(1, request(json!(1), "tools/list", json!({})));
     assert_eq!(response["id"], 1);
-    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 21);
+    assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 22);
     server.assert_socket_silent(1);
     server.finish();
 }
@@ -570,7 +570,7 @@ fn a_failed_call_to_a_live_desktop_changes_nothing() {
     }
     server.assert_stdio_silent(Duration::from_millis(100));
     assert_eq!(server.upstream_status(3), "connected");
-    assert_eq!(server.tool_names(4).len(), 22);
+    assert_eq!(server.tool_names(4).len(), 23);
     server.finish();
 }
 

@@ -2,6 +2,22 @@
 
 mod common;
 
+#[test]
+fn token_and_spec_reads_do_not_create_missing_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("missing");
+    for args in [["tokens", "export"], ["spec", "1:1"]] {
+        common::command()
+            .arg("--db")
+            .arg(&db)
+            .args(args)
+            .assert()
+            .failure()
+            .code(1);
+        assert!(!db.exists(), "{args:?} initialized a missing store");
+    }
+}
+
 /// Materialize fixture_v1 into a DB via `pull --from-file` and return the
 /// (tempdir, db-arg) pair every read command needs.
 fn fixture_db() -> (tempfile::TempDir, String) {
@@ -920,11 +936,13 @@ fn import_variables_output_shape_is_the_variable_count_alone() {
 
 /// M6 (spec §4 debt ledger): `figmog tools`' JSON output shape — an array
 /// with one `{name, source, cacheable}` row per tool, nothing more.
-/// `--no-upstream` keeps this offline and deterministic: exactly the 21
+/// `--no-upstream` keeps this offline and deterministic: exactly the 22
 /// local `figmog_*` tools (v0.0.2 §2 added `figmog_subtree`, §5 added
-/// `figmog_images`), every one `source: "local"`.
+/// `figmog_images`, NWS-2968 `figmog_spec`), every one `source: "local"`.
 #[test]
 fn tools_output_shape_is_name_source_cacheable_rows() {
+    // A running project owner supplies its own registry even when this CLI
+    // asks for --no-upstream. Keep this direct-registry test isolated.
     let dir = tempfile::tempdir().unwrap();
     let out = common::command()
         .current_dir(dir.path())
@@ -933,7 +951,7 @@ fn tools_output_shape_is_name_source_cacheable_rows() {
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     let rows = v.as_array().expect("tools output is a JSON array");
-    assert_eq!(rows.len(), 21, "21 local figmog_* tools, no upstream");
+    assert_eq!(rows.len(), 22, "22 local figmog_* tools, no upstream");
     for row in rows {
         let obj = row.as_object().expect("each row is a JSON object");
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
@@ -2461,6 +2479,7 @@ fn direct_cli_and_call_print_identical_reads_for_every_local_tool() {
         "figmog_text",
         "figmog_where",
         "figmog_at",
+        "figmog_spec",
     ]
     .into();
     assert_eq!(tools_seen, local_reads);

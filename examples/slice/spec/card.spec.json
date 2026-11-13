@@ -1,0 +1,341 @@
+{
+  "node": {
+    "children": [
+      {
+        "children": [],
+        "id": "1:2",
+        "layout": {
+          "size": {
+            "height": 28,
+            "width": 272
+          },
+          "sizing": {
+            "horizontal": "fill",
+            "vertical": "hug"
+          }
+        },
+        "name": "Title",
+        "type": "TEXT",
+        "values": {
+          "fill": [
+            {
+              "css": "--color-text-primary",
+              "raw": "#1a1a1f",
+              "token": "text/primary",
+              "variable_id": "VariableID:2:2"
+            }
+          ],
+          "typography": {
+            "font_family": {
+              "css": null,
+              "raw": "Inter",
+              "token": "font/family/sans",
+              "variable_id": "VariableID:1:14"
+            },
+            "font_size": {
+              "css": "--font-size-title",
+              "raw": 20,
+              "token": "font/size/title",
+              "variable_id": "VariableID:1:11"
+            },
+            "font_weight": {
+              "css": "--font-weight-bold",
+              "raw": 700,
+              "token": "font/weight/bold",
+              "variable_id": "VariableID:1:12"
+            },
+            "letter_spacing": {
+              "raw": 0,
+              "untokenized": true
+            },
+            "line_height": {
+              "raw": 28,
+              "untokenized": true
+            }
+          }
+        }
+      },
+      {
+        "children": [
+          {
+            "children": [],
+            "id": "1:4",
+            "layout": {
+              "size": {
+                "height": 24,
+                "width": 240
+              },
+              "sizing": {
+                "horizontal": "fill",
+                "vertical": "hug"
+              }
+            },
+            "name": "Body",
+            "type": "TEXT",
+            "values": {
+              "fill": [
+                {
+                  "matches": [
+                    {
+                      "css": "--ink-900",
+                      "token": "ink/900",
+                      "variable_id": "VariableID:1:3"
+                    },
+                    {
+                      "css": "--color-text-primary",
+                      "token": "text/primary",
+                      "variable_id": "VariableID:2:2"
+                    }
+                  ],
+                  "raw": "#1a1a1f",
+                  "untokenized": true
+                }
+              ],
+              "typography": {
+                "font_family": {
+                  "matches": [
+                    {
+                      "css": null,
+                      "token": "font/family/sans",
+                      "variable_id": "VariableID:1:14"
+                    }
+                  ],
+                  "raw": "Inter",
+                  "untokenized": true
+                },
+                "font_size": {
+                  "css": "--font-size-body",
+                  "raw": 16,
+                  "token": "font/size/body",
+                  "variable_id": "VariableID:1:10"
+                },
+                "font_weight": {
+                  "raw": 400,
+                  "untokenized": true
+                },
+                "letter_spacing": {
+                  "raw": 0,
+                  "untokenized": true
+                },
+                "line_height": {
+                  "css": "--font-line-body",
+                  "raw": 24,
+                  "token": "font/line/body",
+                  "variable_id": "VariableID:1:13"
+                }
+              }
+            }
+          },
+          {
+            "children": [],
+            "id": "1:5",
+            "layout": {
+              "size": {
+                "height": 16,
+                "width": 24
+              },
+              "sizing": {
+                "horizontal": "fixed",
+                "vertical": "fixed"
+              }
+            },
+            "name": "Badge",
+            "type": "RECTANGLE",
+            "values": {
+              "fill": [
+                {
+                  "css": "--color-brand",
+                  "raw": "#0066cc",
+                  "token": "brand",
+                  "variable_id": "VariableID:2:3"
+                }
+              ],
+              "radius": {
+                "bottom_left": {
+                  "raw": 4,
+                  "untokenized": true
+                },
+                "bottom_right": {
+                  "raw": 4,
+                  "untokenized": true
+                },
+                "top_left": {
+                  "raw": 4,
+                  "untokenized": true
+                },
+                "top_right": {
+                  "raw": 4,
+                  "untokenized": true
+                }
+              }
+            }
+          }
+        ],
+        "id": "1:3",
+        "layout": {
+          "align": {
+            "counter": "center",
+            "primary": "center"
+          },
+          "direction": "horizontal",
+          "gap": {
+            "matches": [
+              {
+                "css": "--spacing-2",
+                "token": "space/2",
+                "variable_id": "VariableID:1:8"
+              }
+            ],
+            "raw": 8,
+            "untokenized": true
+          },
+          "padding": {
+            "bottom": {
+              "raw": 0,
+              "untokenized": true
+            },
+            "left": {
+              "raw": 0,
+              "untokenized": true
+            },
+            "right": {
+              "raw": 0,
+              "untokenized": true
+            },
+            "top": {
+              "raw": 0,
+              "untokenized": true
+            }
+          },
+          "size": {
+            "height": 24,
+            "width": 272
+          },
+          "sizing": {
+            "horizontal": "fill",
+            "vertical": "hug"
+          }
+        },
+        "name": "Meta row",
+        "type": "FRAME",
+        "values": {}
+      }
+    ],
+    "id": "1:1",
+    "layout": {
+      "align": {
+        "counter": "start",
+        "primary": "start"
+      },
+      "direction": "vertical",
+      "gap": {
+        "css": "--spacing-4",
+        "raw": 16,
+        "token": "space/4",
+        "variable_id": "VariableID:1:7"
+      },
+      "padding": {
+        "bottom": {
+          "css": "--spacing-4",
+          "raw": 16,
+          "token": "space/4",
+          "variable_id": "VariableID:1:7"
+        },
+        "left": {
+          "raw": 24,
+          "untokenized": true
+        },
+        "right": {
+          "raw": 24,
+          "untokenized": true
+        },
+        "top": {
+          "css": "--spacing-4",
+          "raw": 16,
+          "token": "space/4",
+          "variable_id": "VariableID:1:7"
+        }
+      },
+      "size": {
+        "height": 100,
+        "width": 320
+      },
+      "sizing": {
+        "horizontal": "fixed",
+        "vertical": "hug"
+      }
+    },
+    "name": "Card",
+    "type": "FRAME",
+    "values": {
+      "fill": [
+        {
+          "css": "--surface",
+          "raw": "#fafafc",
+          "token": "surface",
+          "variable_id": "VariableID:2:1"
+        }
+      ],
+      "radius": {
+        "bottom_left": {
+          "css": "--radius-md",
+          "raw": 12,
+          "token": "radius/md",
+          "variable_id": "VariableID:1:6"
+        },
+        "bottom_right": {
+          "css": "--radius-md",
+          "raw": 12,
+          "token": "radius/md",
+          "variable_id": "VariableID:1:6"
+        },
+        "top_left": {
+          "css": "--radius-md",
+          "raw": 12,
+          "token": "radius/md",
+          "variable_id": "VariableID:1:6"
+        },
+        "top_right": {
+          "css": "--radius-md",
+          "raw": 12,
+          "token": "radius/md",
+          "variable_id": "VariableID:1:6"
+        }
+      },
+      "stroke": [
+        {
+          "css": "--border-subtle",
+          "raw": "#e0e3e6",
+          "token": "border/subtle",
+          "variable_id": "VariableID:1:5"
+        }
+      ],
+      "stroke_weight": {
+        "css": "--stroke-thin",
+        "raw": 1,
+        "token": "stroke/thin",
+        "variable_id": "VariableID:1:9"
+      }
+    }
+  },
+  "tokens_snapshot": {
+    "collections": 2,
+    "css_unavailable": null,
+    "digest": "fnv1a64:fd631e535712b153",
+    "exported_at": "2026-11-02T09:00:00Z",
+    "format": "bare",
+    "format_version": "1",
+    "source": "file",
+    "state": "current",
+    "theme": {
+      "collection": "Theme",
+      "collection_id": "VariableCollectionId:2:0",
+      "dark_mode": "Dark",
+      "dark_mode_id": "2:1",
+      "light_mode": "Light",
+      "light_mode_id": "2:0"
+    },
+    "variables": 17
+  },
+  "unsupported": []
+}
