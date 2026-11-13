@@ -11,6 +11,14 @@
 //! (`store::stale_image_ids` / `store::evict_stale_cache`) — a repeat
 //! request against an unchanged file spends zero Figma API calls.
 //!
+//! **Opt-in render reuse (NWS-2958).** With [`RenderPolicy::reuse`] a
+//! render is cached against its [`render_fingerprint`] instead — the
+//! node's subtree plus the render settings — in the `render_index` /
+//! `render_blobs` tables, and stays a hit across file versions until the
+//! fingerprint changes. Those rows are outside the version-change
+//! eviction; [`plan_render_eviction`] removes orphans and enforces a byte
+//! quota instead. Off by default: see `docs/SPEC.md` §15.
+//!
 //! **Two-step call shape.** [`scan`] (read-only, against already-open
 //! table readers) then [`resolve`] (network + cache-write, against
 //! `&mut KeyedStream<Id, Rec, P>`) rather than one function that does
@@ -35,14 +43,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fold::pipeline::terminal::TableReader;
+use fold::pipeline::terminal::{MultimapReader, TableReader};
 use fold::pipeline::{Keyed, Push};
 use fold::stream::{KeyedStream, Readable};
 use serde_json::{Value, json};
 
 use crate::api::{ApiError, FigmaApi};
+use crate::assets::sha256_hex;
 use crate::ident::normalize_node_ref;
-use crate::model::{FileMeta, Id, ImageBlobRec, ImagePinRec, NodeRec, Rec};
+use crate::model::{
+    FileMeta, Id, ImageBlobRec, ImagePinRec, NodeRec, Rec, RenderBlobRec, RenderIndexRec,
+};
 
 /// [`ImageItem::kind`] for a node render.
 pub const RENDER: &str = "render";
@@ -59,6 +70,419 @@ pub const FILL: &str = "fill";
 /// available. Without either, they return an upgrade-specific error.
 /// Fill rows never need a marker.
 pub const RENDER_PIN_GENERATION: u32 = 2;
+
+/// Version of the render fingerprint scheme (NWS-2958), folded into every
+/// fingerprint and stored on every [`RenderIndexRec`]. Bump it whenever
+/// what [`render_fingerprint`] hashes changes: every row stored under an
+/// older scheme then reads as an orphan and is evicted, never served.
+pub const RENDER_FINGERPRINT_SCHEME: u32 = 1;
+
+/// Default hard byte quota for fingerprint-indexed render bytes
+/// (`render_blobs`, NWS-2958): 256 MiB. Counts each distinct blob once.
+pub const RENDER_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How one image request treats cached renders (NWS-2958). The default
+/// is exactly the pre-NWS-2958 behavior: renders are cached per file
+/// version only, and nothing is written to or read from the
+/// fingerprint-indexed render cache. Explicit refresh additionally
+/// invalidates any fingerprinted copies of the refreshed identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderPolicy {
+    /// Opt in to cross-version render reuse: a render stays a hit for as
+    /// long as its node's [`render_fingerprint`] is unchanged, whatever
+    /// else in the file was edited. Off by default until the rendering
+    /// contract is confirmed against Figma's images endpoint.
+    pub reuse: bool,
+    /// Ignore every cached render (version-pinned and fingerprinted) and
+    /// refetch, replacing or invalidating both cache representations
+    /// after success. Fills are content-addressed and unaffected.
+    pub refresh: bool,
+    /// Hard byte quota for fingerprint-indexed render bytes, enforced
+    /// after every opted-in request that wrote or found something to
+    /// evict.
+    pub max_bytes: u64,
+}
+
+impl Default for RenderPolicy {
+    fn default() -> Self {
+        RenderPolicy {
+            reuse: false,
+            refresh: false,
+            max_bytes: RENDER_CACHE_MAX_BYTES,
+        }
+    }
+}
+
+/// The read handles [`scan`]/[`scan_split`] need, borrowed from one
+/// `st.rtx(..)` reader tuple at a concrete `open_store!` site (see this
+/// module's doc comment for why the tuple itself can't be passed).
+pub struct ScanReaders<'r, 'a, R: Readable> {
+    pub nodes: &'r TableReader<'a, R, String, NodeRec>,
+    pub children: &'r MultimapReader<'a, R, String, (u32, String)>,
+    pub meta: &'r TableReader<'a, R, u8, FileMeta>,
+    pub images: &'r TableReader<'a, R, String, ImageBlobRec>,
+    pub pins: &'r TableReader<'a, R, String, ImagePinRec>,
+    pub render_index: &'r TableReader<'a, R, String, RenderIndexRec>,
+    pub render_blobs: &'r TableReader<'a, R, String, RenderBlobRec>,
+}
+
+/// Bind a [`ScanReaders`] named `$r` from one `st.rtx(..)` reader tuple
+/// (`figmog_pipeline!`'s top-level order — see `dispatch::RootReaders`)
+/// and evaluate `$body` with it: the one place that knows which tuple
+/// positions [`scan`] reads.
+#[macro_export]
+macro_rules! with_scan_readers {
+    ($tuple:expr, |$r:ident| $body:expr) => {{
+        let (
+            (nodes, children, ..),
+            _,
+            _,
+            _,
+            _,
+            _,
+            meta,
+            _,
+            _,
+            images,
+            pins,
+            _,
+            render_index,
+            render_blobs,
+        ) = $tuple;
+        let $r = $crate::images::ScanReaders {
+            nodes: &nodes,
+            children: &children,
+            meta: &meta,
+            images: &images,
+            pins: &pins,
+            render_index: &render_index,
+            render_blobs: &render_blobs,
+        };
+        $body
+    }};
+}
+
+/// Fingerprint of what a render of `node_id` at `format`/`scale_milli`
+/// shows (NWS-2958), as SHA-256 hex — or `None` when figmog can't vouch
+/// for one, and the render falls back to plain per-version caching.
+///
+/// Hashed, together with [`RENDER_FINGERPRINT_SCHEME`], `format` and
+/// `scale_milli`:
+///
+/// - **the subtree**: every node's stored canonical raw JSON
+///   ([`NodeRec::raw`]), in preorder and child order, as nested
+///   `[raw, [children...]]` arrays. Instance children arrive expanded in
+///   the REST response, variable and style values are baked into the raw
+///   properties, image fills are referenced by content hash and fonts are
+///   named in text styles, so this is nearly everything that affects the
+///   picture. Node ids are part of the raw JSON, so a fingerprint belongs
+///   to exactly one node;
+/// - **local main components** (conservative): for every INSTANCE in the
+///   subtree whose main component is mirrored, that component's own
+///   subtree hash, transitively — so editing a main component invalidates
+///   its instances' renders even if an expansion missed the change;
+/// - **inherited variable modes** (conservative): every ancestor's
+///   `explicitVariableModes`, root first.
+///
+/// `None` (the conservative fallback) when the node, an ancestor or a
+/// subtree node is missing from the mirror, when an earlier sibling is a
+/// mask (`isMask`) that might clip it, or when the tree is inconsistent.
+pub fn render_fingerprint<R: Readable>(
+    nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
+    node_id: &str,
+    format: &str,
+    scale_milli: u32,
+) -> Option<String> {
+    Fingerprinter::new(nodes, children).fingerprint(node_id, format, scale_milli)
+}
+
+/// [`render_fingerprint`] with the per-node part (everything but format
+/// and scale) memoized, so one scan computes each subtree at most once.
+struct Fingerprinter<'r, 'a, R: Readable> {
+    nodes: &'r TableReader<'a, R, String, NodeRec>,
+    children: &'r MultimapReader<'a, R, String, (u32, String)>,
+    base: BTreeMap<String, Option<String>>,
+    components: BTreeMap<String, Option<(String, BTreeSet<String>)>>,
+    /// Earliest mask/unreadable sibling per parent, computed once per
+    /// sibling list rather than parsing every prefix for every subject.
+    sibling_limits: BTreeMap<String, SiblingMasks>,
+}
+
+struct SiblingMasks {
+    edges: Vec<(u32, String)>,
+    cursor: usize,
+    mask: Option<u32>,
+    unreadable: Option<u32>,
+}
+
+impl<'r, 'a, R: Readable> Fingerprinter<'r, 'a, R> {
+    fn new(
+        nodes: &'r TableReader<'a, R, String, NodeRec>,
+        children: &'r MultimapReader<'a, R, String, (u32, String)>,
+    ) -> Self {
+        Fingerprinter {
+            nodes,
+            children,
+            base: BTreeMap::new(),
+            components: BTreeMap::new(),
+            sibling_limits: BTreeMap::new(),
+        }
+    }
+
+    fn fingerprint(&mut self, node_id: &str, format: &str, scale_milli: u32) -> Option<String> {
+        if !self.base.contains_key(node_id) {
+            let base = self.compute_base(node_id);
+            self.base.insert(node_id.to_string(), base);
+        }
+        let base = self.base.get(node_id)?.as_ref()?;
+        let input = format!(
+            "figmog-render-fingerprint\0{RENDER_FINGERPRINT_SCHEME}\0{format}\0{scale_milli}\0{base}"
+        );
+        Some(sha256_hex(input.as_bytes()))
+    }
+
+    fn compute_base(&mut self, node_id: &str) -> Option<String> {
+        let node = self.nodes.get(&node_id.to_string())?;
+        if self.masked_by_sibling(&node)? {
+            return None;
+        }
+        let context = self.inherited_modes(&node)?;
+        let (subtree, mut pending) = subtree_canonical(self.nodes, self.children, node_id)?;
+
+        // Transitive local main components, each hashed once.
+        let mut deps: BTreeMap<String, String> = BTreeMap::new();
+        while let Some(component_id) = pending.pop_first() {
+            if deps.contains_key(&component_id) {
+                continue;
+            }
+            if !self.components.contains_key(&component_id) {
+                let computed = if self.nodes.contains(&component_id) {
+                    subtree_canonical(self.nodes, self.children, &component_id)
+                        .map(|(canon, more)| (sha256_hex(canon.as_bytes()), more))
+                } else {
+                    // A remote (library) main component: only the REST
+                    // expansion inside the instance can speak for it.
+                    Some(("remote".to_string(), BTreeSet::new()))
+                };
+                self.components.insert(component_id.clone(), computed);
+            }
+            let (hash, more) = self.components.get(&component_id)?.as_ref()?;
+            deps.insert(component_id.clone(), hash.clone());
+            pending.extend(more.iter().filter(|c| !deps.contains_key(*c)).cloned());
+        }
+        let deps = serde_json::to_string(&deps).ok()?;
+        Some(format!("{context}\0{deps}\0{subtree}"))
+    }
+
+    /// Every ancestor's `explicitVariableModes`, root first, as canonical
+    /// JSON; `None` if an ancestor is missing or unreadable.
+    fn inherited_modes(&self, node: &NodeRec) -> Option<String> {
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut parent = node.parent_id.clone();
+        while let Some(parent_id) = parent {
+            if !seen.insert(parent_id.clone()) {
+                return None;
+            }
+            let ancestor = self.nodes.get(&parent_id)?;
+            let raw: Value = serde_json::from_str(&ancestor.raw).ok()?;
+            if let Some(modes) = raw.get("explicitVariableModes") {
+                chain.push(json!([parent_id, modes]));
+            }
+            parent = ancestor.parent_id;
+        }
+        chain.reverse();
+        serde_json::to_string(&chain).ok()
+    }
+
+    /// Whether a sibling drawn before `node` is a mask. Such a mask clips
+    /// `node` in the canvas, and figmog doesn't know whether a
+    /// single-node export applies it, so the render isn't fingerprinted.
+    fn masked_by_sibling(&mut self, node: &NodeRec) -> Option<bool> {
+        let Some(parent_id) = &node.parent_id else {
+            return Some(false);
+        };
+        if !self.sibling_limits.contains_key(parent_id) {
+            let mut edges = self.children.get(parent_id);
+            edges.sort();
+            self.sibling_limits.insert(
+                parent_id.clone(),
+                SiblingMasks {
+                    edges,
+                    cursor: 0,
+                    mask: None,
+                    unreadable: None,
+                },
+            );
+        }
+        let siblings = self.sibling_limits.get_mut(parent_id)?;
+        while let Some((index, sibling_id)) = siblings.edges.get(siblings.cursor) {
+            if *index >= node.child_index {
+                break;
+            }
+            siblings.cursor += 1;
+            let raw = self
+                .nodes
+                .get(sibling_id)
+                .and_then(|sibling| serde_json::from_str::<Value>(&sibling.raw).ok());
+            match raw {
+                None => {
+                    siblings.unreadable.get_or_insert(*index);
+                }
+                Some(raw) if raw.get("isMask").and_then(Value::as_bool) == Some(true) => {
+                    siblings.mask.get_or_insert(*index);
+                }
+                Some(_) => {}
+            }
+        }
+        if siblings
+            .unreadable
+            .is_some_and(|index| index < node.child_index)
+        {
+            return None;
+        }
+        Some(siblings.mask.is_some_and(|index| index < node.child_index))
+    }
+}
+
+/// `root`'s subtree as nested `[raw, [children...]]` JSON arrays, built
+/// iteratively (no recursion depth limit) in child order, plus the main
+/// component ids of every INSTANCE in it. `None` if a node is missing or
+/// the children edges revisit a node.
+fn subtree_canonical<R: Readable>(
+    nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
+    root: &str,
+) -> Option<(String, BTreeSet<String>)> {
+    enum Step {
+        Open(String),
+        Close,
+    }
+    let mut out = String::new();
+    let mut components = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![Step::Open(root.to_string())];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Close => out.push_str("]]"),
+            Step::Open(id) => {
+                if !seen.insert(id.clone()) {
+                    return None;
+                }
+                let node = nodes.get(&id)?;
+                // A node right after its parent's `[` opens the list;
+                // every later sibling follows a `]]`.
+                if !(out.is_empty() || out.ends_with('[')) {
+                    out.push(',');
+                }
+                out.push('[');
+                out.push_str(&node.raw);
+                out.push_str(",[");
+                if let Some(component_id) = node.component_id {
+                    components.insert(component_id);
+                }
+                let mut edges = children.get(&id);
+                edges.sort();
+                stack.push(Step::Close);
+                for (_, child) in edges.into_iter().rev() {
+                    stack.push(Step::Open(child));
+                }
+            }
+        }
+    }
+    Some((out, components))
+}
+
+/// The digest a fingerprinted render's bytes are stored and validated
+/// under ([`RenderBlobRec::sha256`]): SHA-256, lowercase hex.
+pub fn render_blob_digest(bytes: &[u8]) -> String {
+    sha256_hex(bytes)
+}
+
+/// Whether a stored render blob is intact for `row`: its bytes hash to
+/// the key both rows name, at the recorded length.
+fn blob_is_valid(blob: &RenderBlobRec, row: &RenderIndexRec) -> bool {
+    blob.sha256 == row.sha256
+        && blob.bytes.len() as u64 == row.byte_len
+        && sha256_hex(&blob.bytes) == row.sha256
+}
+
+/// What [`plan_render_eviction`] removes: index rows (fingerprints) in
+/// eviction order, and the blobs (SHA-256 keys) no remaining row
+/// references, sorted.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RenderEviction {
+    pub index: Vec<String>,
+    pub blobs: Vec<String>,
+}
+
+/// Plan the fingerprint-indexed render cache's eviction (NWS-2958), in
+/// two separate passes over `index` ordered oldest first (`seq`, then
+/// fingerprint as the deterministic tie-break):
+///
+/// 1. **orphan cleanup**: every row in `orphans` — renders whose
+///    fingerprint no node has any more;
+/// 2. **hard byte quota**: while the distinct blobs the remaining rows
+///    reference exceed `max_bytes`, the oldest remaining row, valid or
+///    not.
+///
+/// A blob is removed once no remaining row references it — including
+/// `displaced` blobs, those an overwritten row used to reference.
+pub fn plan_render_eviction(
+    index: &BTreeMap<String, RenderIndexRec>,
+    orphans: &BTreeSet<String>,
+    displaced: &BTreeSet<String>,
+    max_bytes: u64,
+) -> RenderEviction {
+    let mut order: Vec<&RenderIndexRec> = index.values().collect();
+    order.sort_by(|a, b| {
+        a.seq
+            .cmp(&b.seq)
+            .then_with(|| a.fingerprint.cmp(&b.fingerprint))
+    });
+
+    let mut evicted: Vec<&RenderIndexRec> = Vec::new();
+    let mut live: Vec<&RenderIndexRec> = Vec::new();
+    for row in order {
+        if orphans.contains(&row.fingerprint) {
+            evicted.push(row);
+        } else {
+            live.push(row);
+        }
+    }
+
+    // Distinct blob -> (byte length, referencing rows).
+    let mut refs: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+    for row in &live {
+        refs.entry(row.sha256.as_str())
+            .or_insert((row.byte_len, 0))
+            .1 += 1;
+    }
+    let mut total: u64 = refs.values().map(|(len, _)| *len).sum();
+    let mut live = live.into_iter();
+    while total > max_bytes {
+        let Some(row) = live.next() else { break };
+        evicted.push(row);
+        if let Some(entry) = refs.get_mut(row.sha256.as_str()) {
+            entry.1 -= 1;
+            if entry.1 == 0 {
+                total -= entry.0;
+            }
+        }
+    }
+
+    let blobs: BTreeSet<String> = evicted
+        .iter()
+        .map(|row| row.sha256.clone())
+        .chain(displaced.iter().cloned())
+        .filter(|sha| refs.get(sha.as_str()).is_none_or(|(_, count)| *count == 0))
+        .collect();
+    RenderEviction {
+        index: evicted.iter().map(|row| row.fingerprint.clone()).collect(),
+        blobs: blobs.into_iter().collect(),
+    }
+}
 
 /// A caller with no Figma API token still gets every cache hit for free
 /// (spec §5: "a repeat request on an unchanged file spends zero budget");
@@ -187,7 +611,10 @@ impl ImageItem {
 /// Everything the read-only half of image fetching can determine from the
 /// mirror alone, with no network access: the current file version, every
 /// render/fill cache hit, and the set of `imageRef`s the requested nodes'
-/// raw `fills` reference. Produced by [`scan`], consumed by [`resolve`] —
+/// raw `fills` reference — plus, when render reuse is opted in
+/// (NWS-2958), each requested render's fingerprint. A possible cache
+/// write also collects the render index with its orphans for upkeep.
+/// Produced by [`scan`], consumed by [`resolve`] —
 /// see this module's doc comment for why they're split at all.
 pub struct Scanned {
     version: String,
@@ -195,6 +622,17 @@ pub struct Scanned {
     unverified_renders: BTreeSet<String>,
     fill_refs: BTreeSet<String>,
     fill_hits: BTreeMap<String, ImageItem>,
+    policy: RenderPolicy,
+    /// Requested render id -> fingerprint (opted-in requests only; ids
+    /// without one fall back to per-version caching).
+    render_fps: BTreeMap<String, String>,
+    /// Every stored render index row, collected only for a possible
+    /// write/refresh. Cache-only requests need only keyed lookups.
+    render_index: BTreeMap<String, RenderIndexRec>,
+    /// Fingerprints in `render_index` no node has any more.
+    orphans: BTreeSet<String>,
+    #[cfg(test)]
+    fingerprint_work: (usize, usize),
 }
 
 /// Whether a row fetched by its key hash actually belongs to the
@@ -231,24 +669,13 @@ fn matches_identity(
 /// `version` parameter and as the stored rows' `file_version` — so a
 /// pull landing between the two halves can't relabel a fetch.
 pub fn scan<R: Readable>(
-    nodes: &TableReader<'_, R, String, NodeRec>,
-    meta: &TableReader<'_, R, u8, FileMeta>,
-    images: &TableReader<'_, R, String, ImageBlobRec>,
-    pins: &TableReader<'_, R, String, ImagePinRec>,
+    readers: &ScanReaders<'_, '_, R>,
     node_ids: &[String],
     format: &str,
     scale_milli: u32,
+    policy: RenderPolicy,
 ) -> Scanned {
-    scan_split(
-        nodes,
-        meta,
-        images,
-        pins,
-        node_ids,
-        node_ids,
-        format,
-        scale_milli,
-    )
+    scan_split(readers, node_ids, node_ids, format, scale_milli, policy)
 }
 
 /// [`scan`] with the renders and the fill scan asked for separately
@@ -257,46 +684,127 @@ pub fn scan<R: Readable>(
 /// without fetching their fills, and fetches image fills without
 /// rendering the nodes that hold them; pass the same `render_ids` to
 /// [`resolve`].
-#[allow(clippy::too_many_arguments)]
+///
+/// With `policy.reuse` (NWS-2958) a render is first looked up by its
+/// [`render_fingerprint`] in the render index, whose blob must still hash
+/// to its recorded digest; a miss there, or a node without a fingerprint,
+/// falls back to the per-version lookup. `policy.refresh` skips every
+/// render lookup.
 pub fn scan_split<R: Readable>(
-    nodes: &TableReader<'_, R, String, NodeRec>,
-    meta: &TableReader<'_, R, u8, FileMeta>,
-    images: &TableReader<'_, R, String, ImageBlobRec>,
-    pins: &TableReader<'_, R, String, ImagePinRec>,
+    readers: &ScanReaders<'_, '_, R>,
     render_ids: &[String],
     fill_ids: &[String],
     format: &str,
     scale_milli: u32,
+    policy: RenderPolicy,
 ) -> Scanned {
+    let ScanReaders {
+        nodes,
+        children,
+        meta,
+        images,
+        pins,
+        render_index,
+        render_blobs,
+    } = readers;
     let version = meta.get(&0).map(|m| m.version.clone()).unwrap_or_default();
 
+    let mut fingerprinter = Fingerprinter::new(nodes, children);
+    // Without version provenance a fingerprint cannot vouch for pinned
+    // bytes. Preserve existing rows, but neither read nor maintain them.
+    let reuse = policy.reuse && !version.is_empty();
+    let mut render_fps: BTreeMap<String, String> = BTreeMap::new();
     let mut render_hits: BTreeMap<String, ImageItem> = BTreeMap::new();
     let mut unverified_renders = BTreeSet::new();
     for id in render_ids {
-        let key = image_key(RENDER, id, format, scale_milli);
-        if let Some(rec) = images.get(&key)
-            && rec.file_version == version
-            && matches_identity(&rec, RENDER, id, format, scale_milli)
-        {
-            if !pins.get(&key).is_some_and(|pin| {
-                pin.generation == RENDER_PIN_GENERATION && pin.file_version == rec.file_version
-            }) {
-                unverified_renders.insert(id.clone());
-                continue;
+        let fingerprint = if reuse {
+            fingerprinter.fingerprint(id, format, scale_milli)
+        } else {
+            None
+        };
+        if let Some(fp) = &fingerprint {
+            render_fps.insert(id.clone(), fp.clone());
+        }
+        if policy.refresh {
+            continue;
+        }
+        let fingerprinted = fingerprint
+            .and_then(|fp| render_index.get(&fp))
+            .filter(|row| {
+                row.scheme == RENDER_FINGERPRINT_SCHEME
+                    && row.subject == *id
+                    && row.format == format
+                    && row.scale_milli == scale_milli
+            })
+            .and_then(|row| {
+                render_blobs
+                    .get(&row.sha256)
+                    .filter(|blob| blob_is_valid(blob, &row))
+            });
+        let bytes = match fingerprinted {
+            Some(blob) => Some(blob.bytes),
+            None => {
+                let key = image_key(RENDER, id, format, scale_milli);
+                match images.get(&key).filter(|rec| {
+                    rec.file_version == version
+                        && matches_identity(rec, RENDER, id, format, scale_milli)
+                }) {
+                    Some(rec)
+                        if pins.get(&key).is_some_and(|pin| {
+                            pin.generation == RENDER_PIN_GENERATION
+                                && pin.file_version == rec.file_version
+                        }) =>
+                    {
+                        Some(rec.bytes)
+                    }
+                    Some(_) => {
+                        unverified_renders.insert(id.clone());
+                        None
+                    }
+                    None => None,
+                }
             }
+        };
+        if let Some(bytes) = bytes {
             render_hits.insert(
                 id.clone(),
                 ImageItem {
                     subject: id.clone(),
                     kind: RENDER,
                     format: format.to_string(),
-                    bytes: rec.bytes.clone(),
+                    bytes,
                     cached: true,
                     error: None,
                 },
             );
         }
     }
+
+    // Cache maintenance is only needed on a possible write. In
+    // particular, a single hit (or a fills-only request) never collects
+    // or re-fingerprints unrelated render rows.
+    let may_write = render_ids.iter().any(|id| !render_hits.contains_key(id));
+    let index: BTreeMap<String, RenderIndexRec> =
+        if may_write && (reuse || policy.refresh) && !version.is_empty() {
+            render_index.iter().collect()
+        } else {
+            BTreeMap::new()
+        };
+    // Orphans are checked only during write maintenance. Even rows
+    // fetched at the current Figma version need checking here: another
+    // pull can widen that version's mirror with vector geometry.
+    let orphans: BTreeSet<String> = index
+        .iter()
+        .filter(|(fp, row)| {
+            reuse
+                && (row.scheme != RENDER_FINGERPRINT_SCHEME
+                    || fingerprinter
+                        .fingerprint(&row.subject, &row.format, row.scale_milli)
+                        .as_ref()
+                        != Some(*fp))
+        })
+        .map(|(fp, _)| fp.clone())
+        .collect();
 
     let mut fill_refs: BTreeSet<String> = BTreeSet::new();
     for id in fill_ids {
@@ -334,6 +842,19 @@ pub fn scan_split<R: Readable>(
         unverified_renders,
         fill_refs,
         fill_hits,
+        policy,
+        render_fps,
+        render_index: index,
+        orphans,
+        #[cfg(test)]
+        fingerprint_work: (
+            fingerprinter.base.len(),
+            fingerprinter
+                .sibling_limits
+                .values()
+                .map(|siblings| siblings.cursor)
+                .sum(),
+        ),
     }
 }
 
@@ -347,6 +868,11 @@ pub fn scan_split<R: Readable>(
 /// missing-credential error instead of a network attempt. `file_key: None`
 /// allows cache extraction from an explicit store without a known file
 /// identity; misses report that missing identity, even if a token exists.
+///
+/// With render reuse opted in (the policy `scan` captured), a fetched
+/// render that has a fingerprint is stored as a fingerprinted render
+/// rather than a per-version row, and the render cache's eviction plan
+/// ([`plan_render_eviction`]) is applied afterwards.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve<P: Push<Keyed<Id, Rec>>>(
     st: &mut KeyedStream<Id, Rec, P>,
@@ -364,7 +890,18 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
         unverified_renders,
         fill_refs,
         mut fill_hits,
+        policy,
+        render_fps,
+        mut render_index,
+        mut orphans,
+        #[cfg(test)]
+            fingerprint_work: _,
     } = scanned;
+    // Fingerprinted renders written by this call (NWS-2958) get insertion
+    // sequence numbers after every stored row's.
+    let mut next_seq = render_index.values().map(|row| row.seq).max().unwrap_or(0) + 1;
+    let mut displaced: BTreeSet<String> = BTreeSet::new();
+    let mut wrote_fingerprinted = false;
     let scale_m = scale_milli(scale);
     let unavailable_reason = if file_key.is_none() {
         NO_FILE_KEY_MSG
@@ -419,18 +956,61 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
                                 ),
                                 Some(url) => match download(url) {
                                     Ok(bytes) => {
-                                        let key = image_key(RENDER, id, format, scale_m);
-                                        store_image(
-                                            st,
-                                            &key,
-                                            RENDER,
-                                            id,
-                                            format,
-                                            scale_m,
-                                            &version,
-                                            &bytes,
-                                            pinned_version.is_some(),
-                                        );
+                                        // A successful refresh supersedes
+                                        // both cache policies for this exact
+                                        // render identity. Remove every old
+                                        // fingerprint, then optionally store
+                                        // the new opted-in one below.
+                                        if policy.refresh && pinned_version.is_some() {
+                                            orphans.extend(render_index.iter().filter_map(
+                                                |(fp, row)| {
+                                                    (row.subject == *id
+                                                        && row.format == format
+                                                        && row.scale_milli == scale_m)
+                                                        .then_some(fp.clone())
+                                                },
+                                            ));
+                                        }
+                                        if let Some(fp) = render_fps.get(id)
+                                            && pinned_version.is_some()
+                                        {
+                                            // Opted-in reuse (NWS-2958): the
+                                            // render is pinned to the version
+                                            // the fingerprint was computed at.
+                                            let row = RenderIndexRec {
+                                                fingerprint: fp.clone(),
+                                                scheme: RENDER_FINGERPRINT_SCHEME,
+                                                subject: id.clone(),
+                                                format: format.to_string(),
+                                                scale_milli: scale_m,
+                                                file_version: version.clone(),
+                                                seq: next_seq,
+                                                sha256: sha256_hex(&bytes),
+                                                byte_len: bytes.len() as u64,
+                                            };
+                                            next_seq += 1;
+                                            store_render(st, &row, &bytes);
+                                            if let Some(old) = render_index.insert(fp.clone(), row)
+                                            {
+                                                displaced.insert(old.sha256);
+                                            }
+                                            orphans.remove(fp);
+                                            wrote_fingerprinted = true;
+                                        }
+                                        if !render_fps.contains_key(id) || policy.refresh {
+                                            let key = image_key(RENDER, id, format, scale_m);
+                                            store_image(
+                                                st,
+                                                &key,
+                                                RENDER,
+                                                id,
+                                                format,
+                                                scale_m,
+                                                &version,
+                                                &bytes,
+                                                pinned_version.is_some(),
+                                            );
+                                        }
                                         ImageItem {
                                             subject: id.clone(),
                                             kind: RENDER,
@@ -478,6 +1058,28 @@ pub fn resolve<P: Push<Keyed<Id, Rec>>>(
                     }
                 }
             }
+        }
+    }
+
+    // Render cache upkeep (NWS-2958), on write maintenance or successful
+    // refresh. A non-reuse refresh only invalidates matching identities;
+    // quota enforcement remains an opted-in policy.
+    if wrote_fingerprinted || !orphans.is_empty() {
+        let max_bytes = if policy.reuse {
+            policy.max_bytes
+        } else {
+            u64::MAX
+        };
+        let plan = plan_render_eviction(&render_index, &orphans, &displaced, max_bytes);
+        if !plan.index.is_empty() || !plan.blobs.is_empty() {
+            st.wtx(|tx| {
+                for fp in &plan.index {
+                    tx.remove(&Id::RenderIndex(fp.clone()));
+                }
+                for sha in &plan.blobs {
+                    tx.remove(&Id::RenderBlob(sha.clone()));
+                }
+            });
         }
     }
 
@@ -613,6 +1215,28 @@ fn store_image<P: Push<Keyed<Id, Rec>>>(
         } else {
             tx.remove(&pin_id);
         }
+    });
+}
+
+/// Write one fingerprinted render (NWS-2958): its immutable,
+/// content-addressed blob and its index row, in one transaction.
+fn store_render<P: Push<Keyed<Id, Rec>>>(
+    st: &mut KeyedStream<Id, Rec, P>,
+    row: &RenderIndexRec,
+    bytes: &[u8],
+) {
+    st.wtx(|tx| {
+        tx.upsert(
+            &Id::RenderBlob(row.sha256.clone()),
+            &Rec::RenderBlob(RenderBlobRec {
+                sha256: row.sha256.clone(),
+                bytes: bytes.to_vec(),
+            }),
+        );
+        tx.upsert(
+            &Id::RenderIndex(row.fingerprint.clone()),
+            &Rec::RenderIndex(row.clone()),
+        );
     });
 }
 
@@ -1246,11 +1870,15 @@ mod tests {
         seed_pinned_row(&mut st, key, colliding);
 
         let ids = vec![requested_id.clone()];
-        let scanned = st.rtx(
-            |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
-                scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
-            },
-        );
+        let scanned = st.rtx(|readers| {
+            crate::with_scan_readers!(readers, |r| scan(
+                &r,
+                &ids,
+                "png",
+                1000,
+                RenderPolicy::default()
+            ))
+        });
         assert!(
             !scanned.render_hits.contains_key(&requested_id),
             "a key-hash collision must never be served as a cache hit"
@@ -1282,11 +1910,15 @@ mod tests {
         seed_pinned_row(&mut st, key, colliding);
 
         let ids = vec![requested_id.clone()];
-        let scanned = st.rtx(
-            |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
-                scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
-            },
-        );
+        let scanned = st.rtx(|readers| {
+            crate::with_scan_readers!(readers, |r| scan(
+                &r,
+                &ids,
+                "png",
+                1000,
+                RenderPolicy::default()
+            ))
+        });
         assert!(
             !scanned.render_hits.contains_key(&requested_id),
             "a format/scale mismatch under the same key must never be served"
@@ -1317,11 +1949,15 @@ mod tests {
                     }),
                 );
             });
-            let scanned = st.rtx(
-                |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
-                    scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
-                },
-            );
+            let scanned = st.rtx(|readers| {
+                crate::with_scan_readers!(readers, |r| scan(
+                    &r,
+                    &ids,
+                    "png",
+                    1000,
+                    RenderPolicy::default()
+                ))
+            });
             assert_eq!(
                 scanned.render_hits.contains_key("1:2"),
                 expect_hit,
@@ -1334,20 +1970,27 @@ mod tests {
     /// call site makes (this module's own doc comment) — the one seam
     /// this test suite proves end to end.
     macro_rules! scan_and_resolve {
-        ($st:expr, $api:expr, $download:expr, $ids:expr, $format:expr, $scale:expr) => {{
-            let scanned = $st.rtx(
-                |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
-                    scan(
-                        &nodes,
-                        &meta,
-                        &images,
-                        &pins,
-                        $ids,
-                        $format,
-                        scale_milli($scale),
-                    )
-                },
-            );
+        ($st:expr, $api:expr, $download:expr, $ids:expr, $format:expr, $scale:expr) => {
+            scan_and_resolve!(
+                $st,
+                $api,
+                $download,
+                $ids,
+                $format,
+                $scale,
+                RenderPolicy::default()
+            )
+        };
+        ($st:expr, $api:expr, $download:expr, $ids:expr, $format:expr, $scale:expr, $policy:expr) => {{
+            let scanned = $st.rtx(|readers| {
+                crate::with_scan_readers!(readers, |r| scan(
+                    &r,
+                    $ids,
+                    $format,
+                    scale_milli($scale),
+                    $policy
+                ))
+            });
             resolve(
                 &mut $st,
                 scanned,
@@ -1560,11 +2203,15 @@ mod tests {
                 (None, None),
                 (Some(&script as &dyn FigmaApi), None),
             ] {
-                let scanned = st.rtx(
-                    |((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _)| {
-                        scan(&nodes, &meta, &images, &pins, &ids, "png", 1000)
-                    },
-                );
+                let scanned = st.rtx(|readers| {
+                    crate::with_scan_readers!(readers, |r| scan(
+                        &r,
+                        &ids,
+                        "png",
+                        1000,
+                        RenderPolicy::default()
+                    ))
+                });
                 let items = resolve(
                     &mut st, scanned, api, &download, file_key, &ids, "png", None,
                 );
@@ -1640,8 +2287,9 @@ mod tests {
         );
 
         let key = image_key(RENDER, "1:2", "png", 1000);
-        let (row, pin) = st
-            .rtx(|(_, _, _, _, _, _, _, _, _, images, pins, _)| (images.get(&key), pins.get(&key)));
+        let (row, pin) = st.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, _, _, _)| {
+            (images.get(&key), pins.get(&key))
+        });
         assert_eq!(row.unwrap().file_version, "100");
         assert_eq!(
             pin,
@@ -1688,7 +2336,7 @@ mod tests {
                 let items = scan_and_resolve!(st, Some(&script), &download, &ids, "png", None);
                 assert_eq!(items[0].bytes, vec![9]);
                 assert!(!items[0].cached);
-                let (row, pin) = st.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, _)| {
+                let (row, pin) = st.rtx(|(_, _, _, _, _, _, _, _, _, images, pins, ..)| {
                     (images.get(&key), pins.get(&key))
                 });
                 assert_eq!(row.unwrap().file_version, "");
@@ -1830,5 +2478,742 @@ mod tests {
         assert_eq!(items.len(), 1);
         let err = items[0].error.as_deref().unwrap();
         assert!(err.contains("rate limited"), "{err}");
+    }
+
+    // ---- NWS-2958: fingerprinted render reuse ----
+
+    /// What a synthetic file's editable parts hold; `Default` is v1.
+    #[derive(Clone)]
+    struct Design {
+        version: &'static str,
+        /// Frame A's text (`1:2` characters).
+        title: &'static str,
+        /// Frame A's text font.
+        font: &'static str,
+        /// Main component `3:1`'s fill red channel — also resolved into its
+        /// instance `4:2`, as the REST response would.
+        main_red: f64,
+        /// Main component child `3:2`'s text — deliberately *not*
+        /// propagated into the instance's expansion, to prove the
+        /// main-component dependency alone invalidates.
+        main_label: &'static str,
+        /// Frame D's child image fill content hash.
+        image_ref: &'static str,
+        /// Frame E's explicit variable mode, inherited by `6:2`.
+        mode: &'static str,
+        /// Frame B's name.
+        b_name: &'static str,
+    }
+
+    impl Default for Design {
+        fn default() -> Self {
+            Design {
+                version: "v1",
+                title: "Hello",
+                font: "Inter",
+                main_red: 0.1,
+                main_label: "Go",
+                image_ref: "img1",
+                mode: "light",
+                b_name: "B",
+            }
+        }
+    }
+
+    /// A synthetic `GET /v1/files/:key` response: frames A (text), B,
+    /// C (an instance of main component `3:1`), D (an image fill), E
+    /// (explicit variable mode) and a masked group.
+    fn design_file(d: &Design) -> Value {
+        json!({
+            "name": "Synthetic",
+            "version": d.version,
+            "lastModified": "2026-11-01T00:00:00Z",
+            "document": {"id": "0:0", "type": "DOCUMENT", "name": "Document", "children": [
+                {"id": "0:1", "type": "CANVAS", "name": "Page", "children": [
+                    {"id": "1:1", "type": "FRAME", "name": "A", "children": [
+                        {"id": "1:2", "type": "TEXT", "name": "Title", "characters": d.title,
+                         "style": {"fontFamily": d.font, "fontSize": 16.0}}
+                    ]},
+                    {"id": "2:1", "type": "FRAME", "name": d.b_name, "children": [
+                        {"id": "2:2", "type": "RECTANGLE", "name": "R",
+                         "fills": [{"type": "SOLID", "color": {"r": 0.5, "g": 0.5, "b": 0.5, "a": 1.0}}]}
+                    ]},
+                    {"id": "3:1", "type": "COMPONENT", "name": "Button",
+                     "fills": [{"type": "SOLID", "color": {"r": d.main_red, "g": 0.0, "b": 0.0, "a": 1.0}}],
+                     "children": [
+                        {"id": "3:2", "type": "TEXT", "name": "Label", "characters": d.main_label}
+                    ]},
+                    {"id": "4:1", "type": "FRAME", "name": "C", "children": [
+                        {"id": "4:2", "type": "INSTANCE", "name": "Button", "componentId": "3:1",
+                         "fills": [{"type": "SOLID", "color": {"r": d.main_red, "g": 0.0, "b": 0.0, "a": 1.0}}],
+                         "children": [
+                            {"id": "I4:2;3:2", "type": "TEXT", "name": "Label", "characters": "Go"}
+                        ]}
+                    ]},
+                    {"id": "5:1", "type": "FRAME", "name": "D", "children": [
+                        {"id": "5:2", "type": "RECTANGLE", "name": "Photo",
+                         "fills": [{"type": "IMAGE", "imageRef": d.image_ref, "scaleMode": "FILL"}]}
+                    ]},
+                    {"id": "6:1", "type": "FRAME", "name": "E",
+                     "explicitVariableModes": {"VariableCollectionId:1:1": d.mode},
+                     "children": [
+                        {"id": "6:2", "type": "RECTANGLE", "name": "Swatch"}
+                    ]},
+                    {"id": "7:1", "type": "GROUP", "name": "Masked", "children": [
+                        {"id": "7:2", "type": "RECTANGLE", "name": "Mask", "isMask": true},
+                        {"id": "7:3", "type": "RECTANGLE", "name": "Clipped"}
+                    ]}
+                ]}
+            ]},
+            "components": {"3:1": {"key": "kb", "name": "Button", "description": ""}},
+            "componentSets": {},
+            "styles": {}
+        })
+    }
+
+    // The pipeline type is only nameable at an `open_store!` site, so the
+    // reads these tests repeat are macros, like `scan_and_resolve!`.
+
+    /// Apply `d` exactly as a pull does: sync, then the version-triggered
+    /// eviction of `images` rows (`cli::pull::do_pull`'s own sequence).
+    macro_rules! mirror {
+        ($st:expr, $d:expr) => {{
+            let d: &Design = $d;
+            let flattened = crate::flatten::flatten_file(&design_file(d)).unwrap();
+            let prior = $st.rtx(|((nodes, ..), components, component_sets, styles, ..)| {
+                crate::store::collect_sweepable(&nodes, &components, &component_sets, &styles)
+            });
+            crate::store::sync(&mut $st, &prior, &flattened, 0);
+            let stale = $st.rtx(|(_, _, _, _, _, _, _, cache, _, images, pins, ..)| {
+                let mut ids = crate::store::stale_cache_ids(&cache, d.version);
+                ids.extend(crate::store::stale_image_ids(&images, &pins, d.version));
+                ids
+            });
+            crate::store::evict_stale_cache(&mut $st, &stale);
+        }};
+    }
+
+    macro_rules! fp {
+        ($st:expr, $id:expr) => {
+            fp!($st, $id, "png", 1000)
+        };
+        ($st:expr, $id:expr, $format:expr, $scale:expr) => {
+            $st.rtx(|((nodes, children, ..), ..)| {
+                render_fingerprint(&nodes, &children, $id, $format, $scale)
+            })
+        };
+    }
+
+    macro_rules! index_rows {
+        ($st:expr) => {
+            $st.rtx(|(.., index, _)| {
+                index
+                    .iter()
+                    .map(|(_, row)| row)
+                    .collect::<Vec<RenderIndexRec>>()
+            })
+        };
+    }
+
+    macro_rules! blob_keys {
+        ($st:expr) => {
+            $st.rtx(|(.., blobs)| blobs.iter().map(|(k, _)| k).collect::<Vec<String>>())
+        };
+    }
+
+    fn reuse() -> RenderPolicy {
+        RenderPolicy {
+            reuse: true,
+            ..RenderPolicy::default()
+        }
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Script one `images_render` answer covering `ids`, each node's URL
+    /// `https://s3/<id>-<tag>.png`.
+    fn answer(script: &Script, ids: &[String], tag: &str) {
+        let map: serde_json::Map<String, Value> = ids
+            .iter()
+            .map(|id| (id.clone(), json!(format!("https://s3/{id}-{tag}.png"))))
+            .collect();
+        script
+            .render_responses
+            .borrow_mut()
+            .push(Ok(json!({ "images": map })));
+    }
+
+    /// A downloader serving 4 bytes (`tag`'s first byte plus the node id's
+    /// leading digit) for every URL `answer` builds.
+    fn url_bytes(url: &str) -> Result<Vec<u8>, ApiError> {
+        let name = url.trim_start_matches("https://s3/");
+        let (id, tag) = name
+            .trim_end_matches(".png")
+            .rsplit_once('-')
+            .ok_or_else(|| ApiError::Network(format!("unexpected url {url}")))?;
+        Ok(vec![tag.as_bytes()[0], id.as_bytes()[0], b'p', b'g'])
+    }
+
+    // -- the fingerprint itself --
+
+    /// The rendering-contract fixtures (NWS-2958 revised: text, instances,
+    /// image fills, ancestor effects): each edit changes exactly the
+    /// fingerprints of the renders that show it.
+    #[test]
+    fn a_fingerprint_changes_only_with_its_own_subtree_and_render_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        let v1 = Design::default();
+        mirror!(st, &v1);
+        let frames = ["1:1", "2:1", "4:1", "5:1", "6:2"];
+        let base: Vec<Option<String>> = frames.iter().map(|id| fp!(st, id)).collect();
+        assert!(base.iter().all(Option::is_some), "{base:?}");
+        let distinct: BTreeSet<_> = base.iter().collect();
+        assert_eq!(distinct.len(), frames.len(), "one fingerprint per node");
+
+        // Deterministic, and blind to the version: re-mirroring identical
+        // content under a new version keeps every fingerprint.
+        mirror!(
+            st,
+            &Design {
+                version: "v2",
+                ..v1.clone()
+            }
+        );
+        assert_eq!(
+            frames.iter().map(|id| fp!(st, id)).collect::<Vec<_>>(),
+            base
+        );
+
+        // Render settings are part of it.
+        assert_ne!(fp!(st, "1:1", "svg", 1000), base[0]);
+        assert_ne!(fp!(st, "1:1", "png", 2000), base[0]);
+
+        // Each edit, and the fingerprints it must change.
+        let edits: [(Design, &[&str]); 7] = [
+            (
+                Design {
+                    title: "Hi",
+                    ..v1.clone()
+                },
+                &["1:1"],
+            ), // text
+            (
+                Design {
+                    font: "Basis",
+                    ..v1.clone()
+                },
+                &["1:1"],
+            ), // font
+            (
+                Design {
+                    b_name: "B2",
+                    ..v1.clone()
+                },
+                &["2:1"],
+            ), // own props
+            // Main component edit, resolved into the instance (REST).
+            (
+                Design {
+                    main_red: 0.9,
+                    ..v1.clone()
+                },
+                &["4:1"],
+            ),
+            // Main component edit the expansion doesn't show.
+            (
+                Design {
+                    main_label: "Buy",
+                    ..v1.clone()
+                },
+                &["4:1"],
+            ),
+            (
+                Design {
+                    image_ref: "img2",
+                    ..v1.clone()
+                },
+                &["5:1"],
+            ), // fill
+            (
+                Design {
+                    mode: "dark",
+                    ..v1.clone()
+                },
+                &["6:2"],
+            ), // inherited mode
+        ];
+        const VERSIONS: [&str; 7] = ["e0", "e1", "e2", "e3", "e4", "e5", "e6"];
+        for (n, (design, changed)) in edits.into_iter().enumerate() {
+            let version = VERSIONS[n];
+            mirror!(st, &Design { version, ..design });
+            for (id, before) in frames.iter().zip(&base) {
+                let now = fp!(st, id);
+                assert!(now.is_some(), "{id} keeps a fingerprint after edit {n}");
+                if changed.contains(id) {
+                    assert_ne!(&now, before, "edit {n} must change {id}");
+                } else {
+                    assert_eq!(&now, before, "edit {n} must leave {id} alone");
+                }
+            }
+            mirror!(
+                st,
+                &Design {
+                    version: "back",
+                    ..v1.clone()
+                }
+            );
+        }
+    }
+
+    /// The conservative fallback: no fingerprint (so per-version caching
+    /// only) for a node a sibling mask may clip, or one not mirrored.
+    #[test]
+    fn a_masked_or_unmirrored_node_has_no_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        mirror!(st, &Design::default());
+        assert!(fp!(st, "7:2").is_some(), "the mask itself is fine");
+        assert_eq!(fp!(st, "7:3"), None, "drawn after a sibling mask");
+        assert_eq!(fp!(st, "99:9"), None, "not in the mirror");
+    }
+
+    // -- reuse across versions, through scan + resolve --
+
+    /// Done-when: editing one frame leaves cached renders of unrelated
+    /// frames valid (no image request for them), while editing a frame's
+    /// own content, or a main component it instances, invalidates it.
+    #[test]
+    fn with_reuse_an_edit_refetches_only_the_renders_that_show_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        let v1 = Design::default();
+        mirror!(st, &v1);
+        let script = Script::new();
+        let frames = ids(&["1:1", "2:1", "4:1"]);
+
+        answer(&script, &frames, "a");
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &frames, "png", None, reuse());
+        assert!(items.iter().all(|i| !i.cached && i.error.is_none()));
+
+        // Edit frame A's text.
+        mirror!(
+            st,
+            &Design {
+                version: "v2",
+                title: "Edited",
+                ..v1.clone()
+            }
+        );
+        answer(&script, &ids(&["1:1"]), "b");
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &frames, "png", None, reuse());
+        assert_eq!(script.render_calls.borrow()[1], ids(&["1:1"]));
+        assert_eq!(
+            script.render_versions.borrow()[1].as_deref(),
+            Some("v2"),
+            "a refetch is still pinned to the mirrored version"
+        );
+        let cached: Vec<bool> = items.iter().map(|i| i.cached).collect();
+        assert_eq!(cached, [false, true, true]);
+        assert_eq!(items[0].bytes[0], b'b');
+        assert_eq!(items[1].bytes[0], b'a', "B is served from the v1 render");
+
+        // Edit the main component C instances.
+        mirror!(
+            st,
+            &Design {
+                version: "v3",
+                title: "Edited",
+                main_red: 0.8,
+                ..v1.clone()
+            }
+        );
+        answer(&script, &ids(&["4:1"]), "c");
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &frames, "png", None, reuse());
+        assert_eq!(script.render_calls.borrow()[2], ids(&["4:1"]));
+        let cached: Vec<bool> = items.iter().map(|i| i.cached).collect();
+        assert_eq!(cached, [true, true, false]);
+
+        // Nothing left to fetch: even without a token every render hits.
+        let items = scan_and_resolve!(st, None, &url_bytes, &frames, "png", None, reuse());
+        assert!(items.iter().all(|i| i.cached && i.error.is_none()));
+        assert_eq!(script.render_calls.borrow().len(), 3);
+
+        // Orphan cleanup: the superseded A and C renders are gone, along
+        // with their blobs; one row and one blob per frame remain.
+        let rows = index_rows!(st);
+        let subjects: Vec<&str> = rows.iter().map(|r| r.subject.as_str()).collect();
+        assert_eq!(rows.len(), 3, "{subjects:?}");
+        let live: BTreeSet<String> = rows.iter().map(|r| r.sha256.clone()).collect();
+        assert_eq!(blob_keys!(st).into_iter().collect::<BTreeSet<_>>(), live);
+        for row in &rows {
+            assert_eq!(Some(row.fingerprint.clone()), fp!(st, &row.subject));
+        }
+    }
+
+    /// The default (no opt-in) behaves exactly as before NWS-2958: any
+    /// version change refetches every render, and the fingerprint tables
+    /// are never written.
+    #[test]
+    fn without_reuse_a_version_change_refetches_every_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        let v1 = Design::default();
+        mirror!(st, &v1);
+        let script = Script::new();
+        let frames = ids(&["1:1", "2:1", "4:1"]);
+
+        answer(&script, &frames, "a");
+        scan_and_resolve!(st, Some(&script), &url_bytes, &frames, "png", None);
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &frames, "png", None);
+        assert!(items.iter().all(|i| i.cached), "same version: all hits");
+
+        mirror!(
+            st,
+            &Design {
+                version: "v2",
+                title: "Edited",
+                ..v1.clone()
+            }
+        );
+        answer(&script, &frames, "b");
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &frames, "png", None);
+        assert_eq!(script.render_calls.borrow()[1], frames);
+        assert!(items.iter().all(|i| !i.cached));
+        assert!(index_rows!(st).is_empty());
+        assert!(blob_keys!(st).is_empty());
+    }
+
+    #[test]
+    fn refresh_refetches_a_valid_fingerprinted_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        mirror!(st, &Design::default());
+        let script = Script::new();
+        let frame = ids(&["2:1"]);
+        answer(&script, &frame, "a");
+        scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, reuse());
+        let first_blob = index_rows!(st)[0].sha256.clone();
+
+        answer(&script, &frame, "b");
+        let refresh = RenderPolicy {
+            refresh: true,
+            ..reuse()
+        };
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, refresh);
+        assert!(!items[0].cached);
+        assert_eq!(items[0].bytes[0], b'b');
+        assert_eq!(script.render_calls.borrow().len(), 2);
+        // The row now points at the new bytes; the displaced blob is gone.
+        let rows = index_rows!(st);
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].sha256, first_blob);
+        assert_eq!(blob_keys!(st), vec![rows[0].sha256.clone()]);
+    }
+
+    /// Switching policies after a refresh must never resurrect either
+    /// cache's pre-refresh bytes. Ordinary no-reuse fetches still leave
+    /// the fingerprint cache alone.
+    #[test]
+    fn refresh_supersedes_both_cache_representations_in_both_directions() {
+        for initial in [RenderPolicy::default(), reuse()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut st = crate::open_store!(dir.path().join("db"));
+            mirror!(st, &Design::default());
+            let script = Script::new();
+            let frame = ids(&["2:1"]);
+            answer(&script, &frame, "a");
+            scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, initial);
+
+            let refresh = RenderPolicy {
+                reuse: !initial.reuse,
+                refresh: true,
+                ..RenderPolicy::default()
+            };
+            answer(&script, &frame, "b");
+            let fresh =
+                scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, refresh);
+            assert_eq!(fresh[0].bytes[0], b'b');
+            for policy in [initial, refresh, initial] {
+                let policy = RenderPolicy {
+                    refresh: false,
+                    ..policy
+                };
+                let hit = scan_and_resolve!(st, None, &url_bytes, &frame, "png", None, policy);
+                assert!(hit[0].cached, "{initial:?} -> {refresh:?}: {hit:?}");
+                assert_eq!(hit[0].bytes, fresh[0].bytes);
+            }
+            assert_eq!(script.render_calls.borrow().len(), 2);
+            if !refresh.reuse {
+                assert!(index_rows!(st).is_empty());
+                assert!(blob_keys!(st).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_version_disables_fingerprint_reads_and_preserves_existing_rows() {
+        for missing_meta in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut st = crate::open_store!(dir.path().join("db"));
+            mirror!(st, &Design::default());
+            let script = Script::new();
+            let frame = ids(&["2:1"]);
+            answer(&script, &frame, "a");
+            scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, reuse());
+            let before = index_rows!(st);
+            if missing_meta {
+                st.wtx(|tx| tx.remove(&Id::Meta));
+            } else {
+                mirror!(
+                    st,
+                    &Design {
+                        version: "",
+                        ..Design::default()
+                    }
+                );
+            }
+
+            // Matching nodes and intact fingerprinted bytes are still a
+            // miss without a mirrored version to pin their provenance.
+            let miss = scan_and_resolve!(st, None, &url_bytes, &frame, "png", None, reuse());
+            assert!(!miss[0].cached);
+            assert!(miss[0].error.is_some());
+            answer(&script, &frame, "b");
+            let fetched =
+                scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, reuse());
+            assert!(!fetched[0].cached);
+            assert_eq!(fetched[0].bytes[0], b'b');
+            assert_eq!(script.render_versions.borrow()[1], None);
+            assert_eq!(index_rows!(st), before);
+            assert_eq!(blob_keys!(st), vec![before[0].sha256.clone()]);
+        }
+    }
+
+    /// Count actual fingerprinted subjects and decoded sibling prefixes,
+    /// rather than using timing thresholds. Growing unrelated cached
+    /// content must not grow the work of a repeated first-frame hit.
+    #[test]
+    fn repeated_hits_skip_whole_cache_maintenance_and_sibling_parsing_is_linear() {
+        for count in [16, 256] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut st = crate::open_store!(dir.path().join("db"));
+            let frames: Vec<String> = (0..count).map(|n| format!("1:{n}")).collect();
+            let children: Vec<Value> = frames
+                .iter()
+                .map(|id| json!({"id": id, "type": "FRAME", "name": id}))
+                .collect();
+            let file = json!({
+                "name": "Synthetic", "version": "v1", "lastModified": "synthetic",
+                "document": {"id": "0:0", "type": "DOCUMENT", "children": [
+                    {"id": "0:1", "type": "CANVAS", "children": children}
+                ]}
+            });
+            let flattened = crate::flatten::flatten_file(&file).unwrap();
+            crate::store::sync(&mut st, &Default::default(), &flattened, 0);
+            let scanned = st.rtx(|readers| {
+                crate::with_scan_readers!(readers, |r| {
+                    scan_split(&r, &frames, &[], "png", 1000, reuse())
+                })
+            });
+            assert_eq!(scanned.fingerprint_work, (count, count - 1));
+            let script = Script::new();
+            answer(&script, &frames, "a");
+            resolve(
+                &mut st,
+                scanned,
+                Some(&script),
+                &url_bytes,
+                Some("file"),
+                &frames,
+                "png",
+                None,
+            );
+
+            // Make every stored row's provenance older than the mirror,
+            // so an accidental maintenance pass must compute them all.
+            let mut meta = st.rtx(|(_, _, _, _, _, _, meta, ..)| meta.get(&0).unwrap());
+            meta.version = "v2".to_string();
+            st.wtx(|tx| tx.upsert(&Id::Meta, &Rec::Meta(meta.clone())));
+            for _ in 0..3 {
+                let hit = st.rtx(|readers| {
+                    crate::with_scan_readers!(readers, |r| {
+                        scan_split(&r, &frames[..1], &[], "png", 1000, reuse())
+                    })
+                });
+                assert_eq!(hit.fingerprint_work, (1, 0), "{count} cached frames");
+                assert_eq!(hit.render_hits.len(), 1);
+                assert!(hit.render_index.is_empty());
+                assert!(hit.orphans.is_empty());
+                let fills_only = st.rtx(|readers| {
+                    crate::with_scan_readers!(readers, |r| {
+                        scan_split(&r, &[], &frames[..1], "png", 1000, reuse())
+                    })
+                });
+                assert_eq!(fills_only.fingerprint_work, (0, 0));
+                assert!(fills_only.render_index.is_empty());
+            }
+        }
+    }
+
+    /// Blobs are validated by digest on read: bytes that no longer hash
+    /// to their key are never served.
+    #[test]
+    fn a_corrupted_render_blob_is_a_miss_and_is_refetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        mirror!(st, &Design::default());
+        let script = Script::new();
+        let frame = ids(&["2:1"]);
+        answer(&script, &frame, "a");
+        let first = scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, reuse());
+        let sha = index_rows!(st)[0].sha256.clone();
+        st.wtx(|tx| {
+            tx.upsert(
+                &Id::RenderBlob(sha.clone()),
+                &Rec::RenderBlob(RenderBlobRec {
+                    sha256: sha.clone(),
+                    bytes: vec![0xde, 0xad, 0xbe, 0xef],
+                }),
+            );
+        });
+
+        answer(&script, &frame, "a");
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &frame, "png", None, reuse());
+        assert!(!items[0].cached, "a tampered blob must read as a miss");
+        assert_eq!(items[0].bytes, first[0].bytes);
+        assert_eq!(script.render_calls.borrow().len(), 2);
+        // Refetching the same bytes repaired the blob under its key.
+        let items = scan_and_resolve!(st, None, &url_bytes, &frame, "png", None, reuse());
+        assert!(items[0].cached);
+        assert_eq!(items[0].bytes, first[0].bytes);
+    }
+
+    /// The hard byte quota evicts still-valid renders, oldest first.
+    #[test]
+    fn the_byte_quota_evicts_the_oldest_renders_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        mirror!(st, &Design::default());
+        let script = Script::new();
+        // Every render is 4 bytes: room for two.
+        let policy = RenderPolicy {
+            max_bytes: 8,
+            ..reuse()
+        };
+        for id in ["1:1", "2:1", "4:1"] {
+            answer(&script, &ids(&[id]), "a");
+            scan_and_resolve!(
+                st,
+                Some(&script),
+                &url_bytes,
+                &ids(&[id]),
+                "png",
+                None,
+                policy
+            );
+        }
+        let mut subjects: Vec<String> = index_rows!(st).into_iter().map(|r| r.subject).collect();
+        subjects.sort();
+        assert_eq!(subjects, ids(&["2:1", "4:1"]), "1:1 was oldest");
+        assert_eq!(blob_keys!(st).len(), 2);
+
+        // The evicted render is fetched again; the others still hit.
+        answer(&script, &ids(&["1:1"]), "a");
+        let all = ids(&["1:1", "2:1", "4:1"]);
+        let items = scan_and_resolve!(st, Some(&script), &url_bytes, &all, "png", None, policy);
+        assert_eq!(script.render_calls.borrow()[3], ids(&["1:1"]));
+        let cached: Vec<bool> = items.iter().map(|i| i.cached).collect();
+        assert_eq!(cached, [false, true, true]);
+        let mut subjects: Vec<String> = index_rows!(st).into_iter().map(|r| r.subject).collect();
+        subjects.sort();
+        assert_eq!(subjects, ids(&["1:1", "4:1"]), "now 2:1 was oldest");
+    }
+
+    // -- eviction planning --
+
+    fn row(fp: &str, seq: u64, sha: &str, len: u64) -> (String, RenderIndexRec) {
+        (
+            fp.to_string(),
+            RenderIndexRec {
+                fingerprint: fp.to_string(),
+                scheme: RENDER_FINGERPRINT_SCHEME,
+                subject: "1:1".to_string(),
+                format: "png".to_string(),
+                scale_milli: 1000,
+                file_version: "v1".to_string(),
+                seq,
+                sha256: sha.to_string(),
+                byte_len: len,
+            },
+        )
+    }
+
+    #[test]
+    fn eviction_drops_orphans_oldest_first_then_enforces_the_quota_oldest_first() {
+        let index: BTreeMap<String, RenderIndexRec> = [
+            row("f-new-orphan", 5, "s1", 10),
+            row("f-old-orphan", 1, "s2", 10),
+            row("f-valid-old", 2, "s3", 10),
+            row("f-valid-mid", 3, "s4", 10),
+            row("f-valid-new", 4, "s5", 10),
+        ]
+        .into_iter()
+        .collect();
+        let orphans: BTreeSet<String> = ["f-new-orphan", "f-old-orphan"].map(String::from).into();
+
+        let none = BTreeSet::new();
+        // Plenty of room: only orphans go.
+        let plan = plan_render_eviction(&index, &orphans, &none, 1_000);
+        assert_eq!(plan.index, ["f-old-orphan", "f-new-orphan"]);
+        assert_eq!(plan.blobs, ["s1", "s2"]);
+
+        // Room for two: then the oldest valid render goes too.
+        let plan = plan_render_eviction(&index, &orphans, &none, 20);
+        assert_eq!(plan.index, ["f-old-orphan", "f-new-orphan", "f-valid-old"]);
+        assert_eq!(plan.blobs, ["s1", "s2", "s3"]);
+
+        // A zero quota empties the cache, deterministically ordered.
+        let plan = plan_render_eviction(&index, &BTreeSet::new(), &none, 0);
+        assert_eq!(
+            plan.index,
+            [
+                "f-old-orphan",
+                "f-valid-old",
+                "f-valid-mid",
+                "f-valid-new",
+                "f-new-orphan"
+            ]
+        );
+    }
+
+    #[test]
+    fn eviction_ties_break_by_fingerprint_and_shared_blobs_count_once() {
+        let index: BTreeMap<String, RenderIndexRec> = [
+            row("b", 1, "shared", 10),
+            row("a", 1, "shared", 10),
+            row("c", 2, "own", 10),
+        ]
+        .into_iter()
+        .collect();
+        let none = BTreeSet::new();
+        // 20 distinct bytes fit exactly: nothing to do.
+        let plan = plan_render_eviction(&index, &none, &none, 20);
+        assert_eq!(plan, RenderEviction::default());
+
+        // Over by one: "a" (tie at seq 1, smaller fingerprint) goes first,
+        // but its blob stays while "b" still references it, so "b" goes
+        // too before the total drops.
+        let plan = plan_render_eviction(&index, &none, &none, 19);
+        assert_eq!(plan.index, ["a", "b"]);
+        assert_eq!(plan.blobs, ["shared"]);
+
+        // A displaced blob is dropped only once nothing references it.
+        let displaced: BTreeSet<String> = ["gone", "own"].map(String::from).into();
+        let plan = plan_render_eviction(&index, &none, &displaced, 100);
+        assert!(plan.index.is_empty());
+        assert_eq!(plan.blobs, ["gone"]);
     }
 }

@@ -26,7 +26,7 @@ fn older_binary_variable_writes_invalidate_snapshot_provenance() {
     macro_rules! summary {
         () => {
             store.rtx(
-                |(_, _, _, _, variables, collections, _, _, _, _, _, snapshot)| {
+                |(_, _, _, _, variables, collections, _, _, _, _, _, snapshot, ..)| {
                     variable_snapshot(&variables, &collections, &snapshot)
                 },
             )
@@ -40,7 +40,7 @@ fn older_binary_variable_writes_invalidate_snapshot_provenance() {
     assert_eq!(stale["digest"], Value::Null);
     assert_eq!(stale["source"], Value::Null);
     store.rtx(
-        |((nodes, ..), _, _, _, variables, collections, _, _, _, _, _, snapshot)| {
+        |((nodes, ..), _, _, _, variables, collections, _, _, _, _, _, snapshot, ..)| {
             let rows = vars(&nodes, &variables, &collections, &snapshot, None, false).unwrap();
             assert_eq!(rows[0]["code_syntax"], Value::Null);
         },
@@ -557,6 +557,8 @@ fn stats_vars_and_components_are_byte_identical_to_the_quadratic_versions() {
             _,
             _,
             snapshot,
+            _,
+            _,
         )| {
             let got = components(&nodes, &components_t, &sets).unwrap();
             let want = reference::components(&nodes, &components_t, &sets);
@@ -648,6 +650,8 @@ fn nws_2942_scale() {
             _,
             _,
             snapshot,
+            _,
+            _,
         )| {
             let n = nodes.iter().count();
             eprintln!("nodes={n} components={}", components_t.iter().count());
@@ -733,6 +737,8 @@ fn deep_raw_record_features_remain_available() {
                 images,
                 pins,
                 _,
+                render_index,
+                render_blobs,
             )| {
                 let annotated = OwnedValue(
                     node(
@@ -791,13 +797,19 @@ fn deep_raw_record_features_remain_available() {
                     payload
                 );
                 crate::images::scan(
-                    &nodes,
-                    &meta,
-                    &images,
-                    &pins,
+                    &crate::images::ScanReaders {
+                        nodes: &nodes,
+                        children: &children,
+                        meta: &meta,
+                        images: &images,
+                        pins: &pins,
+                        render_index: &render_index,
+                        render_blobs: &render_blobs,
+                    },
                     &["0:0".to_string()],
                     "png",
                     1000,
+                    crate::images::RenderPolicy::default(),
                 )
             },
         );

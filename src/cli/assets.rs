@@ -358,20 +358,16 @@ fn fetch_direct(
     let mut renders = Blobs::new();
     let mut fills = Blobs::new();
     if !icon_ids.is_empty() {
-        let scanned = st.rtx(
-            |((nodes, ..), _, _, _, _, _, meta, _, _, images_table, pins, _)| {
-                images::scan_split(
-                    &nodes,
-                    &meta,
-                    &images_table,
-                    &pins,
-                    icon_ids,
-                    &[],
-                    "svg",
-                    1000,
-                )
-            },
-        );
+        let scanned = st.rtx(|readers| {
+            crate::with_scan_readers!(readers, |r| images::scan_split(
+                &r,
+                icon_ids,
+                &[],
+                "svg",
+                1000,
+                images::RenderPolicy::default(),
+            ))
+        });
         let items = images::resolve(
             &mut st,
             scanned,
@@ -385,20 +381,16 @@ fn fetch_direct(
         renders.extend(items.iter().filter(|i| i.kind == images::RENDER).map(blob));
     }
     if !fill_nodes.is_empty() {
-        let scanned = st.rtx(
-            |((nodes, ..), _, _, _, _, _, meta, _, _, images_table, pins, _)| {
-                images::scan_split(
-                    &nodes,
-                    &meta,
-                    &images_table,
-                    &pins,
-                    &[],
-                    fill_nodes,
-                    "png",
-                    1000,
-                )
-            },
-        );
+        let scanned = st.rtx(|readers| {
+            crate::with_scan_readers!(readers, |r| images::scan_split(
+                &r,
+                &[],
+                fill_nodes,
+                "png",
+                1000,
+                images::RenderPolicy::default(),
+            ))
+        });
         let items = images::resolve(
             &mut st,
             scanned,

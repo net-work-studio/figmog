@@ -739,7 +739,9 @@ mod tests {
         drop(older);
         migrate_key(&layout, KEY).unwrap().unwrap();
         let store = crate::open_store!(layout.shared_dir(KEY).join("db"));
-        assert!(store.rtx(|(.., config, _, _, _)| crate::store::read_geometry(&config)));
+        assert!(
+            store.rtx(|(_, _, _, _, _, _, _, _, config, ..)| crate::store::read_geometry(&config))
+        );
     }
 
     #[test]
@@ -785,7 +787,9 @@ mod tests {
         drop(recreated);
         assert!(!tombstone(&legacy).exists());
         let store = crate::open_store!(&legacy_db);
-        assert!(store.rtx(|(.., config, _, _, _)| crate::store::read_geometry(&config)));
+        assert!(
+            store.rtx(|(_, _, _, _, _, _, _, _, config, ..)| crate::store::read_geometry(&config))
+        );
     }
 
     #[test]

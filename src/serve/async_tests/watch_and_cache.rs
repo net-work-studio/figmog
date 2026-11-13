@@ -41,7 +41,7 @@ fn seed_cache(path: &std::path::Path, prior_file: Option<&Value>) {
 
 fn cache_rows(path: &std::path::Path) -> Vec<Rec> {
     let st = crate::open_store!(path);
-    st.rtx(|(_, _, _, _, _, _, _, cache, _, images, _, _)| {
+    st.rtx(|(_, _, _, _, _, _, _, cache, _, images, _, _, _, _)| {
         cache
             .iter()
             .map(|(_, rec)| Rec::ProxyCache(rec))
@@ -196,7 +196,7 @@ fn same_version_async_pulls_evict_images_when_metadata_or_records_change() {
         assert!(st.get(&Id::ImageBlob(frame_key.clone())).is_none());
         assert!(st.get(&Id::ImagePin(frame_key)).is_none());
         assert_eq!(
-            st.rtx(|(_, _, _, _, _, _, _, _, _, _, pins, _)| pins.iter().count()),
+            st.rtx(|(_, _, _, _, _, _, _, _, _, _, pins, ..)| pins.iter().count()),
             0
         );
     }
@@ -668,6 +668,7 @@ fn routed_fresh_pull_preserves_a_poll_owed_after_images() {
             "png",
             None,
             true,
+            crate::images::RenderPolicy::default(),
             Box::new(move |value| answer.send(value).unwrap()),
         )
         .unwrap();

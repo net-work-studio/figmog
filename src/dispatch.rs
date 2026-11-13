@@ -19,7 +19,8 @@ use serde_json::{Value, json};
 use crate::mcp::ToolDef;
 use crate::model::{
     ComponentRec, ComponentSetRec, FileMeta, ImageBlobRec, ImagePinRec, MirrorConfigRec, NodeRec,
-    ProxyCacheRec, StyleRec, VariableCollectionRec, VariableRec, VariableSnapshotRec,
+    ProxyCacheRec, RenderBlobRec, RenderIndexRec, StyleRec, VariableCollectionRec, VariableRec,
+    VariableSnapshotRec,
 };
 use crate::query;
 
@@ -37,12 +38,13 @@ pub(crate) type NodeReaders<'a, R> = (
 );
 
 /// Read handles for the whole pipeline, in `figmog_pipeline!`'s top-level
-/// order — the exact tuple `st.rtx`'s closure receives. 12 elements: the
+/// order — the exact tuple `st.rtx`'s closure receives. 14 elements: the
 /// `nodes` branch bundle, then `components`, `component_sets`, `styles`,
 /// `variables`, `variable_collections`, `meta`, `proxy_cache`,
 /// `mirror_config` (v0.0.2 spec §4), `images` (v0.0.2 spec §5),
-/// `image_pins` (NWS-2960), `variable_snapshot` (NWS-2961 — appended
-/// last, non-breaking).
+/// `image_pins` (NWS-2960), `variable_snapshot` (NWS-2961),
+/// `render_index` and `render_blobs` (NWS-2958 — appended last,
+/// non-breaking).
 pub(crate) type RootReaders<'a, R> = (
     NodeReaders<'a, R>,
     TableReader<'a, R, String, ComponentRec>,
@@ -56,6 +58,8 @@ pub(crate) type RootReaders<'a, R> = (
     TableReader<'a, R, String, ImageBlobRec>,
     TableReader<'a, R, String, ImagePinRec>,
     TableReader<'a, R, u8, VariableSnapshotRec>,
+    TableReader<'a, R, String, RenderIndexRec>,
+    TableReader<'a, R, String, RenderBlobRec>,
 );
 
 // ---- arg extraction ----
@@ -692,6 +696,8 @@ impl ReadCommand {
             _images,
             _image_pins,
             variable_snapshot,
+            _render_index,
+            _render_blobs,
         ) = r;
         match self {
             Self::Status => query::status(
@@ -1063,7 +1069,9 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                     },
                     "format": {"type": "string", "description": "Render format: png or svg (default png)."},
                     "scale": {"type": "number", "description": "Render scale (default 1)."},
-                    "renders": {"type": "boolean", "description": "Render the nodes (default true). false: only fetch the image fills their own `fills` reference."}
+                    "renders": {"type": "boolean", "description": "Render the nodes (default true). false: only fetch the image fills their own `fills` reference."},
+                    "reuse": {"type": "boolean", "description": "Opt in to reusing a cached render across file versions while the node's own subtree and the render settings are unchanged (default false)."},
+                    "refresh": {"type": "boolean", "description": "Ignore cached renders and fetch them again (default false)."}
                 },
                 "required": ["ids"]
             }),

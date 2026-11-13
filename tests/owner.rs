@@ -433,7 +433,7 @@ fn eof_during_a_rejected_requests_reconnect_keeps_the_drain_budget() {
     let listener = UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let record = json!({"generation":"drain-test", "pid":std::process::id(),
-        "project":root, "protocol":1, "socket":socket, "version":env!("CARGO_PKG_VERSION")});
+        "project":root, "protocol":2, "socket":socket, "version":env!("CARGO_PKG_VERSION")});
     std::fs::write(root.join("owner.json"), record.to_string()).unwrap();
     let (ready, initialized) = mpsc::channel();
     let (hello, reconnecting) = mpsc::channel();
@@ -464,7 +464,7 @@ fn eof_during_a_rejected_requests_reconnect_keeps_the_drain_budget() {
         let mut writer = stream;
         let response = json!({"jsonrpc":"2.0", "id":first["id"], "result":{
             "attach_errors":{}, "generation":"drain-test", "pid":std::process::id(),
-            "project":record["project"], "protocol":1, "version":env!("CARGO_PKG_VERSION"),
+            "project":record["project"], "protocol":2, "version":env!("CARGO_PKG_VERSION"),
             "settings":{"watch":false,"interval":10,"upstream":null}}});
         writeln!(writer, "{response}").unwrap();
         ready.send(()).unwrap();
@@ -895,6 +895,80 @@ fn a_mismatched_owner_is_refused_with_an_explanation() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot share it"));
     assert!(served.load(Ordering::SeqCst) >= 2);
+}
+
+/// Image policies cannot silently fall back to a protocol-1 owner's old semantics.
+#[test]
+fn image_policies_refuse_a_protocol_one_owner_at_the_same_binary_version() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo();
+    seed(repo.path(), KEY, &common::fixture_v1());
+    let root = mirror_root(repo.path());
+    let runtime = tempfile::Builder::new()
+        .prefix("fr-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let address_dir = runtime.path().join("figmog");
+    std::fs::create_dir(&address_dir).unwrap();
+    std::fs::set_permissions(&address_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hash = root
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let socket = address_dir.join(format!("{hash:016x}.sock"));
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let record = json!({"generation": "old", "pid": 4_000_000u64,
+        "project": root.display().to_string(), "protocol": 1,
+        "socket": socket.display().to_string(), "version": env!("CARGO_PKG_VERSION")});
+    std::fs::write(root.join("owner.json"), record.to_string()).unwrap();
+    // Model the base owner's protocol-1 handshake with the identical
+    // package version: version checking alone cannot reject this owner.
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let hello: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(hello["method"], "figmog/hello");
+            assert_eq!(hello["params"]["version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(hello["params"]["protocol"], 2);
+            let reply = json!({"jsonrpc": "2.0", "id": hello["id"], "result": {
+                "attach_errors": {}, "generation": "old", "pid": 4_000_000u64,
+                "project": root.display().to_string(), "protocol": 1,
+                "settings": {"interval": 10, "upstream": null, "watch": false},
+                "version": env!("CARGO_PKG_VERSION")}});
+            writeln!(stream, "{reply}").unwrap();
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "no image call forwarded"
+            );
+        }
+    });
+    for policy in ["--refresh", "--reuse-renders"] {
+        let out = common::command()
+            .args(["images", "1:1", policy])
+            .current_dir(repo.path())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("protocol 1"), "{error}");
+        assert!(error.contains("protocol 2"), "{error}");
+        assert!(error.contains("cannot share it"), "{error}");
+    }
+    server.join().unwrap();
+    assert!(owners_in(repo.path()).is_empty());
 }
 
 /// Two repositories run fully independent owners at the same time.

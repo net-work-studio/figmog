@@ -782,6 +782,11 @@ impl StackSettings {
 pub(crate) struct InspectorSettings {
     /// On in development builds (never in production builds).
     pub(crate) enabled: bool,
+    /// The `@figmog/react` Vite plugin adds `data-figmog` and
+    /// `data-figmog-node` to mapped components' root elements on its own
+    /// (development builds only). Off by default: explicit locators come
+    /// first (NWS-2957).
+    pub(crate) attributes: bool,
     /// `Modifier+…+Key`, e.g. `Alt+Shift+F`.
     pub(crate) shortcut: String,
 }
@@ -816,6 +821,7 @@ impl Settings {
             "inspector": {
                 "enabled": self.inspector.enabled,
                 "shortcut": self.inspector.shortcut,
+                "attributes": self.inspector.attributes,
             },
             "verify": {
                 "loop": self.verify.enabled,
@@ -857,9 +863,11 @@ impl Settings {
             "inspector" => format!(
                 "[inspector]\n\
                  enabled = {}  # in development builds only\n\
-                 shortcut = {}\n",
+                 shortcut = {}\n\
+                 attributes = {}  # automatic data-figmog attributes (development builds only)\n",
                 self.inspector.enabled,
                 quote(&self.inspector.shortcut),
+                self.inspector.attributes,
             ),
             "verify" => format!(
                 "[verify]\n\
@@ -965,6 +973,7 @@ struct RawSettings {
     tokens: Option<String>,
     inspector_enabled: Option<bool>,
     shortcut: Option<String>,
+    inspector_attributes: Option<bool>,
     verify_loop: Option<bool>,
     dev_server: Option<String>,
     threshold: Option<f64>,
@@ -988,12 +997,13 @@ impl RawSettings {
     /// Set a known `<table>.<key>` ([`RawSettings::is_known`]), validating
     /// its type and value. Errors are prefixed `<table>.<key>: `.
     /// The keys [`RawSettings::set`] knows, by table.
-    const KNOWN: [(&'static str, &'static str); 15] = [
+    const KNOWN: [(&'static str, &'static str); 16] = [
         ("stack", "framework"),
         ("stack", "styling"),
         ("stack", "tokens"),
         ("inspector", "enabled"),
         ("inspector", "shortcut"),
+        ("inspector", "attributes"),
         ("verify", "loop"),
         ("verify", "dev_server"),
         ("verify", "threshold"),
@@ -1036,6 +1046,7 @@ impl RawSettings {
                 self.tokens = Some(tokens);
             }
             ("inspector", "enabled") => self.inspector_enabled = Some(boolean(value)?),
+            ("inspector", "attributes") => self.inspector_attributes = Some(boolean(value)?),
             ("inspector", "shortcut") => {
                 let shortcut = string(value)?;
                 check_shortcut(&shortcut).map_err(invalid)?;
@@ -1104,6 +1115,7 @@ impl RawSettings {
         take(&mut self.tokens, other.tokens);
         take(&mut self.inspector_enabled, other.inspector_enabled);
         take(&mut self.shortcut, other.shortcut);
+        take(&mut self.inspector_attributes, other.inspector_attributes);
         take(&mut self.verify_loop, other.verify_loop);
         take(&mut self.dev_server, other.dev_server);
         take(&mut self.threshold, other.threshold);
@@ -1134,6 +1146,7 @@ impl RawSettings {
                     .shortcut
                     .clone()
                     .unwrap_or_else(|| DEFAULT_SHORTCUT.to_string()),
+                attributes: self.inspector_attributes.unwrap_or(false),
             },
             verify: VerifySettings {
                 enabled: self.verify_loop.unwrap_or(true),
@@ -1967,6 +1980,7 @@ mod tests {
         assert_eq!(defaults.stack.tokens, DEFAULT_TOKENS_PATH);
         assert!(defaults.inspector.enabled);
         assert_eq!(defaults.inspector.shortcut, DEFAULT_SHORTCUT);
+        assert!(!defaults.inspector.attributes);
         assert!(defaults.verify.enabled);
         assert_eq!(defaults.verify.dev_server, DEFAULT_DEV_SERVER);
         assert_eq!(defaults.verify.threshold, DEFAULT_THRESHOLD);
@@ -1975,7 +1989,7 @@ mod tests {
             "[files]\ndefault = \"{KEY}\"\nlibrary = \"{OTHER}\"\n\
              [stack]\nframework = 'react'\nstyling = \"tailwind\" # v1\ntokens = \"app/tokens.css\"\n\
              future = \"kept\"\n\
-             [inspector]\nenabled = false\nshortcut = \"ctrl+F12\"\n\
+             [inspector]\nenabled = false\nshortcut = \"ctrl+F12\"\nattributes = true\n\
              [verify]\nloop = false\ndev_server = \"http://127.0.0.1:3000/app\"\nthreshold = 87.5\n"
         );
         let config = parse_config(&text, CONFIG_FILE).unwrap();
@@ -1995,6 +2009,7 @@ mod tests {
         );
         assert!(!settings.inspector.enabled);
         assert_eq!(settings.inspector.shortcut, "ctrl+F12");
+        assert!(settings.inspector.attributes);
         assert!(!settings.verify.enabled);
         assert_eq!(settings.verify.dev_server, "http://127.0.0.1:3000/app");
         assert_eq!(settings.verify.threshold, 87.5);
@@ -2232,6 +2247,7 @@ mod tests {
             ),
             ("[stack]\ntokens = \"src/\"\n", 2, "not a file path"),
             ("[inspector]\nenabled = \"yes\"\n", 2, "expected a boolean"),
+            ("[inspector]\nattributes = 1\n", 2, "expected a boolean"),
             ("[inspector]\nshortcut = \"F\"\n", 2, "not a shortcut"),
             (
                 "[inspector]\nshortcut = \"Alt+Alt+F\"\n",

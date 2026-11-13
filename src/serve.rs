@@ -1991,12 +1991,18 @@ fn handle_tool_call(
             let format = format.as_deref().unwrap_or("png");
             let scale = dispatch::arg_f64(args, "scale")?;
             let renders = dispatch::arg_bool_opt(args, "renders")?.unwrap_or(true);
+            let policy = crate::images::RenderPolicy {
+                reuse: dispatch::arg_bool_opt(args, "reuse")?.unwrap_or(false),
+                refresh: dispatch::arg_bool_opt(args, "refresh")?.unwrap_or(false),
+                ..Default::default()
+            };
             let (token, reply) = offload.reply();
             session.images(
                 &ids,
                 format,
                 scale,
                 renders,
+                policy,
                 Box::new(move |result| {
                     let output =
                         result.map(|items| ToolOutput::Raw(crate::images::to_mcp_content(&items)));

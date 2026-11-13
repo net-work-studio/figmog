@@ -41,17 +41,25 @@ pub(super) fn cmd_images(
     format: String,
     scale: Option<f64>,
     out: Option<PathBuf>,
+    policy: images::RenderPolicy,
 ) -> Result<(), String> {
     let out_dir = out.unwrap_or_else(|| PathBuf::from("figmog-images"));
 
     let fetched = if let Some(root) = socket_root
         && let Some(result) = socket::try_images_call(
             root,
-            json!({"ids": ids, "format": format, "scale": scale, "file": db.key}),
+            json!({
+                "ids": ids,
+                "format": format,
+                "scale": scale,
+                "file": db.key,
+                "reuse": policy.reuse,
+                "refresh": policy.refresh,
+            }),
         ) {
         from_socket_result(result?)?
     } else {
-        fetch_direct(db, &ids, &format, scale)?
+        fetch_direct(db, &ids, &format, scale, policy)?
     };
 
     std::fs::create_dir_all(&out_dir)
@@ -117,23 +125,16 @@ fn fetch_direct(
     ids: &[String],
     format: &str,
     scale: Option<f64>,
+    policy: images::RenderPolicy,
 ) -> Result<Vec<Fetched>, String> {
     let node_ids = images::normalize_ids(ids);
     let scale_m = images::scale_milli(scale);
     let mut st = db.open_existing(|path| crate::open_store!(path))?;
-    let scanned = st.rtx(
-        |((nodes, ..), _, _, _, _, _, meta, _, _, images_table, pins, _)| {
-            images::scan(
-                &nodes,
-                &meta,
-                &images_table,
-                &pins,
-                &node_ids,
-                format,
-                scale_m,
-            )
-        },
-    );
+    let scanned = st.rtx(|readers| {
+        crate::with_scan_readers!(readers, |r| images::scan(
+            &r, &node_ids, format, scale_m, policy
+        ))
+    });
     // An explicit store has no network identity. Cache extraction needs
     // neither that identity nor credentials, even for a mixed hit/miss batch.
     let token = match db.key {
