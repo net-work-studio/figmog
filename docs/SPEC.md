@@ -1016,7 +1016,11 @@ connection keeps §6a's JSON-RPC errors and internal write tools. `attach`
 lists the relay's startup files: the owner opens each, queueing a first
 pull for a missing mirror when it watches (the old `figmog serve FILE...`
 startup); open failures come back in `attach_errors` and fail the relay's
-startup.
+startup. A watch-enabled owner rejects nonempty startup attachments without
+its own credentials before opening any sessions. Its response explains that
+credentials are read at owner startup and that it must be restarted after
+authentication changes. Empty attachment lists and `--no-watch` remain
+token-free.
 
 **Worktree context stays in the relay.** The owner has no default file and
 writes no `.figmog/current`. For every per-file local tool call with no
@@ -1112,7 +1116,12 @@ launch past 1 MiB), working directory the relay's project root. A thread
 reaps it, so it is never left a zombie. A launched owner that exits
 non-zero before becoming ready fails the relay with the log's tail; the
 relay waits at most 60 s for an owner (an old one's shutdown drain is
-bounded at 15 s).
+bounded at 15 s). Initial relays, CLI probes, and runtime reconnects use
+deadline-aware socket connection establishment. A full listener backlog,
+HELLO writes and reads (including partial frames or notifications), and
+retry waits all share the remaining overall budget; individual I/O calls
+cannot renew it. Runtime reconnects also remain cancellable at the relay's
+EOF deadline.
 
 **Cost of an idle restart.** The watch watermark is not persisted (§6
 "Watch watermarks"), so a restarted owner makes one reconciliation pull
@@ -1861,34 +1870,44 @@ When mirror and legacy roots coincide it is a no-op. Per key:
    directory and lock identities; if an older writer wins this transition,
    fail before copying or deleting anything.
 3. Remove any staging dir `<mirror root>/.<key>.migrating` left by an
-   interrupted run (safe: the migration lock excludes a live one), copy the old directory into it (regular files and
-   directories only, fsynced; the lock anchor is not copied), take a fresh
-   anchor and native writer lock on the staged `db/`, and write
-   `migrated-from` naming the source. Revalidate source and staged ownership
+   interrupted run (safe: the migration lock excludes a live one). Persist
+   a random source cookie outside `db`, then copy the old directory into
+   staging (regular files and directories only, fsynced; ownership anchors
+   and the source cookie are not copied). Take a fresh anchor and native
+   writer lock on the staged `db/`. Write a versioned `migrated-from` marker
+   containing the raw source-path bytes, directory device/inode, cookie,
+   and prepared retirement state. Revalidate source and staged ownership
    before publication.
 4. Atomically rename the staging dir to `<mirror root>/<key>`; the staged
    anchor and writer lock (still held) move with it, so the destination is
    owned the moment it appears.
 5. Atomically rename the old directory to its tombstone
    `.figmog/.<key>.deleting` beside it, retaining both locks. Revalidate the
-   renamed tombstone and remove it recursively, then the marker. Never revisit
-   the old source pathname: an older process may have created a new store
-   there after the rename. A tombstone is never opened as a store.
+   renamed tombstone, fsync the rename, and atomically persist retired state
+   in the destination before deleting any tombstone contents. Delete only
+   the proven original tombstone, keeping its source cookie until last, then
+   remove the marker and fsync the destination. Never revisit the old source
+   pathname after retirement: an older process may have created a new store
+   there. A tombstone is never opened as a database.
 
-A crash during 3 leaves the old store intact and active (the staging dir
-is ignored and redone on rerun). A crash after 4 leaves the marker, which
-the active-store rules report and a rerun finishes by doing 5 while holding
-both stores' anchors *and* native fjall writer locks (as in 2, so an older
-binary's serve on either store refuses it). The marker names the source
-checkout's old directory, and only a rerun from that checkout removes it:
-another worktree's own old mirror is an independent copy, so there the
-rerun refuses, naming the checkout that must finish — unless the recorded
-source is already gone, when it just removes the source's tombstone (if
-any) and the marker. A crash during 5's deletion leaves a half-deleted
-tombstone, which a rerun removes without opening it. An old directory an
-older binary's interrupted step 5 left half deleted in place is still
-protected by anchors and native writer locks without opening or recovering
-its contents. The same protection applies while removing stale staging
-directories and tombstones; missing lock files inside these partial private
-trees are created without initializing a database. A stray tombstone with no
-marker is removed by any rerun.
+A crash during 3 leaves the old store intact and active (staging is ignored
+and redone on rerun). A prepared marker after 4 permits retirement only when
+directory identity and cookie prove that the original is still at the source
+or tombstone. A source still at its original path must be resumed from its
+checkout. A different worktree's own legacy mirror remains independent.
+Both figmog anchors and native fjall locks remain required throughout cleanup.
+
+Once retired state is durable, recovery never opens or removes the old source
+path, even if it has been recreated. It can finish deleting a full or partial
+original tombstone while preserving that replacement. Missing or mismatched
+identity proof is refused without deleting the ambiguous tree; this includes
+the narrow interruption between removing the final cookie and its directory.
+The error directs the user to inspect and preserve copies before resolving
+the marker manually. Older pathname-only markers likewise refuse automatic
+cleanup when a source or tombstone survives; when both are absent, the marker
+can be removed safely.
+
+Cleanup of unmarked staging directories and stray tombstones retains the
+existing anchor/native-lock protection without opening torn database contents.
+Missing lock files inside those partial private trees are created without
+initializing a database.
