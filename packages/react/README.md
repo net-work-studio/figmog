@@ -43,13 +43,27 @@ The tests start a tiny `node:http` server over `test/fixtures/` (a synthetic
 card page plus a "wrong padding" variant) and drive real Chromium captures at
 1440 px and 390 px.
 
-`test/tokens.test.ts` checks `figmog tokens export` (NWS-2967) in a real
+`test/tokens.test.ts` checks `figmog tokens export` (NWS-2967, NWS-2948) in a real
 browser: it compiles the Rust golden file `tests/fixtures/tokens/export.css`
 (repository root; kept current by `cargo test --test tokens`, so no cargo
 build is needed here) together with `@import "tailwindcss"` using Tailwind's
 own `compile` API, loads the result in Chromium and asserts the computed
 colours, padding and radius of `bg-brand`, `p-card`, `rounded-md`, ... in
 light mode, under `data-theme="dark"` on the root, and in a dark subtree.
+It does the same with `tests/fixtures/tokens/modes.css` (NWS-2948:
+independent Brand × Theme × Density collections), checking `bg-button-hover`
+(a semantic alias chain through Theme into Brand), `pt-card-gap` and
+`pl-space-inset` with the theme, brand and density modes nested either way
+or set on one element.
+`test/spec.test.ts` checks `figmog spec`'s CSS translation (NWS-2947) the
+same way: it renders the Rust golden file `tests/fixtures/spec/edge.spec.json`
+(the edge-case fixture: negative spacing, wrap, grid, min/max, constraints,
+clipping, text auto-resize and truncation, mixed runs, an instance) as nested
+elements — once with each node's `css` inline, once with its Tailwind class
+hint compiled against `tests/fixtures/spec/tokens.css` — and asserts at
+1440 px and 390 px that every node's box equals the design's recorded
+bounding box (also inside a CSS border, and with a unitless token as padding),
+and that bound tokens, opacity tokens, kept newlines and text rules resolve.
 `tailwindcss` (pinned `4.3.4`, a dev dependency) is the compiler itself and
 has no dependencies of its own; `@tailwindcss/cli`/`@tailwindcss/node` would
 add native `lightningcss` binaries and a file-watcher stack this test does

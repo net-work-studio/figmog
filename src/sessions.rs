@@ -47,6 +47,8 @@ struct ImageJob {
     ids: Vec<String>,
     format: String,
     scale: Option<f64>,
+    /// Render `ids` (`false`: only fetch their fill images, NWS-2952).
+    renders: bool,
     reply: ImageReply,
 }
 
@@ -1070,6 +1072,7 @@ impl FileSession {
         ids: &[String],
         format: &str,
         scale: Option<f64>,
+        renders: bool,
         reply: ImageReply,
     ) -> Result<(), String> {
         if !self.mirrored {
@@ -1094,6 +1097,7 @@ impl FileSession {
             ids: ids.to_vec(),
             format: format.to_string(),
             scale,
+            renders,
             reply,
         };
         if self.busy {
@@ -1327,17 +1331,20 @@ fn open_session_inner(
                     ids,
                     format,
                     scale,
+                    renders,
                     reply,
                 }) => {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let node_ids = crate::images::normalize_ids(&ids);
+                        let render_ids: &[String] = if renders { &node_ids } else { &[] };
                         let scanned = st.rtx(
                             |(_, ((nodes, ..), _, _, _, _, _, meta, _, _, images, pins, _))| {
-                                crate::images::scan(
+                                crate::images::scan_split(
                                     &nodes,
                                     &meta,
                                     &images,
                                     &pins,
+                                    render_ids,
                                     &node_ids,
                                     &format,
                                     crate::images::scale_milli(scale),
@@ -1350,7 +1357,7 @@ fn open_session_inner(
                             api.as_deref().map(|a| a as &dyn FigmaApi),
                             &crate::api::download_bytes,
                             network_key.as_deref(),
-                            &node_ids,
+                            render_ids,
                             &format,
                             scale,
                         )

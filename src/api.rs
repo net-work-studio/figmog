@@ -237,7 +237,8 @@ impl UreqApi {
         }
     }
 
-    #[cfg(test)]
+    /// Cap every request's overall deadline (`figmog doctor`'s quick
+    /// checks; tests).
     pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
         self.http.timeout = timeout;
         self

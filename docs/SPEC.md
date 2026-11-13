@@ -786,7 +786,7 @@ process's life.
 `figmog_components`, `figmog_styles`, `figmog_uses`, `figmog_vars`,
 `figmog_sync`) + 5 whole-file structural queries (`figmog_stats`,
 `figmog_path`, `figmog_text`, `figmog_where`, `figmog_at`) +
-`figmog_spec` (the binding-aware spec, §17) + `figmog_images` (§15) + 2 multi-file management tools that aren't
+`figmog_spec` (the code-ready spec, §17) + `figmog_images` (§15) + 2 multi-file management tools that aren't
 per-file (`figmog_open`, `figmog_files`). Every tool but
 `figmog_sync`/`figmog_open`/`figmog_images` reads the local mirror at
 zero Figma API cost; `figmog_sync` and `figmog_open` schedule pulls, and `figmog_images` fetches renders and fills, so
@@ -1345,80 +1345,151 @@ Token export and spec matching select values by ID (NWS-2967). Without
 `--snapshot`/`snapshot: true` the result stays the plain row array; with
 it, `{snapshot, variables}`.
 
-### Token export (NWS-2967)
+### Token export, diff and check (NWS-2967, NWS-2948)
 
-`figmog tokens export [--out <path>] [--collection <name>] [--light-mode
-<mode>] [--dark-mode <mode>]` renders the variable snapshot as one CSS
-file (`src/tokens.rs`, pure; the CLI half is `src/cli/tokens.rs`).
+`figmog tokens export [--out <path> | --stdout] [--force] [--format tailwind|css]
+[--mode <collection>/<mode>=<selector>]...` renders the variable snapshot
+as one CSS file; `figmog tokens diff [--file <path>]` and `figmog tokens
+check [--file <path>]` (same `--format`/`--mode`) compare a committed file
+with that rendering. The renderer and comparison are pure
+(`src/tokens.rs`); the CLI half is `src/cli/tokens.rs`. DTCG JSON and
+TypeScript output are out of v1 scope.
 
-**How it reads.** It is not a new read tool: the CLI maps it to the
+**How it reads.** None is a new read tool: the CLI maps each to the
 existing `figmog_vars {snapshot: true}` read (`ReadCommand::Vars`), so it
 is socket-routed to a running serve/background owner or opens the store
 directly exactly like `figmog vars --snapshot` (§10 "Socket-first
 routing"), and renders that JSON locally. A serving binary older than the
-mode-identity or `collection_id` fields is reported as an error asking
-to restart it.
+mode-identity or `collection_id` fields is reported as an error asking to restart it.
+Authoritative `vars` rows also carry `collection_id` (additive JSON).
+
+**Settings.** In a project, the token file is `[stack] tokens`, the format
+`[tokens] format` and the mode mapping `[tokens.modes]` (§16);
+`--format` replaces the format and each `--mode` one mapping. With `--db`
+there is no project: defaults apply, `export` writes to stdout unless
+`--out` names a file, and `diff`/`check` need `--file`.
 
 **Snapshot.** Only state `current` exports; `none`, `legacy` (no
 provenance) and `empty` are exit-1 errors. Only authoritative rows are
 exported — an inferred-only variable (bound in the file, absent from the
 snapshot) is skipped and reported.
 
-**Output.** Deterministic, every block sorted by property name:
-
-1. a header comment with the snapshot's `source`, `format`,
-   `format_version`, `exported_at` and `digest` (null when absent) and the
-   theme choice;
-2. `:root { … }` — every exported variable's value in its collection's
-   default mode, except the theme collection, which uses its light mode;
-3. `[data-theme="dark"] { … }` — the theme collection's variables in the
-   dark mode (absent without a theme collection). Every theme-collection
-   variable, aliases included, is redeclared there, so `data-theme` works
-   on the root or on any subtree. A custom property's `var()` resolves
-   where the property is declared, so every variable outside the theme
-   collection that aliases a theme variable — directly or through a chain
-   — is also redeclared there, with its one value (otherwise
-   `var(--color-action-primary)` would keep its light value inside a dark
-   subtree);
-4. `@theme { … }` and `@theme inline { … }` — the Tailwind v4 theme
-   (below). Empty blocks are omitted.
-
-**Theme collection and modes.** Collections are grouped and tested for
-theme membership by ID. `--collection` selects a display name and rejects
-that name when more than one collection has it. Without `--collection`,
-the theme is the one collection with a mode whose name contains "dark"
-(ASCII-case-insensitive) — none ⇒ no dark block (an error if
-`--light-mode`/`--dark-mode` was given), several ⇒ an error asking for
-`--collection`. The dark mode is `--dark-mode`, else the collection's one
-mode named like "dark"; the light mode is `--light-mode`, else its one mode
-named like "light", else its default mode. Unknown names, several
-matches (including duplicate display names) and light = dark are errors.
-Mode display names select flags; mode IDs identify the chosen values.
-Other mode kinds and combining
-collections are out of scope.
-
-**Names.** `codeSyntax.WEB` (`--x` or `var(--x)`) when `x` is nonempty
-ASCII letters, digits, `-` and `_`; an invalid WEB value is reported and
-falls back to the name path: the variable name lower-cased, every run of
+**Identity and names.** A token is its variable id, within its
+collection, never its display name. Exporters select values by mode ID
+(`values_by_mode_id`, `default_mode_id`), with `mode_names` used only
+for presentation and selector defaults. Repeated mode names keep every
+value; a name-based mapping matching several modes is an error naming
+those IDs. An explicit mode ID can disambiguate a mapping. Mode summaries
+carry `collection_id` and `mode_id`; the theme summary also carries
+`light_mode_id` and `dark_mode_id`.
+ Its CSS name is `codeSyntax.WEB`
+(`--x` or `var(--x)`) when `x` is nonempty ASCII letters, digits, `-` and
+`_` — WEB code syntax can be any expression, so anything else (a JS
+identifier, `var(--x, red)`, `calc(...)`) is reported and falls back to
+the name path: the variable name lower-cased, every run of
 non-alphanumerics (including the `/` group separators) one `-`, prefixed
 `--` (`Color/Brand Primary` → `--color-brand-primary`; no collection
 prefix). A name with no ASCII alphanumerics is skipped and reported. Two
-variables with one name are an error naming both (`token name collision:
-`a/b` (VariableID:…) and `a b` (VariableID:…) both export as `--a-b` …`).
+variables with one name — `brand/primary` and `brand-primary`, or
+`primary` in two collections — are an error naming both, never an
+overwrite: ``token name collision: `primary` (collection "Brand",
+VariableID:…) and `primary` (collection "Product", VariableID:…) both
+export as `--primary` …``.
+
+**Modes.** Every collection's modes map to selectors: exactly one *root*
+mode, written to `:root`, and every other mode its own selector. Each
+collection's mapping comes from `[tokens.modes]`/`--mode` (keys
+`"<collection>/<mode>"`; a key naming no mode of the snapshot, or more than
+one, is an error), else the default:
+
+- root: the mode mapped to `:root`; else the collection's one mode named
+  like "light" (ASCII-case-insensitive substring) when it also has one
+  named like "dark"; else its default mode. Several `:root` modes, or a
+  default root mapped elsewhere, are errors;
+- the one mode named like "dark" → `[data-theme="dark"]`;
+- any other mode → `[data-<collection>="<mode>"]`, both kebab-cased like a
+  name path (`Density`/`Compact` → `[data-density="compact"]`); a name
+  with no ASCII alphanumerics must be mapped explicitly;
+- `""` leaves a mode out (listed in the header as `(not exported)`).
+
+Two modes of one collection on one selector are an error; modes of
+different collections may share one (`"Color/Dark"` and `"Theme/Dark"`
+both on `[data-theme="dark"]` switch together). Collections are
+independent — theme × density × brand — and each block declares only its
+own collections' variables, so nothing overwrites another collection.
+Modes of one collection are not nested inside each other (other than
+under the root mode).
+
+**Output.** Deterministic, every block sorted by property name:
+
+1. a header comment with the snapshot's `source`, `format`,
+   `format_version`, `exported_at` and `digest` (null when absent), then
+   one ` * theme: collection "<c>": mode "<root>" -> :root, mode "<m>" ->
+   <selector>, …` line per collection with more than one mode (sorted by
+   collection, then mode), or ` * theme: none (every collection exports one
+   mode)`;
+2. `:root { … }` — every exported variable's root-mode value;
+3. one block per other selector (sorted), with each variable of a
+   collection mapped there in that mode;
+4. combined blocks `<own> <other>, <own><other>` (sorted; `<own>:is(<other>)`
+   when `<other>` starts with a type selector) — see below;
+5. format `tailwind` only: `@theme { … }` and `@theme inline { … }` — the
+   Tailwind v4 theme (below). Empty blocks are omitted.
+
+**Subtrees.** A custom property's `var()` resolves where the property is
+declared, so a variable declared only in `:root` that aliases one a mode
+overrides would keep its root value inside that mode's subtree. Each
+mode's block therefore also redeclares every variable of *another*
+collection that aliases, directly or through a chain (in any of its
+modes), a variable the block declares — with its root value. For each of
+that variable's own non-root modes, a combined block (its mode's selector
+outside this one, or both on one element) declares it with that mode's
+value; at specificity (0,2,0) it outranks both plain blocks, so nesting
+either collection inside the other, or setting both on one element, keeps
+both modes (`[data-theme="dark"] [data-density="compact"],
+[data-theme="dark"][data-density="compact"] { --space-section: 32px }`).
 
 **Values.** COLOR → `#rrggbb`, or `#rrggbbaa` below full alpha (each
-channel `round(clamp(x, 0, 1) × 255)`). FLOAT → `<n>px` when its `scopes`
-include `GAP` or `WIDTH_HEIGHT` (spacing/size) or `CORNER_RADIUS`
-(radius); any other FLOAT is emitted unitless and reported. Numbers print
-in shortest round-trip form (`16`, `0.5`). An alias → `var(--target)`;
-CSS resolves chains. Every emitted FLOAT carries its own unit, so a px
-FLOAT aliasing a unitless one → `calc(var(--target) * 1px)` (a bare
+channel `round(clamp(x, 0, 1) × 255)`). FLOAT units come from `scopes`,
+each implying one unit: px for `GAP`, `WIDTH_HEIGHT`, `CORNER_RADIUS`,
+`FONT_SIZE`, `LINE_HEIGHT`, `LETTER_SPACING`, `PARAGRAPH_SPACING`,
+`PARAGRAPH_INDENT`, `STROKE_FLOAT` and `EFFECT_FLOAT`; `%` for `OPACITY`
+(Figma opacity variables are 0–100: `50` → `50%`); none for
+`FONT_WEIGHT`. When all scopes agree the FLOAT is `<n><unit>`; scopes
+implying different units, `ALL_SCOPES`, no scopes or an unknown scope are
+an *ambiguous unit*: unitless, reported. Numbers print in shortest
+round-trip form (`16`, `0.5`). An alias → `var(--target)`; CSS resolves
+chains. Every emitted FLOAT carries its own unit, so a FLOAT with a unit
+aliasing a unitless one → `calc(var(--target) * 1px)` (or `* 1%`; a bare
 `var()` would make `padding: 16` invalid, i.e. 0px), while a unitless
-FLOAT aliasing a px one is skipped and reported (CSS cannot strip a
-unit; emitting the resolved number would silently detach the alias), as
-is an alias between COLOR and FLOAT. STRING, BOOLEAN and other types are skipped and
-reported, as is a variable missing a needed mode's value or aliasing a
-variable that isn't exported (transitively).
+FLOAT aliasing one with a unit, or a px FLOAT aliasing a `%` one (and the
+reverse), is skipped and reported (CSS cannot strip or convert a unit;
+emitting the resolved number would silently detach the alias), as is an
+alias between COLOR and FLOAT.
+STRING, BOOLEAN and other types are skipped and reported, as is a
+variable missing a needed mode's value.
+
+**Aliases.** Aliases are kept as references, never flattened:
+
+- an alias to a variable absent from the snapshot — typically a remote
+  library variable the import doesn't carry — is reported as unresolved
+  (`… not in the variable snapshot … unresolved, not flattened`) and the
+  variable skipped;
+- alias cycles are found per combination of modes: the alias graph over
+  all modes is split into strongly connected components, and each that
+  loops is checked under every combination CSS can produce — every set of
+  matching mode selectors, each collection in the mode whose selector
+  matches (its root mode when none does) — so collections sharing a
+  selector (every dark mode on `[data-theme="dark"]` by default) switch
+  together and a loop closing only when one is Light and the other Dark
+  is no cycle. Two modes of one collection never apply at once, so a
+  variable has one value per combination. The limit counts legal contexts,
+  including shared-selector coupling. Components with more than 4096
+  legal mode combinations are skipped unchecked. A member of a cycle is skipped and
+  reported with the cycle and either `in every mode` or `only in some
+  modes (first: "Theme" mode "Dark")`; a loop no combination closes is no
+  cycle;
+- a variable aliasing a skipped one is skipped too, transitively.
 
 **Tailwind namespaces.** COLOR → `--color-*`, spacing/size → `--spacing-*`,
 radius → `--radius-*`; unitless FLOATs get no theme entry. A name already
@@ -1431,31 +1502,81 @@ prefixed (`--surface` → `--color-surface`). Entries:
   emitted mode ⇒ `@theme inline { --color-action-primary:
   var(--color-brand) }` (the utility uses the alias target directly);
 - otherwise ⇒ `@theme { --color-brand: <root value> }`: the utility reads
-  `var(--color-brand)`, which the unlayered `:root`/`[data-theme]` blocks
-  override per mode.
+  `var(--color-brand)`, which the unlayered mode blocks override.
 
 A theme name that collides with another theme name or another token's
-name is an error naming both variables.
+name is an error naming both variables (format `tailwind` only).
 
-**Output and report.** Without `--out` the CSS goes to stdout and, when
-anything was reported, one `{"report": [...]}` JSON line to stderr. With
-`--out` the file is written and stdout gets `{out, tokens, theme,
-report}` JSON. Report entries are `{variable_id, name, reason}`, sorted.
+**Export output and report.** To the token file (`--out <path>`, else
+`[stack] tokens` in a project), creating its directory and leaving
+identical bytes untouched. It never writes through a symlink (the token
+file itself being one is an error, `--force` or not); `[stack] tokens`
+must resolve inside the project (its nearest existing ancestor,
+symlinks resolved, is under the project root); and an existing file that
+does not start with ``/* Generated by `figmog tokens export` `` — a
+hand-written stylesheet named as the token file — is an error unless
+`--force`. Stdout gets `{out, status: written|unchanged,
+format, tokens, theme, modes, report}` JSON. `theme` is the one collection
+with a mode on `[data-theme="dark"]` as `{collection, light_mode,
+dark_mode}` (else null; `figmog spec` shows it); `modes` lists every
+collection's `{collection, mode, selector}` (`selector` null when left
+out). With `--stdout`, `--out -`, or `--db` without `--out`, the CSS goes
+to stdout and, when anything was reported, one `{"report": [...]}` JSON
+line to stderr. Report entries are `{variable_id, name, reason}`, sorted.
+
+**Diff.** `tokens diff` compares the committed file (`--file`, else
+`[stack] tokens`) with a fresh rendering, as flat CSS: declarations are
+matched by block (selector, whitespace-collapsed, or `@theme`/`@theme
+inline`) and property name. It prints `{status, file, snapshot,
+header_changed, added, removed, changed}` and exits 0: `status` is
+`up_to_date` (byte-identical), `out_of_date` or `missing` (no file: every
+declaration is `added`); `added`/`removed` entries are `{name, block,
+value, variable_id}`, `changed` entries `{name, block, from, to,
+variable_id}` (`variable_id` from the fresh export, null for a removed
+name), sorted by name then block; `header_changed` flags a different
+header comment (snapshot provenance or mode mapping); `snapshot` is the
+provenance below. A file that isn't flat CSS blocks (nested blocks, text
+outside a block) is an exit-1 error.
+
+**Check.** `tokens check` passes only when the committed file is
+byte-identical to the rendering, printing `{status: "ok", file,
+certifies: "matches the last published snapshot", result: "<file> matches
+the last published snapshot", snapshot: {source, format, format_version,
+exported_at, digest}, note}` — the snapshot's provenance (NWS-2961). It
+certifies the file against the variable snapshot in the mirror, never the
+live Figma file, and `note` says so: Figma changes published after that
+snapshot are seen only once it is re-imported or re-pulled. The
+comparison is byte-exact, header included, so a re-import whose values
+are identical but whose provenance (`exported_at`, digest) differs reports
+the file stale (only `header_changed`) — intended: the file must match
+the last published snapshot, provenance and all, and `tokens export`
+refreshes it. Otherwise it
+prints the diff report on stdout and exits 1 with the error "`<file>`
+does not match the last published snapshot (N added, N removed, N
+changed[, header … changed]) — run `figmog tokens export` to regenerate
+it" (or "`<file>` does not exist — …"). It never writes the file.
 
 **Fixtures.** `tests/fixtures/tokens/variables.json` (synthetic: a
 Light/Dark `Theme` collection, an alias chain `action/hover →
 action/primary → brand → ocean/500` and a GAP alias of a unitless FLOAT)
-exports to the golden `tests/fixtures/tokens/export.css`
-(`tests/tokens.rs`; `FIGMOG_BLESS=1` regenerates it).
-`packages/react/test/tokens.test.ts` compiles that golden file with
-Tailwind v4 and asserts computed values in Chromium in both modes.
+exports to the golden `export.css` (tailwind) and `export.plain.css`
+(css); `modes.json` (Brand × Theme × Density with aliases across them, a
+dark-only alias cycle and an alias to a remote variable, `Brand/Globex`
+mapped to `.brand-globex`) to `modes.css` (`tests/tokens.rs`, which also
+covers `diff`/`check` and the figmog.toml settings in a project;
+`FIGMOG_BLESS=1` regenerates the goldens).
+`packages/react/test/tokens.test.ts` compiles `export.css` and
+`modes.css` with Tailwind v4 and asserts computed values in Chromium: both
+modes, dark subtrees, and theme/brand/density modes nested either way or
+on one element, through nested semantic aliases.
 
 ## 10. CLI surface
 
 JSON is the CLI's only output mode (there is no `--json` flag — there's
 nothing to select between). Every command prints pretty-printed JSON on
 stdout via one seam (`cli::write_json`) — the one exception is `tokens
-export` without `--out`, whose stdout is the CSS file itself (§9); every failure prints
+export` to stdout (`--stdout`, `--out -`, or `--db` without `--out`), whose
+stdout is the CSS file itself (§9); every failure prints
 `{"error": "..."}` on stderr and exits 1 (a raw internal panic exits 101
 instead, still as one JSON stderr line — see `open_store_checked`'s doc
 comment in `src/cli/mod.rs`). A reader that vanishes mid-write (piped
@@ -1476,8 +1597,15 @@ mapping of the 18 read-only query commands onto `dispatch::ReadCommand`),
 surface, so every tool `figmog serve` would expose is reachable without
 an MCP client), `src/cli/images.rs` (`images`, §15),
 `src/cli/socket.rs` (the client half of the control plane, §6a),
-`src/cli/migrate.rs` (`migrate`, §16), and `src/cli/tokens.rs` (`tokens
-export`, §9 — mapped onto the `figmog_vars` read, then rendered as CSS).
+`src/cli/migrate.rs` (`migrate`, §16), `src/cli/init.rs` (`init` and
+`settings`, §16), `src/cli/doctor.rs` (`doctor`, §16), and
+`src/cli/tokens.rs` (`tokens export|diff|check`, §9 — mapped onto the
+`figmog_vars` read, then rendered as CSS and compared with the token
+file), and `src/cli/map.rs` (`map check|coverage`, §18 — `coverage` mapped
+onto the `figmog_components` read, then compared with `figmog.map.json`),
+and `src/cli/assets.rs` (`assets export`, §19 — the `figmog_subtree` and
+`figmog_components` reads plus `figmog_images`, then files written into
+the project).
 `src/cli/auth.rs` handles credential commands and hidden terminal input;
 `src/auth.rs` owns credential resolution and native storage.
 
@@ -1493,7 +1621,9 @@ Default mirror paths come from the project layout (§16): the key's
 file is `figmog.toml`'s `[files] default`, else `.figmog/current` (in the
 project root). Every command except `version`, `auth` and `--db`
 invocations discovers the project first, so a malformed `figmog.toml` or
-`figmog.local.toml` fails every such command with `<file>:<line>: <message>`.
+`figmog.local.toml` fails every such command with `<file>:<line>: <message>`
+(`doctor` reports it as its failed `config` check instead; `init`,
+`doctor` and `settings` refuse `--db`).
 `figmog migrate [FILE]` (§16) moves old mirrors into the shared root.
 Persisted `.figmog/current`
 contents are trimmed and must be a bare key of at least 10 ASCII
@@ -1758,8 +1888,10 @@ outside `sync`'s, and is never swept.
 ## 15. Images
 
 `figmog images <node-id>... [--format png|svg] [--scale N] [--out <dir>]`
-and the `figmog_images { ids, format?, scale?, file? }` tool fetch image
-bytes. Nothing in figmog calls them on its own: the images endpoints are
+and the `figmog_images { ids, format?, scale?, renders?, file? }` tool fetch image
+bytes. `renders: false` (default true; NWS-2952) skips the renders and
+fetches only the fills the nodes' own `fills` reference — what `figmog
+assets export` (§19) uses for image fills. Nothing in figmog calls them on its own: the images endpoints are
 Figma's most rate-limited, so a fetch happens only when a person or an
 agent asks for one.
 
@@ -1857,7 +1989,8 @@ and opens the explicit store, including for cached-image extraction.
 ## 16. Project config and mirror roots
 
 Source: `src/project.rs` (discovery, config, active-store rules),
-`src/cli/migrate.rs` (`figmog migrate`).
+`src/cli/migrate.rs` (`figmog migrate`), `src/cli/init.rs` (`figmog init`,
+`figmog settings`), `src/cli/doctor.rs` (`figmog doctor`).
 
 **Project root.** The nearest directory containing a regular file named
 `figmog.toml`, walking up from the working directory but never past the
@@ -1888,28 +2021,101 @@ the project has a `figmog.toml`). Both use the same hand-parsed TOML subset
 ```toml
 [files]
 default = "AbCdEf1234"                                  # file key or Figma URL
-design-system = "https://www.figma.com/design/XYZ/..."  # named entry
+library = "https://www.figma.com/design/XYZ/..."        # named entry
+
+[verify]
+dev_server = "http://localhost:3000"
 ```
 
-Supported: an optional UTF-8 BOM, `#` comments, blank lines, quoted or bare
-`[table]` headers (including `["files"]`), and inside
+Supported: an optional UTF-8 BOM, `#` comments, blank lines, quoted or bare `[table]` headers, inside
 `[files]` only `key = "string"` (bare or quoted keys; basic strings with
-`\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings). Every
-`[files]` value must be a file key or Figma URL and is stored as its key.
-Unsupported `files` encodings (dotted assignments, inline tables, array
-tables or subtables) are explicit errors. Other tables, top-level keys and
-`[[array]]` tables are skipped unparsed
-(reserved for later settings, never an error), except that multi-line
-strings (`"""` and `'''`) in skipped values are tracked so a `[files]`
-line inside one is content, not the table; multi-line values inside
-`[files]` itself are an error. Errors — unterminated
-headers, strings or multi-line strings, a missing `=`, a non-string value, trailing text, an
-invalid file reference, a duplicate key or a second `[files]` table — read
-`figmog.toml:<line>: <message>` (or `figmog.local.toml:...`). Local entries
-replace same-named ones. Only `default` has meaning today: it is the file
-every command uses when none is given, ahead of `.figmog/current`, which
-remains the fallback (and is still written by `pull` and serve's default
-session). Named entries are parsed and validated but not yet addressable.
+`\" \\ \n \t \r \uXXXX` escapes, or literal `'...'` strings), and inside
+the settings tables `[stack]`, `[inspector]`, `[verify]`, `[tokens]` and
+`[assets]` (below) `key = <value>` where the value is such a string, `true`/`false`,
+or a decimal integer or float (`_` separators allowed), and inside
+`[tokens.modes]` only `"<collection>/<mode>" = "<selector>"` (quoted keys,
+string values; NWS-2948). Unsupported `files` forms (dotted assignments, inline tables, arrays or subtables) are explicit errors. Every `[files]` value
+must be a file key or Figma URL and is stored as its key. Other tables,
+top-level keys and `[[array]]` tables are skipped unparsed (reserved for
+later settings, never an error), except that multi-line strings (`"""`
+and `'''`) in skipped values are tracked so a header line inside one is
+content, not a table. In the settings tables, a key this binary does not
+know has its value skipped unparsed whatever its shape (arrays, inline
+tables, dates, multi-line strings — tracked across lines by bracket depth
+outside strings, so a header line inside one is content); a *known* key's
+value must be a single-line string, boolean or number, and multi-line
+strings, arrays and inline tables there are an error. Errors — unterminated headers, strings or
+multi-line strings, a missing `=`, a value of the wrong type, trailing
+text, an invalid file reference or setting, a duplicate key or a second
+copy of a known table, an unknown key's value left open at the end of
+the file (`unterminated value`) — read `figmog.toml:<line>: <message>` (or
+`figmog.local.toml:...`); a settings error names its key
+(`figmog.toml:7: verify.threshold: must be between 0 and 100, found
+500`). Local entries replace same-named ones, key by key in the settings
+tables too. In `[files]`, `default` is the *product* file: the file every
+command uses when none is given, ahead of `.figmog/current`, which remains
+the fallback (and is still written by `pull` and serve's default session).
+`library` names the optional library file holding tokens and components
+(for later features). Other named entries are parsed and validated but
+not yet addressable.
+
+**Settings (NWS-2946).** The typed settings later features read
+(`project::Settings`, through `ProjectConfig::settings` /
+`Layout::settings`; `figmog settings` for tools outside the binary).
+Every key is optional; a missing key is its default:
+
+| key | type | default | rule |
+|---|---|---|---|
+| `stack.framework` | string | `"react"` | v1: `react` only |
+| `stack.styling` | string | `"tailwind"` | v1: `tailwind` only |
+| `stack.tokens` | string | `"src/figmog-tokens.css"` | relative path inside the project: no `..`, not absolute, no `\`, last segment a file name (not `.`, `..` or empty) |
+| `inspector.enabled` | boolean | `true` | the dev-server inspector, development builds only |
+| `inspector.shortcut` | string | `"Alt+Shift+F"` | one or more of `Ctrl`/`Alt`/`Shift`/`Meta` (any case, each once), `+`-joined, then one ASCII letter or digit, or `F1`–`F12` |
+| `verify.loop` | boolean | `true` | the verify loop on or off |
+| `verify.dev_server` | string | `"http://localhost:5173"` | `http`/`https`, no credentials, loopback host only (`localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`): v1 is local only |
+| `verify.threshold` | number | `95` | advisory match score, 0–100 (the screenshot comparison's `score`) |
+| `tokens.format` | string | `"tailwind"` | `tailwind` (CSS variables plus a Tailwind v4 `@theme`) or `css` (CSS variables only); DTCG and TypeScript are not v1 (NWS-2948) |
+| `assets.icons` | string | `"src/icons"` | the icon components' folder (`svg/` beneath it holds the SVGs); a relative path inside the project, like `stack.tokens` (NWS-2952) |
+| `assets.images` | string | `"public/figma"` | the image fills' folder; same rule |
+| `assets.manifest` | string | `"figmog.assets.json"` | the generated asset manifest `figmog spec` reads; same rule |
+| `assets.prefix` | string | `"Icon"` | every icon component name starts with it: an ASCII capital letter, then up to 31 ASCII letters or digits |
+| `assets.current_color` | boolean | `false` | convert single-color icons to `currentColor` (opt-in; multicolor icons always keep their colors) |
+| `assets.components` | string | `"tsx"` | `tsx` or `jsx` |
+
+`[tokens.modes]` (NWS-2948) maps variable-collection modes to the
+selectors `figmog tokens` writes them under, one `"<collection>/<mode>" =
+"<selector>"` per mode: `":root"` makes it the collection's root mode,
+`""` leaves it out, anything else must be one CSS selector (no surrounding
+spaces, `,`, `{`, `}`, `;`, `@` or comments). Keys must contain a `/`;
+whether they name a real mode is checked against the snapshot at export
+time (§9 "Token export, diff and check"). Modes not named keep the default mapping.
+`figmog.local.toml` replaces single mappings. `figmog init` writes neither
+`[tokens]` table, nor `[assets]` (§19).
+
+```toml
+[tokens]
+format = "tailwind"
+
+[tokens.modes]
+"Theme/Dark" = '[data-theme="dark"]'   # the default for a dark-like mode
+"Brand/Globex" = ".brand-globex"
+"Density/Spacious" = ""                  # not exported
+```
+
+The verify contract is fixed for v1 and not configurable: viewports 1440
+and 390 CSS px wide, `light` color scheme, `default` state
+(`VERIFY_VIEWPORTS`, `VERIFY_COLOR_SCHEME`, `VERIFY_STATE`). A key this
+binary does not know inside a settings table is kept, not rejected
+(`ProjectConfig::unknown_keys`, sorted `<table>.<key>`), so a newer
+figmog's settings never break an older binary; its value, of any shape,
+is skipped (above). `figmog doctor` reports unknown keys as a warning.
+
+`figmog settings` prints `{project_root, config (the figmog.toml path or
+null), files, unknown_keys, stack: {framework, styling, tokens,
+tokens_path}, inspector: {enabled, shortcut}, verify: {loop, dev_server,
+threshold, viewports, color_scheme, state}, tokens: {format, modes}}`
+(`tokens_path` is absolute).
+It does not take `--db`.
 
 **Legacy roots.** Every existing `.figmog` directory between the working
 directory and project root is checked, nearest first for `current`. A
@@ -2008,25 +2214,159 @@ directories and tombstones; missing lock files inside these partial private
 trees are created without initializing a database. A stray tombstone with no
 marker is removed by any rerun.
 
-## 17. Binding-aware spec (NWS-2968)
+**`figmog init` (NWS-2946).** One non-interactive command from a React
++ Tailwind repository to a working mirror and MCP registration
+(`src/cli/init.rs`). It never prompts; every answer is a flag or
+detected: `--file <key|URL>` (the product file; default: `figmog.toml`'s
+`[files] default`, else `.figmog/current` — never `figmog.local.toml`'s,
+which is machine-local: with no `[files]` in `figmog.toml`, no
+`.figmog/current` and no `--file`, `init` asks for `--file`), `--library`, `--framework`,
+`--styling`, `--tokens`, `--dev-server`, `--token-stdin`, `--from-file
+<saved response>` (offline first pull), `--no-pull`, `--mcp-command`.
+It does not take `--db`. Steps, in order, each idempotent:
 
-`figmog spec <node>` and the `figmog_spec {id}` tool describe one
-auto-layout subtree — typically a card — the way a developer rebuilds it:
-layout plus values, every value either the variable token it is bound to
-or explicitly untokenized. Source: `src/spec.rs` (pure), composed in
-`query::spec`.
+1. Validate every flag (reading and shape-checking a `--token-stdin`
+   token) before writing anything, then discover the project (above):
+   `init` writes at the existing `figmog.toml`'s directory; with none up
+   the tree, at the working directory when it has its own `package.json`
+   (a monorepo package such as `apps/web` — consistent with discovery,
+   which walks up from there and finds the new `figmog.toml` first; the
+   mirror root stays the repository's), else the Git top level, else the
+   working directory. Commands run outside that package (say, from the
+   repository root) do not see its `figmog.toml`, and old mirrors in
+   another directory's `.figmog/` are not migrated.
+2. `figmog.toml`: created whole (a header comment, then `[files]`,
+   `[stack]`, `[inspector]`, `[verify]` with every key written), or, when
+   it exists, only the known tables it lacks are appended after a blank
+   line — an existing table is never edited, and a flag that contradicts
+   an existing table's value (its default when the key is absent) is an
+   error naming the key. An existing `[files]` without `default` is an
+   error. The stack is detected only for a new `[stack]`: React from a
+   `react` key in `package.json`'s `dependencies`, `devDependencies` or
+   `peerDependencies` (searched in that order); Tailwind from a
+   `tailwindcss`, `@tailwindcss/vite` or `@tailwindcss/postcss`
+   dependency, else a `tailwind.config.{js,cjs,mjs,ts,cts,mts}` file;
+   `--framework`/`--styling` skip detection. Not finding both is an error
+   (v1 supports React + Tailwind only) naming the flags to pass. The file
+   is read back through discovery before continuing.
+3. Token: `--token-stdin` saves it through `auth::login` (§10
+   "Credentials"); otherwise `auth status` is reported.
+4. `.gitignore`: `.figmog/` and `figmog.local.toml`, by the §10 "Git
+   ignore rules".
+5. `figmog migrate` (every key) moves old `.figmog/<key>/db` mirrors to
+   the shared root (above).
+6. `.mcp.json` at the project root (Claude Code's project scope): adds
+   `mcpServers.figmog = {"type": "stdio", "command": "figmog" (or
+   --mcp-command), "args": ["serve"], "env": {}}`. An identical entry is
+   left alone; a different one is kept unless `--mcp-command` was given
+   (then replaced); every other key is preserved. The file is rewritten
+   (sorted keys, two-space indent, trailing newline) only when the entry
+   changes. Invalid JSON or a non-object is an error, never overwritten.
+   v1 registers Claude Code only and never runs `claude`.
+7. `AGENTS.md`: figmog's block — how to read the design (MCP tools, CLI),
+   the stack and token file from the settings, the v1 verify contract,
+   what never to commit — between `<!-- figmog:begin (managed by `figmog
+   init`; edits inside are replaced) -->` and `<!-- figmog:end -->`.
+   Created when absent, appended (after a blank line) when it has no
+   markers, replaced in place when it has exactly one begin marker before
+   one end marker; any other marker layout is an error. Nothing outside
+   the markers changes.
+8. The first pull of the project's default file as every later command
+   resolves it (`figmog.local.toml`'s `[files] default` when it overrides
+   the committed one), exactly as `figmog pull <key> [--from-file]`
+   (socket-routed when a serve answers, else direct; with the global
+   `--no-socket`, no socket is looked for or contacted) —
+   last, so a failing pull (say, no token) leaves the rest set up, which
+   its error says. `--no-pull` skips it.
+
+Output: `{project_root, config: {path, status: created|updated|unchanged,
+added_tables}, files: {default, library}, stack: {framework, styling,
+tokens, source: {framework, styling}}, token, gitignore: {updated},
+migrated, mcp: {path, status: added|updated|kept|unchanged, server},
+agents: {path, status: created|appended|updated|unchanged}, pull:
+{skipped, file?, churn?}}`. `files` and `stack` — and the `AGENTS.md`
+block — come from `figmog.toml` alone: machine-local overrides in
+`figmog.local.toml` are never committed. A rerun with the same flags
+rewrites no file.
+
+**`figmog doctor` (NWS-2946).** Checks the setup (`src/cli/doctor.rs`) and
+prints `{status, checks: [{name, status, detail}]}`, the checks in this
+fixed order, each `ok`, `warn` or `fail`; `status` is the worst. It
+discovers the project itself, so a malformed config is a failed check
+rather than an exit before the report. `--upstream <url>` names the
+desktop MCP server (default as for `serve`); `--db` is refused.
+
+| check | ok | warn | fail |
+|---|---|---|---|
+| `config` | `figmog.toml` read | no `figmog.toml` (defaults apply); unknown settings keys | malformed config |
+| `token` | a token resolves | — | none, or the credential store fails |
+| `mirror` | the product file's active store exists | no product file; not pulled yet; migration pending | invalid `.figmog/current`; two mirrors |
+| `file_access` | `GET /v1/files/:key/meta` answers | network error or rate limit; skipped (no token or no product file) | 403 or another HTTP error |
+| `variables_access` | `GET /v1/files/:key/variables/local` answers | 403/404 (not on this plan: use `import-variables`); network or other error; skipped | — |
+| `desktop_mcp` | the desktop server initializes | unreachable (figmog's own tools still work) | — |
+| `mcp_config` | `.mcp.json` has a `figmog` server whose command is an executable path or on `PATH` | no file, no entry, or an unresolvable command | unreadable or invalid JSON |
+| `dev_server` | a TCP connection to `[verify] dev_server`'s host and port succeeds, or the verify loop is off | not reachable; name resolution failed or timed out | — |
+
+The store is never opened (a running serve may hold it). The dev
+server's `localhost` / `*.localhost` host goes straight to `127.0.0.1` and
+`::1` without a resolver, an IP literal as is; any other name is resolved
+on a detached thread abandoned after 2 s (a `warn`). Network checks
+are bounded — 10 s per complete Figma check, the desktop client's 2 s connect
+and 10 s request timeouts, 2 s per dev-server address — and a network
+failure is a `warn` ("could not reach Figma"), so an offline machine gets
+a complete report quickly. Each Figma check runs on a worker under one
+absolute deadline, including client creation, DNS resolution and HTTP.
+The HTTP client receives only the remaining budget. Doctor abandons a
+worker that exceeds the deadline, discards its late result and continues
+with a warning. Figma checks use serve's API client (debug
+builds honor `FIGMOG_API_BASE`, for tests). The token is never printed.
+Exit 0 unless a check failed; then the report is still printed and
+`{"error": "doctor: failed checks: <names>"}` goes to stderr, exit 1.
+
+## 17. Code-ready spec (NWS-2968, NWS-2947)
+
+`figmog spec <node> [--tailwind | --no-tailwind]` and the
+`figmog_spec {id, tokens?, tailwind?, map?}` tool describe one subtree — a
+card, a page section — the way a developer builds it. Source:
+`src/spec.rs` (pure) and `src/spec/css.rs` (the CSS declarations and the
+Tailwind hint), composed in `query::spec`. NWS-2968 was the slice (one
+auto-layout card); NWS-2947 grew it to the full description below.
 
 **How it reads.** A local read like any other (`ReadCommand::Spec`, §6
 "Read adapters"): direct CLI, socket/owner-routed CLI, `figmog call` and
 MCP all return the same JSON, and the NWS-2902 parity tests cover it. It
 runs on a read worker. The inputs are exactly the `figmog_subtree {id}`
-answer (raw JSON, children nested) and the `figmog_vars {snapshot: true}`
-answer, so the output is a function of the mirror alone. `id` takes a
+answer (raw JSON, children nested), the `figmog_vars {snapshot: true}`
+answer, and the `components`/`component_sets` records of the subtree's
+instances, so the output is a function of the mirror alone. `id` takes a
 bare id, a `12-34` id or a Figma URL (§12); an unknown id is the standard
 `no node … in the mirror` error.
 
+**Project settings.** Token CSS names and root modes come from the token
+export (§9) run with the project's `[tokens]` settings (NWS-2948), so
+they match the committed token file; `figmog_spec` takes them as an
+optional `tokens: {format?, modes?}` argument (validated like
+figmog.toml's `[tokens]`/`[tokens.modes]`). The Tailwind class hint
+(`tailwind: true`) is on when the project's `[stack] styling` is
+`tailwind` (§16; v1's only styling, so on in every project), and
+`--tailwind`/`--no-tailwind` (or an explicit `tailwind` argument)
+override it. The Figma → code component map (§18) is the optional `map`
+argument: the content of `figmog.map.json`, validated exactly like the
+file. The asset manifest (§19) is the optional `assets` argument: the
+manifest's content (or its normalized `{version, icons: [{node_id, key,
+component, path, svg}], images: [{image_ref, path, url}]}` form),
+validated strictly (node ids, imageRefs, component names, project-relative
+paths, root-relative URLs). `figmog spec` in a project and the stdio relay
+(`figmog serve`'s default shape) fill in whichever of the four the caller
+left out (`map` from the project root's `figmog.map.json` and `assets`
+from `[assets] manifest`, each read on every call; when there is none,
+none; when it is invalid, the call fails naming the file and JSON path);
+with `--db`, `figmog call`, or an MCP client of an in-process serve, an
+omitted `tokens` is the default mapping, an omitted `tailwind` is off and
+an omitted `map` or `assets` is none.
+
 **Output.** One JSON object, every key sorted (`serde_json` without
-`preserve_order`):
+`preserve_order`); byte-identical across runs for the same mirror:
 
 ```
 {
@@ -2037,19 +2377,61 @@ bare id, a `12-34` id or a Figma URL (§12); an unknown id is the standard
 }
 ```
 
-A spec node is `{id, name, type, layout?, values, children}` with
-`children` in child-index order. `tokens_snapshot` is the §9 snapshot
-summary the names refer to, plus the theme the token export picks
-(`{collection, collection_id, light_mode, dark_mode}` or null) and
-`css_unavailable`:
-null, or the token export's error (no `current` snapshot, a name
-collision, an ambiguous theme), in which case every `css` is null.
+`tokens_snapshot` is the §9 snapshot summary the names refer to, plus the
+theme the token export picks (`{collection, light_mode, dark_mode}` or
+null) and `css_unavailable`: null, or the token export's error (no
+`current` snapshot, a name collision, an ambiguous theme), in which case
+every `css` name is null and bound values are written raw in the CSS.
+The theme summary includes collection and mode IDs as well as their display names.
 
-**Layout** (only on auto-layout frames and on children of one):
+### Two layers
 
-- `direction`: `horizontal` | `vertical` (`layoutMode`);
+A spec node is
+
+```
+{id, name, type,
+ design?,                      // what Figma recorded
+ layout?, values, content?, instance?, css?, tailwind?,   // figmog's reading
+ children}
+```
+
+with `children` in child-index order. A hidden layer (`visible: false`)
+keeps only `{id, name, type, design?}`.
+
+- **`design`** is the recorded layout, copied verbatim (never
+  normalized): `layoutMode`, `layoutWrap`, `layoutPositioning`,
+  `layoutAlign`, `layoutGrow`, `layoutSizingHorizontal`/`Vertical`,
+  `primaryAxisSizingMode`, `counterAxisSizingMode`,
+  `primaryAxisAlignItems`, `counterAxisAlignItems`,
+  `counterAxisAlignContent`, `itemSpacing`, `counterAxisSpacing`,
+  `itemReverseZIndex`, `strokesIncludedInLayout`, `padding*`,
+  `min/maxWidth`, `min/maxHeight`, `constraints`, `clipsContent`,
+  `rotation`, `absoluteBoundingBox`, `textAutoResize`, the twelve `grid*`
+  fields, and for TEXT `style: {textAutoResize, textTruncation, maxLines,
+  textAlignHorizontal, textAlignVertical}` — whichever the node has.
+- **figmog's interpretation** is everything else: `layout` and `values`
+  (value entries, below), `content`, `instance`, and `css` — a
+  `{property: value}` map of the declarations figmog derives, a bound
+  value as its token's `var(--name)`. `tailwind` is a class string derived
+  from exactly those declarations.
+
+What figmog can't translate exactly is listed under `unsupported` and
+left out of `css` — never approximated. The design layer still records
+it, and the node's other values and children are still specified.
+
+### Layout
+
+`layout` (on auto-layout and grid frames, their children, absolutely
+positioned nodes, and the root when it carries `layoutSizing*`):
+
+- `direction`: `horizontal` | `vertical`; `wrap: true` and `wrap_gap`
+  (the `counterAxisSpacing` entry; Figma's default, the item spacing, when
+  absent) for `layoutWrap: WRAP`;
 - `gap`: a value entry for `itemSpacing`, or `"auto"` under
-  `SPACE_BETWEEN`;
+  `SPACE_BETWEEN` (a bound `itemSpacing` there is still shown, as
+  `item_spacing`, and listed: CSS doesn't use it);
+- `grid` (`layoutMode: GRID`): `{columns, rows, column_gap, row_gap}` —
+  the counts and the `gridColumnGap`/`gridRowGap` entries;
 - `padding`: `{top, right, bottom, left}` value entries (an absent padding
   is Figma's 0);
 - `align`: `{primary, counter}` from `primaryAxisAlignItems` /
@@ -2061,83 +2443,615 @@ collision, an ambiguous theme), in which case every `css` is null.
   across it ⇒ fill; the node's own `primaryAxisSizingMode` /
   `counterAxisSizingMode` (absent ⇒ `AUTO`) ⇒ hug or fixed; a TEXT node's
   `textAutoResize` (`WIDTH_AND_HEIGHT` both axes, `HEIGHT` vertical) ⇒
-  hug; else fixed. Emitted on children of an auto-layout parent, on
-  auto-layout frames, and on the spec root when it carries
-  `layoutSizing*`;
+  hug; else fixed;
+- `width`/`height`: value entries for a fixed dimension the CSS declares
+  (bindings: `boundVariables.size.x`/`.y`, else `width`/`height`); a bound
+  dimension the CSS doesn't declare (a fill/hug sizing, a LEFT_RIGHT or
+  SCALE constraint) is still shown as its token here, and listed;
+- `min_width`, `max_width`, `min_height`, `max_height`: value entries;
+- `position: "absolute"` for an absolutely positioned node;
 - `size`: `{width, height}` from `absoluteBoundingBox`, whenever `layout`
   is present.
 
-**Values:** `fill` and `stroke` (arrays, one entry per visible `SOLID`
-paint; the raw value is `#rrggbb`, or `#rrggbbaa` below full alpha, the
-paint's `opacity` folded into alpha — the token export's color form),
-`stroke_weight` (with visible uniform strokes, defaulting to 1 when
-`strokeWeight` is omitted), `radius` (`{top_left, top_right,
-bottom_right, bottom_left}` from `rectangleCornerRadii`, else
-`cornerRadius`; absent when the node has neither and no corner binding),
-and on TEXT nodes `typography`: `font_family`, `font_size`,
-`font_weight`, `line_height` (`lineHeightPx`; `"auto"` for
-`INTRINSIC_%`), `letter_spacing`, each present when the type style has it.
+### Values
+
+`fill` and `stroke` (arrays, one entry per visible `SOLID` paint; the raw
+value is `#rrggbb`, or `#rrggbbaa` below full alpha, the paint's `opacity`
+folded into alpha — the token export's color form; a bound paint with
+opacity below 1 also carries `paint_opacity`, combined with the token
+through CSS `color-mix` so the token's own alpha survives), `stroke_weight`
+(with visible strokes, defaulting to 1 when Figma omits it), `radius` (`{top_left, top_right, bottom_right,
+bottom_left}` from `rectangleCornerRadii`, else `cornerRadius`; absent
+when the node has neither and no corner binding), `opacity` (a layer
+opacity below 1, or bound; matched against tokens as 0–100, Figma's
+opacity-variable scale), `effects` (one object per visible effect: `type`
+plus `offset_x`, `offset_y`, `radius`, `spread`, `color` entries for
+shadows, `radius` for blurs), and on TEXT nodes `typography`:
+`font_family`, `font_size`, `font_weight`, `line_height` (`lineHeightPx`;
+`"auto"` for `INTRINSIC_%`), `letter_spacing`, each present when the type
+style has it.
 
 **Value entries.** Bound:
 `{"token": <variable name | null>, "variable_id", "css": <name | null>,
-"raw": <Figma's baked value>}`. Bindings are read from the paint's
+"raw": <Figma's baked value>, "bound_at": [<JSON pointer>, ...]}` —
+`bound_at` lists (sorted) the RFC 6901 pointers, relative to the node's
+raw JSON, of the bindings read for it (`/fills/0/boundVariables/color`,
+`/boundVariables/fills/0`, `/styleOverrideTable/1/boundVariables/fontWeight`…). Bindings are read from the paint's
 `boundVariables.color`, else the node's `boundVariables.fills[i]` /
-`strokes[i]`; `itemSpacing`, `paddingTop`…; uniform stroke weight from
-`boundVariables.individualStrokeWeights.{top,right,bottom,left}` when
-all four sides name the same variable, with the flat `strokeWeight`
-binding also supported. Mixed or partially bound sides are unsupported.
-Corner bindings use `boundVariables.rectangleCornerRadii`'s
-`RECTANGLE_TOP_LEFT_CORNER_RADIUS` and corresponding keys, with the flat
-`topLeftRadius`… forms also supported. Text properties come from the
-node's `boundVariables`, else
-its type style's (`fontFamily`, `fontSize`, `fontWeight`, `lineHeight`,
-`letterSpacing`), an alias or an array of aliases naming one variable.
-`token` is the variable's name in the snapshot (null for a variable bound
-in the file but absent from the snapshot); `css` is the custom property
-name `figmog tokens export` emits for it (§9 "Token export", taken from
-that export run on the same snapshot, so they cannot drift) — null for a
-variable the export skips (STRING, BOOLEAN…). An alias variable is shown
-as itself (`surface`, not the primitive it aliases).
+`strokes[i]`; uniform stroke bindings can also use
+`individualStrokeWeights.{top,right,bottom,left}` when all four name
+the same variable (conflicting or partially bound sides are unsupported);
+`itemSpacing`, `counterAxisSpacing`, `gridColumnGap`,
+`gridRowGap`, `paddingTop`…, `strokeWeight`, `topLeftRadius`… (else
+`rectangleCornerRadii.RECTANGLE_*`), `size.x`/`size.y` (else `width`/
+`height`), `minWidth`…, `opacity`; an effect's own `boundVariables`
+(`offsetX`, `offsetY`, `radius`, `spread`, `color`); text properties from
+the node's `boundVariables`, else its type style's (`fontFamily`,
+`fontSize`, `fontWeight`, `lineHeight`, `letterSpacing`; a mixed-run
+node and each run read the style's first), an alias or an array of
+aliases naming one variable. `token` is the variable's name in the
+snapshot (null for a variable bound in the file but absent from the
+snapshot); `css` is the custom property name `figmog tokens export` emits
+for it (§9, taken from that export run on the same snapshot, so they
+cannot drift) — null for a variable the export skips (STRING, BOOLEAN…).
+An alias variable is shown as itself (`surface`, not the primitive it
+aliases).
 
-Unbound: `{"untokenized": true, "raw", "matches"?}` — never token usage.
-`matches` lists (sorted by token name, then id) every snapshot variable
-`{token, variable_id, css}` whose value in its root mode — the theme
-collection's light mode, else its collection's default mode, aliases
+**Token claims only from bindings.** Unbound: `{"untokenized": true,
+"raw", "matches"?}` — never token usage, and the CSS uses the raw value
+(`8px`, never `var(--spacing-2)`). `matches` lists (sorted by token name,
+then id) every snapshot variable `{token, variable_id, css}` whose value
+in its root mode — the mode the token export writes to `:root` under the
+project's mapping (§9), else its collection's default mode, aliases
 followed — equals the raw value (colors as `#rrggbb[aa]`, numbers within
 1e-6, strings exactly), of the property's type, and scoped for it:
 `ALL_SCOPES`, or `ALL_FILLS` plus `TEXT_FILL` / `FRAME_FILL` /
 `SHAPE_FILL` by node type for fills, `STROKE_COLOR`, `STROKE_FLOAT`,
-`CORNER_RADIUS`, `GAP` (gap and padding), `FONT_FAMILY`, `FONT_SIZE`,
-`FONT_WEIGHT`, `LINE_HEIGHT`, `LETTER_SPACING`. Omitted when nothing
-matches.
+`CORNER_RADIUS`, `GAP` (gaps and padding), `WIDTH_HEIGHT` (sizes and
+min/max), `OPACITY`, `EFFECT_COLOR`, `EFFECT_FLOAT`, `FONT_FAMILY`,
+`FONT_SIZE`, `FONT_WEIGHT`, `LINE_HEIGHT`, `LETTER_SPACING`. Omitted when
+nothing matches.
 
-**Unsupported, never approximated.** Each case is listed under
-`unsupported` with the node id and reason, and the affected part is left
-out of the spec:
+**No binding disappears silently.** Every `VARIABLE_ALIAS` in a node's
+raw JSON (children excluded) is either read — and then shown in a bound
+entry's `bound_at` — or listed under `unsupported` by its pointer
+(`/boundVariables/visible: bound to a variable: not specified`; a binding
+a hidden paint carries, a gradient stop's, `textRangeFills`…). A
+property bound in two places to different variables is listed too. A
+mixed-run node's node-level per-range arrays count as read when the base
+style and the runs' overrides name every variable in them.
+
+### Content and instances
+
+- `content.text`: a TEXT node's `characters` (`content.text_token`, a
+  bound entry, when `characters` is bound).
+- `content.runs` (mixed text runs: `characterStyleOverrides` naming a
+  style other than 0): every run in order, `{start, end, text, style}`
+  (offsets in UTF-16 code units, as Figma's; `style` the override id, 0
+  the base style), plus for an override its `typography` and `fill`
+  entries (only the properties the override sets), `css` and `tailwind`.
+  Explicit normal styles reset inherited italics, text case and letter
+  spacing. Mixed text applies decorations on each run, including base
+  runs, so an override can remove them.
+- `content.assets`: `{kind: "image", node_id, paint, image_ref,
+  scale_mode}` per visible `IMAGE` fill; `{kind: "vector", node_id,
+  format: "svg"}` for a node CSS can't draw (`VECTOR`,
+  `BOOLEAN_OPERATION`, `STAR`, `LINE`, `REGULAR_POLYGON` — one asset, its
+  children are part of it and not specified; its fills/strokes are still
+  value entries but get no CSS); `{kind: "export", node_id, formats}` for
+  a node with `exportSettings` (`PNG@2x`…). Without an asset manifest
+  (§19), assets are referenced by node id and `imageRef` only. With one,
+  an exported image fill's entry also carries the file's `path` and
+  `url` (null outside `public/`), and its `unsupported` reason says it
+  was exported (its scaling and cropping still have no CSS); a node that
+  is an exported icon gets `{kind: "icon", node_id, component, path,
+  svg, jsx: "<IconX />"}` (instead of the `vector` entry, for a vector
+  node). Lookup tries the node's own id first, then for an instance its
+  main component's key, then its main component's id. Keys work across
+  files; node ids match only within the exported file (the CLI and relay
+  supply the spec's file as `for_file`). Without a manifest the output
+  is unchanged.
+- `instance` (INSTANCE nodes): `{component_id, component: {name, key,
+  remote} | null, component_set: {id, name, key} | null, variant: {name:
+  value} (VARIANT properties), properties: {name: {type, value, token?}}
+  (the other component properties, `token` a bound entry), code_component}`.
+  `code_component` is the code component the map (§18) gives the
+  instance's component or its set — `{figma, path, export, props, jsx,
+  coverage, unmapped_properties, unmapped_overrides, unknown_props}` — or
+  null when there is no map or no entry for it. A component missing from
+  the mirror is listed under `unsupported`. The instance's children are
+  still specified in full either way.
+
+### The CSS layer
+
+Per node, from the parent's layout and its own:
+
+| design | `css` |
+|---|---|
+| auto layout | `display: flex`, `flex-direction`, `gap` (`column-gap` + `row-gap` when wrapping), `justify-content` (non-start), `align-items` (always: CSS's default is stretch), `flex-wrap` + `align-content` |
+| negative `itemSpacing` (no wrap) | no gap; `margin-left`/`margin-top` = the spacing on every in-flow child after the first (exact: the children overlap the same way) |
+| `layoutMode: GRID` | `display: grid`, `grid-template-columns`/`-rows` = `gridColumnsSizing`/`gridRowsSizing` (Figma's own CSS track lists), `column-gap`, `row-gap`; a child gets `grid-column`/`grid-row: <anchor + 1> / span <span>` and `justify-self`/`align-self` from `gridChild*Align` |
+| padding | `padding` when all four sides are equal, else the longhands; an unbound 0 is left out |
+| sizing in a flex parent | main axis: fill → `flex: 1 1 0%` + `min-width: 0` (`min-height: 0` in a column: Figma lets a fill child shrink to nothing), fixed → `width`/`height` + `flex-shrink: 0`, hug → `flex-shrink: 0`; cross axis: fill → `align-self: stretch`, fixed → the dimension |
+| sizing in a grid parent | fill → `justify-self`/`align-self: stretch`, fixed → the dimension, hug → `fit-content` |
+| sizing of the root | fixed → the dimension, horizontal hug → `width: fit-content`, fill → `100%` |
+| `min/max*` | `min-width`… |
+| absolute child (`layoutPositioning: ABSOLUTE`, or any child of a frame without auto layout) | `position: absolute` (the parent gets `position: relative`); per axis from `constraints` (default LEFT/TOP) and the boxes: LEFT/TOP → `left`/`top`, RIGHT/BOTTOM → `right`/`bottom`, LEFT_RIGHT/TOP_BOTTOM → both, CENTER → `calc(50% ± offset)` + `translate(-50%)`, SCALE → percentages for offset and size; a fixed dimension otherwise. Inside a parent with a CSS border (a stroke included in layout) the offsets are reduced by the border width (CSS measures them from the padding box); SCALE there is unsupported |
+| `clipsContent` (with children) | `overflow: hidden` |
+| fill | one visible solid paint → `background-color` (`color` on TEXT) |
+| stroke | one visible solid paint with `strokeAlign`: `outline-*` (Figma strokes take no layout space), `outline-offset` −weight (INSIDE) or −weight/2 (CENTER); a `border-*` for INSIDE with `strokesIncludedInLayout` |
+| radius | `border-radius`, or the corner longhands |
+| full `ELLIPSE` | `border-radius: 50%`; partial arcs and donuts are vector assets |
+| one drop/inner shadow | `box-shadow` (`inset`); a TEXT drop shadow → `text-shadow`. Two or more shadows are unsupported: CSS lists them top-most first and Figma's effect order is unverified |
+| opacity | `opacity` |
+| typography | `font-family` (quoted), `font-size`, `font-weight`, `line-height` (`normal` for auto), `letter-spacing`, `font-style: italic`, `text-align`, `text-transform` / `font-variant-caps`, `text-decoration-line` |
+| text | `white-space: pre-wrap` (Figma keeps newlines and runs of spaces); `textAutoResize: WIDTH_AND_HEIGHT` → `pre`; `HEIGHT` and `NONE` follow from the sizing |
+| `textTruncation: ENDING` | one line: `overflow: hidden; text-overflow: ellipsis; white-space: pre`; `maxLines` > 1: `-webkit-line-clamp` |
+| padding or border | `box-sizing: border-box` (Figma sizes include both) |
+
+Lengths are `px` with at most three decimals; a bound value with a CSS
+name is its `var()` — matched to the unit the token export writes it in
+(§9): a unitless FLOAT (e.g. `ALL_SCOPES`) used as a length is
+`calc(var(--x) * 1px)`, a unitless one used as opacity (Figma's 0–100)
+`calc(var(--x) / 100)`, a `%` one as opacity as is; a unit the property
+can't take (a `%` token as a gap, a px token as a font weight) is listed
+and left out.
+
+**Tailwind hint** (`tailwind`). One class per declaration, ordered by
+property group (position, layout, size, paint, text): keyword utilities
+(`flex`, `flex-col`, `items-center`, `self-stretch`, `shrink-0`,
+`flex-1`, `absolute`, `overflow-hidden`, `line-clamp-2`, …); a value bound
+to a token with a Tailwind theme name in the right namespace becomes that
+theme utility (`--color-surface` → `bg-surface`, `--spacing-4` →
+`gap-4`, `p-4`, `--radius-md` → `rounded-md`); any other bound value the
+arbitrary property `[font-size:var(--font-size-title)]`; an unbound value
+an arbitrary value (`gap-[8px]`, `bg-[#1a1a1f]`) — never a theme utility.
+Arbitrary values preserve CSS string delimiters and escapes. Literal
+underscores are escaped before spaces become underscores, so a font such
+as `Foo_Bar` or `O'Reilly` keeps the same name after Tailwind compilation.
+`pt-X pb-X` / `pl-X pr-X` collapse to `py-X` / `px-X`. `box-sizing:
+border-box` has no class (Tailwind's preflight sets it).
+
+### Unsupported, never approximated
+
+Each case is listed under `unsupported` with the node id and reason, and
+the affected part is left out of `css` (and, where noted, of the spec):
 
 | case | left out |
 |---|---|
 | `visible: false` | the node's layout, values and children |
-| `layoutMode` other than `HORIZONTAL`/`VERTICAL`/`NONE` (e.g. `GRID`) | its own layout; children get no sizing |
-| `layoutWrap: WRAP` | its own layout; children get no sizing |
-| `layoutMode: NONE` with children (constraints-based frame, group) | children's positions (no sizing) |
-| `layoutPositioning: ABSOLUTE` | the node's position and sizing |
-| TEXT with nonzero `characterStyleOverrides` (mixed runs) | its fill and typography |
-| a visible non-`SOLID` paint (gradients, `IMAGE`, …) | that paint |
+| `layoutMode` other than `HORIZONTAL`/`VERTICAL`/`GRID`/`NONE` | its own layout; children unplaced |
+| a GROUP (or other non-frame) with children | its children's positions (they follow the enclosing frame's constraints) |
+| `layoutWrap: WRAP` on a vertical frame | the wrapping |
+| negative `itemSpacing` in a wrapping frame; negative `counterAxisSpacing` or grid gap | that gap |
+| `gridColumnsSizing`/`gridRowsSizing` missing or not a plain track list | that template |
+| `itemReverseZIndex` | the stacking order |
+| an absolute child before in-flow siblings | the stacking order (CSS paints it above them) |
+| `rotation` on an absolutely positioned node | its position and size |
+| `rotation` on any other node | the rotation (its CSS size is the rotated bounds) |
+| `layoutPositioning: ABSOLUTE` on the spec root | its position in its parent |
+| a visible `IMAGE` fill | the CSS background (it is under `content.assets`) |
+| any other non-`SOLID` paint (gradients, video…) | that paint |
+| several visible fills or strokes | that CSS property |
+| a non-normal `blendMode` (layer or paint) | the blend |
 | a property bound to several variables (mixed alias array) | that property |
-| visible `effects` | the effects |
-| layer `opacity` below 1 | the opacity |
-| `individualStrokeWeights` | the stroke weight |
+| a binding the spec doesn't read (by pointer), or a property bound to different variables in two places | that binding |
+| a bound size or `itemSpacing` the CSS doesn't use (sizing, constraints, `SPACE_BETWEEN`) | the token in CSS (still shown as a token reference) |
+| a token whose exported unit the property can't take | that declaration |
+| two or more shadows | the `box-shadow` / `text-shadow` |
+| a SCALE constraint inside a CSS border | that offset |
+| a vector-like node's children | the children (part of the asset) |
+| `LAYER_BLUR`/`BACKGROUND_BLUR` (no exact CSS `blur()`), `showShadowBehindNode`, a non-normal shadow blend, an inner or spread shadow on text | that effect |
+| `individualStrokeWeights`, `strokeDashes`, a text stroke, a missing `strokeAlign` | the CSS stroke |
+| `cornerSmoothing` | the smoothing |
+| `textAlignVertical` other than TOP in a fixed-height text box, `paragraphSpacing`, `paragraphIndent`, list text (`lineTypes`) | that text rule |
+| mixed runs splitting a UTF-16 surrogate pair, a run style missing from `styleOverrideTable` | the runs / that run's style |
+| a component not in the mirror | the instance's component name |
 
-The node's other values and its children are still specified.
+### Fixtures and tests
 
-**Fixtures.** `tests/fixtures/spec/card.json` (a synthetic file: a
-vertical auto-layout card with a horizontal row using the older sizing
-fields, a GRID child, an absolutely positioned ribbon with a gradient,
-and a mixed-run caption) and `tests/fixtures/spec/variables.json` (a
-synthetic export with a Light/Dark theme collection) produce the golden
-`tests/fixtures/spec/card.spec.json` (`tests/spec.rs`; `FIGMOG_BLESS=1`
-regenerates it). The tests also check that every binding in the
-specified nodes appears as its token, that each `css` name appears in
-the `tokens export` output for the same snapshot, the flagged unbound
-padding, the `matches` gap, and the unsupported grid child.
+`tests/fixtures/spec/card.json` (a vertical auto-layout card: a
+horizontal row using the older sizing fields, a CSS-grid gallery with an
+image fill, an absolute ribbon with a gradient, a mixed-run caption) and
+`tests/fixtures/spec/edge.json` (negative spacing, wrap, a 2×2 grid with
+a span and an aligned cell, min/max sizes, a frame without auto layout
+with every constraint, a rotated child and clipping, text auto-resize,
+truncation, line clamp and mixed runs, an instance with variant
+properties and a vector icon, an image fill with a shadow and opacity, an
+absolute ribbon, plus the review cases: unitless and `%` tokens used as
+lengths and opacity, a bound size under a LEFT_RIGHT constraint, a
+`SPACE_BETWEEN` row with a bound spacing, an absolute child inside a CSS
+border, two shadows, a text with a newline), with
+`tests/fixtures/spec/variables.json` (card) and `edge-variables.json`
+(the same plus unitless/`%` FLOATs), produce the golden `card.spec.json`
+(no hint) and `edge.spec.json` (with the Tailwind hint), and `tokens.css`
+(the token export of the edge variables)
+(`tests/spec.rs`; `FIGMOG_BLESS=1` regenerates them). The tests check
+byte-identical output across runs and against `figmog call figmog_spec`,
+the issue's done-when line on both fixtures — every binding in the
+subtree, by pointer, appears in a token reference's `bound_at` or is
+listed under `unsupported` by that pointer, every value entry without one is
+flagged untokenized, each `css` name appears in the `tokens export`
+output — and the project defaults for `tokens` and `tailwind`.
+
+**The two contract viewports.** The spec is viewport-independent JSON;
+what can differ by viewport is its translation. `packages/react`'s
+`test/spec.test.ts` renders `edge.spec.json` in Chromium twice — each
+node's `css` inline, and its Tailwind hint compiled by Tailwind v4 against
+`tokens.css` — at 1440 px and 390 px, and asserts that every node's box
+(relative to the root) equals its recorded `absoluteBoundingBox` within
+half a pixel, except nodes under a position-related `unsupported` entry
+and the width of a hugging text node (font-dependent); and that bound
+tokens (including unitless and `%` ones scaled for padding and opacity),
+clipping, truncation, run styles and kept newlines resolve.
+
+## 18. Figma → code component map (NWS-2949)
+
+Source: `src/map.rs` (pure: validation, the per-instance
+`code_component`, coverage), `src/cli/map.rs` (`figmog map`). Agents
+should reuse a project's existing components instead of rebuilding them
+from rectangles; the map records which code component implements which
+Figma component.
+
+**The file.** `figmog.map.json` at the project root (§16), committed, small
+and hand-confirmed (v1 has no `map suggest` and no Code Connect import):
+
+```
+{
+  "version": 1,
+  "components": [
+    {
+      "figma": {"component_set": "<key>"},          // or {"component": "<key>"}
+      "code": {"path": "src/components/PricingCard.tsx", "export": "PricingCard"},
+      "props": {                                     // optional
+        "Tier":  {"prop": "tier", "values": {"Free": "free", "Pro": "pro"}},
+        "Title": {"prop": "title"},
+        "Badge": {"prop": "badge"}
+      }
+    }
+  ]
+}
+```
+
+- **Identity: the Figma key.** An entry names a component (a variant or a
+  standalone component) or a component set by its `key` from the file's
+  `components`/`componentSets` maps (the `components` and
+  `component_sets` sinks, §4), never by node id: the key is what Figma
+  publishes, survives renames and moves, and is the same in the library
+  and in every file that uses the component, while an instance's
+  `componentId` is a file-local node id. A `component` entry wins over its
+  set's `component_set` entry. Keys come from `figmog components`.
+- `code.path`: relative to the project root, `/`-separated, no `..`, not
+  absolute (the same rule as `[stack] tokens`); figmog never reads the
+  file, `map coverage` only checks that it exists inside the project (a
+  symlink leading out of it reads `outside_project`). `code.export`: a
+  JS identifier starting with an uppercase letter (a JSX component).
+- `props`: Figma property name → `{prop, values?}`. The name is a
+  variant property (`Tier`) or another component property, written with
+  or without Figma's `#id` suffix (`Title` matches `Title#11:0` unless
+  two properties share the base name — then the full name is needed).
+  `prop` is a JSX attribute name (a JS identifier, `-` allowed after the
+  first character); two Figma properties can't share one. `values` maps
+  the Figma value as text (`"Pro"`, `"true"`; for an instance swap, the
+  swapped-in component's key) to the code value — a string, number,
+  boolean, or `null` (leave the prop out: the code default). Without
+  `values` the Figma value passes through (a string, or a boolean); an
+  instance swap without `values` renders the swapped-in component's own
+  mapped element (`icon={<StarIcon />}`).
+- **Strict.** Unknown keys anywhere, a missing or other `version`, a
+  duplicate target, a bad path, export or prop name are errors, each
+  naming the file and the JSON path:
+  `figmog.map.json: components[0].props["Tier"].prop: "1tier" is not a
+  prop name …`. A map key naming no property is not a file error (the
+  file is checked without the mirror): `spec` and `coverage` list it
+  under `unknown_props`.
+
+**In the spec** (§17). Each INSTANCE whose component or set has an entry
+gets `instance.code_component`:
+
+```
+{
+  "figma": {"component_set": "<key>"},           // the entry that matched
+  "path": "src/components/PricingCard.tsx",
+  "export": "PricingCard",
+  "props": {"badge": true, "tier": "pro", "title": "Pro"},
+  "jsx": "<PricingCard badge tier=\"pro\" title=\"Pro\" />",
+  "coverage": "full" | "partial",
+  "unmapped_properties": [{name, type, value, reason}],   // by name
+  "unmapped_overrides": [{id, name, field, reason}],      // by id, field
+  "unknown_props": ["<map key>"]                          // sorted
+}
+```
+
+`jsx` lists the props in name order: a string as `"…"` (or `{"…"}` when it
+holds `"`, `\`, `&`, braces, angle brackets or a control character), `true`
+as the bare name, other values as `{…}`, a swapped-in element as
+`{<Export />}`; `null` props are left out. **`coverage` is `"full"` only
+when nothing is listed under `unmapped_*`** — the map never claims an
+instance it can't express:
+
+- `unmapped_properties`: an instance property the map has no prop for; a
+  value not listed in `values`; an instance swap to a component with no
+  entry, or whose entry identifies only a component set without the
+  authoritative variant properties needed to select its props; a swap
+  target with explicit prop mappings whose property values are unavailable,
+  including a component-specific entry; a property bound to a variable
+  (the map would pass a literal); an ambiguous suffix match.
+- A **`component` entry** names one variant, so its identity covers a
+  VARIANT property with no explicit mapping (`Tier=Pro` needs no prop).
+  Explicit mappings still require the instance's property values. A
+  `component_set` entry has to map variant properties. Other properties
+  need a prop either way.
+- `unmapped_overrides` (`reason` says which kind):
+  - `override` — every `overrides[].overriddenFields` entry, on the
+    instance and on every nested instance, that a mapped property doesn't
+    explain. Explained means the overridden node's
+    `componentPropertyReferences` names, for that field (`characters`,
+    `visible`, `mainComponent` for `componentId`), a property of this
+    instance that the map expressed. Text overrides and style changes
+    made by hand are therefore listed; so is every override on a nested
+    instance (figmog can't tell whether the main component or this
+    instance made it, so it errs towards partial). The instance's own
+    `componentProperties` override is covered by the property check.
+  - `swap` (field `componentId`) — a nested instance whose component
+    differs from the one at the same place in the main component, unless
+    its `componentPropertyReferences.mainComponent` names a mapped
+    property of this instance. This doesn't rely on Figma listing the
+    swap in `overrides`. "The same place" uses Figma's id convention for
+    instance children: `I<instance>;<node>` copies main-component node
+    `<node>` (`I1:2;10:7` ↔ `10:7`; deeper, `I1:2;10:7;30:1` ↔
+    `I10:7;30:1`), checked against the main component's nested instances
+    in the mirror (`query::spec` passes them, node id → component id, as
+    the component record's `main`). Only nested instances that match are
+    descended into.
+  - `unverifiable_swap` (field `componentId`) — a nested instance that
+    can't be checked: the main component isn't in this mirror (a library
+    component; each outermost nested instance is listed), or it has no node at that place. Conservatively partial.
+  - `unverified_slot_shape` (field `slot`) — a `SLOT` descendant with
+    children. **Slot detection rests on an assumed REST shape** (slots
+    as `type: "SLOT"` nodes whose children are the content), not yet
+    verified against real Figma files; it also flags default slot
+    content. Kept conservative (partial) until verified with real Figma
+    access.
+- `unknown_props` (map keys naming no property of the instance — a stale
+  entry) is a warning only and doesn't make the mapping partial.
+
+**`figmog map check`** validates the file (exit 1 with the file and JSON
+path; a missing file is an error) without reading the mirror:
+`{"map": "figmog.map.json", "components": <entries>}`.
+
+**`figmog map coverage`** compares the map with the mirror's design-system
+inventory (the `figmog_components` read, socket-routed or direct like any
+read) and the project's files. A missing map file is an empty map; an
+invalid one fails.
+
+```
+{
+  "map": {"path": "figmog.map.json", "present": bool},
+  "summary": {mapped, unmapped, not_in_mirror, code_files_not_present},
+  "mapped": [{"figma": {kind, key, name, node_ids}, "code": {path, export},
+              "code_file": "present" | "missing" | "outside_project",
+              "unknown_props": [...] | null}],      // by kind, then key
+  "unmapped": [{kind, key, name, node_id, variants?, variants_mapped?}],
+                                                    // by name, key, node id
+  "not_in_mirror": [{"figma": {...}, "code": {...}}]   // by kind, then key
+}
+```
+
+`unmapped` lists each component set that neither has an entry nor has
+every variant mapped (with its `variants` and `variants_mapped` counts),
+and each standalone component without an entry. `not_in_mirror` lists
+entries whose key this mirror doesn't have (a removed component, or one
+from another file of the project). `unknown_props` checks the map's
+property names against the set's `componentPropertyDefinitions` (for a
+set or a variant entry). It is null when there are no definitions to
+check against: for a standalone component (`figmog_components` doesn't
+report its definitions), and for a set whose node isn't in the mirror (a
+library component set used here: `figmog_components` reports its
+`property_definitions` as null). Both `map` commands read the project's
+map, so neither takes `--db`, and `coverage` reads the project's default
+mirror (figmog.toml's `[files] default`, else `.figmog/current`) — the
+same one `figmog components` reads; it takes no file argument. Listing code components with
+no Figma counterpart (scanning the code), `map suggest` and Code Connect
+import come later.
+
+**MCP.** The map reaches agents only through `figmog_spec`
+(`code_component`); there is no separate map tool. The stdio relay
+injects the project's map per call (an agent's own `map` argument wins).
+
+**Tests.** `src/map.rs` unit tests (every validation error's file and
+path, JSX rendering and escaping, partial reasons, nested overrides and
+slots, the suffix ambiguity); `tests/map.rs` on the synthetic
+`tests/fixtures/map/pricing.json` + `figmog.map.json` (the done-when:
+`spec` emits `<PricingCard badge tier="pro" title="Pro" />` for the
+covered instance and a partial mapping naming the hand-edited price for
+the other, byte-identical across runs and against `figmog call
+figmog_spec` with the same `map`; `coverage` reports the unmapped
+components, the entry that's not in the mirror, a stale prop and a
+missing code file; invalid maps fail `check`, `coverage` and `spec` with
+the file and path); `tests/owner.rs` covers the relay's injection.
+
+## 19. Asset pipeline (NWS-2952)
+
+Source: `src/assets.rs` (pure: icon discovery, naming, React components,
+content-hashed image names, the manifest), `src/svg.rs` (the SVG
+sanitizer), `src/cli/assets.rs` (reads, fetches and writes).
+
+`figmog assets export [--icons <node>]... [--images <node>]... [--force]
+[--partial]` exports, into the folders figmog.toml's `[assets]` names
+(§16):
+
+- **Icons.** Each `--icons` root yields icons: a component set → each
+  visible variant; a page, section, frame or group holding components →
+  each visible component set's variants and standalone component at any
+  depth (a component's own content is never searched); anything else (a
+  component, an instance, a vector, a frame of vectors) → the node itself.
+  Each icon is rendered as SVG at scale 1 (the `figmog images` render
+  cache, version-pinned, §15), sanitized (below), and written twice:
+  `<icons>/svg/<Name>.svg` and a React component `<icons>/<Name>.tsx`
+  (or `.jsx`), plus a barrel `<icons>/index.ts` (`index.js`).
+- **Images.** Every visible `IMAGE` fill under each `--images` root
+  (visible nodes only) is fetched (`figmog_images` with `renders: false`)
+  and written to `<images>/<first 16 hex of its SHA-256>.<ext>`, the
+  extension sniffed from the bytes (PNG, JPEG, GIF, WebP; anything else
+  is skipped). The name depends only on the content, so an unchanged
+  image never produces a diff.
+- **Manifest** (`[assets] manifest`): `{"$generated", version: 1,
+  sources: {file, icons, images}, icons: [{component, figma_name, file,
+  key, node_id, path, svg, colors: "single"|"multi", current_color}],
+  images: [{file, image_ref, path, url, format, bytes, sha256, nodes}]}`
+  (`file`: the Figma file key the export read; `figma_name` cut to 512
+  bytes) — sorted keys,
+  icons by component name, images by imageRef, no timestamps or file
+  version (a re-export after unrelated edits is byte-identical). `url` is
+  the root-relative URL when the images folder is `public` or under
+  `public/` (the Vite / Next.js static folder), else null. URL path
+  segments are percent-encoded; filesystem paths keep their original
+  spelling. `sources`
+  records the file and the roots, so a plain `figmog assets export`
+  repeats the last export — and refuses when the project's file is no
+  longer the recorded one (the roots are that file's node ids; pass
+  `--icons`/`--images` to export from the new file, which replaces the
+  manifest). `figmog spec` reads it (§17).
+
+**Naming.** An icon's name is built from ASCII letters and digits only
+(every other character separates words), PascalCased: a variant from its
+set's name (last `/` segment) and its property values (`Icon` / `Name=Arrow
+Right` → `IconArrowRight`), anything else from the last `/` segment of its
+own name. The `[assets] prefix` (default `Icon`) is prepended unless the
+name already starts with it as a word. Names longer than 64 characters,
+names with no ASCII letter or digit, Windows device names (`CON`, `PRN`,
+`AUX`, `NUL`, `COM1`–`9`, `LPT1`–`9`, any case, after prefixing), and
+names that collide case-insensitively (case-insensitive filesystems) are
+skipped — every
+icon in a collision, with the node ids involved; nothing is picked
+arbitrarily.
+
+**Untrusted input.** Names, ids, imageRefs and markup come from the Figma
+file. Figma names never reach generated code (only the manifest, as JSON
+data); node ids reach a comment only after a strict character check
+(`[A-Za-z0-9:;-]`, ≤ 128); imageRefs must be ASCII alphanumeric; file
+names are the validated component name or the content hash (SHA-256 via
+`ring`, already compiled in through rustls). Every write target is
+checked before anything is written. Path comparisons normalize relative
+components, including `.`. The manifest must not sit inside an output
+directory or occupy one of its ancestors. The complete planned output
+graph rejects duplicate destinations and file/directory conflicts before
+any write, including with `--force`. Every target must stay inside the
+project. Symlinks anywhere below the project root are refused, including
+with `--force`. An existing target must be a regular file. Directory
+spellings must match the names on disk; case aliases produce an error
+that names the existing spelling. Missing directories are created one at a
+time, each checked (never `create_dir_all` through a link). Each file is
+written atomically: a new temporary file in the same directory (created
+exclusively, `O_NOFOLLOW`), then renamed over the target. A target that
+exists only under another case (a renamed icon on a case-insensitive
+filesystem) is moved aside and replaced, so the new spelling lands on
+disk, and is never reported as `stale`. An existing file is replaced only when figmog wrote
+it — a text file starting with figmog's generated header (`// Generated
+by \`figmog assets export\`…`, `<!-- … -->` for SVG, a leading
+`"$generated"` key for the manifest), an image whose bytes are what its
+content-hash name says — or with `--force`. One refusal and nothing is
+written. A file whose bytes are already right is not rewritten, so
+re-exporting an unchanged file changes no files (not even mtimes).
+The stale inventory includes barrels inferred from previous icon paths
+and languages. Abandoned barrels are reported, including an images-only
+export's old barrel; stale files are never deleted automatically. On a
+case-sensitive filesystem, an old case-only spelling is reported too.
+
+**SVG sanitizing** (`src/svg.rs`, no XML dependency): a strict,
+non-validating reader — elements, quoted attributes, text, CDATA,
+comments and PIs; the five predefined entities and numeric references
+only; any `<!DOCTYPE`/`<!ENTITY>` rejects the document (no entity
+expansion); size (4 MiB), depth (64), element (20 000) and attribute (64)
+caps; malformed markup and duplicate ids are errors. Duplicate ids are
+rejected before pruning or reference checks. Then an allowlist: only
+SVG's shape, paint-server, clip/mask, text and common filter-primitive elements
+survive (everything else — `script`, `style`, `foreignObject`, `a`,
+animations, `feImage`, prefixed names — is dropped with its content);
+only allowlisted presentation/geometry attributes survive (no `on*`,
+`class`, `xml:base`); values containing quotes, `<>&`, backticks,
+braces, backslashes or control characters are dropped; `href` must be a
+local `#id` (or, on `<image>`, a base64 raster `data:` URI) — and a
+`<use>` may reference only an `<image>` or a basic shape (`path`, `rect`,
+`circle`, `ellipse`, `line`, `polyline`, `polygon`), never a `<g>`,
+`<svg>`, `<symbol>` or another `<use>`, so references can't fan out
+(dropped and reported otherwise); `fill`,
+`stroke`, `clip-path`, `mask`, `filter` may reference only a local
+`url(#id)`, and a reference to an undefined id is dropped; `style` keeps
+only `mask-type`, `mix-blend-mode` and `isolation` keywords. Every
+removal is reported per icon (`removed` in the command's output). Light
+optimization only: comments, PIs, whitespace outside text-bearing
+contexts, empty `<defs>`/`<g>`, unreferenced ids and attribute-less `<g>` wrappers go; geometry is
+verbatim. Text whitespace is retained, and text subtrees serialize
+without inserted indentation or newlines, including inherited
+`xml:space="preserve"`. Limitations: no `<style>` sheets (CSS-styled SVGs
+lose those styles), no `<symbol>`/`<marker>`/`<switch>`; meant for Figma's own SVG
+export shape.
+
+**Fidelity.** An icon is single-color when exactly one flat paint color
+(fill, stroke, stop, flood — normalized, `none` ignored; a shape that no
+`fill` applies to counts as its default black; an existing
+`currentColor` is a color of its own) appears outside
+`<clipPath>`/`<mask>` (their colors are geometry, not paint) and it uses
+no gradient, pattern, filter, image or `color` attribute (which would
+pin `currentColor`). With `current_color = true` that color becomes
+`currentColor` (an implicit black fill is written out as
+`fill="currentColor"`), so Tailwind text colors apply; multicolor
+icons and logos always keep their colors (`colors` in the manifest).
+Embedded color alpha is combined with effective paint opacity. Conversion
+is declined when alpha cannot be represented safely, including when
+moving embedded alpha or materializing an implicit fill on referenced
+geometry could override use-site paints or opacity. Mask/clip geometry
+must also keep its inherited paints. Ids
+are renumbered in document order: the `.svg` file prefixes them with the
+component name; the component losslessly encodes every UTF-16 code unit
+of React's `useId()` as four hexadecimal digits, prefixed with `figmog`.
+This preserves React's ID distinctions across instances and independent
+roots with distinct `identifierPrefix` values. Instances then keep their
+gradient, mask, clip-path and filter references separate. Components need React 18+
+(for `useId`) and the automatic JSX runtime, nothing else; they are
+`aria-hidden` unless given `aria-label`/`aria-labelledby`, and spread
+their props last (`className`, `width`, … override).
+
+**Reads and routing.** The roots' `figmog_subtree` and the
+`figmog_components` inventory (component keys, set names), then the
+renders and fills — through a running serve's socket when one answers
+(the shared owner holds the store), else from the store opened directly,
+like `figmog images`: cache hits cost nothing, misses spend Figma API
+budget and need a token. `assets` writes into the project, so it doesn't
+take `--db`.
+
+**Failures.** An icon or image that can't be exported (a failed fetch,
+an unusable name or SVG, a collision) is listed under `skipped` with the
+reason; by default a skipped asset writes nothing (so a good manifest is
+never replaced by one missing an entry) and exits 1. `--partial` writes
+the rest (the manifest then lists only those) and still exits 1. Files a
+previous export listed that this one doesn't produce are reported as
+`stale`, never deleted.
+
+**Output.** `{manifest, sources, icons: [{component, node_id, path, svg,
+colors, current_color, removed}], images: [...], files: [{path, status:
+"written"|"unchanged"}], written, unchanged, skipped, stale}`.
+
+**Tests.** `src/svg.rs` (Figma shapes, hostile markup, entities, limits,
+`<use>` targets, colors incl. implicit black and `currentColor`, JSX),
+`src/cli/assets.rs` (symlinks, simulated case-insensitive lookups, case
+renames, atomic writes), `serve::async_tests` (`renders: false` makes no
+render request), the multi-file manifest test in `tests/assets.rs`, `src/assets.rs` (SHA-256 vectors, sniffing, naming,
+discovery, plan determinism, collisions, opt-in `currentColor`, manifest
+validation); `tests/assets.rs` on the synthetic
+`tests/fixtures/assets/icons.json` with seeded renders (the done-when: the
+icon set exports to React components — golden in
+`tests/fixtures/assets/export/` — and re-exporting changes no bytes and no
+mtimes; hostile SVG; foreign files, symlinks, `--force`; all-or-nothing
+and `--partial`; `spec` with and without the manifest);
+`tests/owner.rs` (export routed through the shared owner, the relay's
+manifest injection); `examples/slice/app/test/icons.test.mjs` renders the
+golden components with React (react-dom/server) and checks repeated
+instances never share an id and every reference resolves inside its own
+`<svg>`.
+
+Deferred: deleting stale files (`--prune`), sprites, an icon `size`
+prop / Tailwind sizing classes, CSS for image fills' scale modes and
+crops in `figmog spec`, raster icons, and a sanitizer for `<style>`.

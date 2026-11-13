@@ -646,6 +646,58 @@ impl Relay {
         if crate::serve::writes::is_internal(&name) || !crate::proxy::is_local_tool(&name) {
             return Ok(());
         }
+        // `figmog_spec` names tokens as this project's token file does
+        // (NWS-2948): its `[tokens]` settings, unless the agent passed some;
+        // and shows the Tailwind class hint when `[stack] styling` is
+        // `tailwind` (NWS-2947), unless the agent said `tailwind`; and maps
+        // instances to code components with the project's figmog.map.json
+        // (NWS-2949), unless the agent passed a `map` — an invalid map file
+        // is this call's error, naming the file and the JSON path.
+        if name == "figmog_spec" {
+            let params = &mut frame["params"];
+            if !params["arguments"].is_object() {
+                params["arguments"] = json!({});
+            }
+            let settings = self.layout.settings();
+            if params["arguments"].get("tokens").is_none_or(Value::is_null) {
+                params["arguments"]["tokens"] = settings.tokens.export_options().to_json();
+            }
+            if params["arguments"]
+                .get("tailwind")
+                .is_none_or(Value::is_null)
+            {
+                params["arguments"]["tailwind"] =
+                    json!(settings.stack.styling == crate::project::Styling::Tailwind);
+            }
+            if params["arguments"].get("map").is_none_or(Value::is_null)
+                && let Some(map) = crate::map::CodeMap::load(&self.layout.project_root)?
+            {
+                params["arguments"]["map"] = map.to_json();
+            }
+            // ... and names exported assets from the project's asset
+            // manifest (NWS-2952), unless the agent passed `assets`.
+            // For the file this call targets, resolved as below: its icons
+            // match by node id only when exported from that file.
+            if params["arguments"].get("assets").is_none_or(Value::is_null)
+                && let Some(assets) = crate::assets::AssetIndex::load(
+                    &self.layout.project_root,
+                    &settings.assets.manifest,
+                )?
+            {
+                let args = &params["arguments"];
+                let target = match args.get("file") {
+                    Some(Value::String(file)) => parse_file_ref(file),
+                    _ => crate::dispatch::infer_file_from_node_ref(args).or_else(|| {
+                        self.default_key.clone().or_else(|| {
+                            (self.referenced.len() == 1)
+                                .then(|| self.referenced.iter().next().cloned())
+                                .flatten()
+                        })
+                    }),
+                };
+                params["arguments"]["assets"] = assets.for_file(target.as_deref()).to_json();
+            }
+        }
         let args = &frame["params"]["arguments"];
         // Match the owner's typed validation before a rejected request
         // can affect this relay's sole-file default or admission checks.

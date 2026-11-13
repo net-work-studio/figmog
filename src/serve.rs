@@ -1990,11 +1990,13 @@ fn handle_tool_call(
             let format = dispatch::arg_str(args, "format")?;
             let format = format.as_deref().unwrap_or("png");
             let scale = dispatch::arg_f64(args, "scale")?;
+            let renders = dispatch::arg_bool_opt(args, "renders")?.unwrap_or(true);
             let (token, reply) = offload.reply();
             session.images(
                 &ids,
                 format,
                 scale,
+                renders,
                 Box::new(move |result| {
                     let output =
                         result.map(|items| ToolOutput::Raw(crate::images::to_mcp_content(&items)));

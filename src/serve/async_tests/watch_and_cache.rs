@@ -667,6 +667,7 @@ fn routed_fresh_pull_preserves_a_poll_owed_after_images() {
             &["0:0".into()],
             "png",
             None,
+            true,
             Box::new(move |value| answer.send(value).unwrap()),
         )
         .unwrap();

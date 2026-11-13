@@ -3,6 +3,32 @@
     "children": [
       {
         "children": [],
+        "content": {
+          "text": "Spring garden plan"
+        },
+        "css": {
+          "align-self": "stretch",
+          "color": "var(--color-text-primary)",
+          "flex-shrink": "0",
+          "font-family": "\"Inter\"",
+          "font-size": "var(--font-size-title)",
+          "font-weight": "var(--font-weight-bold)",
+          "line-height": "28px",
+          "white-space": "pre-wrap"
+        },
+        "design": {
+          "absoluteBoundingBox": {
+            "height": 28,
+            "width": 272,
+            "x": 24,
+            "y": 16
+          },
+          "layoutSizingHorizontal": "FILL",
+          "layoutSizingVertical": "HUG",
+          "style": {
+            "textAutoResize": "HEIGHT"
+          }
+        },
         "id": "1:2",
         "layout": {
           "size": {
@@ -19,6 +45,9 @@
         "values": {
           "fill": [
             {
+              "bound_at": [
+                "/boundVariables/fills/0"
+              ],
               "css": "--color-text-primary",
               "raw": "#1a1a1f",
               "token": "text/primary",
@@ -27,18 +56,27 @@
           ],
           "typography": {
             "font_family": {
+              "bound_at": [
+                "/boundVariables/fontFamily"
+              ],
               "css": null,
               "raw": "Inter",
               "token": "font/family/sans",
               "variable_id": "VariableID:1:14"
             },
             "font_size": {
+              "bound_at": [
+                "/boundVariables/fontSize"
+              ],
               "css": "--font-size-title",
               "raw": 20,
               "token": "font/size/title",
               "variable_id": "VariableID:1:11"
             },
             "font_weight": {
+              "bound_at": [
+                "/boundVariables/fontWeight"
+              ],
               "css": "--font-weight-bold",
               "raw": 700,
               "token": "font/weight/bold",
@@ -59,6 +97,31 @@
         "children": [
           {
             "children": [],
+            "content": {
+              "text": "Four raised beds, planted in May"
+            },
+            "css": {
+              "color": "#1a1a1f",
+              "flex": "1 1 0%",
+              "font-family": "\"Inter\"",
+              "font-size": "var(--font-size-body)",
+              "font-weight": "400",
+              "line-height": "var(--font-line-body)",
+              "min-width": "0",
+              "white-space": "pre-wrap"
+            },
+            "design": {
+              "absoluteBoundingBox": {
+                "height": 24,
+                "width": 240,
+                "x": 24,
+                "y": 60
+              },
+              "layoutGrow": 1,
+              "style": {
+                "textAutoResize": "HEIGHT"
+              }
+            },
             "id": "1:4",
             "layout": {
               "size": {
@@ -104,6 +167,9 @@
                   "untokenized": true
                 },
                 "font_size": {
+                  "bound_at": [
+                    "/boundVariables/fontSize"
+                  ],
                   "css": "--font-size-body",
                   "raw": 16,
                   "token": "font/size/body",
@@ -118,6 +184,9 @@
                   "untokenized": true
                 },
                 "line_height": {
+                  "bound_at": [
+                    "/boundVariables/lineHeight"
+                  ],
                   "css": "--font-line-body",
                   "raw": 24,
                   "token": "font/line/body",
@@ -128,8 +197,29 @@
           },
           {
             "children": [],
+            "css": {
+              "background-color": "var(--color-brand)",
+              "border-radius": "4px",
+              "flex-shrink": "0",
+              "height": "16px",
+              "width": "24px"
+            },
+            "design": {
+              "absoluteBoundingBox": {
+                "height": 16,
+                "width": 24,
+                "x": 272,
+                "y": 64
+              },
+              "layoutSizingHorizontal": "FIXED",
+              "layoutSizingVertical": "FIXED"
+            },
             "id": "1:5",
             "layout": {
+              "height": {
+                "raw": 16,
+                "untokenized": true
+              },
               "size": {
                 "height": 16,
                 "width": 24
@@ -137,6 +227,10 @@
               "sizing": {
                 "horizontal": "fixed",
                 "vertical": "fixed"
+              },
+              "width": {
+                "raw": 24,
+                "untokenized": true
               }
             },
             "name": "Badge",
@@ -144,6 +238,9 @@
             "values": {
               "fill": [
                 {
+                  "bound_at": [
+                    "/fills/0/boundVariables/color"
+                  ],
                   "css": "--color-brand",
                   "raw": "#0066cc",
                   "token": "brand",
@@ -171,6 +268,30 @@
             }
           }
         ],
+        "css": {
+          "align-items": "center",
+          "align-self": "stretch",
+          "display": "flex",
+          "flex-direction": "row",
+          "flex-shrink": "0",
+          "gap": "8px",
+          "justify-content": "center"
+        },
+        "design": {
+          "absoluteBoundingBox": {
+            "height": 24,
+            "width": 272,
+            "x": 24,
+            "y": 60
+          },
+          "counterAxisAlignItems": "CENTER",
+          "counterAxisSizingMode": "AUTO",
+          "itemSpacing": 8,
+          "layoutAlign": "STRETCH",
+          "layoutMode": "HORIZONTAL",
+          "primaryAxisAlignItems": "CENTER",
+          "primaryAxisSizingMode": "FIXED"
+        },
         "id": "1:3",
         "layout": {
           "align": {
@@ -224,12 +345,44 @@
         "children": [
           {
             "children": [],
+            "css": {
+              "align-self": "stretch",
+              "background-color": "var(--surface)",
+              "grid-column": "1 / span 1",
+              "grid-row": "1 / span 1",
+              "justify-self": "stretch"
+            },
+            "design": {
+              "absoluteBoundingBox": {
+                "height": 200,
+                "width": 132,
+                "x": 24,
+                "y": 100
+              },
+              "gridColumnAnchorIndex": 0,
+              "gridRowAnchorIndex": 0,
+              "layoutSizingHorizontal": "FILL",
+              "layoutSizingVertical": "FILL"
+            },
             "id": "1:7",
+            "layout": {
+              "size": {
+                "height": 200,
+                "width": 132
+              },
+              "sizing": {
+                "horizontal": "fill",
+                "vertical": "fill"
+              }
+            },
             "name": "Photo A",
             "type": "RECTANGLE",
             "values": {
               "fill": [
                 {
+                  "bound_at": [
+                    "/fills/0/boundVariables/color"
+                  ],
                   "css": "--surface",
                   "raw": "#fafafc",
                   "token": "surface",
@@ -240,14 +393,118 @@
           },
           {
             "children": [],
+            "content": {
+              "assets": [
+                {
+                  "image_ref": "0000000000000000000000000000000000000000",
+                  "kind": "image",
+                  "node_id": "1:8",
+                  "paint": "fills[0]",
+                  "scale_mode": "FILL"
+                }
+              ]
+            },
+            "css": {
+              "align-self": "stretch",
+              "grid-column": "2 / span 1",
+              "grid-row": "1 / span 1",
+              "justify-self": "stretch"
+            },
+            "design": {
+              "absoluteBoundingBox": {
+                "height": 200,
+                "width": 132,
+                "x": 164,
+                "y": 100
+              },
+              "gridColumnAnchorIndex": 1,
+              "gridRowAnchorIndex": 0,
+              "layoutSizingHorizontal": "FILL",
+              "layoutSizingVertical": "FILL"
+            },
             "id": "1:8",
+            "layout": {
+              "size": {
+                "height": 200,
+                "width": 132
+              },
+              "sizing": {
+                "horizontal": "fill",
+                "vertical": "fill"
+              }
+            },
             "name": "Photo B",
             "type": "RECTANGLE",
             "values": {}
           }
         ],
+        "css": {
+          "align-self": "stretch",
+          "column-gap": "var(--spacing-2)",
+          "display": "grid",
+          "flex-shrink": "0",
+          "grid-template-columns": "1fr 1fr",
+          "grid-template-rows": "200px",
+          "height": "200px"
+        },
+        "design": {
+          "absoluteBoundingBox": {
+            "height": 200,
+            "width": 272,
+            "x": 24,
+            "y": 100
+          },
+          "gridColumnCount": 2,
+          "gridColumnGap": 8,
+          "gridColumnsSizing": "1fr 1fr",
+          "gridRowCount": 1,
+          "gridRowGap": 0,
+          "gridRowsSizing": "200px",
+          "layoutMode": "GRID",
+          "layoutSizingHorizontal": "FILL",
+          "layoutSizingVertical": "FIXED"
+        },
         "id": "1:6",
         "layout": {
+          "grid": {
+            "column_gap": {
+              "bound_at": [
+                "/boundVariables/gridColumnGap"
+              ],
+              "css": "--spacing-2",
+              "raw": 8,
+              "token": "space/2",
+              "variable_id": "VariableID:1:8"
+            },
+            "columns": 2,
+            "row_gap": {
+              "raw": 0,
+              "untokenized": true
+            },
+            "rows": 1
+          },
+          "height": {
+            "raw": 200,
+            "untokenized": true
+          },
+          "padding": {
+            "bottom": {
+              "raw": 0,
+              "untokenized": true
+            },
+            "left": {
+              "raw": 0,
+              "untokenized": true
+            },
+            "right": {
+              "raw": 0,
+              "untokenized": true
+            },
+            "top": {
+              "raw": 0,
+              "untokenized": true
+            }
+          },
           "size": {
             "height": 200,
             "width": 272
@@ -263,13 +520,101 @@
       },
       {
         "children": [],
+        "css": {
+          "height": "40px",
+          "left": "280px",
+          "position": "absolute",
+          "top": "0px",
+          "width": "40px"
+        },
+        "design": {
+          "absoluteBoundingBox": {
+            "height": 40,
+            "width": 40,
+            "x": 280,
+            "y": 0
+          },
+          "layoutPositioning": "ABSOLUTE"
+        },
         "id": "1:9",
+        "layout": {
+          "height": {
+            "raw": 40,
+            "untokenized": true
+          },
+          "position": "absolute",
+          "size": {
+            "height": 40,
+            "width": 40
+          },
+          "sizing": {
+            "horizontal": "fixed",
+            "vertical": "fixed"
+          },
+          "width": {
+            "raw": 40,
+            "untokenized": true
+          }
+        },
         "name": "Ribbon",
         "type": "RECTANGLE",
         "values": {}
       },
       {
         "children": [],
+        "content": {
+          "runs": [
+            {
+              "end": 8,
+              "start": 0,
+              "style": 0,
+              "text": "Updated "
+            },
+            {
+              "css": {
+                "font-weight": "700"
+              },
+              "end": 14,
+              "start": 8,
+              "style": 1,
+              "text": "weekly",
+              "typography": {
+                "font_weight": {
+                  "matches": [
+                    {
+                      "css": "--font-weight-bold",
+                      "token": "font/weight/bold",
+                      "variable_id": "VariableID:1:12"
+                    }
+                  ],
+                  "raw": 700,
+                  "untokenized": true
+                }
+              }
+            }
+          ],
+          "text": "Updated weekly"
+        },
+        "css": {
+          "align-self": "stretch",
+          "color": "var(--color-text-primary)",
+          "flex-shrink": "0",
+          "font-family": "\"Inter\"",
+          "font-size": "16px",
+          "font-weight": "400",
+          "line-height": "24px",
+          "white-space": "pre-wrap"
+        },
+        "design": {
+          "absoluteBoundingBox": {
+            "height": 24,
+            "width": 272,
+            "x": 24,
+            "y": 316
+          },
+          "layoutSizingHorizontal": "FILL",
+          "layoutSizingVertical": "HUG"
+        },
         "id": "1:10",
         "layout": {
           "size": {
@@ -283,9 +628,101 @@
         },
         "name": "Caption",
         "type": "TEXT",
-        "values": {}
+        "values": {
+          "fill": [
+            {
+              "bound_at": [
+                "/fills/0/boundVariables/color"
+              ],
+              "css": "--color-text-primary",
+              "raw": "#1a1a1f",
+              "token": "text/primary",
+              "variable_id": "VariableID:2:2"
+            }
+          ],
+          "typography": {
+            "font_family": {
+              "matches": [
+                {
+                  "css": null,
+                  "token": "font/family/sans",
+                  "variable_id": "VariableID:1:14"
+                }
+              ],
+              "raw": "Inter",
+              "untokenized": true
+            },
+            "font_size": {
+              "matches": [
+                {
+                  "css": "--font-size-body",
+                  "token": "font/size/body",
+                  "variable_id": "VariableID:1:10"
+                }
+              ],
+              "raw": 16,
+              "untokenized": true
+            },
+            "font_weight": {
+              "raw": 400,
+              "untokenized": true
+            },
+            "letter_spacing": {
+              "raw": 0,
+              "untokenized": true
+            },
+            "line_height": {
+              "matches": [
+                {
+                  "css": "--font-line-body",
+                  "token": "font/line/body",
+                  "variable_id": "VariableID:1:13"
+                }
+              ],
+              "raw": 24,
+              "untokenized": true
+            }
+          }
+        }
       }
     ],
+    "css": {
+      "align-items": "flex-start",
+      "background-color": "var(--surface)",
+      "border-radius": "var(--radius-md)",
+      "box-sizing": "border-box",
+      "display": "flex",
+      "flex-direction": "column",
+      "gap": "var(--spacing-4)",
+      "outline-color": "var(--border-subtle)",
+      "outline-offset": "calc(var(--stroke-thin) * -1)",
+      "outline-style": "solid",
+      "outline-width": "var(--stroke-thin)",
+      "padding-bottom": "var(--spacing-4)",
+      "padding-left": "24px",
+      "padding-right": "24px",
+      "padding-top": "var(--spacing-4)",
+      "position": "relative",
+      "width": "320px"
+    },
+    "design": {
+      "absoluteBoundingBox": {
+        "height": 400,
+        "width": 320,
+        "x": 0,
+        "y": 0
+      },
+      "counterAxisAlignItems": "MIN",
+      "itemSpacing": 16,
+      "layoutMode": "VERTICAL",
+      "layoutSizingHorizontal": "FIXED",
+      "layoutSizingVertical": "HUG",
+      "paddingBottom": 16,
+      "paddingLeft": 24,
+      "paddingRight": 24,
+      "paddingTop": 16,
+      "primaryAxisAlignItems": "MIN"
+    },
     "id": "1:1",
     "layout": {
       "align": {
@@ -294,6 +731,9 @@
       },
       "direction": "vertical",
       "gap": {
+        "bound_at": [
+          "/boundVariables/itemSpacing"
+        ],
         "css": "--spacing-4",
         "raw": 16,
         "token": "space/4",
@@ -301,6 +741,9 @@
       },
       "padding": {
         "bottom": {
+          "bound_at": [
+            "/boundVariables/paddingBottom"
+          ],
           "css": "--spacing-4",
           "raw": 16,
           "token": "space/4",
@@ -315,6 +758,9 @@
           "untokenized": true
         },
         "top": {
+          "bound_at": [
+            "/boundVariables/paddingTop"
+          ],
           "css": "--spacing-4",
           "raw": 16,
           "token": "space/4",
@@ -328,6 +774,10 @@
       "sizing": {
         "horizontal": "fixed",
         "vertical": "hug"
+      },
+      "width": {
+        "raw": 320,
+        "untokenized": true
       }
     },
     "name": "Card",
@@ -335,6 +785,9 @@
     "values": {
       "fill": [
         {
+          "bound_at": [
+            "/fills/0/boundVariables/color"
+          ],
           "css": "--surface",
           "raw": "#fafafc",
           "token": "surface",
@@ -343,24 +796,36 @@
       ],
       "radius": {
         "bottom_left": {
+          "bound_at": [
+            "/boundVariables/rectangleCornerRadii/RECTANGLE_BOTTOM_LEFT_CORNER_RADIUS"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
           "variable_id": "VariableID:1:6"
         },
         "bottom_right": {
+          "bound_at": [
+            "/boundVariables/rectangleCornerRadii/RECTANGLE_BOTTOM_RIGHT_CORNER_RADIUS"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
           "variable_id": "VariableID:1:6"
         },
         "top_left": {
+          "bound_at": [
+            "/boundVariables/rectangleCornerRadii/RECTANGLE_TOP_LEFT_CORNER_RADIUS"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
           "variable_id": "VariableID:1:6"
         },
         "top_right": {
+          "bound_at": [
+            "/boundVariables/rectangleCornerRadii/RECTANGLE_TOP_RIGHT_CORNER_RADIUS"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
@@ -369,6 +834,9 @@
       },
       "stroke": [
         {
+          "bound_at": [
+            "/strokes/0/boundVariables/color"
+          ],
           "css": "--border-subtle",
           "raw": "#e0e3e6",
           "token": "border/subtle",
@@ -376,6 +844,12 @@
         }
       ],
       "stroke_weight": {
+        "bound_at": [
+          "/boundVariables/individualStrokeWeights/bottom",
+          "/boundVariables/individualStrokeWeights/left",
+          "/boundVariables/individualStrokeWeights/right",
+          "/boundVariables/individualStrokeWeights/top"
+        ],
         "css": "--stroke-thin",
         "raw": 1,
         "token": "stroke/thin",
@@ -404,24 +878,16 @@
   },
   "unsupported": [
     {
-      "id": "1:10",
-      "reason": "mixed text runs (characterStyleOverrides): fill and typography not specified"
-    },
-    {
-      "id": "1:6",
-      "reason": "layoutMode GRID: own layout and child positions not specified"
-    },
-    {
       "id": "1:8",
-      "reason": "fills[0]: IMAGE paint not specified"
+      "reason": "fills[0]: IMAGE paint: referenced under content.assets, no CSS background until the asset manifest (NWS-2952)"
+    },
+    {
+      "id": "1:9",
+      "reason": "absolute child before in-flow siblings: CSS paints it above them, Figma below: stacking not specified"
     },
     {
       "id": "1:9",
       "reason": "fills[0]: GRADIENT_LINEAR paint not specified"
-    },
-    {
-      "id": "1:9",
-      "reason": "layoutPositioning ABSOLUTE: position and sizing not specified"
     }
   ]
 }

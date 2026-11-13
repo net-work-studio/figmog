@@ -2,29 +2,29 @@
   "builds": {
     "after": {
       "card": "examples/slice/app/src/Card.jsx",
-      "commit": "7f3dc8a80db9a7e7460c1a072cc1186fd351e368",
+      "commit": "ff38de14ef5c9b03c89d96db10d4c8c2b47b6b3d",
       "dirty": false,
       "tree": {
         "files": 8,
-        "sha256": "8dfbda178d0ce89f5880c7b17454561ec8abb553b1f06bbd5ca2521e08303481"
+        "sha256": "2cb8029099725520daa87cc4b42c6fec37e4e1e90ff0dc8e143c817b113fa8b3"
       }
     },
     "before": {
       "card": "examples/slice/app/baseline/Card.jsx",
-      "commit": "7f3dc8a80db9a7e7460c1a072cc1186fd351e368",
+      "commit": "ff38de14ef5c9b03c89d96db10d4c8c2b47b6b3d",
       "dirty": false,
       "tree": {
         "files": 8,
-        "sha256": "146992474643837b339ffc41f3c617b4fd7d0ee6fc136de66ccb9b33709ff8fc"
+        "sha256": "b04ba29f5cd27abfa631560cae8bcae5579425f16905abd2b24cf13925833365"
       }
     },
     "broken": {
       "card": "examples/slice/app/variants/Card.wrong-padding.jsx",
-      "commit": "7f3dc8a80db9a7e7460c1a072cc1186fd351e368",
+      "commit": "ff38de14ef5c9b03c89d96db10d4c8c2b47b6b3d",
       "dirty": false,
       "tree": {
         "files": 8,
-        "sha256": "be9a1303cd6a0ad44b3799d6334eaf1aac4bc8a1e7cd36685de26ecad1566230"
+        "sha256": "7bab9a024f0fedd1dc1df081ddadac6b4c88f7be5d9edda937f99c2b96870a43"
       }
     }
   },
@@ -213,12 +213,12 @@
   "scoreNote": "advisory: 100 * (1 - mismatched / (W*H)) against the Figma render; never a pass/fail gate",
   "spec": {
     "path": "examples/slice/spec/card.spec.json",
-    "sha256": "94574056f7a6a55a7b0e33abc3f89ec343812d34e776100a083bb5fe6e8a9fda"
+    "sha256": "4ff4989ed4c033b02c2de1403ff118e195f7501db282c57e569c249f6ef67038"
   },
   "tokens": {
     "css": {
       "path": "examples/slice/app/src/tokens.css",
-      "sha256": "e93ad00bdcda567267874b977d716bec584fc4abba087e6e132312e522c8da80"
+      "sha256": "06d51aab01d30d9b0a495141bc06fcc5a64b87e21c00ce02ba66b373ae62c021"
     },
     "snapshot": {
       "digest": "fnv1a64:fd631e535712b153",

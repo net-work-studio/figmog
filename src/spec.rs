@@ -1,40 +1,50 @@
-//! `figmog spec <node>` / `figmog_spec` (NWS-2968): a binding-aware spec
-//! of one auto-layout subtree — layout (direction, gap, padding,
-//! alignment, sizing) and values (fill, stroke, radius, typography), each
-//! value shown as the variable token it is bound to, or flagged as
-//! untokenized (naming any token whose default/light value it equals).
+//! `figmog spec <node>` / `figmog_spec`: a code-ready description of one
+//! subtree (NWS-2968's slice, grown by NWS-2947). Per node, two layers:
 //!
-//! Pure: the inputs are exactly the `figmog_subtree` answer for the node
-//! (raw JSON, children nested) and the `figmog_vars {snapshot: true}`
-//! answer, so the output is a function of the mirror alone. A bound
-//! token's `css` name comes from [`crate::tokens::export_css`] run on the
-//! same snapshot, so it is the name `figmog tokens export` emits, never a
-//! parallel naming rule.
+//! - **design** — what Figma recorded: the layout properties (auto layout,
+//!   grid, sizing, constraints, min/max, clipping, text auto-resize)
+//!   copied verbatim;
+//! - **figmog's interpretation** — `layout` and `values` (every value
+//!   shown as the variable token it is bound to, or flagged untokenized,
+//!   naming any token whose root value it equals), `content` (text, mixed
+//!   runs, assets), `instance` (component, variant properties) and `css`
+//!   (the declarations figmog derives), plus an optional Tailwind class
+//!   hint.
 //!
-//! Anything outside the slice — grid or wrapping layout, absolutely
-//! positioned children, constraints-based frames, mixed text runs,
-//! non-solid paints, effects, layer opacity, hidden layers — is listed
-//! under `unsupported` with the node id and reason and left out of the
-//! spec, never approximated (SPEC §6 "`figmog_spec`").
+//! Whatever figmog can't translate exactly is listed under `unsupported`
+//! with the node id and reason and left out of `css`, never approximated
+//! (SPEC §17).
+//!
+//! Pure: the inputs are the `figmog_subtree` answer for the node (raw
+//! JSON, children nested), the `figmog_vars {snapshot: true}` answer, and
+//! the component records the subtree's instances name, so the output is a
+//! function of the mirror alone. A bound token's `css` name comes from
+//! [`crate::tokens::export_css`] run on the same snapshot, so it is the
+//! name `figmog tokens export` emits, never a parallel naming rule.
 //!
 //! Determinism: every object is a `serde_json::Map` (sorted keys, no
-//! `preserve_order`), `unsupported` is a sorted set, children keep
-//! child-index order, and `matches` lists are sorted by token name then
+//! `preserve_order`), `unsupported` is a sorted set, children and runs
+//! keep their order, and `matches` lists are sorted by token name then
 //! variable id.
+
+mod css;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
+use crate::assets::AssetIndex;
 use crate::deep_json::OwnedValue;
-use crate::tokens::{ExportOptions, Theme, color, export_css};
+use crate::map::CodeMap;
+use crate::tokens::{ExportOptions, color, export_css};
+use css::{Css, CssVal, num, px};
 
 /// One authoritative variable row of `figmog vars --snapshot`.
 struct Var<'a> {
     name: String,
     resolved_type: String,
-    collection_id: String,
-    default_mode_id: Option<String>,
+    collection_key: String,
+    default_mode: Option<String>,
     scopes: Vec<String>,
     /// Mode ID → raw value or alias.
     values: BTreeMap<String, &'a Value>,
@@ -63,8 +73,14 @@ struct Tokens<'a> {
     vars: BTreeMap<String, Var<'a>>,
     /// Variable id → custom property name, from the token export.
     css: BTreeMap<String, String>,
-    /// Variable id → its value in the root mode (the theme collection's
-    /// light mode, else the collection's default mode), aliases followed.
+    /// Variable id → Tailwind theme name, from the token export.
+    theme: BTreeMap<String, String>,
+    /// Variable id → the unit a FLOAT token is exported with (`None`:
+    /// unitless), from the token export.
+    units: BTreeMap<String, Option<&'static str>>,
+    /// Variable id → its value in the root mode (the mode the token export
+    /// writes to `:root`, else the collection's default mode), aliases
+    /// followed.
     root: BTreeMap<String, Lit>,
 }
 
@@ -76,21 +92,26 @@ struct Prop {
     scopes: &'static [&'static str],
 }
 
-const GAP: Prop = Prop {
-    resolved_type: "FLOAT",
-    scopes: &["GAP"],
-};
-const RADIUS: Prop = Prop {
-    resolved_type: "FLOAT",
-    scopes: &["CORNER_RADIUS"],
-};
+const fn float(scopes: &'static [&'static str]) -> Prop {
+    Prop {
+        resolved_type: "FLOAT",
+        scopes,
+    }
+}
+
+const GAP: Prop = float(&["GAP"]);
+const SIZE: Prop = float(&["WIDTH_HEIGHT"]);
+const RADIUS: Prop = float(&["CORNER_RADIUS"]);
+const OPACITY: Prop = float(&["OPACITY"]);
+const STROKE_WEIGHT: Prop = float(&["STROKE_FLOAT"]);
+const EFFECT_FLOAT: Prop = float(&["EFFECT_FLOAT"]);
 const STROKE_COLOR: Prop = Prop {
     resolved_type: "COLOR",
     scopes: &["STROKE_COLOR"],
 };
-const STROKE_WEIGHT: Prop = Prop {
-    resolved_type: "FLOAT",
-    scopes: &["STROKE_FLOAT"],
+const EFFECT_COLOR: Prop = Prop {
+    resolved_type: "COLOR",
+    scopes: &["EFFECT_COLOR"],
 };
 
 /// Fill scope by node type: text, frame-like, or shape.
@@ -108,52 +129,177 @@ fn fill_prop(node_type: &str) -> Prop {
     }
 }
 
+/// Frame-like nodes: a `layoutMode: NONE` one places its children by
+/// their constraints.
+const FRAME_LIKE: [&str; 5] = ["FRAME", "COMPONENT", "COMPONENT_SET", "INSTANCE", "SECTION"];
+
+/// Nodes CSS can't draw: each is one vector asset (its children are part
+/// of it and not specified separately).
+const VECTOR_LIKE: [&str; 5] = [
+    "VECTOR",
+    "BOOLEAN_OPERATION",
+    "STAR",
+    "LINE",
+    "REGULAR_POLYGON",
+];
+
+/// The recorded layout properties the `design` layer copies verbatim.
+const DESIGN_KEYS: [&str; 41] = [
+    "absoluteBoundingBox",
+    "clipsContent",
+    "constraints",
+    "counterAxisAlignContent",
+    "counterAxisAlignItems",
+    "counterAxisSizingMode",
+    "counterAxisSpacing",
+    "gridChildHorizontalAlign",
+    "gridChildVerticalAlign",
+    "gridColumnAnchorIndex",
+    "gridColumnCount",
+    "gridColumnGap",
+    "gridColumnSpan",
+    "gridColumnsSizing",
+    "gridRowAnchorIndex",
+    "gridRowCount",
+    "gridRowGap",
+    "gridRowSpan",
+    "gridRowsSizing",
+    "itemReverseZIndex",
+    "itemSpacing",
+    "layoutAlign",
+    "layoutGrow",
+    "layoutMode",
+    "layoutPositioning",
+    "layoutSizingHorizontal",
+    "layoutSizingVertical",
+    "layoutWrap",
+    "maxHeight",
+    "maxWidth",
+    "minHeight",
+    "minWidth",
+    "paddingBottom",
+    "paddingLeft",
+    "paddingRight",
+    "paddingTop",
+    "primaryAxisAlignItems",
+    "primaryAxisSizingMode",
+    "rotation",
+    "strokesIncludedInLayout",
+    "textAutoResize",
+];
+
+/// Text-layout properties of a TEXT node's type style the `design` layer
+/// copies (under `design.style`).
+const DESIGN_STYLE_KEYS: [&str; 5] = [
+    "maxLines",
+    "textAlignHorizontal",
+    "textAlignVertical",
+    "textAutoResize",
+    "textTruncation",
+];
+
 /// Build the spec. `tree` is the `figmog_subtree` answer for the node;
-/// `vars` the `figmog_vars {snapshot: true}` answer.
-pub fn build(tree: &Value, vars: &Value) -> Value {
-    let (css, theme, css_unavailable) = match export_css(vars, &ExportOptions::default()) {
-        Ok(export) => (export.names, export.theme, Value::Null),
-        Err(e) => (BTreeMap::new(), None, Value::String(e)),
+/// `vars` the `figmog_vars {snapshot: true}` answer; `components` maps a
+/// component id to `{name, key, remote, component_set}` for the subtree's
+/// instances ([`component_ids`]); `tokens` the token export options (the
+/// project's `[tokens]` settings), so the CSS names and root modes match
+/// the committed token file; `tailwind` adds the per-node class hint;
+/// `map` is the project's Figma → code component map (NWS-2949), which
+/// fills each mapped instance's `code_component`; `assets` the project's
+/// asset manifest (NWS-2952), which names the exported icon component
+/// and image file in `content.assets`.
+pub fn build(
+    tree: &Value,
+    vars: &Value,
+    components: &Value,
+    tokens: &ExportOptions,
+    tailwind: bool,
+    map: Option<&CodeMap>,
+    assets: Option<&AssetIndex>,
+) -> Value {
+    let (css, theme, theme_names, units, roots, css_unavailable) = match export_css(vars, tokens) {
+        Ok(export) => (
+            export.names,
+            export.theme,
+            export.theme_names,
+            export.units,
+            export.root_modes,
+            Value::Null,
+        ),
+        Err(e) => (
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Value::String(e),
+        ),
     };
-    let tokens = Tokens::new(vars, css, theme.as_ref());
+    let mut tokens = Tokens::new(vars, css, theme_names, &roots);
+    tokens.units = units;
     let mut cx = Cx {
         tokens: &tokens,
+        components,
+        tailwind,
+        map,
+        assets,
         unsupported: BTreeSet::new(),
+        consumed: BTreeSet::new(),
+        style_base: "/style".into(),
     };
-    let node = cx.tree(tree);
+    let node = cx.node(
+        tree,
+        &Up {
+            kind: Parent::Root,
+            bbox: None,
+            margin: None,
+            border: None,
+        },
+    );
     let unsupported: Vec<Value> = cx
         .unsupported
         .into_iter()
         .map(|(id, reason)| json!({"id": id, "reason": reason}))
         .collect();
-    let mut snapshot = if vars["snapshot"].is_object() {
-        copy_value(&vars["snapshot"])
-    } else {
-        OwnedValue::object()
-    };
-    snapshot.insert("css_unavailable".into(), OwnedValue(css_unavailable));
-    snapshot.insert("theme".into(), OwnedValue(json!(theme)));
-    let mut result = OwnedValue(json!({"unsupported": unsupported}));
-    result.insert("node".into(), node);
-    result.insert("tokens_snapshot".into(), snapshot);
-    result.into_inner()
+    let mut snapshot = vars["snapshot"].as_object().cloned().unwrap_or_default();
+    snapshot.insert("css_unavailable".into(), css_unavailable);
+    snapshot.insert("theme".into(), json!(theme));
+    let mut out = json!({"tokens_snapshot": snapshot, "unsupported": unsupported});
+    out["node"] = node;
+    out
 }
 
-/// Raw properties may contain arbitrary JSON, including malformed values at
-/// otherwise scalar fields. Keep their copies guarded and use the growing-stack
-/// boundary for containers instead of `Value::clone`'s recursive implementation.
-fn copy_value(value: &Value) -> OwnedValue {
-    match value {
-        Value::Array(_) | Value::Object(_) => crate::deep_json::from_str(
-            &crate::deep_json::to_string(value).expect("serialize raw spec property"),
-        )
-        .expect("parse serialized raw spec property"),
-        _ => OwnedValue(value.clone()),
+/// The component ids of every INSTANCE in `tree`, and of every component
+/// an instance-swap property swaps in, for the component records [`build`]
+/// takes.
+pub fn component_ids(tree: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut pending = vec![tree];
+    while let Some(n) = pending.pop() {
+        if n["type"] == "INSTANCE" {
+            if let Some(id) = n["componentId"].as_str() {
+                out.insert(id.to_string());
+            }
+            for (_, p) in n["componentProperties"].as_object().into_iter().flatten() {
+                if p["type"] == "INSTANCE_SWAP"
+                    && let Some(id) = p["value"].as_str()
+                {
+                    out.insert(id.to_string());
+                }
+            }
+        }
+        pending.extend(n["children"].as_array().into_iter().flatten());
     }
+    out
 }
 
 impl<'a> Tokens<'a> {
-    fn new(vars: &'a Value, css: BTreeMap<String, String>, theme: Option<&Theme>) -> Tokens<'a> {
+    fn new(
+        vars: &'a Value,
+        css: BTreeMap<String, String>,
+        theme: BTreeMap<String, String>,
+        roots: &BTreeMap<String, String>,
+    ) -> Tokens<'a> {
         let mut all = BTreeMap::new();
         for row in vars["variables"].as_array().into_iter().flatten() {
             if row["source"] != "imported" {
@@ -165,8 +311,11 @@ impl<'a> Tokens<'a> {
                 Var {
                     name: text("name"),
                     resolved_type: text("resolved_type"),
-                    collection_id: text("collection_id"),
-                    default_mode_id: row["default_mode_id"].as_str().map(str::to_string),
+                    collection_key: row["collection_id"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| text("collection")),
+                    default_mode: row["default_mode_id"].as_str().map(str::to_string),
                     scopes: row["scopes"]
                         .as_array()
                         .into_iter()
@@ -183,31 +332,38 @@ impl<'a> Tokens<'a> {
         }
         let root = all
             .keys()
-            .filter_map(|id| Some((id.clone(), root_value(&all, theme, id, 0)?)))
+            .filter_map(|id| Some((id.clone(), root_value(&all, roots, id, 0)?)))
             .collect();
         Tokens {
             vars: all,
             css,
+            theme,
+            units: BTreeMap::new(),
             root,
         }
     }
 
-    /// A bound value: the token, its CSS name and the raw value.
-    fn bound(&self, variable_id: &str, raw: OwnedValue) -> OwnedValue {
-        let mut out = OwnedValue(json!({
-            "token": self.vars.get(variable_id).map(|v| v.name.clone()),
-            "variable_id": variable_id,
-            "css": self.css.get(variable_id),
-        }));
-        out.insert("raw".into(), raw);
+    /// A bound value: the token, its CSS name, the raw value, and the
+    /// JSON pointers (relative to the node) of the binding.
+    fn bound(&self, bind: &Bind, raw: Value) -> Value {
+        let mut at = bind.at.clone();
+        at.sort();
+        at.dedup();
+        let mut out = json!({
+            "token": self.vars.get(&bind.var).map(|v| v.name.clone()),
+            "variable_id": bind.var,
+            "css": self.css.get(&bind.var),
+            "bound_at": at,
+        });
+        out["raw"] = raw;
         out
     }
 
     /// An unbound value: flagged untokenized, plus every eligible token
     /// whose root value equals it.
-    fn untokenized(&self, raw: OwnedValue, lit: Option<&Lit>, prop: Prop) -> OwnedValue {
-        let mut out = OwnedValue(json!({"untokenized": true}));
-        out.insert("raw".into(), raw);
+    fn untokenized(&self, raw: Value, lit: Option<&Lit>, prop: Prop) -> Value {
+        let mut out = json!({"untokenized": true});
+        out["raw"] = raw;
         let Some(lit) = lit else {
             return out;
         };
@@ -225,49 +381,44 @@ impl<'a> Tokens<'a> {
             .collect();
         matches.sort();
         if !matches.is_empty() {
-            let matches = matches
+            out["matches"] = matches
                 .into_iter()
                 .map(
                     |(name, id)| json!({"token": name, "variable_id": id, "css": self.css.get(id)}),
                 )
                 .collect();
-            out.insert("matches".into(), OwnedValue(Value::Array(matches)));
         }
         out
     }
 
     /// The value entry for `raw` with optional binding `variable_id`.
-    fn entry(
-        &self,
-        binding: Option<String>,
-        raw: OwnedValue,
-        lit: Option<&Lit>,
-        prop: Prop,
-    ) -> OwnedValue {
+    fn entry(&self, binding: Option<Bind>, raw: Value, lit: Option<&Lit>, prop: Prop) -> Value {
         match binding {
-            Some(id) => self.bound(&id, raw),
+            Some(b) => self.bound(&b, raw),
             None => self.untokenized(raw, lit, prop),
         }
     }
 }
 
+/// An untokenized raw `0` — a CSS default, so not declared.
+fn is_unbound_zero(e: &Value) -> bool {
+    e.get("variable_id").is_none() && e["raw"].as_f64() == Some(0.0)
+}
+
 /// A variable's value in its root mode, aliases followed (bounded, so a
 /// cyclic snapshot can't loop).
 fn root_value(
-    all: &BTreeMap<String, Var<'_>>,
-    theme: Option<&Theme>,
+    all: &BTreeMap<String, Var>,
+    roots: &BTreeMap<String, String>,
     id: &str,
     depth: usize,
 ) -> Option<Lit> {
     let v = all.get(id)?;
-    let mode = match theme {
-        Some(t) if t.collection_id == v.collection_id => Some(&t.light_mode_id),
-        _ => v.default_mode_id.as_ref(),
-    }?;
+    let mode = roots.get(&v.collection_key).or(v.default_mode.as_ref())?;
     let raw = v.values.get(mode)?;
     if raw["type"] == "VARIABLE_ALIAS" {
         return (depth < 32)
-            .then(|| root_value(all, theme, raw["id"].as_str()?, depth + 1))
+            .then(|| root_value(all, roots, raw["id"].as_str()?, depth + 1))
             .flatten();
     }
     match v.resolved_type.as_str() {
@@ -300,66 +451,163 @@ fn alias_id(v: Option<&Value>) -> Result<Option<String>, ()> {
     }
 }
 
-/// Flat bindings remain supported, while REST also nests corner bindings
-/// under rectangleCornerRadii and uniform stroke bindings under its sides.
-/// Two representations may agree; conflicting or partially bound uniform
-/// strokes cannot be represented as one binding.
-fn node_binding(n: &Value, key: &str) -> Result<Option<String>, ()> {
-    let bindings = n.get("boundVariables");
-    let flat = alias_id(bindings.and_then(|b| b.get(key)))?;
-    let nested = if key == "strokeWeight" {
-        match bindings.and_then(|b| b.get("individualStrokeWeights")) {
-            None => None,
-            Some(sides) => {
-                let mut variable = None;
-                for side in ["top", "right", "bottom", "left"] {
-                    let current = alias_id(sides.get(side))?.ok_or(())?;
-                    if variable
-                        .as_ref()
-                        .is_some_and(|previous| previous != &current)
-                    {
-                        return Err(());
-                    }
-                    variable = Some(current);
-                }
-                variable
-            }
-        }
-    } else {
-        let corner = match key {
-            "topLeftRadius" => Some("RECTANGLE_TOP_LEFT_CORNER_RADIUS"),
-            "topRightRadius" => Some("RECTANGLE_TOP_RIGHT_CORNER_RADIUS"),
-            "bottomRightRadius" => Some("RECTANGLE_BOTTOM_RIGHT_CORNER_RADIUS"),
-            "bottomLeftRadius" => Some("RECTANGLE_BOTTOM_LEFT_CORNER_RADIUS"),
-            _ => None,
-        };
-        alias_id(corner.and_then(|corner| {
-            bindings
-                .and_then(|b| b.get("rectangleCornerRadii"))
-                .and_then(|radii| radii.get(corner))
-        }))?
+/// Every variable an alias or an alias array names.
+fn alias_ids(v: Option<&Value>) -> BTreeSet<String> {
+    let items = match v {
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(a) => vec![a],
+        None => vec![],
     };
-    match (flat, nested) {
-        (Some(flat), Some(nested)) if flat != nested => Err(()),
-        (Some(id), _) | (_, Some(id)) => Ok(Some(id)),
-        _ => Ok(None),
+    items
+        .into_iter()
+        .filter(|a| a["type"] == "VARIABLE_ALIAS")
+        .filter_map(|a| a["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A binding: the variable, and the JSON pointers (relative to the node)
+/// that name it.
+#[derive(Debug, Clone, PartialEq)]
+struct Bind {
+    var: String,
+    at: Vec<String>,
+}
+
+/// `base` + the RFC 6901 pointer of `path`.
+fn pointer(base: &str, path: &[&str]) -> String {
+    let mut out = base.to_string();
+    for p in path {
+        out.push('/');
+        out.push_str(&p.replace('~', "~0").replace('/', "~1"));
+    }
+    out
+}
+
+/// `v[p]`, an array index when `v` is an array.
+fn step<'a>(v: &'a Value, p: &str) -> Option<&'a Value> {
+    match v {
+        Value::Array(items) => items.get(p.parse::<usize>().ok()?),
+        _ => v.get(p),
     }
 }
 
-/// The node's layout parent, as far as sizing is concerned.
+/// Every `VARIABLE_ALIAS` under `v` (children excluded), by pointer.
+fn alias_pointers(v: &Value, at: &str, out: &mut Vec<String>) {
+    let mut pending = vec![(v, at.to_string())];
+    while let Some((value, path)) = pending.pop() {
+        match value {
+            Value::Object(m) if m.get("type").and_then(Value::as_str) == Some("VARIABLE_ALIAS") => {
+                out.push(path)
+            }
+            Value::Object(m) => {
+                for (key, value) in m {
+                    if !(path.is_empty() && key == "children") {
+                        pending.push((value, pointer(&path, &[key])));
+                    }
+                }
+            }
+            Value::Array(xs) => {
+                for (i, value) in xs.iter().enumerate() {
+                    pending.push((value, pointer(&path, &[&i.to_string()])));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What CSS needs from a value.
+#[derive(Clone, Copy, PartialEq)]
+enum Want {
+    /// A length: px literals; a unitless token is scaled by `1px`.
+    Px,
+    /// A length, left out when it is an unbound zero.
+    PxNonZero,
+    /// `opacity`: a 0–1 literal; a `%` token as is, a unitless (0–100)
+    /// token divided by 100.
+    Opacity,
+    /// A plain number (`font-weight`).
+    Number,
+    /// A color.
+    Color,
+    /// A font family (a quoted string).
+    Family,
+}
+
+/// A node's absolute bounding box.
+#[derive(Debug, Clone, Copy)]
+struct Rect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+fn rect(n: &Value) -> Option<Rect> {
+    let b = n.get("absoluteBoundingBox")?;
+    Some(Rect {
+        x: b["x"].as_f64()?,
+        y: b["y"].as_f64()?,
+        w: b["width"].as_f64()?,
+        h: b["height"].as_f64()?,
+    })
+}
+
+/// The node's layout parent.
 #[derive(Clone, Copy, PartialEq)]
 enum Parent {
     /// The spec's root: its parent is outside the spec.
     Root,
-    /// An auto-layout parent with this direction.
-    Auto(&'static str),
-    /// A parent whose layout isn't specified (none, grid, wrap).
-    Other,
+    /// An auto-layout (flex) parent with this direction.
+    Flex(&'static str),
+    /// A `layoutMode: GRID` parent.
+    Grid,
+    /// A frame without auto layout: children are placed by constraints.
+    Free,
+    /// A parent whose child placement isn't specified (a group, an
+    /// unknown layout mode).
+    Unplaced,
 }
 
-struct Cx<'a, 'vars> {
-    tokens: &'a Tokens<'vars>,
+/// What a node inherits from its parent.
+#[derive(Clone)]
+struct Up {
+    kind: Parent,
+    /// The parent's bounding box (for constraints).
+    bbox: Option<Rect>,
+    /// A negative auto-layout gap, as a margin on every in-flow child
+    /// after the first.
+    margin: Option<(&'static str, CssVal)>,
+    /// The parent's CSS border width (a stroke included in layout): CSS
+    /// offsets an absolute child from the padding box, inside it.
+    border: Option<CssVal>,
+}
+
+/// What a node is as a container.
+#[derive(Clone, Copy, PartialEq)]
+enum Container {
+    Flex(&'static str),
+    Grid,
+    Free,
+    /// Children not placed (group, unknown layout mode).
+    Unplaced,
+    /// No children to place.
+    Leaf,
+}
+
+struct Cx<'a> {
+    tokens: &'a Tokens<'a>,
+    components: &'a Value,
+    tailwind: bool,
+    map: Option<&'a CodeMap>,
+    assets: Option<&'a AssetIndex>,
     unsupported: BTreeSet<(String, String)>,
+    /// The current node's binding pointers read so far; any other is
+    /// listed as unsupported (never dropped silently).
+    consumed: BTreeSet<String>,
+    /// Where the type style read by [`Cx::binding`] lives in the node
+    /// (`/style`, or a run's `/styleOverrideTable/<n>`).
+    style_base: String,
 }
 
 /// `SOLID` paint color as `#rrggbb[aa]`, the paint's opacity folded into
@@ -368,303 +616,1200 @@ fn paint_color(paint: &Value) -> Option<String> {
     let c = paint.get("color")?;
     let opacity = paint.get("opacity").and_then(Value::as_f64).unwrap_or(1.0);
     let a = c.get("a").and_then(Value::as_f64).unwrap_or(1.0);
-    // Only channels influence the color; unrelated, potentially deep paint
-    // properties never need to be copied.
-    color(&json!({
-        "r": c.get("r")?.as_f64()?,
-        "g": c.get("g")?.as_f64()?,
-        "b": c.get("b")?.as_f64()?,
-        "a": a * opacity,
-    }))
+    color(
+        &json!({"r": c["r"].as_f64()?, "g": c["g"].as_f64()?, "b": c["b"].as_f64()?, "a": a * opacity}),
+    )
 }
 
 fn lower(v: &Value, default: &str) -> String {
     v.as_str().unwrap_or(default).to_ascii_lowercase()
 }
 
-impl Cx<'_, '_> {
+/// The `design` layer: the recorded layout properties, verbatim.
+fn design(n: &Value) -> Map<String, Value> {
+    let mut out: Map<String, Value> = DESIGN_KEYS
+        .iter()
+        .filter_map(|k| Some((k.to_string(), copy_value(n.get(*k)?))))
+        .collect();
+    if n["type"] == "TEXT" {
+        let style: Map<String, Value> = DESIGN_STYLE_KEYS
+            .iter()
+            .filter_map(|k| Some((k.to_string(), copy_value(n["style"].get(*k)?))))
+            .collect();
+        if !style.is_empty() {
+            out.insert("style".into(), Value::Object(style));
+        }
+    }
+    out
+}
+
+fn copy_value(value: &Value) -> Value {
+    crate::deep_json::from_str(
+        &crate::deep_json::to_string(value).expect("serialize raw spec property"),
+    )
+    .expect("parse serialized raw spec property")
+    .into_inner()
+}
+
+/// A CSS track list as Figma writes `gridColumnsSizing`: plain tokens and
+/// functions only (`1fr 1fr`, `repeat(2, minmax(0, 1fr))`, `48px auto`).
+fn track_list(s: &str) -> bool {
+    !s.trim().is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || " .,()%-".contains(c))
+}
+
+impl Cx<'_> {
     fn unsupported(&mut self, id: &str, reason: impl Into<String>) {
         self.unsupported.insert((id.to_string(), reason.into()));
     }
 
-    /// A node's binding for `key` (node `boundVariables`, then — for text
-    /// properties — the type style's own), reporting a mixed binding.
-    fn binding(&mut self, n: &Value, id: &str, key: &str) -> Result<Option<String>, ()> {
-        let found = node_binding(n, key).and_then(|b| match b {
-            Some(b) => Ok(Some(b)),
-            None => alias_id(
-                n.get("style")
-                    .and_then(|s| s.get("boundVariables"))
-                    .and_then(|b| b.get(key)),
-            ),
-        });
-        if found.is_err() {
-            let reason = if key == "strokeWeight"
-                && n["boundVariables"].get("individualStrokeWeights").is_some()
-            {
-                "strokeWeight: mixed or partially bound sides: not specified".into()
-            } else {
-                format!("{key}: bound to several variables (mixed): not specified")
-            };
-            self.unsupported(id, reason);
+    /// The binding at `path` under `v` (whose pointer is `base`): marked
+    /// read, and `Err(pointer)` for a mixed alias array.
+    fn lookup(&mut self, v: &Value, base: &str, path: &[&str]) -> Result<Option<Bind>, String> {
+        let mut at = Some(v);
+        for p in path {
+            at = at.and_then(|x| step(x, p));
         }
-        found
+        let ptr = pointer(base, path);
+        if at.is_some() {
+            self.consumed.insert(ptr.clone());
+        }
+        match alias_id(at) {
+            Ok(Some(var)) => Ok(Some(Bind { var, at: vec![ptr] })),
+            Ok(None) => Ok(None),
+            Err(()) => Err(ptr),
+        }
+    }
+
+    /// Two places one property can be bound (a paint and the node's
+    /// `fills[i]`, a node and its type style): the first wins; the second
+    /// naming the same variable joins it, another variable is listed.
+    fn either(
+        &mut self,
+        id: &str,
+        first: Result<Option<Bind>, String>,
+        second: Result<Option<Bind>, String>,
+    ) -> Result<Option<Bind>, ()> {
+        let mixed = |cx: &mut Self, p: &str| {
+            cx.unsupported(
+                id,
+                format!("{p}: bound to several variables (mixed): not specified"),
+            );
+        };
+        match (first, second) {
+            (Err(p), _) => {
+                mixed(self, &p);
+                Err(())
+            }
+            (Ok(None), Err(p)) => {
+                mixed(self, &p);
+                Err(())
+            }
+            (Ok(None), Ok(b)) => Ok(b),
+            (Ok(Some(mut a)), other) => {
+                match other {
+                    Ok(Some(b)) if b.var == a.var => a.at.extend(b.at),
+                    Ok(Some(b)) => self.unsupported(
+                        id,
+                        format!(
+                            "{}: bound to {}, but {} ({}) is used: not specified",
+                            b.at[0], b.var, a.at[0], a.var
+                        ),
+                    ),
+                    Err(p) => mixed(self, &p),
+                    Ok(None) => {}
+                }
+                Ok(Some(a))
+            }
+        }
+    }
+
+    /// A node's binding for `key`: the node's `boundVariables`, then — for
+    /// text properties — the type style's own, reporting a mixed binding.
+    /// With `runs` (a mixed-run node, or a run), only the type style's: the
+    /// node-level per-range arrays are read when the style and the runs'
+    /// overrides name every variable in them, else they stay unread (and
+    /// listed).
+    fn binding(&mut self, n: &Value, id: &str, key: &str, runs: bool) -> Result<Option<Bind>, ()> {
+        let style_base = self.style_base.clone();
+        let corner = match key {
+            "topLeftRadius" => Some("RECTANGLE_TOP_LEFT_CORNER_RADIUS"),
+            "topRightRadius" => Some("RECTANGLE_TOP_RIGHT_CORNER_RADIUS"),
+            "bottomRightRadius" => Some("RECTANGLE_BOTTOM_RIGHT_CORNER_RADIUS"),
+            "bottomLeftRadius" => Some("RECTANGLE_BOTTOM_LEFT_CORNER_RADIUS"),
+            _ => None,
+        };
+        if let Some(corner) = corner {
+            let flat = self.lookup(n, "", &["boundVariables", key]);
+            let nested = self.lookup(n, "", &["boundVariables", "rectangleCornerRadii", corner]);
+            if let (Ok(Some(flat)), Ok(Some(nested))) = (&flat, &nested)
+                && flat.var != nested.var
+            {
+                self.unsupported(
+                    id,
+                    format!("{key}: conflicting flat and nested bindings: radius not specified"),
+                );
+                return Err(());
+            }
+            return self.either(id, flat, nested);
+        }
+        if key == "strokeWeight"
+            && let Some(sides) = n["boundVariables"].get("individualStrokeWeights")
+        {
+            let mut binding: Option<Bind> = None;
+            for side in ["top", "right", "bottom", "left"] {
+                let found = self.lookup(sides, "/boundVariables/individualStrokeWeights", &[side]);
+                match found {
+                    Ok(Some(mut found))
+                        if binding
+                            .as_ref()
+                            .is_none_or(|previous| previous.var == found.var) =>
+                    {
+                        if let Some(previous) = &mut binding {
+                            previous.at.append(&mut found.at);
+                        } else {
+                            binding = Some(found);
+                        }
+                    }
+                    _ => {
+                        self.unsupported(id, "individualStrokeWeights: mixed or partially bound sides: stroke weight not specified");
+                        return Err(());
+                    }
+                }
+            }
+            let flat = self.lookup(n, "", &["boundVariables", key]);
+            if let (Ok(Some(flat)), Some(nested)) = (&flat, &binding)
+                && flat.var != nested.var
+            {
+                self.unsupported(id, "strokeWeight: conflicting flat and nested bindings: stroke weight not specified");
+                return Err(());
+            }
+            return self.either(id, flat, Ok(binding));
+        }
+        if !runs {
+            let node = self.lookup(n, "", &["boundVariables", key]);
+            let style = self.lookup(&n["style"], &style_base, &["boundVariables", key]);
+            return self.either(id, node, style);
+        }
+        let style = self.lookup(&n["style"], &style_base, &["boundVariables", key]);
+        if let Some(v) = n.get("boundVariables").and_then(|b| b.get(key)) {
+            let mut named = BTreeSet::new();
+            if let Ok(Some(b)) = &style {
+                named.insert(b.var.clone());
+            }
+            for (_, o) in n["styleOverrideTable"].as_object().into_iter().flatten() {
+                named.extend(alias_ids(o.get("boundVariables").and_then(|b| b.get(key))));
+            }
+            if alias_ids(Some(v)).is_subset(&named) {
+                self.consumed.insert(pointer("", &["boundVariables", key]));
+            }
+        }
+        self.either(id, style, Ok(None))
     }
 
     /// A numeric property: bound or untokenized, raw value as stored.
+    /// `keys` are the binding keys tried in order (a property Figma binds
+    /// under more than one name; `size.x` is a path).
     fn number(
         &mut self,
         n: &Value,
         id: &str,
-        key: &str,
-        raw: OwnedValue,
+        keys: &[&str],
+        raw: Value,
         prop: Prop,
-    ) -> Option<OwnedValue> {
-        let binding = self.binding(n, id, key).ok()?;
+    ) -> Option<Value> {
+        let raw = OwnedValue(raw);
+        let binding = self.bind_any(n, id, keys).ok()?;
         let lit = raw.as_f64().map(Lit::Number);
-        Some(self.tokens.entry(binding, raw, lit.as_ref(), prop))
+        Some(
+            self.tokens
+                .entry(binding, raw.into_inner(), lit.as_ref(), prop),
+        )
     }
 
-    /// Visit in child order and assemble children in postorder. Both pending
-    /// and finished outputs remain guarded if construction exits early.
-    fn tree(&mut self, root: &Value) -> OwnedValue {
-        enum Task<'a> {
-            Visit(&'a Value, Parent),
-            Finish(OwnedValue, usize),
-        }
-        let mut pending = vec![Task::Visit(root, Parent::Root)];
-        let mut finished = Vec::new();
-        while let Some(task) = pending.pop() {
-            match task {
-                Task::Visit(n, parent) => {
-                    let (out, child_parent) = self.node(n, parent);
-                    if let Some(child_parent) = child_parent {
-                        let kids = n["children"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-                        pending.push(Task::Finish(out, kids.len()));
-                        pending.extend(kids.iter().rev().map(|n| Task::Visit(n, child_parent)));
-                    } else {
-                        finished.push(out);
+    /// The first of `keys` that is bound (see [`Cx::number`]).
+    fn bind_any(&mut self, n: &Value, id: &str, keys: &[&str]) -> Result<Option<Bind>, ()> {
+        for key in keys {
+            let path: Vec<&str> = key.split('.').collect();
+            let found = if path.len() == 1 {
+                self.binding(n, id, key, false)?
+            } else {
+                let mut full = vec!["boundVariables"];
+                full.extend(path);
+                match self.lookup(n, "", &full) {
+                    Ok(b) => b,
+                    Err(p) => {
+                        self.unsupported(
+                            id,
+                            format!("{p}: bound to several variables (mixed): not specified"),
+                        );
+                        return Err(());
                     }
                 }
-                Task::Finish(mut out, count) => {
-                    let mut children = OwnedValue::array();
-                    for child in finished.drain(finished.len() - count..) {
-                        children.push(child);
-                    }
-                    out.insert("children".into(), children);
-                    finished.push(out);
-                }
+            };
+            if found.is_some() {
+                return Ok(found);
             }
         }
-        finished.pop().expect("one root")
+        Ok(None)
     }
 
-    /// One node's own fields and its children's layout context. Hidden layers
-    /// omit their descendants, matching the recursive traversal's contract.
-    fn node(&mut self, n: &Value, parent: Parent) -> (OwnedValue, Option<Parent>) {
+    /// An entry's CSS value for `prop`: the bound token's `var()` (with
+    /// its Tailwind theme name) when the token export names it — scaled to
+    /// what `prop` takes when the export writes it unitless, listed as
+    /// unsupported when the export's unit can't be converted — else the
+    /// raw value. `None` when neither exists.
+    fn css_value(&mut self, id: &str, prop: &str, e: &Value, want: Want) -> Option<CssVal> {
+        if let Some(var) = e["variable_id"].as_str()
+            && let Some(name) = self.tokens.css.get(var)
+        {
+            let plain = CssVal {
+                value: format!("var({name})"),
+                theme: self.tokens.theme.get(var).cloned(),
+            };
+            let unit = self.tokens.units.get(var).copied();
+            return match (want, unit) {
+                (Want::Color, _) if e["paint_opacity"].as_f64().is_some() => {
+                    let opacity = e["paint_opacity"].as_f64().expect("checked above");
+                    Some(CssVal::lit(format!(
+                        "color-mix(in srgb, {} {}%, transparent)",
+                        plain.value,
+                        num(opacity * 100.0)
+                    )))
+                }
+                (Want::Color | Want::Family, _) | (_, None) => Some(plain),
+                (Want::Px | Want::PxNonZero, Some(Some("px")))
+                | (Want::Opacity, Some(Some("%")))
+                | (Want::Number, Some(None)) => Some(plain),
+                (Want::Px | Want::PxNonZero, Some(None)) => {
+                    Some(CssVal::lit(format!("calc(var({name}) * 1px)")))
+                }
+                (Want::Opacity, Some(None)) => {
+                    Some(CssVal::lit(format!("calc(var({name}) / 100)")))
+                }
+                (_, Some(unit)) => {
+                    let unit = unit.unwrap_or("unitless");
+                    self.unsupported(
+                        id,
+                        format!("{prop}: token {name} is exported in {unit}, which {prop} can't take: not specified"),
+                    );
+                    None
+                }
+            };
+        }
+        let raw = &e["raw"];
+        match want {
+            Want::PxNonZero if is_unbound_zero(e) => None,
+            Want::Px | Want::PxNonZero => raw.as_f64().map(px),
+            Want::Opacity | Want::Number => raw.as_f64().map(num),
+            Want::Color => raw.as_str().map(str::to_string),
+            Want::Family => raw.as_str().map(|s| format!("{s:?}")),
+        }
+        .map(CssVal::lit)
+    }
+
+    /// Bindings of this node the spec didn't read: listed, never dropped.
+    fn unread_bindings(&mut self, n: &Value, id: &str) {
+        let mut all = Vec::new();
+        alias_pointers(n, "", &mut all);
+        for p in all {
+            let read = self
+                .consumed
+                .iter()
+                .any(|c| p == *c || p.starts_with(&format!("{c}/")));
+            if !read {
+                self.unsupported(id, format!("{p}: bound to a variable: not specified"));
+            }
+        }
+    }
+
+    fn node(&mut self, n: &Value, up: &Up) -> Value {
+        let mut pending = vec![(n, up.clone(), None)];
+        let mut built: Vec<(OwnedValue, Option<usize>)> = Vec::new();
+        while let Some((raw, up, parent)) = pending.pop() {
+            let (value, children) = self.node_shallow(raw, &up);
+            let index = built.len();
+            built.push((OwnedValue(value), parent));
+            pending.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|(child, up)| (child, up, Some(index))),
+            );
+        }
+        while built.len() > 1 {
+            let (mut child, parent) = built.pop().expect("child");
+            if let Some(children) = child.0.get_mut("children").and_then(Value::as_array_mut) {
+                children.reverse();
+            }
+            built[parent.expect("parent")].0.0["children"]
+                .as_array_mut()
+                .expect("children")
+                .push(child.into_inner());
+        }
+        let mut root = built.pop().expect("root").0;
+        if let Some(children) = root.0.get_mut("children").and_then(Value::as_array_mut) {
+            children.reverse();
+        }
+        root.into_inner()
+    }
+
+    fn node_shallow<'n>(&mut self, n: &'n Value, up: &Up) -> (Value, Vec<(&'n Value, Up)>) {
         let id = n["id"].as_str().unwrap_or_default().to_string();
         let node_type = n["type"].as_str().unwrap_or_default().to_string();
-        let mut out = OwnedValue::object();
-        out.insert("id".into(), OwnedValue(json!(id)));
+        let mut out = Map::new();
+        out.insert("id".into(), json!(id));
         out.insert("name".into(), copy_value(&n["name"]));
-        out.insert("type".into(), OwnedValue(json!(node_type)));
+        out.insert("type".into(), json!(node_type));
+        let design = design(n);
+        if !design.is_empty() {
+            out.insert("design".into(), Value::Object(design));
+        }
         if n["visible"] == false {
             self.unsupported(&id, "hidden layer (visible: false): not specified");
-            return (out, None);
+            return (Value::Object(out), Vec::new());
         }
-        if let Some(o) = n["opacity"].as_f64().filter(|o| *o < 1.0) {
-            self.unsupported(&id, format!("layer opacity {o}: not specified"));
+        self.consumed.clear();
+        let mut css = Css::default();
+        if let Some((prop, margin)) = &up.margin {
+            css.set(prop, margin.clone());
         }
-        let effects: BTreeSet<&str> = n["effects"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|e| e["visible"] != false)
-            .map(|e| e["type"].as_str().unwrap_or("unknown"))
-            .collect();
-        if !effects.is_empty() {
-            let list: Vec<&str> = effects.into_iter().collect();
-            self.unsupported(&id, format!("effects ({}): not specified", list.join(", ")));
-        }
+        let mut layout = Map::new();
+        let mut values = Map::new();
+        let mut content = Map::new();
+        let ellipse = node_type == "ELLIPSE";
+        let full_ellipse = ellipse
+            && n.get("arcData").is_none_or(|arc| {
+                arc["innerRadius"].as_f64().unwrap_or(0.0) == 0.0
+                    && (arc["endingAngle"].as_f64().unwrap_or(std::f64::consts::TAU)
+                        - arc["startingAngle"].as_f64().unwrap_or(0.0))
+                    .abs()
+                        >= std::f64::consts::TAU - 1e-6
+            });
+        let vector = VECTOR_LIKE.contains(&node_type.as_str()) || (ellipse && !full_ellipse);
 
-        // Layout.
+        // Own layout.
+        let kids: &[Value] = if vector {
+            if let Some(k) = n["children"].as_array().filter(|k| !k.is_empty()) {
+                self.unsupported(
+                    &id,
+                    format!(
+                        "{} children are part of the vector asset: not specified",
+                        k.len()
+                    ),
+                );
+            }
+            &[]
+        } else {
+            n["children"].as_array().map(Vec::as_slice).unwrap_or(&[])
+        };
         let mode = n["layoutMode"].as_str().unwrap_or("NONE");
-        let kids = n["children"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-        let mut dir = match mode {
-            "HORIZONTAL" => Some("HORIZONTAL"),
-            "VERTICAL" => Some("VERTICAL"),
+        let container = match mode {
+            "HORIZONTAL" => Container::Flex("HORIZONTAL"),
+            "VERTICAL" => Container::Flex("VERTICAL"),
+            "GRID" => Container::Grid,
+            "NONE" if kids.is_empty() => Container::Leaf,
+            "NONE" if FRAME_LIKE.contains(&node_type.as_str()) => Container::Free,
             "NONE" => {
-                if !kids.is_empty() {
-                    self.unsupported(
-                        &id,
-                        "no auto layout (constraints-based frame): child positions not specified",
-                    );
-                }
-                None
+                self.unsupported(
+                    &id,
+                    format!(
+                        "{node_type}: children are placed by the enclosing frame's constraints: child positions not specified"
+                    ),
+                );
+                Container::Unplaced
             }
             other => {
                 self.unsupported(
                     &id,
                     format!("layoutMode {other}: own layout and child positions not specified"),
                 );
-                None
+                Container::Unplaced
             }
         };
-        if dir.is_some() && n["layoutWrap"] == "WRAP" {
-            self.unsupported(
-                &id,
-                "layoutWrap WRAP: own layout and child positions not specified",
-            );
-            dir = None;
+        let mut margin = None;
+        match container {
+            Container::Flex(dir) => margin = self.flex(n, &id, dir, &mut layout, &mut css),
+            Container::Grid => self.grid(n, &id, &mut layout, &mut css),
+            _ => {}
         }
-        let absolute = n["layoutPositioning"] == "ABSOLUTE";
-        if absolute {
-            self.unsupported(
-                &id,
-                "layoutPositioning ABSOLUTE: position and sizing not specified",
-            );
+        if n["clipsContent"] == true && !kids.is_empty() {
+            css.lit("overflow", "hidden");
         }
-        let mut layout = OwnedValue::object();
-        if let Some(d) = dir {
+
+        // Placement in the parent, own size, limits.
+        let own = match container {
+            Container::Flex(d) => Some(d),
+            _ => None,
+        };
+        let absolute = self.place(
+            n,
+            &id,
+            up,
+            own,
+            container == Container::Grid,
+            &mut layout,
+            &mut css,
+        );
+        self.limits(n, &id, &mut layout, &mut css);
+        if !layout.is_empty()
+            && let Some(b) = n.get("absoluteBoundingBox")
+        {
             layout.insert(
-                "direction".into(),
-                OwnedValue(json!(d.to_ascii_lowercase())),
-            );
-            let primary = n["primaryAxisAlignItems"].as_str().unwrap_or("MIN");
-            let gap = if primary == "SPACE_BETWEEN" {
-                Some(OwnedValue(json!("auto")))
-            } else {
-                let raw = n
-                    .get("itemSpacing")
-                    .map(copy_value)
-                    .unwrap_or(OwnedValue(json!(0)));
-                self.number(n, &id, "itemSpacing", raw, GAP)
-            };
-            if let Some(gap) = gap {
-                layout.insert("gap".into(), gap);
-            }
-            let mut padding = OwnedValue::object();
-            for (side, key) in [
-                ("top", "paddingTop"),
-                ("right", "paddingRight"),
-                ("bottom", "paddingBottom"),
-                ("left", "paddingLeft"),
-            ] {
-                let raw = n.get(key).map(copy_value).unwrap_or(OwnedValue(json!(0)));
-                if let Some(e) = self.number(n, &id, key, raw, GAP) {
-                    padding.insert(side.into(), e);
-                }
-            }
-            layout.insert("padding".into(), padding);
-            let align = |v: &Value| match v.as_str().unwrap_or("MIN") {
-                "MIN" => "start".to_string(),
-                "MAX" => "end".to_string(),
-                "SPACE_BETWEEN" => "space-between".to_string(),
-                other => other.to_ascii_lowercase(),
-            };
-            layout.insert(
-                "align".into(),
-                OwnedValue(json!({
-                    "primary": align(&n["primaryAxisAlignItems"]),
-                    "counter": align(&n["counterAxisAlignItems"]),
-                })),
+                "size".into(),
+                json!({"width": b["width"], "height": b["height"]}),
             );
         }
-        let has_sizing_fields =
-            n.get("layoutSizingHorizontal").is_some() || n.get("layoutSizingVertical").is_some();
-        let emit_sizing = !absolute
-            && match parent {
-                Parent::Auto(_) => true,
-                Parent::Root => dir.is_some() || has_sizing_fields,
-                Parent::Other => dir.is_some(),
-            };
-        if emit_sizing {
-            let parent_dir = match parent {
-                Parent::Auto(d) => Some(d),
-                _ => None,
-            };
-            layout.insert(
-                "sizing".into(),
-                OwnedValue(json!({
-                    "horizontal": sizing(n, "HORIZONTAL", dir, parent_dir),
-                    "vertical": sizing(n, "VERTICAL", dir, parent_dir),
-                })),
-            );
-        }
-        let has_layout = !layout.as_object().expect("layout object").is_empty();
-        if has_layout && let Some(b) = n.get("absoluteBoundingBox") {
-            let mut size = OwnedValue::object();
-            size.insert("width".into(), copy_value(&b["width"]));
-            size.insert("height".into(), copy_value(&b["height"]));
-            layout.insert("size".into(), size);
-        }
-        if has_layout {
-            out.insert("layout".into(), layout);
+        if !layout.is_empty() {
+            out.insert("layout".into(), Value::Object(layout));
         }
 
         // Values.
-        let mut values = OwnedValue::object();
-        let mixed_text = node_type == "TEXT"
-            && n["characterStyleOverrides"]
-                .as_array()
-                .is_some_and(|o| o.iter().any(|x| x.as_u64() != Some(0)));
-        if mixed_text {
-            self.unsupported(
-                &id,
-                "mixed text runs (characterStyleOverrides): fill and typography not specified",
-            );
+        let mut assets = Vec::new();
+        self.opacity(n, &id, &mut values, &mut css);
+        let fill_css = (!vector).then_some(if node_type == "TEXT" {
+            "color"
         } else {
-            let fills = self.paints(n, &id, "fills", fill_prop(&node_type));
-            if !fills.is_empty() {
-                values.insert("fill".into(), OwnedValue(Value::Array(fills)));
-            }
+            "background-color"
+        });
+        let fills = self.paints(
+            n,
+            "",
+            &id,
+            "fills",
+            fill_prop(&node_type),
+            &mut assets,
+            fill_css.map(|p| (p, &mut css)),
+        );
+        if !fills.is_empty() {
+            values.insert("fill".into(), Value::Array(fills));
         }
-        let strokes = self.paints(n, &id, "strokes", STROKE_COLOR);
-        if !strokes.is_empty() {
-            values.insert("stroke".into(), OwnedValue(Value::Array(strokes)));
-            if n.get("individualStrokeWeights").is_some() {
-                self.unsupported(&id, "individualStrokeWeights: stroke weight not specified");
-            } else {
-                let raw = n
-                    .get("strokeWeight")
-                    .map(copy_value)
-                    .unwrap_or(OwnedValue(json!(1)));
-                if let Some(e) = self.number(n, &id, "strokeWeight", raw, STROKE_WEIGHT) {
-                    values.insert("stroke_weight".into(), e);
+        self.strokes(n, &id, &node_type, vector, &mut values, &mut css);
+        if let Some(radius) = self.radius(n, &id, (!vector).then_some(&mut css)) {
+            values.insert("radius".into(), radius);
+        }
+        if full_ellipse {
+            css.lit("border-radius", "50%");
+        }
+        let effects = self.effects(n, &id, node_type == "TEXT", vector, &mut css);
+        if !effects.is_empty() {
+            values.insert("effects".into(), Value::Array(effects));
+        }
+        if node_type == "TEXT" {
+            self.text(n, &id, &mut values, &mut content, &mut css);
+        }
+        out.insert("values".into(), Value::Object(values));
+
+        // Content: assets. An exported icon (NWS-2952) — the node itself,
+        // or the component an instance shows — is referenced by its
+        // generated component instead of a raw vector.
+        let icon = self.icon(n, &id, &node_type);
+        if let Some(icon) = icon {
+            assets.push(icon);
+        } else if vector {
+            assets.push(json!({"kind": "vector", "node_id": id, "format": "svg"}));
+        }
+        let formats: BTreeSet<String> = n["exportSettings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                let format = s["format"].as_str()?;
+                let c = &s["constraint"];
+                Some(match (c["type"].as_str(), c["value"].as_f64()) {
+                    (Some("SCALE"), Some(v)) if v != 1.0 => format!("{format}@{}x", num(v)),
+                    _ => format.to_string(),
+                })
+            })
+            .collect();
+        if !formats.is_empty() {
+            assets.push(json!({"kind": "export", "node_id": id, "formats": formats}));
+        }
+        if !assets.is_empty() {
+            content.insert("assets".into(), Value::Array(assets));
+        }
+        if !content.is_empty() {
+            out.insert("content".into(), Value::Object(content));
+        }
+        if node_type == "INSTANCE" {
+            out.insert("instance".into(), self.instance(n, &id));
+        }
+
+        // Children.
+        let positioned = |k: &Value| {
+            k["visible"] != false
+                && (container == Container::Free || k["layoutPositioning"] == "ABSOLUTE")
+        };
+        if !absolute
+            && matches!(
+                container,
+                Container::Flex(_) | Container::Grid | Container::Free
+            )
+            && kids.iter().any(positioned)
+        {
+            css.lit("position", "relative");
+        }
+        if css.has("padding")
+            || css.has("padding-top")
+            || css.has("padding-right")
+            || css.has("padding-bottom")
+            || css.has("padding-left")
+            || css.has("border-width")
+        {
+            css.lit("box-sizing", "border-box");
+        }
+        let kind = match container {
+            Container::Flex(d) => Parent::Flex(d),
+            Container::Grid => Parent::Grid,
+            Container::Free => Parent::Free,
+            Container::Unplaced | Container::Leaf => Parent::Unplaced,
+        };
+        self.unread_bindings(n, &id);
+        let bbox = rect(n);
+        let border = css.get("border-width").cloned();
+        let mut seen_in_flow = false;
+        let mut children = Vec::with_capacity(kids.len());
+        for (i, k) in kids.iter().enumerate() {
+            let in_flow = k["visible"] != false && k["layoutPositioning"] != "ABSOLUTE";
+            if matches!(container, Container::Flex(_) | Container::Grid)
+                && k["visible"] != false
+                && k["layoutPositioning"] == "ABSOLUTE"
+                && kids[i + 1..].iter().any(|later| {
+                    later["visible"] != false && later["layoutPositioning"] != "ABSOLUTE"
+                })
+            {
+                self.unsupported(
+                    k["id"].as_str().unwrap_or_default(),
+                    "absolute child before in-flow siblings: CSS paints it above them, Figma below: stacking not specified",
+                );
+            }
+            let child_up = Up {
+                kind,
+                bbox,
+                margin: margin.clone().filter(|_| in_flow && seen_in_flow),
+                border: border.clone(),
+            };
+            seen_in_flow |= in_flow;
+            children.push((k, child_up));
+        }
+        if !css.is_empty() {
+            if self.tailwind {
+                out.insert("tailwind".into(), json!(css.tailwind()));
+            }
+            out.insert("css".into(), css.to_json());
+        }
+        out.insert("children".into(), Value::Array(Vec::new()));
+        (Value::Object(out), children)
+    }
+
+    /// An auto-layout frame: direction, wrap, gap, padding, alignment.
+    /// Returns the margin a negative gap puts on in-flow children after
+    /// the first.
+    fn flex(
+        &mut self,
+        n: &Value,
+        id: &str,
+        dir: &'static str,
+        layout: &mut Map<String, Value>,
+        css: &mut Css,
+    ) -> Option<(&'static str, CssVal)> {
+        layout.insert("direction".into(), json!(dir.to_ascii_lowercase()));
+        css.lit("display", "flex");
+        css.lit(
+            "flex-direction",
+            if dir == "HORIZONTAL" { "row" } else { "column" },
+        );
+        let mut wrap = n["layoutWrap"] == "WRAP";
+        if wrap && dir == "VERTICAL" {
+            self.unsupported(
+                id,
+                "layoutWrap WRAP on a vertical frame: wrapping not specified",
+            );
+            wrap = false;
+        }
+        if wrap {
+            layout.insert("wrap".into(), json!(true));
+            css.lit("flex-wrap", "wrap");
+        }
+        if n["itemReverseZIndex"] == true {
+            self.unsupported(
+                id,
+                "itemReverseZIndex: first child drawn on top: stacking not specified",
+            );
+        }
+        let primary = n["primaryAxisAlignItems"].as_str().unwrap_or("MIN");
+        let mut margin = None;
+        if primary == "SPACE_BETWEEN" {
+            layout.insert("gap".into(), json!("auto"));
+            // Figma ignores the item spacing here; a binding on it is
+            // still shown (and that CSS doesn't use it, listed).
+            if let Ok(Some(bind)) = self.binding(n, id, "itemSpacing", false) {
+                let raw = n.get("itemSpacing").map(copy_value).unwrap_or(json!(0));
+                let e = self.tokens.bound(&bind, raw);
+                self.unsupported(
+                    id,
+                    format!(
+                        "{}: itemSpacing is bound, but primaryAxisAlignItems SPACE_BETWEEN spaces the children: the token is not used in CSS",
+                        bind.at[0]
+                    ),
+                );
+                layout.insert("item_spacing".into(), e);
+            }
+        } else {
+            let raw = n.get("itemSpacing").map(copy_value).unwrap_or(json!(0));
+            let negative = raw.as_f64().is_some_and(|g| g < 0.0);
+            if let Some(gap) = self.number(n, id, &["itemSpacing"], raw, GAP) {
+                let value = self.css_value(id, "gap", &gap, Want::PxNonZero);
+                layout.insert("gap".into(), gap);
+                match (value, negative, wrap) {
+                    (None, _, _) => {}
+                    (Some(_), true, true) => self.unsupported(
+                        id,
+                        "itemSpacing: negative gap in a wrapping frame: gap not specified",
+                    ),
+                    (Some(v), true, false) => {
+                        // CSS gaps can't be negative; a negative margin on
+                        // every later child overlaps them the same way.
+                        let side = if dir == "HORIZONTAL" {
+                            "margin-left"
+                        } else {
+                            "margin-top"
+                        };
+                        margin = Some((side, v));
+                    }
+                    (Some(v), false, true) => css.set("column-gap", v),
+                    (Some(v), false, false) => css.set("gap", v),
                 }
             }
         }
-        if let Some(radius) = self.radius(n, &id) {
-            values.insert("radius".into(), radius);
-        }
-        if node_type == "TEXT" && !mixed_text {
-            let typography = self.typography(n, &id);
-            if !typography
-                .as_object()
-                .expect("typography object")
-                .is_empty()
-            {
-                values.insert("typography".into(), typography);
+        if wrap {
+            // Figma's counter-axis spacing defaults to the item spacing
+            // (value and binding).
+            let own = n.get("counterAxisSpacing").filter(|v| !v.is_null());
+            let raw = own
+                .or_else(|| n.get("itemSpacing"))
+                .map(copy_value)
+                .unwrap_or(json!(0));
+            let keys: &[&str] = if own.is_some() {
+                &["counterAxisSpacing"]
+            } else {
+                &["counterAxisSpacing", "itemSpacing"]
+            };
+            let negative = raw.as_f64().is_some_and(|g| g < 0.0);
+            if let Some(gap) = self.number(n, id, keys, raw, GAP) {
+                if negative {
+                    self.unsupported(
+                        id,
+                        "counterAxisSpacing: negative gap between wrapped rows: row-gap not specified",
+                    );
+                } else if let Some(v) = self.css_value(id, "row-gap", &gap, Want::PxNonZero) {
+                    css.set("row-gap", v);
+                }
+                layout.insert("wrap_gap".into(), gap);
             }
         }
-        out.insert("values".into(), values);
-
-        let child_parent = match dir {
-            Some(d) => Parent::Auto(d),
-            None => Parent::Other,
+        self.padding(n, id, layout, css);
+        let align = |v: &Value| match v.as_str().unwrap_or("MIN") {
+            "MIN" => "start".to_string(),
+            "MAX" => "end".to_string(),
+            "SPACE_BETWEEN" => "space-between".to_string(),
+            other => other.to_ascii_lowercase(),
         };
-        (out, Some(child_parent))
+        layout.insert(
+            "align".into(),
+            json!({
+                "primary": align(&n["primaryAxisAlignItems"]),
+                "counter": align(&n["counterAxisAlignItems"]),
+            }),
+        );
+        match primary {
+            "CENTER" => css.lit("justify-content", "center"),
+            "MAX" => css.lit("justify-content", "flex-end"),
+            "SPACE_BETWEEN" => css.lit("justify-content", "space-between"),
+            _ => {}
+        }
+        let counter = match n["counterAxisAlignItems"].as_str().unwrap_or("MIN") {
+            "CENTER" => "center",
+            "MAX" => "flex-end",
+            "BASELINE" => "baseline",
+            _ => "flex-start",
+        };
+        css.lit("align-items", counter);
+        if wrap {
+            let content = if n["counterAxisAlignContent"] == "SPACE_BETWEEN" {
+                "space-between"
+            } else if counter == "baseline" {
+                "flex-start"
+            } else {
+                counter
+            };
+            css.lit("align-content", content);
+        }
+        margin
     }
 
-    /// Visible `SOLID` paints of `fills`/`strokes` as value entries;
-    /// any other paint type is unsupported.
-    fn paints(&mut self, n: &Value, id: &str, key: &str, prop: Prop) -> Vec<Value> {
+    /// A `layoutMode: GRID` frame: track counts, sizing, gaps, padding.
+    fn grid(&mut self, n: &Value, id: &str, layout: &mut Map<String, Value>, css: &mut Css) {
+        css.lit("display", "grid");
+        let mut grid = Map::new();
+        grid.insert("columns".into(), copy_value(&n["gridColumnCount"]));
+        grid.insert("rows".into(), copy_value(&n["gridRowCount"]));
+        for (key, prop) in [
+            ("gridColumnsSizing", "grid-template-columns"),
+            ("gridRowsSizing", "grid-template-rows"),
+        ] {
+            match n[key].as_str() {
+                Some(s) if track_list(s) => css.lit(prop, s.trim()),
+                Some(s) => self.unsupported(
+                    id,
+                    format!("{key} {s:?}: not a CSS track list: {prop} not specified"),
+                ),
+                None => self.unsupported(id, format!("{key} not recorded: {prop} not specified")),
+            }
+        }
+        for (key, name, prop) in [
+            ("gridColumnGap", "column_gap", "column-gap"),
+            ("gridRowGap", "row_gap", "row-gap"),
+        ] {
+            let raw = n.get(key).map(copy_value).unwrap_or(json!(0));
+            let negative = raw.as_f64().is_some_and(|g| g < 0.0);
+            if let Some(gap) = self.number(n, id, &[key], raw, GAP) {
+                if negative {
+                    self.unsupported(
+                        id,
+                        format!("{key}: negative grid gap: {prop} not specified"),
+                    );
+                } else if let Some(v) = self.css_value(id, prop, &gap, Want::PxNonZero) {
+                    css.set(prop, v);
+                }
+                grid.insert(name.into(), gap);
+            }
+        }
+        layout.insert("grid".into(), Value::Object(grid));
+        self.padding(n, id, layout, css);
+    }
+
+    /// Auto-layout padding: `layout.padding` entries and CSS.
+    fn padding(&mut self, n: &Value, id: &str, layout: &mut Map<String, Value>, css: &mut Css) {
+        let mut padding = Map::new();
+        let mut sides: [Option<CssVal>; 4] = Default::default();
+        for (i, (side, key, prop)) in [
+            ("top", "paddingTop", "padding-top"),
+            ("right", "paddingRight", "padding-right"),
+            ("bottom", "paddingBottom", "padding-bottom"),
+            ("left", "paddingLeft", "padding-left"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let raw = n.get(key).map(copy_value).unwrap_or(json!(0));
+            if let Some(e) = self.number(n, id, &[key], raw, GAP) {
+                sides[i] = self.css_value(id, prop, &e, Want::PxNonZero);
+                padding.insert(side.into(), e);
+            }
+        }
+        layout.insert("padding".into(), Value::Object(padding));
+        css.four(
+            "padding",
+            [
+                "padding-top",
+                "padding-right",
+                "padding-bottom",
+                "padding-left",
+            ],
+            sides,
+        );
+    }
+
+    /// `width`/`height` from the bounding box: a `layout.width`/`height`
+    /// entry (bound through `boundVariables.size.x`/`width`…) and CSS.
+    fn dim(
+        &mut self,
+        n: &Value,
+        id: &str,
+        axis: &str,
+        layout: &mut Map<String, Value>,
+        css: &mut Css,
+    ) {
+        let (key, prop, keys) = if axis == "HORIZONTAL" {
+            ("width", "width", ["size.x", "width"])
+        } else {
+            ("height", "height", ["size.y", "height"])
+        };
+        let raw = copy_value(&n["absoluteBoundingBox"][key]);
+        if raw.is_null() {
+            self.unsupported(id, format!("no absoluteBoundingBox: {prop} not specified"));
+            return;
+        }
+        if let Some(e) = self.number(n, id, &keys, raw, SIZE) {
+            if let Some(v) = self.css_value(id, prop, &e, Want::Px) {
+                css.set(prop, v);
+            }
+            layout.insert(key.into(), e);
+        }
+    }
+
+    /// Place the node in its parent: `layout.sizing` and the CSS for its
+    /// size and position. Returns whether it is absolutely positioned.
+    #[allow(clippy::too_many_arguments)]
+    fn place(
+        &mut self,
+        n: &Value,
+        id: &str,
+        up: &Up,
+        own: Option<&'static str>,
+        grid: bool,
+        layout: &mut Map<String, Value>,
+        css: &mut Css,
+    ) -> bool {
+        let absolute = match up.kind {
+            Parent::Free => true,
+            Parent::Flex(_) | Parent::Grid => n["layoutPositioning"] == "ABSOLUTE",
+            Parent::Root => {
+                if n["layoutPositioning"] == "ABSOLUTE" {
+                    self.unsupported(
+                        id,
+                        "layoutPositioning ABSOLUTE on the spec root: its position in its parent is not specified",
+                    );
+                }
+                false
+            }
+            Parent::Unplaced => false,
+        };
+        let parent_dir = match up.kind {
+            Parent::Flex(d) if !absolute => Some(d),
+            _ => None,
+        };
+        let has_sizing_fields =
+            n.get("layoutSizingHorizontal").is_some() || n.get("layoutSizingVertical").is_some();
+        let emit_sizing = match up.kind {
+            Parent::Flex(_) | Parent::Grid | Parent::Free => true,
+            Parent::Root => own.is_some() || grid || has_sizing_fields,
+            Parent::Unplaced => own.is_some() || grid,
+        };
+        let h = sizing(n, "HORIZONTAL", own, parent_dir);
+        let v = sizing(n, "VERTICAL", own, parent_dir);
+        if emit_sizing {
+            layout.insert(
+                "sizing".into(),
+                json!({"horizontal": h.clone(), "vertical": v.clone()}),
+            );
+        }
+        if !absolute && n["rotation"].as_f64().is_some_and(|r| r.abs() > 1e-6) {
+            self.unsupported(
+                id,
+                format!(
+                    "rotation {}: the rotation is not specified (sizes are the rotated bounds)",
+                    num(n["rotation"].as_f64().unwrap_or_default())
+                ),
+            );
+        }
+        if absolute {
+            layout.insert("position".into(), json!("absolute"));
+            self.position(n, id, up, [&h, &v], layout, css);
+        } else {
+            self.flow(n, id, up, [&h, &v], layout, css);
+        }
+        // A bound width/height the CSS doesn't declare (it follows the
+        // sizing or the constraints): shown as its token, and listed.
+        for (key, keys, s) in [
+            ("width", ["size.x", "width"], &h),
+            ("height", ["size.y", "height"], &v),
+        ] {
+            if layout.contains_key(key) {
+                continue;
+            }
+            if let Ok(Some(bind)) = self.bind_any(n, id, &keys) {
+                let why = if absolute {
+                    "its constraints".to_string()
+                } else {
+                    format!("its {s} sizing")
+                };
+                self.unsupported(
+                    id,
+                    format!(
+                        "{}: {key} is bound, but the CSS {key} follows {why}: the token is not used in CSS",
+                        bind.at[0]
+                    ),
+                );
+                let raw = copy_value(&n["absoluteBoundingBox"][key]);
+                layout.insert(key.into(), self.tokens.bound(&bind, raw));
+            }
+        }
+        absolute
+    }
+
+    /// An in-flow node's size (and grid placement) in its parent.
+    fn flow(
+        &mut self,
+        n: &Value,
+        id: &str,
+        up: &Up,
+        sizing: [&str; 2],
+        layout: &mut Map<String, Value>,
+        css: &mut Css,
+    ) {
+        for (axis, s) in [("HORIZONTAL", sizing[0]), ("VERTICAL", sizing[1])] {
+            let horizontal = axis == "HORIZONTAL";
+            let full = if horizontal { "width" } else { "height" };
+            match (up.kind, s) {
+                (_, "fixed") => self.dim(n, id, axis, layout, css),
+                (Parent::Root, "hug") if horizontal => css.lit("width", "fit-content"),
+                (Parent::Root, "fill") => css.lit(full, "100%"),
+                (Parent::Flex(d), "fill") if d == axis => {
+                    // Fill shares the space, down to nothing like Figma's.
+                    css.lit("flex", "1 1 0%");
+                    css.lit(
+                        if horizontal {
+                            "min-width"
+                        } else {
+                            "min-height"
+                        },
+                        "0",
+                    );
+                }
+                (Parent::Flex(_), "fill") => css.lit("align-self", "stretch"),
+                (Parent::Grid, "fill") => css.lit(
+                    if horizontal {
+                        "justify-self"
+                    } else {
+                        "align-self"
+                    },
+                    "stretch",
+                ),
+                (Parent::Grid, "hug") => css.lit(full, "fit-content"),
+                _ => {}
+            }
+            if let Parent::Flex(d) = up.kind
+                && d == axis
+                && s != "fill"
+            {
+                css.lit("flex-shrink", "0");
+            }
+            if up.kind == Parent::Grid && s != "fill" {
+                let (key, prop) = if horizontal {
+                    ("gridChildHorizontalAlign", "justify-self")
+                } else {
+                    ("gridChildVerticalAlign", "align-self")
+                };
+                match n[key].as_str() {
+                    Some("MIN") => css.lit(prop, "start"),
+                    Some("CENTER") => css.lit(prop, "center"),
+                    Some("MAX") => css.lit(prop, "end"),
+                    _ => {}
+                }
+            }
+        }
+        if up.kind == Parent::Grid {
+            for (anchor, span, prop) in [
+                ("gridColumnAnchorIndex", "gridColumnSpan", "grid-column"),
+                ("gridRowAnchorIndex", "gridRowSpan", "grid-row"),
+            ] {
+                let span = n[span].as_u64().unwrap_or(1);
+                match n[anchor].as_u64() {
+                    Some(a) => css.lit(prop, format!("{} / span {span}", a + 1)),
+                    None if span > 1 => css.lit(prop, format!("span {span}")),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// An absolutely positioned node: offsets from its constraints,
+    /// relative to the parent's box (Figma's default constraints are
+    /// LEFT/TOP).
+    fn position(
+        &mut self,
+        n: &Value,
+        id: &str,
+        up: &Up,
+        sizing: [&str; 2],
+        layout: &mut Map<String, Value>,
+        css: &mut Css,
+    ) {
+        css.lit("position", "absolute");
+        if let Some(r) = n["rotation"].as_f64().filter(|r| r.abs() > 1e-6) {
+            self.unsupported(
+                id,
+                format!("rotation {}: position and size not specified", num(r)),
+            );
+            return;
+        }
+        let (Some(p), Some(b)) = (up.bbox, rect(n)) else {
+            self.unsupported(id, "no absoluteBoundingBox: position not specified");
+            return;
+        };
+        let mut translate = [false, false];
+        for (i, axis) in ["HORIZONTAL", "VERTICAL"].into_iter().enumerate() {
+            let (start, end, d, s, ps, key, default) = if i == 0 {
+                ("left", "right", b.x - p.x, b.w, p.w, "horizontal", "LEFT")
+            } else {
+                ("top", "bottom", b.y - p.y, b.h, p.h, "vertical", "TOP")
+            };
+            let constraint = n["constraints"][key].as_str().unwrap_or(default);
+            let size = sizing[i] != "hug";
+            let percent = |v: f64| format!("{}%", num(v / ps * 100.0));
+            // CSS offsets from the padding box: inside the parent's border.
+            let inset = |v: f64| match &up.border {
+                None => px(v),
+                Some(b) => b.inset(v),
+            };
+            match constraint {
+                "LEFT" | "TOP" | "MIN" => {
+                    css.lit(start, inset(d));
+                    if size {
+                        self.dim(n, id, axis, layout, css);
+                    }
+                }
+                "RIGHT" | "BOTTOM" | "MAX" => {
+                    css.lit(end, inset(ps - d - s));
+                    if size {
+                        self.dim(n, id, axis, layout, css);
+                    }
+                }
+                "LEFT_RIGHT" | "TOP_BOTTOM" | "STRETCH" => {
+                    css.lit(start, inset(d));
+                    css.lit(end, inset(ps - d - s));
+                }
+                "CENTER" => {
+                    // The node's center keeps its offset from the parent's.
+                    let off = d + s / 2.0 - ps / 2.0;
+                    let at = match off {
+                        o if o.abs() < 5e-4 => "50%".to_string(),
+                        o if o > 0.0 => format!("calc(50% + {})", px(o)),
+                        o => format!("calc(50% - {})", px(-o)),
+                    };
+                    css.lit(start, at);
+                    translate[i] = true;
+                    if size {
+                        self.dim(n, id, axis, layout, css);
+                    }
+                }
+                "SCALE" if up.border.is_some() => self.unsupported(
+                    id,
+                    format!(
+                        "constraints.{key} SCALE inside a border: CSS percentages are of the padding box: {start} not specified"
+                    ),
+                ),
+                "SCALE" if ps > 0.0 => {
+                    css.lit(start, percent(d));
+                    css.lit(if i == 0 { "width" } else { "height" }, percent(s));
+                }
+                other => self.unsupported(
+                    id,
+                    format!("constraints.{key} {other}: {start} not specified"),
+                ),
+            }
+        }
+        match translate {
+            [true, true] => css.lit("transform", "translate(-50%, -50%)"),
+            [true, false] => css.lit("transform", "translateX(-50%)"),
+            [false, true] => css.lit("transform", "translateY(-50%)"),
+            [false, false] => {}
+        }
+    }
+
+    /// `minWidth`/`maxWidth`/`minHeight`/`maxHeight`.
+    fn limits(&mut self, n: &Value, id: &str, layout: &mut Map<String, Value>, css: &mut Css) {
+        for (key, name, prop) in [
+            ("minWidth", "min_width", "min-width"),
+            ("maxWidth", "max_width", "max-width"),
+            ("minHeight", "min_height", "min-height"),
+            ("maxHeight", "max_height", "max-height"),
+        ] {
+            let Some(raw) = n.get(key).filter(|v| !v.is_null()).map(copy_value) else {
+                continue;
+            };
+            if let Some(e) = self.number(n, id, &[key], raw, SIZE) {
+                if let Some(v) = self.css_value(id, prop, &e, Want::Px) {
+                    css.set(prop, v);
+                }
+                layout.insert(name.into(), e);
+            }
+        }
+    }
+
+    /// Layer opacity below 1 (or bound) and the node's blend mode.
+    fn opacity(&mut self, n: &Value, id: &str, values: &mut Map<String, Value>, css: &mut Css) {
+        let bound = n["boundVariables"].get("opacity").is_some();
+        if let Some(o) = n["opacity"].as_f64().filter(|o| *o < 1.0 || bound) {
+            // Figma opacity variables are 0–100; the layer stores 0–1.
+            let binding = self.binding(n, id, "opacity", false).ok().flatten();
+            let lit = Lit::Number(o * 100.0);
+            let e = self
+                .tokens
+                .entry(binding, copy_value(&n["opacity"]), Some(&lit), OPACITY);
+            if let Some(v) = self.css_value(id, "opacity", &e, Want::Opacity) {
+                css.set("opacity", v);
+            }
+            values.insert("opacity".into(), e);
+        }
+        if let Some(mode) = n["blendMode"]
+            .as_str()
+            .filter(|m| !["PASS_THROUGH", "NORMAL"].contains(m))
+        {
+            self.unsupported(id, format!("blendMode {mode}: not specified"));
+        }
+    }
+
+    /// Visible `SOLID` paints of `fills`/`strokes` as value entries; an
+    /// `IMAGE` fill becomes an asset reference; any other paint type is
+    /// unsupported. With `css`, a single visible solid paint is declared
+    /// as that property.
+    #[allow(clippy::too_many_arguments)]
+    fn paints(
+        &mut self,
+        n: &Value,
+        base: &str,
+        id: &str,
+        key: &str,
+        prop: Prop,
+        assets: &mut Vec<Value>,
+        css: Option<(&'static str, &mut Css)>,
+    ) -> Vec<Value> {
         let mut out = Vec::new();
+        let mut visible = 0;
         for (i, paint) in n[key].as_array().into_iter().flatten().enumerate() {
             if paint["visible"] == false {
                 continue;
             }
+            visible += 1;
             let ty = paint["type"].as_str().unwrap_or("unknown");
+            if let Some(mode) = paint["blendMode"]
+                .as_str()
+                .filter(|m| !["PASS_THROUGH", "NORMAL"].contains(m))
+            {
+                self.unsupported(id, format!("{key}[{i}]: blendMode {mode}: not specified"));
+            }
+            if ty == "IMAGE" && key == "fills" {
+                let mut asset = json!({
+                    "kind": "image",
+                    "node_id": id,
+                    "paint": format!("fills[{i}]"),
+                    "image_ref": paint["imageRef"],
+                    "scale_mode": paint["scaleMode"],
+                });
+                let exported = paint["imageRef"]
+                    .as_str()
+                    .and_then(|r| self.assets?.image(r));
+                let reason = match exported {
+                    Some(image) => {
+                        asset["path"] = json!(image.path);
+                        asset["url"] = json!(image.url);
+                        format!(
+                            "fills[{i}]: IMAGE paint: exported as {} (content.assets); its scaling and cropping are not translated to CSS",
+                            image.path
+                        )
+                    }
+                    None => format!(
+                        "fills[{i}]: IMAGE paint: referenced under content.assets, no CSS background until the asset manifest (NWS-2952)"
+                    ),
+                };
+                assets.push(asset);
+                self.unsupported(id, reason);
+                continue;
+            }
             let hex = (ty == "SOLID").then(|| paint_color(paint)).flatten();
             let Some(hex) = hex else {
                 self.unsupported(id, format!("{key}[{i}]: {ty} paint not specified"));
@@ -672,63 +1817,509 @@ impl Cx<'_, '_> {
             };
             // The node-level binding is a fallback only when the paint has
             // none of its own: a mixed paint binding stays an error.
-            let binding = match alias_id(paint.get("boundVariables").and_then(|b| b.get("color"))) {
-                Ok(None) => alias_id(
-                    n.get("boundVariables")
-                        .and_then(|b| b.get(key))
-                        .and_then(|b| b.get(i)),
-                ),
-                other => other,
-            };
-            let Ok(binding) = binding else {
-                self.unsupported(id, format!("{key}[{i}]: mixed variable bindings"));
+            let index = i.to_string();
+            let own = self.lookup(n, base, &[key, &index, "boundVariables", "color"]);
+            let node = self.lookup(n, base, &["boundVariables", key, &index]);
+            let Ok(binding) = self.either(id, own, node) else {
                 continue;
             };
             let lit = Lit::Color(hex.clone());
-            out.push(
-                self.tokens
-                    .entry(binding, OwnedValue(json!(hex)), Some(&lit), prop)
-                    .into_inner(),
-            );
+            let mut entry = self.tokens.entry(binding, json!(hex), Some(&lit), prop);
+            let opacity = paint["opacity"].as_f64().unwrap_or(1.0);
+            if entry.get("variable_id").is_some() && opacity != 1.0 {
+                entry["paint_opacity"] = json!(opacity.clamp(0.0, 1.0));
+            }
+            out.push(entry);
+        }
+        if let Some((property, css)) = css {
+            match (visible, out.as_slice()) {
+                (1, [e]) => {
+                    if let Some(v) = self.css_value(id, property, e, Want::Color) {
+                        css.set(property, v);
+                    }
+                }
+                (0 | 1, _) => {}
+                (many, _) => self.unsupported(
+                    id,
+                    format!("{key}: {many} visible paints: CSS {property} not specified"),
+                ),
+            }
         }
         out
     }
 
+    /// Strokes: color entries, weight, and CSS — an `outline` (Figma
+    /// strokes don't take layout space), or a `border` inside an
+    /// auto-layout frame with `strokesIncludedInLayout`.
+    fn strokes(
+        &mut self,
+        n: &Value,
+        id: &str,
+        node_type: &str,
+        vector: bool,
+        values: &mut Map<String, Value>,
+        css: &mut Css,
+    ) {
+        let mut ignored = Vec::new();
+        let strokes = self.paints(n, "", id, "strokes", STROKE_COLOR, &mut ignored, None);
+        if strokes.is_empty() {
+            return;
+        }
+        let visible = n["strokes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["visible"] != false)
+            .count();
+        let color = if visible == 1 {
+            self.css_value(id, "outline-color", &strokes[0], Want::Color)
+        } else {
+            None
+        };
+        values.insert("stroke".into(), Value::Array(strokes));
+        let mut weight = None;
+        if n.get("individualStrokeWeights").is_some() {
+            self.unsupported(id, "individualStrokeWeights: stroke weight not specified");
+        } else if let Some(e) = self.number(
+            n,
+            id,
+            &["strokeWeight"],
+            n.get("strokeWeight").map(copy_value).unwrap_or(json!(1)),
+            STROKE_WEIGHT,
+        ) {
+            weight = self.css_value(id, "outline-width", &e, Want::Px);
+            values.insert("stroke_weight".into(), e);
+        }
+        if vector {
+            return;
+        }
+        let why = if node_type == "TEXT" {
+            Some("text stroke".to_string())
+        } else if visible > 1 {
+            Some(format!("{visible} visible stroke paints"))
+        } else if n["strokeDashes"].as_array().is_some_and(|d| !d.is_empty()) {
+            Some("strokeDashes (dash pattern)".to_string())
+        } else if n.get("strokeAlign").is_none() {
+            Some("strokeAlign not recorded".to_string())
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.unsupported(id, format!("{why}: CSS stroke not specified"));
+            return;
+        }
+        let (Some(color), Some(weight)) = (color, weight) else {
+            return;
+        };
+        let align = n["strokeAlign"].as_str().unwrap_or_default();
+        if align == "INSIDE" && n["strokesIncludedInLayout"] == true {
+            css.set("border-width", weight);
+            css.lit("border-style", "solid");
+            css.set("border-color", color);
+            return;
+        }
+        let offset = match align {
+            "INSIDE" => Some(weight.scaled(-1.0, "px")),
+            "CENTER" => Some(weight.scaled(-0.5, "px")),
+            _ => None,
+        };
+        css.set("outline-width", weight);
+        css.lit("outline-style", "solid");
+        css.set("outline-color", color);
+        if let Some(offset) = offset {
+            css.set("outline-offset", offset);
+        }
+    }
+
     /// The four corner radii, each bound or untokenized; `None` when the
-    /// node has no radius.
-    fn radius(&mut self, n: &Value, id: &str) -> Option<OwnedValue> {
-        const CORNERS: [(&str, &str); 4] = [
-            ("top_left", "topLeftRadius"),
-            ("top_right", "topRightRadius"),
-            ("bottom_right", "bottomRightRadius"),
-            ("bottom_left", "bottomLeftRadius"),
+    /// node has no radius. With `css`, `border-radius`.
+    fn radius(&mut self, n: &Value, id: &str, css: Option<&mut Css>) -> Option<Value> {
+        const CORNERS: [(&str, &str, &str, &str); 4] = [
+            (
+                "top_left",
+                "topLeftRadius",
+                "rectangleCornerRadii.RECTANGLE_TOP_LEFT_CORNER_RADIUS",
+                "border-top-left-radius",
+            ),
+            (
+                "top_right",
+                "topRightRadius",
+                "rectangleCornerRadii.RECTANGLE_TOP_RIGHT_CORNER_RADIUS",
+                "border-top-right-radius",
+            ),
+            (
+                "bottom_right",
+                "bottomRightRadius",
+                "rectangleCornerRadii.RECTANGLE_BOTTOM_RIGHT_CORNER_RADIUS",
+                "border-bottom-right-radius",
+            ),
+            (
+                "bottom_left",
+                "bottomLeftRadius",
+                "rectangleCornerRadii.RECTANGLE_BOTTOM_LEFT_CORNER_RADIUS",
+                "border-bottom-left-radius",
+            ),
         ];
         let bv = n.get("boundVariables");
-        let any_bound = bv.and_then(|b| b.get("rectangleCornerRadii")).is_some()
-            || CORNERS
-                .iter()
-                .any(|(_, k)| bv.and_then(|b| b.get(*k)).is_some());
+        let any_bound = CORNERS
+            .iter()
+            .any(|(_, k, _, _)| bv.and_then(|b| b.get(*k)).is_some())
+            || bv.and_then(|b| b.get("rectangleCornerRadii")).is_some();
         let per_corner = n["rectangleCornerRadii"].as_array();
         if n.get("cornerRadius").is_none() && per_corner.is_none() && !any_bound {
             return None;
         }
-        let mut out = OwnedValue::object();
-        for (i, (side, key)) in CORNERS.iter().enumerate() {
+        let mut out = Map::new();
+        let mut sides: [Option<CssVal>; 4] = Default::default();
+        for (i, (side, key, alt, prop)) in CORNERS.iter().enumerate() {
             let raw = per_corner
                 .and_then(|r| r.get(i))
                 .or_else(|| n.get("cornerRadius"))
                 .map(copy_value)
-                .unwrap_or(OwnedValue(json!(0)));
-            if let Some(e) = self.number(n, id, key, raw, RADIUS) {
+                .unwrap_or(json!(0));
+            if let Some(e) = self.number(n, id, &[key, alt], raw, RADIUS) {
+                sides[i] = self.css_value(id, prop, &e, Want::PxNonZero);
                 out.insert(side.to_string(), e);
             }
+        }
+        if let Some(css) = css {
+            if n["cornerSmoothing"].as_f64().is_some_and(|s| s > 0.0) {
+                self.unsupported(id, "cornerSmoothing: smoothed corners not specified");
+            }
+            css.four(
+                "border-radius",
+                [CORNERS[0].3, CORNERS[1].3, CORNERS[2].3, CORNERS[3].3],
+                sides,
+            );
+        }
+        Some(Value::Object(out))
+    }
+
+    /// Visible effects as value entries; one drop or inner shadow becomes
+    /// `box-shadow` (`text-shadow` for a TEXT drop shadow). Several
+    /// shadows are unsupported: CSS lists them top-most first and Figma's
+    /// effect order isn't verified. Blurs are unsupported (Figma's blur
+    /// radius has no exact CSS `blur()`).
+    fn effects(
+        &mut self,
+        n: &Value,
+        id: &str,
+        text: bool,
+        vector: bool,
+        css: &mut Css,
+    ) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut shadows = Vec::new();
+        for (i, effect) in n["effects"].as_array().into_iter().flatten().enumerate() {
+            if effect["visible"] == false {
+                continue;
+            }
+            let ty = effect["type"].as_str().unwrap_or("unknown").to_string();
+            let mut entry = Map::new();
+            entry.insert("type".into(), json!(ty));
+            let index = i.to_string();
+            let mut field = |cx: &mut Self,
+                             name: &str,
+                             key: &str,
+                             raw: Value|
+             -> Option<OwnedValue> {
+                let raw = OwnedValue(raw);
+                let binding = match cx.lookup(n, "", &["effects", &index, "boundVariables", key]) {
+                    Ok(b) => b,
+                    Err(p) => {
+                        cx.unsupported(
+                            id,
+                            format!("{p}: bound to several variables (mixed): not specified"),
+                        );
+                        return None;
+                    }
+                };
+                let e = if name == "color" {
+                    let hex = color(&raw);
+                    let lit = hex.clone().map(Lit::Color);
+                    cx.tokens
+                        .entry(binding, json!(hex), lit.as_ref(), EFFECT_COLOR)
+                } else {
+                    let lit = raw.as_f64().map(Lit::Number);
+                    cx.tokens
+                        .entry(binding, raw.into_inner(), lit.as_ref(), EFFECT_FLOAT)
+                };
+                entry.insert(name.into(), copy_value(&e));
+                Some(OwnedValue(e))
+            };
+            match ty.as_str() {
+                "DROP_SHADOW" | "INNER_SHADOW" => {
+                    let x = field(
+                        self,
+                        "offset_x",
+                        "offsetX",
+                        copy_value(&effect["offset"]["x"]),
+                    );
+                    let y = field(
+                        self,
+                        "offset_y",
+                        "offsetY",
+                        copy_value(&effect["offset"]["y"]),
+                    );
+                    let r = field(self, "radius", "radius", copy_value(&effect["radius"]));
+                    let sp = field(
+                        self,
+                        "spread",
+                        "spread",
+                        effect.get("spread").map(copy_value).unwrap_or(json!(0)),
+                    );
+                    let c = field(self, "color", "color", copy_value(&effect["color"]));
+                    if vector {
+                        out.push(Value::Object(entry));
+                        continue;
+                    }
+                    let prop = if text { "text-shadow" } else { "box-shadow" };
+                    let len = |cx: &mut Self, e: &Option<OwnedValue>| {
+                        e.as_ref().and_then(|e| cx.css_value(id, prop, e, Want::Px))
+                    };
+                    let (x, y, r, sp) =
+                        (len(self, &x), len(self, &y), len(self, &r), len(self, &sp));
+                    let c = c.and_then(|e| self.css_value(id, prop, &e, Want::Color));
+                    let why = if effect["showShadowBehindNode"] == true {
+                        Some("showShadowBehindNode")
+                    } else if effect["blendMode"]
+                        .as_str()
+                        .is_some_and(|m| !["NORMAL", "PASS_THROUGH"].contains(&m))
+                    {
+                        Some("blendMode")
+                    } else if text && ty == "INNER_SHADOW" {
+                        Some("inner shadow on text")
+                    } else if text && sp.as_ref().is_some_and(|s| s.value != "0px") {
+                        Some("spread on a text shadow")
+                    } else {
+                        None
+                    };
+                    if let Some(why) = why {
+                        self.unsupported(id, format!("effects[{i}]: {ty} {why}: not specified"));
+                    } else if let (Some(x), Some(y), Some(r), Some(sp), Some(c)) = (x, y, r, sp, c)
+                    {
+                        let inset = if ty == "INNER_SHADOW" { "inset " } else { "" };
+                        shadows.push(if text {
+                            format!("{} {} {} {}", x.value, y.value, r.value, c.value)
+                        } else {
+                            format!(
+                                "{inset}{} {} {} {} {}",
+                                x.value, y.value, r.value, sp.value, c.value
+                            )
+                        });
+                    }
+                }
+                "LAYER_BLUR" | "BACKGROUND_BLUR" => {
+                    field(self, "radius", "radius", copy_value(&effect["radius"]));
+                    self.unsupported(
+                        id,
+                        format!("effects[{i}]: {ty}: Figma's blur radius has no exact CSS blur(): not specified"),
+                    );
+                }
+                other => self.unsupported(id, format!("effects[{i}]: {other}: not specified")),
+            }
+            out.push(Value::Object(entry));
+        }
+        let prop = if text { "text-shadow" } else { "box-shadow" };
+        match shadows.as_slice() {
+            [] => {}
+            [one] => css.lit(prop, one.clone()),
+            many => self.unsupported(
+                id,
+                format!(
+                    "effects: {} shadows: their stacking order is unverified: {prop} not specified",
+                    many.len()
+                ),
+            ),
+        }
+        out
+    }
+
+    /// A TEXT node: typography, text CSS, `content.text` and mixed runs.
+    fn text(
+        &mut self,
+        n: &Value,
+        id: &str,
+        values: &mut Map<String, Value>,
+        content: &mut Map<String, Value>,
+        css: &mut Css,
+    ) {
+        let runs = self.runs(n, id);
+        let mixed = runs.is_some();
+        let typography = self.typography(n, id, mixed);
+        let mut base_style = copy_value(&n["style"]);
+        if mixed {
+            // Decorations propagate through descendants and cannot be cancelled
+            // by a span, so mixed text applies them to each run instead.
+            if let Some(style) = base_style.as_object_mut() {
+                style.remove("textDecoration");
+            }
+        }
+        self.type_css(id, &base_style, &typography, css, false);
+        if !typography.is_empty() {
+            values.insert("typography".into(), Value::Object(typography));
+        }
+        let style = &n["style"];
+        let resize = style["textAutoResize"]
+            .as_str()
+            .or(n["textAutoResize"].as_str());
+        // Figma keeps every newline and space: `pre-wrap`, or `pre` for
+        // text that grows in width instead of wrapping.
+        css.lit(
+            "white-space",
+            if resize == Some("WIDTH_AND_HEIGHT") {
+                "pre"
+            } else {
+                "pre-wrap"
+            },
+        );
+        if style["textTruncation"] == "ENDING" || resize == Some("TRUNCATE") {
+            match style["maxLines"].as_u64().or(n["maxLines"].as_u64()) {
+                Some(lines) if lines > 1 => {
+                    css.lit("display", "-webkit-box");
+                    css.lit("-webkit-box-orient", "vertical");
+                    css.lit("-webkit-line-clamp", lines.to_string());
+                    css.lit("overflow", "hidden");
+                }
+                _ => {
+                    css.lit("overflow", "hidden");
+                    css.lit("text-overflow", "ellipsis");
+                    css.lit("white-space", "pre");
+                }
+            }
+        }
+        let hug_height = matches!(resize, Some("WIDTH_AND_HEIGHT" | "HEIGHT"))
+            || n["layoutSizingVertical"] == "HUG";
+        if let Some(v) = style["textAlignVertical"]
+            .as_str()
+            .filter(|v| *v != "TOP" && !hug_height)
+        {
+            self.unsupported(
+                id,
+                format!("textAlignVertical {v} in a fixed-height text box: not specified"),
+            );
+        }
+        for key in ["paragraphSpacing", "paragraphIndent"] {
+            if style[key].as_f64().is_some_and(|v| v != 0.0) {
+                self.unsupported(id, format!("{key}: not specified"));
+            }
+        }
+        if n["lineTypes"]
+            .as_array()
+            .is_some_and(|l| l.iter().any(|t| t != "NONE"))
+        {
+            self.unsupported(id, "list text (lineTypes): not specified");
+        }
+        content.insert("text".into(), copy_value(&n["characters"]));
+        if let Ok(Some(bind)) = self.binding(n, id, "characters", false) {
+            content.insert(
+                "text_token".into(),
+                self.tokens.bound(&bind, copy_value(&n["characters"])),
+            );
+        }
+        if let Some(runs) = runs {
+            content.insert("runs".into(), Value::Array(runs));
+        }
+    }
+
+    /// Mixed text runs: `None` unless `characterStyleOverrides` names a
+    /// style other than the base. Offsets are UTF-16 code units, as
+    /// Figma's own; a run splitting a surrogate pair is unsupported.
+    fn runs(&mut self, n: &Value, id: &str) -> Option<Vec<Value>> {
+        let overrides: Vec<u64> = n["characterStyleOverrides"]
+            .as_array()?
+            .iter()
+            .map(|x| x.as_u64().unwrap_or(0))
+            .collect();
+        if overrides.iter().all(|o| *o == 0) {
+            return None;
+        }
+        let units: Vec<u16> = n["characters"]
+            .as_str()
+            .unwrap_or_default()
+            .encode_utf16()
+            .collect();
+        let style_at = |i: usize| overrides.get(i).copied().unwrap_or(0);
+        let mut spans = Vec::new();
+        let mut start = 0;
+        for i in 1..=units.len() {
+            if i == units.len() || style_at(i) != style_at(start) {
+                spans.push((start, i, style_at(start)));
+                start = i;
+            }
+        }
+        let mut out = Vec::new();
+        for (start, end, style) in spans {
+            let Ok(text) = String::from_utf16(&units[start..end]) else {
+                self.unsupported(
+                    id,
+                    "mixed text runs split a surrogate pair: runs not specified",
+                );
+                return None;
+            };
+            let mut run = Map::new();
+            run.insert("start".into(), json!(start));
+            run.insert("end".into(), json!(end));
+            run.insert("text".into(), json!(text));
+            run.insert("style".into(), json!(style));
+            let mut run_css = Css::default();
+            if style != 0 {
+                let Some(o) = n["styleOverrideTable"].get(style.to_string()) else {
+                    self.unsupported(
+                        id,
+                        format!("styleOverrideTable has no style {style}: run not specified"),
+                    );
+                    out.push(Value::Object(run));
+                    continue;
+                };
+                let pseudo = json!({"style": o, "type": "TEXT"});
+                let base = pointer("", &["styleOverrideTable", &style.to_string()]);
+                self.style_base = base.clone();
+                let typography = self.typography(&pseudo, id, true);
+                self.style_base = "/style".into();
+                self.type_css(id, o, &typography, &mut run_css, true);
+                if !typography.is_empty() {
+                    run.insert("typography".into(), Value::Object(typography));
+                }
+                let paint_node = json!({"fills": copy_value(&o["fills"])});
+                let mut assets = Vec::new();
+                let fills = self.paints(
+                    &paint_node,
+                    &base,
+                    id,
+                    "fills",
+                    fill_prop("TEXT"),
+                    &mut assets,
+                    Some(("color", &mut run_css)),
+                );
+                if !fills.is_empty() {
+                    run.insert("fill".into(), Value::Array(fills));
+                }
+            }
+            let decoration = n["styleOverrideTable"][style.to_string()]
+                .get("textDecoration")
+                .filter(|_| style != 0)
+                .unwrap_or(&n["style"]["textDecoration"]);
+            match decoration.as_str() {
+                Some("UNDERLINE") => run_css.lit("text-decoration-line", "underline"),
+                Some("STRIKETHROUGH") => run_css.lit("text-decoration-line", "line-through"),
+                Some("NONE") => run_css.lit("text-decoration-line", "none"),
+                _ => {}
+            }
+            if !run_css.is_empty() {
+                if self.tailwind {
+                    run.insert("tailwind".into(), json!(run_css.tailwind()));
+                }
+                run.insert("css".into(), run_css.to_json());
+            }
+            out.push(Value::Object(run));
         }
         Some(out)
     }
 
-    /// A TEXT node's type style: family, size, weight, line height and
-    /// letter spacing.
-    fn typography(&mut self, n: &Value, id: &str) -> OwnedValue {
+    /// A type style's family, size, weight, line height and letter
+    /// spacing (only those it has, unless bound).
+    fn typography(&mut self, n: &Value, id: &str, style_first: bool) -> Map<String, Value> {
         const FIELDS: [(&str, &str, &str, Prop); 5] = [
             (
                 "font_family",
@@ -739,60 +2330,43 @@ impl Cx<'_, '_> {
                     scopes: &["FONT_FAMILY"],
                 },
             ),
-            (
-                "font_size",
-                "fontSize",
-                "fontSize",
-                Prop {
-                    resolved_type: "FLOAT",
-                    scopes: &["FONT_SIZE"],
-                },
-            ),
+            ("font_size", "fontSize", "fontSize", float(&["FONT_SIZE"])),
             (
                 "font_weight",
                 "fontWeight",
                 "fontWeight",
-                Prop {
-                    resolved_type: "FLOAT",
-                    scopes: &["FONT_WEIGHT"],
-                },
+                float(&["FONT_WEIGHT"]),
             ),
             (
                 "line_height",
                 "lineHeightPx",
                 "lineHeight",
-                Prop {
-                    resolved_type: "FLOAT",
-                    scopes: &["LINE_HEIGHT"],
-                },
+                float(&["LINE_HEIGHT"]),
             ),
             (
                 "letter_spacing",
                 "letterSpacing",
                 "letterSpacing",
-                Prop {
-                    resolved_type: "FLOAT",
-                    scopes: &["LETTER_SPACING"],
-                },
+                float(&["LETTER_SPACING"]),
             ),
         ];
         let style = &n["style"];
-        let mut out = OwnedValue::object();
+        let mut out = Map::new();
         for (name, field, binding_key, prop) in FIELDS {
-            let Ok(binding) = self.binding(n, id, binding_key) else {
+            let Ok(binding) = self.binding(n, id, binding_key, style_first) else {
                 continue;
             };
             let auto_line = name == "line_height" && style["lineHeightUnit"] == "INTRINSIC_%";
             let raw = if auto_line {
-                OwnedValue(json!("auto"))
+                json!("auto")
             } else {
                 match style.get(field) {
                     Some(raw) => copy_value(raw),
-                    None if binding.is_some() => OwnedValue(Value::Null),
+                    None if binding.is_some() => Value::Null,
                     None => continue,
                 }
             };
-            let lit = match (&*raw, auto_line) {
+            let lit = match (&raw, auto_line) {
                 (_, true) => None,
                 (Value::String(s), _) => Some(Lit::Text(s.clone())),
                 (raw, _) => raw.as_f64().map(Lit::Number),
@@ -803,6 +2377,144 @@ impl Cx<'_, '_> {
             );
         }
         out
+    }
+
+    /// Text CSS from a type style and its typography entries.
+    fn type_css(
+        &mut self,
+        id: &str,
+        style: &Value,
+        typography: &Map<String, Value>,
+        css: &mut Css,
+        run: bool,
+    ) {
+        for (name, prop) in [
+            ("font_family", "font-family"),
+            ("font_size", "font-size"),
+            ("font_weight", "font-weight"),
+            ("line_height", "line-height"),
+            ("letter_spacing", "letter-spacing"),
+        ] {
+            let Some(e) = typography.get(name) else {
+                continue;
+            };
+            let v = match name {
+                "font_family" => self.css_value(id, prop, e, Want::Family),
+                "font_weight" => self.css_value(id, prop, e, Want::Number),
+                "line_height" if e["raw"] == "auto" && e.get("variable_id").is_none() => {
+                    Some(CssVal::lit("normal"))
+                }
+                "letter_spacing" if !run => self.css_value(id, prop, e, Want::PxNonZero),
+                _ => self.css_value(id, prop, e, Want::Px),
+            };
+            if let Some(v) = v {
+                css.set(prop, v);
+            }
+        }
+        if style["italic"] == true {
+            css.lit("font-style", "italic");
+        } else if run && style["italic"] == false {
+            css.lit("font-style", "normal");
+        }
+        match style["textAlignHorizontal"].as_str() {
+            Some("LEFT") if run => css.lit("text-align", "left"),
+            Some("CENTER") => css.lit("text-align", "center"),
+            Some("RIGHT") => css.lit("text-align", "right"),
+            Some("JUSTIFIED") => css.lit("text-align", "justify"),
+            _ => {}
+        }
+        if run && style["textCase"].is_string() {
+            css.lit("text-transform", "none");
+            css.lit("font-variant-caps", "normal");
+        }
+        match style["textCase"].as_str() {
+            Some("UPPER") => css.lit("text-transform", "uppercase"),
+            Some("LOWER") => css.lit("text-transform", "lowercase"),
+            Some("TITLE") => css.lit("text-transform", "capitalize"),
+            Some("SMALL_CAPS") => css.lit("font-variant-caps", "small-caps"),
+            Some("SMALL_CAPS_FORCED") => css.lit("font-variant-caps", "all-small-caps"),
+            _ => {}
+        }
+        match style["textDecoration"].as_str() {
+            Some("UNDERLINE") => css.lit("text-decoration-line", "underline"),
+            Some("STRIKETHROUGH") => css.lit("text-decoration-line", "line-through"),
+            _ => {}
+        }
+    }
+
+    /// The exported icon (NWS-2952) this node is — by its own node id, or
+    /// for an instance by its main component's key, else id (node ids
+    /// only for icons exported from this spec's file) — as a
+    /// `content.assets` entry; `None` without a manifest.
+    fn icon(&self, n: &Value, id: &str, node_type: &str) -> Option<Value> {
+        let assets = self.assets?;
+        let icon = match node_type {
+            "INSTANCE" => assets.icon(None, id).or_else(|| {
+                let cid = n["componentId"].as_str()?;
+                let key = self.components[cid]["key"].as_str();
+                assets.icon(key, cid)
+            })?,
+            _ => assets.icon(None, id)?,
+        };
+        Some(json!({
+            "kind": "icon",
+            "node_id": id,
+            "component": icon.component,
+            "path": icon.path,
+            "svg": icon.svg,
+            "jsx": format!("<{} />", icon.component),
+        }))
+    }
+
+    /// An INSTANCE: its component, variant and other properties, and the
+    /// code component the project's map names (NWS-2949), else `null`.
+    fn instance(&mut self, n: &Value, id: &str) -> Value {
+        let component_id = n["componentId"].as_str().unwrap_or_default();
+        let component = &self.components[component_id];
+        let mut variant = Map::new();
+        let mut properties = Map::new();
+        for (name, p) in n["componentProperties"].as_object().into_iter().flatten() {
+            if p["type"] == "VARIANT" {
+                variant.insert(name.clone(), copy_value(&p["value"]));
+                continue;
+            }
+            let mut prop = Map::new();
+            prop.insert("type".into(), p["type"].clone());
+            prop.insert("value".into(), copy_value(&p["value"]));
+            let own = self.lookup(
+                n,
+                "",
+                &["componentProperties", name, "boundVariables", "value"],
+            );
+            let node = self.lookup(n, "", &["boundVariables", "componentProperties", name]);
+            if let Ok(Some(bind)) = self.either(id, own, node) {
+                prop.insert(
+                    "token".into(),
+                    self.tokens.bound(&bind, copy_value(&p["value"])),
+                );
+            }
+            properties.insert(name.clone(), Value::Object(prop));
+        }
+        if component.is_null() {
+            self.unsupported(
+                id,
+                format!("component {component_id} not in the mirror: component name not specified"),
+            );
+        }
+        json!({
+            "component_id": component_id,
+            "component": if component.is_null() { Value::Null } else {
+                json!({
+                    "name": component["name"],
+                    "key": component["key"],
+                    "remote": component["remote"],
+                })
+            },
+            "component_set": component["component_set"],
+            "variant": variant,
+            "properties": properties,
+            "code_component": crate::map::code_component(self.map, n, component, self.components),
+        })
     }
 }
 
@@ -858,6 +2570,253 @@ fn sizing(n: &Value, axis: &str, own: Option<&str>, parent: Option<&str>) -> Str
 mod tests {
     use super::*;
 
+    fn spec(tree: &Value) -> Value {
+        let vars = json!({"snapshot": {"state": "none"}, "variables": []});
+        build(
+            tree,
+            &vars,
+            &json!({}),
+            &ExportOptions::default(),
+            false,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn mixed_runs_reset_inherited_defaults_and_own_their_decorations() {
+        let tree = json!({"id": "1:1", "type": "TEXT", "characters": "ABC",
+        "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 20},
+        "style": {"italic": true, "textCase": "UPPER", "letterSpacing": 2,
+            "textDecoration": "UNDERLINE", "textAlignHorizontal": "RIGHT"},
+        "characterStyleOverrides": [0, 1, 2],
+        "styleOverrideTable": {
+            "1": {"italic": false, "textCase": "ORIGINAL", "letterSpacing": 0,
+                "textDecoration": "NONE", "textAlignHorizontal": "LEFT"},
+            "2": {"fontSize": 12}
+        }});
+        let out = spec(&tree);
+        let node = &out["node"];
+        assert_eq!(node["css"]["font-style"], "italic");
+        assert_eq!(node["css"]["text-transform"], "uppercase");
+        assert_eq!(node["css"]["letter-spacing"], "2px");
+        assert!(node["css"].get("text-decoration-line").is_none());
+        let runs = &node["content"]["runs"];
+        assert_eq!(runs[0]["css"]["text-decoration-line"], "underline");
+        assert_eq!(
+            runs[1]["css"],
+            json!({
+                "font-style": "normal", "text-transform": "none", "font-variant-caps": "normal",
+                "letter-spacing": "0px", "text-decoration-line": "none", "text-align": "left"
+            })
+        );
+        assert_eq!(runs[2]["css"]["text-decoration-line"], "underline");
+        assert!(runs[2]["css"].get("font-style").is_none());
+        assert_eq!(out["unsupported"], json!([]));
+        let mut tree = tree;
+        tree["style"]["textCase"] = json!("SMALL_CAPS");
+        tree["styleOverrideTable"]["1"]["textCase"] = json!("LOWER");
+        let out = spec(&tree);
+        assert_eq!(
+            out["node"]["content"]["runs"][1]["css"]["font-variant-caps"],
+            "normal"
+        );
+        assert_eq!(
+            out["node"]["content"]["runs"][1]["css"]["text-transform"],
+            "lowercase"
+        );
+    }
+
+    #[test]
+    fn full_ellipses_are_round_and_arcs_are_vector_assets() {
+        let mut tree = json!({"id": "1:1", "type": "ELLIPSE",
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 50},
+            "fills": [{"type": "SOLID", "color": {"r": 1, "g": 0, "b": 0}}]});
+        let full = spec(&tree);
+        assert_eq!(full["node"]["css"]["border-radius"], "50%");
+        assert_eq!(full["node"]["css"]["background-color"], "#ff0000");
+        for (end, inner) in [(std::f64::consts::PI, 0.0), (std::f64::consts::TAU, 0.5)] {
+            tree["arcData"] = json!({"startingAngle": 0, "endingAngle": end, "innerRadius": inner});
+            let out = spec(&tree);
+            assert!(out["node"]["css"].get("background-color").is_none());
+            assert!(out["node"]["css"].get("border-radius").is_none());
+            assert_eq!(
+                out["node"]["content"]["assets"][0],
+                json!({"kind": "vector", "node_id": "1:1", "format": "svg"})
+            );
+        }
+        tree["arcData"] =
+            json!({"startingAngle": 0, "endingAngle": std::f64::consts::TAU, "innerRadius": 0});
+        assert_eq!(spec(&tree)["node"]["css"]["border-radius"], "50%");
+    }
+
+    #[test]
+    fn explicitly_exported_instance_precedes_its_main_component() {
+        let icon = |id: &str, component: &str, file: &str| {
+            json!({"node_id": id,
+            "component": component, "file": file, "key": if id == "9:9" { Some("MainKey") } else { None },
+            "path": format!("src/icons/{component}.tsx"), "svg": format!("src/icons/svg/{component}.svg")})
+        };
+        let assets = AssetIndex::from_json(
+            &json!({"icons": [
+                icon("1:3", "IconInstance", "ABCDEFGHIJKLMNOPQRSTUV"), icon("9:9", "IconMain", "ABCDEFGHIJKLMNOPQRSTUV")
+            ]}),
+            "test",
+        )
+        .unwrap()
+        .for_file(Some("ABCDEFGHIJKLMNOPQRSTUV"));
+        let vars = json!({"snapshot": {"state": "none"}, "variables": []});
+        let tree = json!({"id": "1:3", "type": "INSTANCE", "componentId": "9:9"});
+        let components = json!({"9:9": {"key": "MainKey"}});
+        let run = |assets: &AssetIndex, components: &Value| {
+            build(
+                &tree,
+                &vars,
+                components,
+                &ExportOptions::default(),
+                false,
+                None,
+                Some(assets),
+            )
+        };
+        assert_eq!(
+            run(&assets, &components)["node"]["content"]["assets"][0]["component"],
+            "IconInstance"
+        );
+        let foreign = assets.for_file(Some("ZYXWVUTSRQPONMLKJIHGFE"));
+        assert_eq!(
+            run(&foreign, &components)["node"]["content"]["assets"][0]["component"],
+            "IconMain"
+        );
+        assert!(
+            run(&foreign, &json!({}))["node"]["content"]
+                .get("assets")
+                .is_none()
+        );
+        let instance_only = AssetIndex::from_json(
+            &json!({"icons": [icon("1:3", "IconInstance", "ABCDEFGHIJKLMNOPQRSTUV")]}),
+            "test",
+        )
+        .unwrap()
+        .for_file(Some("ABCDEFGHIJKLMNOPQRSTUV"));
+        assert_eq!(
+            run(&instance_only, &components)["node"]["content"]["assets"][0]["component"],
+            "IconInstance"
+        );
+    }
+
+    #[test]
+    fn bound_paints_retain_paint_opacity_and_token_alpha() {
+        let mut vars = unit_vars();
+        vars["variables"][0] = json!({"source": "imported", "variable_id": "V:1", "name": "red",
+            "resolved_type": "COLOR", "collection": "C", "collection_id": "C:1",
+            "default_mode": "M", "default_mode_id": "M", "mode_names": {"M": "M"}, "scopes": ["ALL_SCOPES"],
+            "values_by_mode": {"M": {"r": 1, "g": 0, "b": 0, "a": 0.5}}, "values_by_mode_id": {"M": {"r": 1, "g": 0, "b": 0, "a": 0.5}}});
+        let paint = json!({"type": "SOLID", "opacity": 0.5, "color": {"r": 1, "g": 0, "b": 0, "a": 0.5},
+            "boundVariables": {"color": {"type": "VARIABLE_ALIAS", "id": "V:1"}}});
+        for ty in ["RECTANGLE", "TEXT"] {
+            let tree = json!({"id": "1:1", "type": ty, "characters": "A", "fills": [paint],
+                "strokes": [paint], "strokeWeight": 2, "strokeAlign": "INSIDE"});
+            let out = build(
+                &tree,
+                &vars,
+                &json!({}),
+                &ExportOptions::default(),
+                false,
+                None,
+                None,
+            );
+            let node = &out["node"];
+            assert_eq!(node["values"]["fill"][0]["raw"], "#ff000040");
+            assert_eq!(node["values"]["fill"][0]["paint_opacity"], 0.5);
+            assert_eq!(
+                node["css"][if ty == "TEXT" {
+                    "color"
+                } else {
+                    "background-color"
+                }],
+                "color-mix(in srgb, var(--red) 50%, transparent)"
+            );
+            if ty != "TEXT" {
+                assert_eq!(
+                    node["css"]["outline-color"],
+                    "color-mix(in srgb, var(--red) 50%, transparent)"
+                );
+            }
+            assert!(node["css"].get("opacity").is_none());
+        }
+    }
+
+    #[test]
+    fn converted_stroke_lengths_remain_symbolic_for_offsets_and_insets() {
+        let mut tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL",
+            "strokes": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0}}],
+            "strokeWeight": 2, "strokeAlign": "INSIDE",
+            "boundVariables": {"strokeWeight": {"type": "VARIABLE_ALIAS", "id": "V:1"}},
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 50},
+            "children": [{"id": "1:2", "type": "RECTANGLE", "layoutPositioning": "ABSOLUTE",
+                "absoluteBoundingBox": {"x": 10, "y": 10, "width": 20, "height": 10}}]});
+        let run = |tree: &Value| {
+            build(
+                tree,
+                &unit_vars(),
+                &json!({}),
+                &ExportOptions::default(),
+                false,
+                None,
+                None,
+            )
+        };
+        for (align, factor) in [("INSIDE", "-1"), ("CENTER", "-0.5")] {
+            tree["strokeAlign"] = json!(align);
+            let out = run(&tree);
+            assert_eq!(
+                out["node"]["css"]["outline-offset"],
+                format!("calc(calc(var(--space-raw) * 1px) * {factor})")
+            );
+        }
+        tree["strokeAlign"] = json!("INSIDE");
+        tree["strokesIncludedInLayout"] = json!(true);
+        let out = run(&tree);
+        let css = &out["node"]["children"][0]["css"];
+        assert_eq!(css["left"], "calc(10px - calc(var(--space-raw) * 1px))");
+        assert_eq!(css["top"], "calc(10px - calc(var(--space-raw) * 1px))");
+    }
+
+    #[test]
+    fn root_value_matching_uses_collection_ids_for_duplicate_display_names() {
+        let vars = json!({"snapshot": {"state": "current"}, "variables": [
+            {"source": "imported", "variable_id": "V:1", "name": "a", "resolved_type": "FLOAT",
+                "collection": "Same", "collection_id": "C:1", "default_mode": "DefaultA", "default_mode_id": "DefaultA", "mode_names": {"DefaultA": "DefaultA", "OtherA": "OtherA"}, "scopes": ["GAP"],
+                "values_by_mode": {"DefaultA": 1, "OtherA": 2}, "values_by_mode_id": {"DefaultA": 1, "OtherA": 2}},
+            {"source": "imported", "variable_id": "V:2", "name": "b", "resolved_type": "FLOAT",
+                "collection": "Same", "collection_id": "C:2", "default_mode": "DefaultB", "default_mode_id": "DefaultB", "mode_names": {"DefaultB": "DefaultB", "OtherB": "OtherB"}, "scopes": ["GAP"],
+                "values_by_mode": {"DefaultB": 3, "OtherB": 4}, "values_by_mode_id": {"DefaultB": 3, "OtherB": 4}}
+        ]});
+        let options = ExportOptions {
+            modes: BTreeMap::from([
+                ("Same/OtherA".into(), ":root".into()),
+                ("Same/OtherB".into(), ":root".into()),
+            ]),
+            ..ExportOptions::default()
+        };
+        for (gap, id) in [(2, "V:1"), (4, "V:2")] {
+            let out = build(
+                &json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL", "itemSpacing": gap}),
+                &vars,
+                &json!({}),
+                &options,
+                false,
+                None,
+                None,
+            );
+            assert_eq!(
+                out["node"]["layout"]["gap"]["matches"][0]["variable_id"], id,
+                "{out}"
+            );
+        }
+    }
+
     #[test]
     fn legacy_sizing_fields() {
         let row = json!({"type": "FRAME", "layoutMode": "HORIZONTAL",
@@ -906,17 +2865,17 @@ mod tests {
         // The paint's own binding is mixed; the node-level fallback must not
         // paper over it (it would read as `Ok(None)` → untokenized).
         let tree = json!({"id": "1:1", "name": "Box", "type": "RECTANGLE",
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 10, "height": 10},
             "fills": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0, "a": 1},
                 "boundVariables": {"color": [
                     {"type": "VARIABLE_ALIAS", "id": "V:1"},
                     {"type": "VARIABLE_ALIAS", "id": "V:2"}]}}],
             "children": []});
-        let vars = json!({"snapshot": {"state": "none"}, "variables": []});
-        let spec = build(&tree, &vars);
-        assert!(spec["node"]["values"].get("fill").is_none(), "{spec}");
+        let out = spec(&tree);
+        assert!(out["node"]["values"].get("fill").is_none(), "{out}");
         assert_eq!(
-            spec["unsupported"],
-            json!([{"id": "1:1", "reason": "fills[0]: mixed variable bindings"}])
+            out["unsupported"],
+            json!([{"id": "1:1", "reason": "/fills/0/boundVariables/color: bound to several variables (mixed): not specified"}])
         );
         // A paint without its own binding still falls back to the node's.
         let mut tree = tree;
@@ -925,234 +2884,9 @@ mod tests {
             .unwrap()
             .remove("boundVariables");
         tree["boundVariables"] = json!({"fills": [{"type": "VARIABLE_ALIAS", "id": "V:3"}]});
-        let spec = build(&tree, &vars);
-        assert_eq!(spec["node"]["values"]["fill"][0]["variable_id"], "V:3");
-        assert_eq!(spec["unsupported"], json!([]));
-    }
-
-    #[test]
-    fn omitted_stroke_weight_uses_one_and_keeps_binding_or_matches() {
-        let tree = json!({"id": "1:1", "name": "Box", "type": "RECTANGLE",
-            "strokes": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0}}],
-            "boundVariables": {"strokeWeight": {"type": "VARIABLE_ALIAS", "id": "V:weight"}},
-            "children": []});
-        let vars = json!({"snapshot": {"state": "current"}, "variables": [{
-            "variable_id": "V:weight", "name": "stroke/weight", "source": "imported",
-            "resolved_type": "FLOAT", "collection": "Stroke", "collection_id": "C:stroke",
-            "default_mode_id": "Value", "mode_names": {"Value": "Value"},
-            "scopes": ["STROKE_FLOAT"], "values_by_mode_id": {"Value": 1}
-        }]});
-        let spec = build(&tree, &vars);
-        assert_eq!(
-            spec["node"]["values"]["stroke_weight"],
-            json!({
-            "token": "stroke/weight", "variable_id": "V:weight", "css": "--stroke-weight", "raw": 1})
-        );
-        assert_eq!(spec["unsupported"], json!([]));
-        let mut unbound = tree.clone();
-        unbound.as_object_mut().unwrap().remove("boundVariables");
-        let spec = build(&unbound, &vars);
-        assert_eq!(
-            spec["node"]["values"]["stroke_weight"],
-            json!({"untokenized": true, "raw": 1,
-            "matches": [{"token": "stroke/weight", "variable_id": "V:weight", "css": "--stroke-weight"}]})
-        );
-        let mut explicit = tree.clone();
-        explicit["strokeWeight"] = json!(3);
-        assert_eq!(
-            build(&explicit, &vars)["node"]["values"]["stroke_weight"]["raw"],
-            3
-        );
-        let mut individual = tree;
-        individual["individualStrokeWeights"] =
-            json!({"top": 2, "right": 1, "bottom": 1, "left": 1});
-        let spec = build(&individual, &vars);
-        assert!(spec["node"]["values"].get("stroke_weight").is_none());
-        assert_eq!(
-            spec["unsupported"],
-            json!([{"id": "1:1", "reason": "individualStrokeWeights: stroke weight not specified"}])
-        );
-        unbound["strokes"][0]["visible"] = json!(false);
-        assert!(
-            build(&unbound, &vars)["node"]["values"]
-                .get("stroke_weight")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn matching_uses_collection_identity_when_display_names_repeat() {
-        let tree = json!({"id": "1:1", "name": "Card", "type": "FRAME", "layoutMode": "VERTICAL",
-            "itemSpacing": 8, "children": []});
-        let vars = json!({"snapshot": {"state": "current"}, "variables": [
-            {"variable_id": "V:theme", "name": "theme-gap", "source": "imported", "resolved_type": "FLOAT",
-                "collection": "Same", "collection_id": "C:theme", "default_mode_id": "Light", "scopes": ["GAP"],
-                "mode_names": {"Light": "Light", "Dark": "Dark"}, "values_by_mode_id": {"Light": 16, "Dark": 24}},
-            {"variable_id": "V:other", "name": "other-gap", "source": "imported", "resolved_type": "FLOAT",
-                "collection": "Same", "collection_id": "C:other", "default_mode_id": "Value", "scopes": ["GAP"],
-                "mode_names": {"Light": "Light", "Value": "Value"}, "values_by_mode_id": {"Light": 99, "Value": 8}}
-        ]});
-        let spec = build(&tree, &vars);
-        assert_eq!(spec["tokens_snapshot"]["theme"]["collection_id"], "C:theme");
-        assert_eq!(
-            spec["node"]["layout"]["gap"]["matches"],
-            json!([
-            {"token": "other-gap", "variable_id": "V:other", "css": "--other-gap"}])
-        );
-    }
-
-    #[test]
-    fn matching_uses_the_default_mode_id_when_mode_names_repeat() {
-        let mut tree = json!({"id": "1:1", "name": "Card", "type": "FRAME",
-            "layoutMode": "VERTICAL", "itemSpacing": 16, "children": []});
-        let vars = json!({"snapshot": {"state": "current"}, "variables": [{
-            "variable_id": "V:gap", "name": "gap", "source": "imported", "resolved_type": "FLOAT",
-            "collection": "Spacing", "collection_id": "C:spacing", "default_mode_id": "M:1",
-            "scopes": ["GAP"], "mode_names": {"M:1": "Value", "M:2": "Value"},
-            "values_by_mode_id": {"M:1": 16, "M:2": 32}}]});
-        let spec = build(&tree, &vars);
-        assert_eq!(
-            spec["node"]["layout"]["gap"]["matches"],
-            json!([
-            {"token": "gap", "variable_id": "V:gap", "css": "--gap"}])
-        );
-        tree["itemSpacing"] = json!(32);
-        let spec = build(&tree, &vars);
-        assert!(spec["node"]["layout"]["gap"].get("matches").is_none());
-    }
-
-    #[test]
-    fn rest_uniform_stroke_bindings_keep_the_actual_variable() {
-        let alias = json!({"type": "VARIABLE_ALIAS", "id": "V:weight"});
-        let tree = json!({"id": "1:1", "name": "Box", "type": "RECTANGLE",
-            "strokes": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0}}],
-            "strokeWeight": 1,
-            "boundVariables": {"individualStrokeWeights": {
-                "top": alias, "right": alias, "bottom": alias, "left": alias}},
-            "children": []});
-        let vars = json!({"snapshot": {"state": "current"}, "variables": [{
-            "variable_id": "V:weight", "name": "stroke/thin", "source": "imported",
-            "resolved_type": "FLOAT", "collection": "Stroke", "collection_id": "C:stroke",
-            "default_mode_id": "M:1", "mode_names": {"M:1": "Value"},
-            "scopes": ["STROKE_FLOAT"], "values_by_mode_id": {"M:1": 1}
-        }]});
-        for explicit_weight in [true, false] {
-            let mut node = tree.clone();
-            if !explicit_weight {
-                node.as_object_mut().unwrap().remove("strokeWeight");
-            }
-            let spec = build(&node, &vars);
-            assert_eq!(
-                spec["node"]["values"]["stroke_weight"],
-                json!({
-                "raw": 1, "variable_id": "V:weight", "token": "stroke/thin", "css": "--stroke-thin"})
-            );
-            assert_eq!(spec["unsupported"], json!([]));
-        }
-
-        let mut partial = tree.clone();
-        partial["boundVariables"]["individualStrokeWeights"]
-            .as_object_mut()
-            .unwrap()
-            .remove("left");
-        let mut mixed = tree.clone();
-        mixed["boundVariables"]["individualStrokeWeights"]["left"]["id"] = json!("V:other");
-        let mut conflicting = tree;
-        conflicting["boundVariables"]["strokeWeight"] =
-            json!({"type": "VARIABLE_ALIAS", "id": "V:other"});
-        for node in [partial, mixed, conflicting] {
-            let spec = build(&node, &vars);
-            assert!(
-                spec["node"]["values"].get("stroke_weight").is_none(),
-                "{spec}"
-            );
-            assert_eq!(
-                spec["unsupported"],
-                json!([{
-                "id": "1:1", "reason": "strokeWeight: mixed or partially bound sides: not specified"}])
-            );
-        }
-    }
-
-    #[test]
-    fn rest_corner_bindings_keep_each_variable_and_report_mixed_corners() {
-        let corners = [
-            ("top_left", "RECTANGLE_TOP_LEFT_CORNER_RADIUS"),
-            ("top_right", "RECTANGLE_TOP_RIGHT_CORNER_RADIUS"),
-            ("bottom_right", "RECTANGLE_BOTTOM_RIGHT_CORNER_RADIUS"),
-            ("bottom_left", "RECTANGLE_BOTTOM_LEFT_CORNER_RADIUS"),
-        ];
-        let mut bindings = serde_json::Map::new();
-        let mut variables = Vec::new();
-        for (corner, rest) in corners {
-            let id = format!("V:{corner}");
-            bindings.insert(rest.into(), json!({"type": "VARIABLE_ALIAS", "id": id}));
-            variables.push(json!({
-                "variable_id": id, "name": format!("radius/{corner}"), "source": "imported",
-                "resolved_type": "FLOAT", "collection": "Radii", "collection_id": "C:radii",
-                "default_mode_id": "M:1", "mode_names": {"M:1": "Value"},
-                "scopes": ["CORNER_RADIUS"], "values_by_mode_id": {"M:1": 12}}));
-        }
-        let vars = json!({"snapshot": {"state": "current"}, "variables": variables});
-        let tree = json!({"id": "1:1", "type": "RECTANGLE", "name": "Box",
-            "rectangleCornerRadii": [12, 12, 12, 12],
-            "boundVariables": {"rectangleCornerRadii": bindings}, "children": []});
-        let spec = build(&tree, &vars);
-        for (corner, _) in corners {
-            let entry = &spec["node"]["values"]["radius"][corner];
-            assert_eq!(entry["variable_id"], format!("V:{corner}"));
-            assert_eq!(entry["raw"], 12);
-            assert!(entry["css"].is_string(), "{entry}");
-            assert!(entry.get("untokenized").is_none(), "{entry}");
-        }
-        assert_eq!(spec["unsupported"], json!([]));
-
-        // Nested bindings alone still establish radius presence; the REST
-        // default raw value is zero when both raw radius fields are absent.
-        let mut absent_raw = tree.clone();
-        absent_raw
-            .as_object_mut()
-            .unwrap()
-            .remove("rectangleCornerRadii");
-        let spec = build(&absent_raw, &vars);
-        assert_eq!(spec["node"]["values"]["radius"]["top_left"]["raw"], 0);
-        assert_eq!(
-            spec["node"]["values"]["radius"]["top_left"]["variable_id"],
-            "V:top_left"
-        );
-
-        let mut mixed = tree.clone();
-        mixed["boundVariables"]["rectangleCornerRadii"][corners[0].1] = json!([
-            {"type": "VARIABLE_ALIAS", "id": "V:top_left"},
-            {"type": "VARIABLE_ALIAS", "id": "V:other"}]);
-        let mut conflicting = tree.clone();
-        conflicting["boundVariables"]["topLeftRadius"] =
-            json!({"type": "VARIABLE_ALIAS", "id": "V:other"});
-        for node in [mixed, conflicting] {
-            let spec = build(&node, &vars);
-            assert!(spec["node"]["values"]["radius"].get("top_left").is_none());
-            assert_eq!(
-                spec["node"]["values"]["radius"]["top_right"]["variable_id"],
-                "V:top_right"
-            );
-            assert_eq!(
-                spec["unsupported"],
-                json!([{
-                "id": "1:1", "reason": "topLeftRadius: bound to several variables (mixed): not specified"}])
-            );
-        }
-        let mut flat = tree;
-        let nested = flat["boundVariables"]
-            .as_object_mut()
-            .unwrap()
-            .remove("rectangleCornerRadii")
-            .unwrap();
-        flat["boundVariables"]["topLeftRadius"] = nested[corners[0].1].clone();
-        let spec = build(&flat, &vars);
-        assert_eq!(
-            spec["node"]["values"]["radius"]["top_left"]["variable_id"],
-            "V:top_left"
-        );
+        let out = spec(&tree);
+        assert_eq!(out["node"]["values"]["fill"][0]["variable_id"], "V:3");
+        assert_eq!(out["unsupported"], json!([]));
     }
 
     #[test]
@@ -1168,21 +2902,301 @@ mod tests {
             "layoutMode": "VERTICAL", "itemSpacing": 8,
             "boundVariables": {"itemSpacing": {"type": "VARIABLE_ALIAS", "id": "V:9"}},
             "children": []});
-        let vars = json!({"snapshot": {"state": "none"}, "variables": []});
-        let spec = build(&tree, &vars);
+        let out = spec(&tree);
         assert_eq!(
-            spec["node"]["layout"]["gap"],
-            json!({"token": null, "variable_id": "V:9", "css": null, "raw": 8})
+            out["node"]["layout"]["gap"],
+            json!({"token": null, "variable_id": "V:9", "css": null, "raw": 8,
+                "bound_at": ["/boundVariables/itemSpacing"]})
         );
         assert_eq!(
-            spec["node"]["layout"]["padding"]["top"],
+            out["node"]["layout"]["padding"]["top"],
             json!({"untokenized": true, "raw": 0})
         );
+        // No CSS name: the bound gap is written raw.
+        assert_eq!(out["node"]["css"]["gap"], "8px");
         assert!(
-            spec["tokens_snapshot"]["css_unavailable"]
+            out["tokens_snapshot"]["css_unavailable"]
                 .as_str()
                 .unwrap()
                 .contains("state: none")
+        );
+    }
+
+    #[test]
+    fn negative_spacing_becomes_child_margins() {
+        let kid = |id: &str| {
+            json!({"id": id, "type": "RECTANGLE", "layoutSizingHorizontal": "FIXED",
+            "layoutSizingVertical": "FIXED",
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 10, "height": 10}})
+        };
+        let tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL",
+            "itemSpacing": -4, "children": [kid("1:2"), kid("1:3")]});
+        let out = spec(&tree);
+        let node = &out["node"];
+        assert!(node["css"].get("gap").is_none(), "{node}");
+        assert!(node["children"][0]["css"].get("margin-left").is_none());
+        assert_eq!(node["children"][1]["css"]["margin-left"], "-4px");
+        assert_eq!(out["unsupported"], json!([]));
+        // Wrapping: no exact CSS, listed.
+        let mut wrapped = tree.clone();
+        wrapped["layoutWrap"] = json!("WRAP");
+        let out = spec(&wrapped);
+        assert!(
+            out["unsupported"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"id": "1:1",
+                "reason": "itemSpacing: negative gap in a wrapping frame: gap not specified"})),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn constraints_place_children_of_a_frame_without_auto_layout() {
+        let child = |id: &str, h: &str, v: &str, x: i64, y: i64| {
+            json!({"id": id, "type": "RECTANGLE",
+                "constraints": {"horizontal": h, "vertical": v},
+                "absoluteBoundingBox": {"x": x, "y": y, "width": 20, "height": 10}})
+        };
+        let tree = json!({"id": "1:1", "type": "FRAME", "clipsContent": true,
+        "absoluteBoundingBox": {"x": 100, "y": 100, "width": 200, "height": 100},
+        "children": [
+            child("1:2", "RIGHT", "BOTTOM", 270, 180),
+            child("1:3", "CENTER", "TOP_BOTTOM", 190, 110),
+            child("1:4", "SCALE", "CENTER", 150, 145),
+        ]});
+        let out = spec(&tree);
+        let n = &out["node"];
+        assert_eq!(n["css"]["position"], "relative");
+        assert_eq!(n["css"]["overflow"], "hidden");
+        assert_eq!(
+            n["children"][0]["css"],
+            json!({"position": "absolute", "right": "10px", "bottom": "10px",
+                "width": "20px", "height": "10px"})
+        );
+        assert_eq!(
+            n["children"][1]["css"],
+            json!({"position": "absolute", "left": "50%",
+                "top": "10px", "bottom": "80px", "width": "20px",
+                "transform": "translateX(-50%)"})
+        );
+        assert_eq!(
+            n["children"][2]["css"],
+            json!({"position": "absolute", "left": "25%", "width": "10%",
+                "top": "50%", "height": "10px", "transform": "translateY(-50%)"})
+        );
+    }
+
+    #[test]
+    fn grid_tracks_gaps_and_spans() {
+        let tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "GRID",
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 10, "height": 10},
+            "gridColumnCount": 2, "gridRowCount": 1, "gridColumnGap": 8, "gridRowGap": 0,
+            "gridColumnsSizing": "1fr 1fr",
+            "children": [{"id": "1:2", "type": "RECTANGLE", "gridColumnSpan": 2,
+                "gridColumnAnchorIndex": 0, "gridRowAnchorIndex": 0,
+                "layoutSizingHorizontal": "FILL", "layoutSizingVertical": "FILL"}]});
+        let out = spec(&tree);
+        let n = &out["node"];
+        assert_eq!(n["css"]["display"], "grid");
+        assert_eq!(n["css"]["grid-template-columns"], "1fr 1fr");
+        assert_eq!(n["css"]["column-gap"], "8px");
+        assert_eq!(n["layout"]["grid"]["columns"], 2);
+        assert_eq!(
+            n["children"][0]["css"],
+            json!({"grid-column": "1 / span 2", "grid-row": "1 / span 1",
+                "justify-self": "stretch", "align-self": "stretch"})
+        );
+        assert_eq!(
+            out["unsupported"],
+            json!([{"id": "1:1", "reason": "gridRowsSizing not recorded: grid-template-rows not specified"}])
+        );
+    }
+
+    #[test]
+    fn unread_bindings_are_listed() {
+        let tree = json!({"id": "1:1", "type": "TEXT",
+            "style": {"textAutoResize": "WIDTH_AND_HEIGHT"},
+            "boundVariables": {"visible": {"type": "VARIABLE_ALIAS", "id": "V:1"}}});
+        assert_eq!(
+            spec(&tree)["unsupported"],
+            json!([{"id": "1:1", "reason": "/boundVariables/visible: bound to a variable: not specified"}])
+        );
+    }
+
+    /// A snapshot with one unitless (ALL_SCOPES) FLOAT, one `%` (OPACITY)
+    /// FLOAT and one px (GAP) FLOAT.
+    fn unit_vars() -> Value {
+        let row = |id: &str, name: &str, scopes: Value, v: f64| {
+            json!({"source": "imported", "variable_id": id, "name": name,
+                "resolved_type": "FLOAT", "collection": "C", "collection_id": "C:1",
+                "default_mode": "M", "default_mode_id": "M", "mode_names": {"M": "M"}, "scopes": scopes, "values_by_mode": {"M": v}, "values_by_mode_id": {"M": v}})
+        };
+        json!({
+            "snapshot": {"state": "current", "source": "file", "format": "bare",
+                "format_version": 1, "exported_at": "2026-01-01T00:00:00Z",
+                "digest": "fnv1a64:0", "variables": 3, "collections": 1},
+            "collections": [{"collection_id": "C:1", "name": "C", "modes": ["M"],
+                "default_mode": "M", "default_mode_id": "M", "mode_names": {"M": "M"}, "source": "imported"}],
+            "variables": [
+                row("V:1", "space/raw", json!(["ALL_SCOPES"]), 12.0),
+                row("V:2", "fade", json!(["OPACITY"]), 50.0),
+                row("V:3", "space/px", json!(["GAP"]), 4.0),
+            ],
+        })
+    }
+
+    #[test]
+    fn unitless_tokens_get_units_in_css_and_mismatches_are_listed() {
+        let alias = |v: &str| json!({"type": "VARIABLE_ALIAS", "id": v});
+        let tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "VERTICAL",
+            "paddingTop": 12, "paddingLeft": 4, "opacity": 0.5, "itemSpacing": 50,
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 10, "height": 10},
+            "boundVariables": {"paddingTop": alias("V:1"), "paddingLeft": alias("V:3"),
+                "opacity": alias("V:2"), "itemSpacing": alias("V:2")},
+            "children": []});
+        let out = build(
+            &tree,
+            &unit_vars(),
+            &json!({}),
+            &ExportOptions::default(),
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            out["tokens_snapshot"]["css_unavailable"],
+            Value::Null,
+            "{out}"
+        );
+        let css = &out["node"]["css"];
+        assert_eq!(css["padding-top"], "calc(var(--space-raw) * 1px)");
+        assert_eq!(css["padding-left"], "var(--space-px)");
+        assert_eq!(css["opacity"], "var(--fade)");
+        assert!(css.get("gap").is_none(), "{css}");
+        assert!(
+            out["unsupported"].as_array().unwrap().contains(&json!({"id": "1:1",
+                "reason": "gap: token --fade is exported in %, which gap can't take: not specified"})),
+            "{out}"
+        );
+        // A unitless opacity token is a 0–100 number.
+        let mut tree = tree;
+        tree["boundVariables"]["opacity"] = alias("V:1");
+        let out = build(
+            &tree,
+            &unit_vars(),
+            &json!({}),
+            &ExportOptions::default(),
+            false,
+            None,
+            None,
+        );
+        assert_eq!(
+            out["node"]["css"]["opacity"],
+            "calc(var(--space-raw) / 100)"
+        );
+    }
+
+    #[test]
+    fn bindings_css_cant_use_are_still_token_references() {
+        let alias = |v: &str| json!({"type": "VARIABLE_ALIAS", "id": v});
+        let tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL",
+            "primaryAxisAlignItems": "SPACE_BETWEEN", "itemSpacing": 8,
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 100},
+            "layoutSizingHorizontal": "FIXED", "layoutSizingVertical": "FIXED",
+            "boundVariables": {"itemSpacing": alias("V:3")},
+            "children": [{"id": "1:2", "type": "RECTANGLE", "layoutPositioning": "ABSOLUTE",
+                "constraints": {"horizontal": "LEFT_RIGHT", "vertical": "TOP"},
+                "absoluteBoundingBox": {"x": 10, "y": 10, "width": 80, "height": 10},
+                "boundVariables": {"size": {"x": alias("V:3")}}}]});
+        let out = build(
+            &tree,
+            &unit_vars(),
+            &json!({}),
+            &ExportOptions::default(),
+            false,
+            None,
+            None,
+        );
+        let node = &out["node"];
+        assert_eq!(node["layout"]["gap"], "auto");
+        assert_eq!(node["layout"]["item_spacing"]["variable_id"], "V:3");
+        assert_eq!(node["children"][0]["layout"]["width"]["variable_id"], "V:3");
+        assert_eq!(
+            node["children"][0]["layout"]["width"]["bound_at"],
+            json!(["/boundVariables/size/x"])
+        );
+        let reasons: Vec<&str> = out["unsupported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["reason"].as_str().unwrap())
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with("/boundVariables/itemSpacing: itemSpacing is bound")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with("/boundVariables/size/x: width is bound")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn absolute_children_inside_a_border_are_offset_from_the_padding_box() {
+        let tree = json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL",
+            "strokes": [{"type": "SOLID", "color": {"r": 0, "g": 0, "b": 0, "a": 1}}],
+            "strokeWeight": 2, "strokeAlign": "INSIDE", "strokesIncludedInLayout": true,
+            "layoutSizingHorizontal": "FIXED", "layoutSizingVertical": "FIXED",
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 100, "height": 50},
+            "children": [{"id": "1:2", "type": "RECTANGLE", "layoutPositioning": "ABSOLUTE",
+                "constraints": {"horizontal": "RIGHT", "vertical": "SCALE"},
+                "absoluteBoundingBox": {"x": 80, "y": 10, "width": 10, "height": 10}}]});
+        let out = spec(&tree);
+        assert_eq!(out["node"]["css"]["border-width"], "2px");
+        let child = &out["node"]["children"][0];
+        assert_eq!(child["css"]["right"], "8px");
+        assert!(
+            out["unsupported"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|u| u["reason"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("constraints.vertical SCALE inside a border")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn several_shadows_are_unsupported_one_is_css() {
+        let shadow = |y: i64| {
+            json!({"type": "DROP_SHADOW", "visible": true, "blendMode": "NORMAL",
+            "color": {"r": 0, "g": 0, "b": 0, "a": 1}, "offset": {"x": 0, "y": y},
+            "radius": 2, "spread": 0, "showShadowBehindNode": false})
+        };
+        let mut tree = json!({"id": "1:1", "type": "RECTANGLE",
+            "absoluteBoundingBox": {"x": 0, "y": 0, "width": 10, "height": 10},
+            "effects": [shadow(1)]});
+        assert_eq!(
+            spec(&tree)["node"]["css"]["box-shadow"],
+            "0px 1px 2px 0px #000000"
+        );
+        tree["effects"] = json!([shadow(1), shadow(2)]);
+        let out = spec(&tree);
+        assert!(out["node"]["css"].get("box-shadow").is_none());
+        assert_eq!(
+            out["node"]["values"]["effects"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            out["unsupported"][0]["reason"],
+            "effects: 2 shadows: their stacking order is unverified: box-shadow not specified"
         );
     }
 }

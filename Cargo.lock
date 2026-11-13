@@ -680,6 +680,7 @@ dependencies = [
  "keyring",
  "libc",
  "postcard",
+ "ring",
  "rpassword",
  "self_cell",
  "serde",

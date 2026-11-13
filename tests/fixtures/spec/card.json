@@ -297,6 +297,18 @@
                 "name": "Gallery",
                 "type": "FRAME",
                 "layoutMode": "GRID",
+                "gridColumnCount": 2,
+                "gridRowCount": 1,
+                "gridColumnGap": 8,
+                "gridRowGap": 0,
+                "gridColumnsSizing": "1fr 1fr",
+                "gridRowsSizing": "200px",
+                "boundVariables": {
+                  "gridColumnGap": {
+                    "type": "VARIABLE_ALIAS",
+                    "id": "VariableID:1:8"
+                  }
+                },
                 "fills": [],
                 "absoluteBoundingBox": {
                   "x": 24,
@@ -334,7 +346,11 @@
                       "y": 100,
                       "width": 132,
                       "height": 200
-                    }
+                    },
+                    "gridColumnAnchorIndex": 0,
+                    "gridRowAnchorIndex": 0,
+                    "layoutSizingHorizontal": "FILL",
+                    "layoutSizingVertical": "FILL"
                   },
                   {
                     "id": "1:8",
@@ -352,7 +368,11 @@
                       "y": 100,
                       "width": 132,
                       "height": 200
-                    }
+                    },
+                    "gridColumnAnchorIndex": 1,
+                    "gridRowAnchorIndex": 0,
+                    "layoutSizingHorizontal": "FILL",
+                    "layoutSizingVertical": "FILL"
                   }
                 ]
               },

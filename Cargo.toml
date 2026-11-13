@@ -32,6 +32,9 @@ webpki-roots = "0.26"
 # Already transitive through ureq. Resolve relative redirects while
 # recomputing each connection's share of the overall request budget.
 url = "2"
+# Already transitive through ureq/rustls (compiled on every target). SHA-256
+# content hashes for exported image file names (NWS-2952).
+ring = "0.17.14"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 # Native credential storage avoids plaintext token files; rpassword reads

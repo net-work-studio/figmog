@@ -3,6 +3,32 @@
     "children": [
       {
         "children": [],
+        "content": {
+          "text": "Spring garden plan"
+        },
+        "css": {
+          "align-self": "stretch",
+          "color": "var(--color-text-primary)",
+          "flex-shrink": "0",
+          "font-family": "\"Inter\"",
+          "font-size": "var(--font-size-title)",
+          "font-weight": "var(--font-weight-bold)",
+          "line-height": "28px",
+          "white-space": "pre-wrap"
+        },
+        "design": {
+          "absoluteBoundingBox": {
+            "height": 28,
+            "width": 272,
+            "x": 24,
+            "y": 16
+          },
+          "layoutSizingHorizontal": "FILL",
+          "layoutSizingVertical": "HUG",
+          "style": {
+            "textAutoResize": "HEIGHT"
+          }
+        },
         "id": "1:2",
         "layout": {
           "size": {
@@ -19,6 +45,9 @@
         "values": {
           "fill": [
             {
+              "bound_at": [
+                "/boundVariables/fills/0"
+              ],
               "css": "--color-text-primary",
               "raw": "#1a1a1f",
               "token": "text/primary",
@@ -27,18 +56,27 @@
           ],
           "typography": {
             "font_family": {
+              "bound_at": [
+                "/boundVariables/fontFamily"
+              ],
               "css": null,
               "raw": "Inter",
               "token": "font/family/sans",
               "variable_id": "VariableID:1:14"
             },
             "font_size": {
+              "bound_at": [
+                "/boundVariables/fontSize"
+              ],
               "css": "--font-size-title",
               "raw": 20,
               "token": "font/size/title",
               "variable_id": "VariableID:1:11"
             },
             "font_weight": {
+              "bound_at": [
+                "/boundVariables/fontWeight"
+              ],
               "css": "--font-weight-bold",
               "raw": 700,
               "token": "font/weight/bold",
@@ -59,6 +97,31 @@
         "children": [
           {
             "children": [],
+            "content": {
+              "text": "Four raised beds, sown in May"
+            },
+            "css": {
+              "color": "#1a1a1f",
+              "flex": "1 1 0%",
+              "font-family": "\"Inter\"",
+              "font-size": "var(--font-size-body)",
+              "font-weight": "400",
+              "line-height": "var(--font-line-body)",
+              "min-width": "0",
+              "white-space": "pre-wrap"
+            },
+            "design": {
+              "absoluteBoundingBox": {
+                "height": 24,
+                "width": 240,
+                "x": 24,
+                "y": 60
+              },
+              "layoutGrow": 1,
+              "style": {
+                "textAutoResize": "HEIGHT"
+              }
+            },
             "id": "1:4",
             "layout": {
               "size": {
@@ -104,6 +167,9 @@
                   "untokenized": true
                 },
                 "font_size": {
+                  "bound_at": [
+                    "/boundVariables/fontSize"
+                  ],
                   "css": "--font-size-body",
                   "raw": 16,
                   "token": "font/size/body",
@@ -118,6 +184,9 @@
                   "untokenized": true
                 },
                 "line_height": {
+                  "bound_at": [
+                    "/boundVariables/lineHeight"
+                  ],
                   "css": "--font-line-body",
                   "raw": 24,
                   "token": "font/line/body",
@@ -128,8 +197,29 @@
           },
           {
             "children": [],
+            "css": {
+              "background-color": "var(--color-brand)",
+              "border-radius": "4px",
+              "flex-shrink": "0",
+              "height": "16px",
+              "width": "24px"
+            },
+            "design": {
+              "absoluteBoundingBox": {
+                "height": 16,
+                "width": 24,
+                "x": 272,
+                "y": 64
+              },
+              "layoutSizingHorizontal": "FIXED",
+              "layoutSizingVertical": "FIXED"
+            },
             "id": "1:5",
             "layout": {
+              "height": {
+                "raw": 16,
+                "untokenized": true
+              },
               "size": {
                 "height": 16,
                 "width": 24
@@ -137,6 +227,10 @@
               "sizing": {
                 "horizontal": "fixed",
                 "vertical": "fixed"
+              },
+              "width": {
+                "raw": 24,
+                "untokenized": true
               }
             },
             "name": "Badge",
@@ -144,6 +238,9 @@
             "values": {
               "fill": [
                 {
+                  "bound_at": [
+                    "/fills/0/boundVariables/color"
+                  ],
                   "css": "--color-brand",
                   "raw": "#0066cc",
                   "token": "brand",
@@ -171,6 +268,30 @@
             }
           }
         ],
+        "css": {
+          "align-items": "center",
+          "align-self": "stretch",
+          "display": "flex",
+          "flex-direction": "row",
+          "flex-shrink": "0",
+          "gap": "8px",
+          "justify-content": "center"
+        },
+        "design": {
+          "absoluteBoundingBox": {
+            "height": 24,
+            "width": 272,
+            "x": 24,
+            "y": 60
+          },
+          "counterAxisAlignItems": "CENTER",
+          "counterAxisSizingMode": "AUTO",
+          "itemSpacing": 8,
+          "layoutAlign": "STRETCH",
+          "layoutMode": "HORIZONTAL",
+          "primaryAxisAlignItems": "CENTER",
+          "primaryAxisSizingMode": "FIXED"
+        },
         "id": "1:3",
         "layout": {
           "align": {
@@ -221,6 +342,42 @@
         "values": {}
       }
     ],
+    "css": {
+      "align-items": "flex-start",
+      "background-color": "var(--surface)",
+      "border-radius": "var(--radius-md)",
+      "box-sizing": "border-box",
+      "display": "flex",
+      "flex-direction": "column",
+      "gap": "var(--spacing-4)",
+      "outline-color": "var(--border-subtle)",
+      "outline-offset": "calc(var(--stroke-thin) * -1)",
+      "outline-style": "solid",
+      "outline-width": "var(--stroke-thin)",
+      "padding-bottom": "var(--spacing-4)",
+      "padding-left": "24px",
+      "padding-right": "24px",
+      "padding-top": "var(--spacing-4)",
+      "width": "320px"
+    },
+    "design": {
+      "absoluteBoundingBox": {
+        "height": 100,
+        "width": 320,
+        "x": 0,
+        "y": 0
+      },
+      "counterAxisAlignItems": "MIN",
+      "itemSpacing": 16,
+      "layoutMode": "VERTICAL",
+      "layoutSizingHorizontal": "FIXED",
+      "layoutSizingVertical": "HUG",
+      "paddingBottom": 16,
+      "paddingLeft": 24,
+      "paddingRight": 24,
+      "paddingTop": 16,
+      "primaryAxisAlignItems": "MIN"
+    },
     "id": "1:1",
     "layout": {
       "align": {
@@ -229,6 +386,9 @@
       },
       "direction": "vertical",
       "gap": {
+        "bound_at": [
+          "/boundVariables/itemSpacing"
+        ],
         "css": "--spacing-4",
         "raw": 16,
         "token": "space/4",
@@ -236,6 +396,9 @@
       },
       "padding": {
         "bottom": {
+          "bound_at": [
+            "/boundVariables/paddingBottom"
+          ],
           "css": "--spacing-4",
           "raw": 16,
           "token": "space/4",
@@ -250,6 +413,9 @@
           "untokenized": true
         },
         "top": {
+          "bound_at": [
+            "/boundVariables/paddingTop"
+          ],
           "css": "--spacing-4",
           "raw": 16,
           "token": "space/4",
@@ -263,6 +429,10 @@
       "sizing": {
         "horizontal": "fixed",
         "vertical": "hug"
+      },
+      "width": {
+        "raw": 320,
+        "untokenized": true
       }
     },
     "name": "Card",
@@ -270,6 +440,9 @@
     "values": {
       "fill": [
         {
+          "bound_at": [
+            "/fills/0/boundVariables/color"
+          ],
           "css": "--surface",
           "raw": "#fafafc",
           "token": "surface",
@@ -278,24 +451,36 @@
       ],
       "radius": {
         "bottom_left": {
+          "bound_at": [
+            "/boundVariables/bottomLeftRadius"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
           "variable_id": "VariableID:1:6"
         },
         "bottom_right": {
+          "bound_at": [
+            "/boundVariables/bottomRightRadius"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
           "variable_id": "VariableID:1:6"
         },
         "top_left": {
+          "bound_at": [
+            "/boundVariables/topLeftRadius"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
           "variable_id": "VariableID:1:6"
         },
         "top_right": {
+          "bound_at": [
+            "/boundVariables/topRightRadius"
+          ],
           "css": "--radius-md",
           "raw": 12,
           "token": "radius/md",
@@ -304,6 +489,9 @@
       },
       "stroke": [
         {
+          "bound_at": [
+            "/strokes/0/boundVariables/color"
+          ],
           "css": "--border-subtle",
           "raw": "#e0e3e6",
           "token": "border/subtle",
@@ -311,6 +499,9 @@
         }
       ],
       "stroke_weight": {
+        "bound_at": [
+          "/boundVariables/strokeWeight"
+        ],
         "css": "--stroke-thin",
         "raw": 1,
         "token": "stroke/thin",

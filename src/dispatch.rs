@@ -182,6 +182,20 @@ pub(crate) fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
     }
 }
 
+/// Optional boolean whose absence means something else than `false` —
+/// `figmog_spec`'s `tailwind` (absent: the project's default). Absent or
+/// `null` ⇒ `Ok(None)`; any other non-boolean is an error.
+pub(crate) fn arg_bool_opt(args: &Value, key: &str) -> Result<Option<bool>, String> {
+    match optional_arg(args, key) {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(other) => Err(format!(
+            "expected boolean for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
+}
+
 /// Optional numeric field — [`require_f64`]'s absent-is-`None` sibling,
 /// used by `figmog_images`'s optional `scale` (v0.0.2 spec §5). Absent or
 /// `null` ⇒ `Ok(None)`; any other non-number is an error (NWS-2944).
@@ -361,6 +375,22 @@ pub(crate) enum ReadCommand {
     /// `figmog_spec` (NWS-2968): binding-aware layout/value spec of a subtree.
     Spec {
         id: String,
+        /// How the token names and root modes are derived: the project's
+        /// `[tokens]` settings (NWS-2948), injected by the CLI and the
+        /// stdio relay; `None` is the default mapping.
+        tokens: Option<crate::tokens::ExportOptions>,
+        /// Add the per-node Tailwind class hint (NWS-2947). `None`: the
+        /// CLI and the stdio relay fill it from the project's `[stack]
+        /// styling`; left `None`, no hint.
+        tailwind: Option<bool>,
+        /// The Figma → code component map (NWS-2949): the project's
+        /// `figmog.map.json`, injected by the CLI and the stdio relay;
+        /// `None`, every `code_component` is null.
+        map: Option<crate::map::CodeMap>,
+        /// The asset manifest (NWS-2952): the project's `[assets]
+        /// manifest`, injected by the CLI and the stdio relay; `None`,
+        /// assets are referenced by node id and imageRef only.
+        assets: Option<crate::assets::AssetIndex>,
     },
 }
 
@@ -473,6 +503,19 @@ impl ReadCommand {
             },
             "figmog_spec" => Self::Spec {
                 id: require_str(args, "id")?,
+                tokens: match args.get("tokens") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(crate::tokens::ExportOptions::from_json(v)?),
+                },
+                tailwind: arg_bool_opt(args, "tailwind")?,
+                map: match args.get("map") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(crate::map::CodeMap::from_json(v, "map")?),
+                },
+                assets: match args.get("assets") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(crate::assets::AssetIndex::from_json(v, "assets")?),
+                },
             },
             _ => return Ok(None),
         }))
@@ -596,8 +639,24 @@ impl ReadCommand {
                 put(&mut args, "under", under.as_ref());
                 "figmog_at"
             }
-            Self::Spec { id } => {
+            Self::Spec {
+                id,
+                tokens,
+                tailwind,
+                map,
+                assets,
+            } => {
                 args = json!({"id": id});
+                if let Some(tokens) = tokens {
+                    args["tokens"] = tokens.to_json();
+                }
+                if let Some(map) = map {
+                    args["map"] = map.to_json();
+                }
+                if let Some(assets) = assets {
+                    args["assets"] = assets.to_json();
+                }
+                put(&mut args, "tailwind", *tailwind);
                 "figmog_spec"
             }
         };
@@ -740,13 +799,25 @@ impl ReadCommand {
                 under,
                 limit,
             } => query::at(nodes, children, x, y, page, under, limit),
-            Self::Spec { id } => query::spec(
+            Self::Spec {
+                id,
+                tokens,
+                tailwind,
+                map,
+                assets,
+            } => query::spec(
                 nodes,
                 children,
+                components,
+                component_sets,
                 variables,
                 variable_collections,
                 variable_snapshot,
                 id,
+                &tokens.unwrap_or_default(),
+                tailwind.unwrap_or(false),
+                map.as_ref(),
+                assets.as_ref(),
             ),
         }
     }
@@ -991,7 +1062,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                         "description": "Node ids (or Figma URLs carrying node-id=) to render, and/or to scan for fill imageRefs."
                     },
                     "format": {"type": "string", "description": "Render format: png or svg (default png)."},
-                    "scale": {"type": "number", "description": "Render scale (default 1)."}
+                    "scale": {"type": "number", "description": "Render scale (default 1)."},
+                    "renders": {"type": "boolean", "description": "Render the nodes (default true). false: only fetch the image fills their own `fills` reference."}
                 },
                 "required": ["ids"]
             }),
@@ -1013,11 +1085,31 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "figmog_spec".into(),
-            description: "Binding-aware spec of an auto-layout subtree: per node, layout (direction, gap, padding, alignment, hug/fill/fixed sizing) and values (fill, stroke, radius, typography), each shown as its bound variable token (name plus the CSS name `figmog tokens export` emits) with the raw value, or flagged untokenized (with any token of equal default/light value under `matches`). Grid/wrap layout, absolute children, constraints frames, mixed text runs, non-solid paints, effects and the like are listed under `unsupported`, never approximated — reads the local mirror (no Figma API cost).".into(),
+            description: "Code-ready spec of a subtree. Per node, two layers: `design` (the layout Figma recorded: auto layout, grid, sizing, constraints, min/max, clipping, text auto-resize, verbatim) and figmog's interpretation — `layout`/`values` (gap, padding, alignment, hug/fill/fixed, grid tracks, fill, stroke, radius, effects, opacity, typography), each value shown as its bound variable token (name plus the CSS name `figmog tokens export` emits) with the raw value, or flagged untokenized (a token of equal value is only ever named under `matches`); `css` (the declarations: flex or CSS grid, constraints as absolute offsets, tokens as var()); `content` (text, mixed runs, image/vector assets by node id and imageRef); `instance` (component, variant properties, and `code_component`: the code component the project's figmog.map.json maps it to — path, export, mapped props, a JSX rendering, and `coverage` \"full\" or \"partial\" with every unmapped property, override (text, swap, nested) and slot listed — else null); and, with `tailwind`, a Tailwind class hint. Whatever has no exact CSS is listed under `unsupported`, never approximated — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Root node id (12:34 or 12-34 form, or a Figma URL)."}
+                    "id": {"type": "string", "description": "Root node id (12:34 or 12-34 form, or a Figma URL)."},
+                    "tokens": {
+                        "type": "object",
+                        "description": "How token CSS names and root modes are derived, as figmog.toml's [tokens]: {format: \"tailwind\"|\"css\", modes: {\"<collection>/<mode>\": \"<selector>\"}}. The figmog CLI and stdio relay pass the project's settings; omit for the default mapping.",
+                        "properties": {
+                            "format": {"type": "string", "enum": ["tailwind", "css"]},
+                            "modes": {"type": "object", "additionalProperties": {"type": "string"}}
+                        }
+                    },
+                    "tailwind": {
+                        "type": "boolean",
+                        "description": "Add a Tailwind class hint per node (theme utilities for bound tokens, arbitrary values otherwise). The figmog CLI and stdio relay turn it on when the project's [stack] styling is tailwind; omit for none."
+                    },
+                    "map": {
+                        "type": "object",
+                        "description": "The Figma → code component map, as figmog.map.json: {version: 1, components: [{figma: {component|component_set: <key>}, code: {path, export}, props?: {\"<Figma property>\": {prop, values?}}}]}. The figmog CLI and stdio relay pass the project's figmog.map.json; omit for none (every code_component null)."
+                    },
+                    "assets": {
+                        "type": "object",
+                        "description": "The asset manifest `figmog assets export` writes ([assets] manifest, default figmog.assets.json): {icons: [{node_id, key, component, path, svg}], images: [{image_ref, path, url}]}. The figmog CLI and stdio relay pass the project's manifest; omit for none (assets by node id and imageRef only)."
+                    }
                 },
                 "required": ["id"]
             }),
@@ -1079,6 +1171,31 @@ pub(crate) fn output_schema(name: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NWS-2952: `figmog_spec`'s `assets` (the manifest, normalized)
+    /// round-trips; an unsafe manifest is the call's error.
+    #[test]
+    fn spec_assets_argument_round_trips_and_is_validated() {
+        let manifest = json!({
+            "icons": [{"node_id": "1:2", "key": "abc", "component": "IconStar",
+                       "path": "src/icons/IconStar.tsx", "svg": "src/icons/svg/IconStar.svg"}],
+            "images": [{"image_ref": "ff00", "path": "public/figma/x.png", "url": "/figma/x.png"}],
+        });
+        let read =
+            ReadCommand::from_tool_args("figmog_spec", &json!({"id": "1:1", "assets": manifest}))
+                .unwrap()
+                .unwrap();
+        let (name, args) = read.to_tool_call();
+        assert_eq!(name, "figmog_spec");
+        assert_eq!(args["assets"]["icons"][0]["component"], "IconStar");
+        assert_eq!(ReadCommand::from_tool_args(name, &args), Ok(Some(read)));
+        let err = ReadCommand::from_tool_args(
+            "figmog_spec",
+            &json!({"id": "1:1", "assets": {"images": [{"image_ref": "x", "path": "../up.png"}]}}),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("assets: images[0].path:"), "{err}");
+    }
 
     #[test]
     fn require_str_reports_wrong_type_not_missing() {

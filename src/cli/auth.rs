@@ -21,21 +21,25 @@ pub(super) enum AuthCommand {
     Logout,
 }
 
+/// A token piped on stdin (`--token-stdin`), bounded; validated by
+/// [`crate::auth::login`].
+pub(super) fn read_token_stdin() -> Result<String, String> {
+    let mut token = String::new();
+    std::io::stdin()
+        .take(crate::auth::MAX_TOKEN_BYTES as u64 + 3)
+        .read_to_string(&mut token)
+        .map_err(|_| "could not read token from stdin".to_string())?;
+    if token.len() > crate::auth::MAX_TOKEN_BYTES + 2 {
+        return Err("token input is too long (maximum 4096 bytes plus a newline)".into());
+    }
+    Ok(token)
+}
+
 pub(super) fn run(command: &AuthCommand) -> Result<(), String> {
     let result = match command {
         AuthCommand::Login { token_stdin } => {
             let token = if *token_stdin {
-                let mut token = String::new();
-                std::io::stdin()
-                    .take(crate::auth::MAX_TOKEN_BYTES as u64 + 3)
-                    .read_to_string(&mut token)
-                    .map_err(|_| "could not read token from stdin".to_string())?;
-                if token.len() > crate::auth::MAX_TOKEN_BYTES + 2 {
-                    return Err(
-                        "token input is too long (maximum 4096 bytes plus a newline)".into(),
-                    );
-                }
-                token
+                read_token_stdin()?
             } else {
                 if !std::io::stdin().is_terminal() {
                     return Err(

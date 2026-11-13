@@ -713,7 +713,12 @@ fn spawn_scripted_upstream(
                     Err(e) => panic!("accept: {e}"),
                 }
             };
-            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            // macOS can inherit the listener's nonblocking state on accept.
+            // Scripted reads must block until data arrives or the timeout expires.
+            stream.set_nonblocking(false).expect("set_blocking");
+            stream
+                .set_read_timeout(Some(TIMEOUT))
+                .expect("set_read_timeout");
             let body = read_request(&mut stream);
             let message: Value = serde_json::from_str(&body).unwrap();
             let id = message["id"].clone();

@@ -10,6 +10,7 @@
 //! See `docs/history/2026-08-15-figmog-build-design.md`.
 
 pub(crate) mod api;
+pub(crate) mod assets;
 pub(crate) mod auth;
 pub mod cache;
 pub mod cli;
@@ -19,6 +20,7 @@ mod dispatch;
 pub mod flatten;
 pub(crate) mod ident;
 pub mod images;
+pub(crate) mod map;
 pub(crate) mod mcp;
 pub mod model;
 pub(crate) mod owner;
@@ -31,6 +33,7 @@ mod session_view;
 mod sessions;
 pub(crate) mod spec;
 pub mod store;
+pub(crate) mod svg;
 pub(crate) mod tokens;
 pub(crate) mod upstream;
 pub mod vars;
