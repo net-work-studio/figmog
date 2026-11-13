@@ -404,6 +404,33 @@ fn serve_e2e_initialize_tools_list_and_tool_calls() {
     );
     assert_eq!(resp["result"]["isError"], json!(true));
 
+    // -- NWS-2944: wrong-typed optional args are tool errors (isError, the
+    // same shape as a missing required field), never silently "absent" --
+    for (id, tool, args, want) in [
+        (
+            10,
+            "figmog_subtree",
+            json!({"id": "1:1", "depth": "2"}),
+            "expected integer for `depth`, got string",
+        ),
+        (
+            11,
+            "figmog_node",
+            json!({"id": "1:2", "file": 12}),
+            "expected string for `file`, got number",
+        ),
+        (
+            12,
+            "figmog_images",
+            json!({"ids": ["1:2"], "format": 1}),
+            "expected string for `format`, got number",
+        ),
+    ] {
+        let resp = call(&mut stdin, &rx, id, tool, args);
+        assert_eq!(resp["result"]["isError"], json!(true), "{tool}: {resp}");
+        assert_eq!(resp["result"]["content"][0]["text"], json!(want), "{tool}");
+    }
+
     // Closing stdin is what makes the (`--no-watch`) serve loop exit: its
     // reader thread sees EOF and drops the sender, so the main loop's
     // blocking `rx.recv()` returns `Disconnected` and the process exits 0.
@@ -585,13 +612,6 @@ fn write_response(stream: &mut TcpStream, status: &str, headers: &[(&str, &str)]
     stream.flush().expect("flush response");
 }
 
-fn request_id(body: &str) -> Value {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("id").cloned())
-        .unwrap_or(Value::Null)
-}
-
 /// Serve scripted calls, either on one persistent serve connection or with
 /// a fresh handshake for each direct CLI invocation. All accepts are bounded.
 fn spawn_fake_upstream(
@@ -637,18 +657,13 @@ fn spawn_scripted_upstream(
             .map(|key| (key.clone(), json!({})))
             .collect();
         listener.set_nonblocking(true).unwrap();
-        let requests = if handshake_each_call {
-            results.len() * 4
-        } else {
-            3 + results.len()
-        };
-        let mut results = results.into_iter();
-        for request in 0..requests {
-            let i = if handshake_each_call {
-                request % 4
-            } else {
-                request
-            };
+        let mut results = results.into_iter().peekable();
+        let mut initialized = false;
+        let mut notified = false;
+        let mut ready = false;
+        let mut called_since_handshake = false;
+        let mut request = 0;
+        while results.peek().is_some() {
             let deadline = Instant::now() + TIMEOUT;
             let (mut stream, _) = loop {
                 match listener.accept() {
@@ -663,15 +678,21 @@ fn spawn_scripted_upstream(
                     Err(e) => panic!("accept: {e}"),
                 }
             };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("set_read_timeout");
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
             let body = read_request(&mut stream);
-            match i {
-                0 => {
+            let message: Value = serde_json::from_str(&body).unwrap();
+            let id = message["id"].clone();
+            // Desktop re-detection may ping, refresh tools, or re-handshake
+            // between scripted calls. Only tools/call consumes a reply.
+            match message["method"].as_str().unwrap() {
+                "initialize" => {
+                    initialized = true;
+                    notified = false;
+                    ready = false;
+                    called_since_handshake = false;
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": request_id(&body),
+                        "id": id,
                         "result": {
                             "protocolVersion": "2025-06-18",
                             "capabilities": {},
@@ -686,13 +707,17 @@ fn spawn_scripted_upstream(
                         &resp,
                     );
                 }
-                1 => {
+                "notifications/initialized" => {
+                    assert!(initialized, "notification before initialize");
+                    notified = true;
                     write_response(&mut stream, "202 Accepted", &[], "");
                 }
-                2 => {
+                "tools/list" => {
+                    assert!(notified, "tools/list before handshake completed");
+                    ready = true;
                     let resp = json!({
                         "jsonrpc": "2.0",
-                        "id": request_id(&body),
+                        "id": id,
                         "result": {"tools": [
                             {
                                 "name": "get_code",
@@ -709,14 +734,27 @@ fn spawn_scripted_upstream(
                         &resp,
                     );
                 }
-                _ => {
-                    let call: Value = serde_json::from_str(&body).unwrap();
-                    assert_eq!(call["method"], "tools/call");
-                    assert_eq!(call["params"]["name"], "get_code");
-                    assert_eq!(call["params"]["arguments"], expected_args);
+                "ping" => {
+                    assert!(ready, "ping before handshake completed");
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        &[("Content-Type", "application/json")],
+                        &json!({"jsonrpc": "2.0", "id": id, "result": {}}).to_string(),
+                    );
+                }
+                "tools/call" => {
+                    assert!(ready, "tools/call before handshake completed");
+                    assert!(
+                        !handshake_each_call || !called_since_handshake,
+                        "direct CLI calls must each perform a fresh handshake"
+                    );
+                    called_since_handshake = true;
+                    assert_eq!(message["params"]["name"], "get_code");
+                    assert_eq!(message["params"]["arguments"], expected_args);
                     let mut resp = json!({
                         "jsonrpc": "2.0",
-                        "id": request_id(&body),
+                        "id": id,
                     });
                     match results.next().expect("scripted reply") {
                         DesktopReply::Result(result) => resp["result"] = result,
@@ -732,10 +770,69 @@ fn spawn_scripted_upstream(
                         &resp.to_string(),
                     );
                 }
+                method => panic!("unexpected upstream method: {method}"),
             }
+            request += 1;
         }
     });
     (format!("http://{addr}/mcp"), handle)
+}
+
+#[test]
+fn scripted_desktop_maintenance_preserves_call_results() {
+    for handshake_each_call in [false, true] {
+        let args = json!({"nodeId": "1:2"});
+        let results: Vec<Value> = (0..3)
+            .map(|i| json!({"content": [{"type": "text", "text": format!("reply {i}")}]}))
+            .collect();
+        let (address, upstream) =
+            spawn_fake_upstream_with_args(results.clone(), handshake_each_call, args.clone());
+        let agent = ureq::AgentBuilder::new().timeout(TIMEOUT).build();
+        let post = |method: &str, params: Value| {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+            let text = agent
+                .post(&address)
+                .set("Content-Type", "application/json")
+                .send_bytes(body.to_string().as_bytes())
+                .unwrap()
+                .into_string()
+                .unwrap();
+            if text.is_empty() {
+                Value::Null
+            } else {
+                let response: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(response["id"], 1);
+                response["result"].clone()
+            }
+        };
+        let handshake = || {
+            let initialized = post("initialize", json!({}));
+            assert_eq!(initialized["protocolVersion"], "2025-06-18");
+            assert_eq!(post("notifications/initialized", json!({})), Value::Null);
+            assert_eq!(
+                post("tools/list", json!({}))["tools"][0]["name"],
+                "get_code"
+            );
+        };
+        handshake();
+        for (i, expected) in results.iter().enumerate() {
+            // Exercise an ordinary live refresh, plus a recovery handshake.
+            // Neither may consume the next scripted tools/call result.
+            if i == 2 || (i > 0 && handshake_each_call) {
+                handshake();
+            }
+            assert_eq!(post("ping", json!({})), json!({}));
+            assert_eq!(
+                post("tools/list", json!({}))["tools"][0]["name"],
+                "get_code"
+            );
+            assert_eq!(
+                post("tools/call", json!({"name": "get_code", "arguments": args})),
+                *expected
+            );
+        }
+        upstream.join().unwrap();
+    }
 }
 
 #[test]
@@ -1128,6 +1225,35 @@ fn desktop_proxy_cli_unknown_and_unavailable_tools_fail_on_both_transports() {
         let error = run(tool, &[]);
         assert_eq!(error["error"], format!("unknown tool: {tool}"));
     }
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+}
+
+/// `--no-upstream` disables desktop re-detection too (NWS-2959): neither
+/// startup nor a call to a desktop tool name ever contacts the desktop
+/// address, and status stays `disabled`.
+#[test]
+fn no_upstream_serve_never_probes_the_desktop() {
+    let (_dir, db) = common::fixture_db();
+    let desktop = TcpListener::bind("127.0.0.1:0").unwrap();
+    desktop.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/mcp", desktop.local_addr().unwrap());
+    let (mut guard, mut stdin, rx) =
+        spawn_serve_with_args(&db, &["--no-upstream", "--upstream", &url]);
+    handshake(&mut stdin, &rx);
+    let resp = call(&mut stdin, &rx, 2, "get_code", json!({}));
+    assert_eq!(
+        resp["result"]["content"][0]["text"],
+        "unknown tool: get_code"
+    );
+    let resp = call(&mut stdin, &rx, 3, "figmog_status", json!({}));
+    assert_eq!(result_json(&resp)["upstream"], "disabled");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        desktop.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "--no-upstream must never connect to the desktop"
+    );
     drop(stdin);
     assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
@@ -2994,6 +3120,8 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
     handshake(&mut stdin, &rx);
 
     let resp = call(&mut stdin, &rx, 2, "figmog_status", json!({}));
+    // One request in flight at a time, so the next line is its answer.
+    assert_eq!(resp["id"], 2, "{resp}");
     assert_eq!(resp["result"]["isError"], false, "{resp}");
     let status = result_json(&resp);
     assert_eq!(status["ready"], false, "{status}");
@@ -3071,6 +3199,63 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
     drop(stdin);
     let exit = wait_with_timeout(&mut guard.0, TIMEOUT);
     assert!(exit.success(), "figmog serve exited with {exit:?}");
+}
+
+/// NWS-2902 adapter parity over the server transports: every local read
+/// in [`common::read_parity_cases`] runs direct (before serve locks the
+/// store), then socket-routed through the same CLI command, then as a raw
+/// MCP `tools/call`. Socket CLI output is byte-identical to direct; the MCP
+/// result is the same JSON. `figmog_status` keeps its documented transport
+/// metadata: the socket CLI strips `ready`/`pull`/`upstream` back to the
+/// direct shape, while MCP reports them.
+#[test]
+fn every_local_read_matches_across_direct_socket_and_mcp() {
+    const KEY: &str = "figmogreadparitykey01";
+    let dir = default_root_fixture(KEY, common::parity_fixture());
+    let cases = common::read_parity_cases();
+    let run = |args: &[&str]| -> Vec<u8> {
+        common::command()
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    let direct: Vec<Vec<u8>> = cases.iter().map(|(args, _, _)| run(args)).collect();
+
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    for ((cli_args, tool, tool_args), direct) in cases.iter().zip(&direct) {
+        let socket = run(cli_args);
+        assert_eq!(
+            String::from_utf8_lossy(&socket),
+            String::from_utf8_lossy(direct),
+            "socket vs direct for {cli_args:?}"
+        );
+        let resp = call(&mut stdin, &rx, 2, tool, tool_args.clone());
+        assert_eq!(
+            resp["result"]["isError"], false,
+            "{tool} {tool_args}: {resp}"
+        );
+        let mut mcp = result_json(&resp);
+        let direct: Value = serde_json::from_slice(direct).unwrap();
+        if *tool == "figmog_status" {
+            assert_eq!(mcp["ready"], true);
+            assert_eq!(mcp["upstream"], "disabled");
+            assert!(mcp["pull"].is_object(), "{mcp}");
+            let obj = mcp.as_object_mut().unwrap();
+            for key in ["ready", "pull", "upstream"] {
+                obj.remove(key);
+            }
+        }
+        assert_eq!(mcp, direct, "MCP vs direct for {tool} {tool_args}");
+    }
+
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
 }
 
 #[test]

@@ -323,11 +323,16 @@ fn deep_where_values_remain_readable_through_cli_and_mcp() {
         .assert()
         .success();
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let lines: Vec<_> = stdout.lines().collect();
-    assert_eq!(lines.len(), 3);
-    for (index, (line, count)) in lines.into_iter().zip([2, 0, 1]).enumerate() {
-        let envelope: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert_eq!(envelope["id"], index + 1);
+    let responses: std::collections::BTreeMap<_, _> = stdout
+        .lines()
+        .map(|line| {
+            let envelope: serde_json::Value = serde_json::from_str(line).unwrap();
+            (envelope["id"].as_u64().unwrap(), envelope)
+        })
+        .collect();
+    assert_eq!(responses.len(), 3);
+    for (id, count) in [(1, 2), (2, 0), (3, 1)] {
+        let envelope = &responses[&id];
         assert_eq!(envelope["result"]["isError"], false);
         let mut rows = parse_deep(
             envelope["result"]["content"][0]["text"]

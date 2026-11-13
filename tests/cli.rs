@@ -1198,6 +1198,145 @@ fn failed_pull_does_not_persist_current_or_create_store() {
     assert!(!dir.path().join(".figmog").exists());
 }
 
+/// NWS-2944: a present-but-wrong-typed optional tool argument is a precise
+/// error, never silently read as "absent" (e.g. a string `depth` used to
+/// mean "unlimited", dumping the whole subtree). Explicit JSON `null` and
+/// an omitted key both keep the default.
+#[test]
+fn call_rejects_wrong_typed_optional_args() {
+    let (_dir, db) = fixture_db();
+    let call = |tool: &str, args: serde_json::Value| {
+        common::command()
+            .args(["call", tool, "--args", &args.to_string(), "--no-upstream"])
+            .args(["--db", &db])
+            .assert()
+    };
+    let cases = [
+        (
+            "figmog_subtree",
+            serde_json::json!({"id": "1:1", "depth": "2"}),
+            "expected integer for `depth`, got string",
+        ),
+        (
+            "figmog_subtree",
+            serde_json::json!({"id": "1:1", "depth": -1}),
+            "expected non-negative integer for `depth`, got -1",
+        ),
+        (
+            "figmog_tree",
+            serde_json::json!({"depth": 1.5}),
+            "expected integer for `depth`, got floating-point number 1.5",
+        ),
+        (
+            "figmog_search",
+            serde_json::json!({"query": "garden", "limit": "5"}),
+            "expected integer for `limit`, got string",
+        ),
+        (
+            "figmog_node",
+            serde_json::json!({"id": "1:2", "children": "true"}),
+            "expected boolean for `children`, got string",
+        ),
+        (
+            "figmog_find",
+            serde_json::json!({"type": "TEXT", "page": 7}),
+            "expected string for `page`, got number",
+        ),
+        (
+            "figmog_node",
+            serde_json::json!({"id": "1:2", "file": 12}),
+            "expected string for `file`, got number",
+        ),
+        // The direct `--db` sync path validates `file` too, before
+        // `do_pull` could report a missing file key.
+        (
+            "figmog_sync",
+            serde_json::json!({"file": 12}),
+            "expected string for `file`, got number",
+        ),
+        (
+            "figmog_subtree",
+            serde_json::json!({"id": "1:1", "fields": "name"}),
+            "expected array for `fields`, got string",
+        ),
+        (
+            "figmog_subtree",
+            serde_json::json!({"id": "1:1", "fields": ["name", 3]}),
+            "expected string for `fields[1]`, got number",
+        ),
+    ];
+    for (tool, args, want) in cases {
+        let out = call(tool, args.clone()).failure().code(1);
+        let v: serde_json::Value = serde_json::from_slice(&out.get_output().stderr).unwrap();
+        assert_eq!(v["error"], want, "{tool} {args}");
+    }
+
+    // Omitted and explicit null both keep the defaults.
+    for args in [
+        serde_json::json!({"id": "1:1"}),
+        serde_json::json!({"id": "1:1", "depth": null, "fields": null, "resolve_vars": null}),
+    ] {
+        let out = call("figmog_subtree", args).success();
+        let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(v["children"].as_array().unwrap().len(), 2);
+    }
+    let out = call(
+        "figmog_subtree",
+        serde_json::json!({"id": "1:1", "depth": 0}),
+    )
+    .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(
+        v.get("children")
+            .is_none_or(|c| c.as_array().unwrap().is_empty()),
+        "{v}"
+    );
+}
+
+#[test]
+fn invalid_local_calls_fail_before_creating_a_mirror() {
+    for (tool, args, error) in [
+        (
+            "figmog_tree",
+            r#""x""#,
+            "expected object for `arguments`, got string",
+        ),
+        (
+            "figmog_tree",
+            "[1,2]",
+            "expected object for `arguments`, got array",
+        ),
+        (
+            "figmog_sync",
+            "true",
+            "expected object for `arguments`, got boolean",
+        ),
+        (
+            "figmog_tree",
+            r#"{"file":"unopenedkey12345","depth":"bad"}"#,
+            "expected integer for `depth`, got string",
+        ),
+    ] {
+        for direct_db in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("db");
+            let mut command = common::command();
+            command
+                .current_dir(dir.path())
+                .args(["call", tool, "--args", args, "--no-upstream"]);
+            if direct_db {
+                command.args(["--db", db.to_str().unwrap()]);
+            }
+            let out = command.assert().failure().code(1);
+            let stderr: serde_json::Value =
+                serde_json::from_slice(&out.get_output().stderr).unwrap();
+            assert_eq!(stderr["error"], error);
+            assert!(!db.exists());
+            assert!(!dir.path().join(".figmog").exists());
+        }
+    }
+}
+
 #[test]
 fn call_figmog_sync_fails_cleanly_not_panicking() {
     // Regression test: `cmd_call`'s `figmog_sync` branch used to open its
@@ -2233,5 +2372,170 @@ fn images_with_no_ids_is_rejected_by_clap() {
         stderr.to_lowercase().contains("required")
             || stderr.to_lowercase().contains("the following required"),
         "expected clap to reject a missing required `ids` argument: {stderr}"
+    );
+}
+
+/// NWS-2902 adapter parity: every local read, run as its direct CLI
+/// command and as `figmog call <tool> --args <json>` against the same
+/// store, prints byte-identical JSON — defaults and omission forms
+/// included. `figmog_status` is the documented exception: the tool form
+/// adds `upstream` transport metadata the direct command omits.
+#[test]
+fn direct_cli_and_call_print_identical_reads_for_every_local_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::parity_fixture()).unwrap(),
+    )
+    .unwrap();
+    let db = dir.path().join("db").display().to_string();
+    common::command()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+
+    let mut tools_seen = std::collections::BTreeSet::new();
+    for (cli_args, tool, tool_args) in common::read_parity_cases() {
+        tools_seen.insert(tool);
+        let direct = common::command()
+            .args(&cli_args)
+            .args(["--db", &db])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let called = common::command()
+            .args([
+                "call",
+                tool,
+                "--args",
+                &tool_args.to_string(),
+                "--no-upstream",
+            ])
+            .args(["--db", &db])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        if tool == "figmog_status" {
+            let direct: serde_json::Value = serde_json::from_slice(&direct).unwrap();
+            let mut called: serde_json::Value = serde_json::from_slice(&called).unwrap();
+            assert!(direct.get("upstream").is_none(), "{direct}");
+            assert_eq!(called["upstream"], "disabled");
+            called.as_object_mut().unwrap().remove("upstream");
+            assert_eq!(called, direct);
+        } else {
+            assert_eq!(
+                String::from_utf8_lossy(&called),
+                String::from_utf8_lossy(&direct),
+                "{cli_args:?} vs {tool} {tool_args}"
+            );
+        }
+    }
+    let local_reads: std::collections::BTreeSet<_> = [
+        "figmog_status",
+        "figmog_pages",
+        "figmog_tree",
+        "figmog_node",
+        "figmog_subtree",
+        "figmog_find",
+        "figmog_search",
+        "figmog_instances",
+        "figmog_components",
+        "figmog_styles",
+        "figmog_uses",
+        "figmog_vars",
+        "figmog_stats",
+        "figmog_path",
+        "figmog_text",
+        "figmog_where",
+        "figmog_at",
+    ]
+    .into();
+    assert_eq!(tools_seen, local_reads);
+
+    // The omission cases above are meaningful, not vacuous.
+    let read = |args: &[&str]| -> serde_json::Value {
+        let out = common::command()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice(&out.get_output().stdout).unwrap()
+    };
+    assert_eq!(read(&["search", "garden"]).as_array().unwrap().len(), 10);
+    assert_eq!(read(&["where", "--pointer", "/layoutMode"])[0]["id"], "1:1");
+    assert_eq!(
+        read(&["where", "--pointer", "/layoutMode", "--equals", "null"]),
+        serde_json::json!([])
+    );
+    for (flagged, baseline) in [
+        (vec!["tree", "1:1", "--depth", "1"], vec!["tree", "1:1"]),
+        (
+            vec!["find", "--type", "TEXT", "--page", "0:1"],
+            vec!["find", "--type", "TEXT"],
+        ),
+        (
+            vec!["where", "--pointer", "/layoutMode", "--equals", "VERTICAL"],
+            vec!["where", "--pointer", "/layoutMode"],
+        ),
+        (
+            vec![
+                "where",
+                "--pointer",
+                "/layoutMode",
+                "--equals",
+                "VERTICAL",
+                "--page",
+                "0:1",
+            ],
+            vec!["where", "--pointer", "/layoutMode", "--equals", "VERTICAL"],
+        ),
+        (
+            vec!["text", "--page", "0:1", "--under", "1:1"],
+            vec!["text", "--page", "0:1"],
+        ),
+    ] {
+        assert_ne!(
+            read(&flagged),
+            read(&baseline),
+            "{flagged:?} must exercise its flag"
+        );
+    }
+    let projected = read(&["dump", "1:1", "--depth", "1", "--fields", "id,name,fills"]);
+    assert!(projected.get("layoutMode").is_none(), "{projected}");
+    assert!(projected.get("fills").is_some(), "{projected}");
+
+    // Errors share one message on both adapters.
+    let direct = common::command()
+        .args(["get", "99:99", "--db", &db])
+        .assert()
+        .failure()
+        .code(1);
+    let called = common::command()
+        .args([
+            "call",
+            "figmog_node",
+            "--args",
+            r#"{"id":"99:99"}"#,
+            "--no-upstream",
+        ])
+        .args(["--db", &db])
+        .assert()
+        .failure()
+        .code(1);
+    assert_eq!(
+        called.get_output().stderr,
+        direct.get_output().stderr,
+        "error parity"
     );
 }

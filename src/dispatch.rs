@@ -7,8 +7,9 @@
 //!
 //! Both call sites destructure the same `st.rtx(|tuple| ...)` reader tuple
 //! ([`RootReaders`]) that `open_store!`'s pipeline produces, so
-//! [`dispatch_read_tool`] can take it directly and stay the single place
-//! that maps a tool name + arguments to a `query::*` call.
+//! [`ReadCommand::execute`] can take it directly and stay the single place
+//! that maps a local read to a `query::*` call — for tool JSON
+//! ([`dispatch_read_tool`]) and the CLI's direct read commands alike.
 
 use fold::pipeline::terminal::search::Bm25Reader;
 use fold::pipeline::terminal::{InvertedIndexReader, MultimapReader, TableReader};
@@ -59,8 +60,40 @@ pub(crate) type RootReaders<'a, R> = (
 
 // ---- arg extraction ----
 
-pub(crate) fn arg_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(Value::as_str).map(str::to_string)
+/// Local tool arguments must be an object. `null` keeps the protocol's
+/// absent-arguments behavior; other JSON types cannot carry named fields.
+pub(crate) fn validate_object_args(args: &Value) -> Result<(), String> {
+    if args.is_object() || args.is_null() {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected object for `arguments`, got {}",
+            json_type_name(args)
+        ))
+    }
+}
+
+/// The value of an optional argument, treating an omitted key and an
+/// explicit JSON `null` alike as "absent" (NWS-2944) — `figmog images`
+/// itself sends `"scale": null` for an unset `--scale`, and a client that
+/// spells "no value" as `null` means the default, not an error.
+fn optional_arg<'a>(args: &'a Value, key: &str) -> Option<&'a Value> {
+    args.get(key).filter(|v| !v.is_null())
+}
+
+/// Optional string field. Absent/`null` ⇒ `Ok(None)`; present but some
+/// other JSON type ⇒ the same `"expected string for `key`, got …"` error
+/// [`require_str`] reports, rather than silently treating it as absent
+/// (NWS-2944).
+pub(crate) fn arg_str(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match optional_arg(args, key) {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!(
+            "expected string for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
 }
 
 /// JSON type name for an error message — `Value`'s own variant names
@@ -92,8 +125,31 @@ pub(crate) fn require_str(args: &Value, key: &str) -> Result<String, String> {
     }
 }
 
-pub(crate) fn arg_usize(args: &Value, key: &str) -> Option<usize> {
-    args.get(key).and_then(Value::as_u64).map(|n| n as usize)
+/// Optional non-negative integer field (`depth`, `limit`). Absent/`null`
+/// ⇒ `Ok(None)`. A non-number ⇒ `"expected integer for `key`, got
+/// string"`; a floating-point representation ⇒ `"… got floating-point
+/// number 2.0"`; a negative integer ⇒ `"expected non-negative integer for
+/// `key`, got -1"` (NWS-2944 — a
+/// string `depth` used to read as "unlimited").
+pub(crate) fn arg_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    let Some(v) = optional_arg(args, key) else {
+        return Ok(None);
+    };
+    if let Some(n) = v.as_u64() {
+        return Ok(Some(usize::try_from(n).unwrap_or(usize::MAX)));
+    }
+    match v.as_i64() {
+        Some(n) => Err(format!(
+            "expected non-negative integer for `{key}`, got {n}"
+        )),
+        None if v.is_number() => Err(format!(
+            "expected integer for `{key}`, got floating-point number {v}"
+        )),
+        None => Err(format!(
+            "expected integer for `{key}`, got {}",
+            json_type_name(v)
+        )),
+    }
 }
 
 /// A JSON Schema non-negative integer, including integral decimal/exponent
@@ -112,14 +168,62 @@ fn json_usize(value: &Value) -> Option<usize> {
     }
 }
 
-pub(crate) fn arg_bool(args: &Value, key: &str) -> bool {
-    args.get(key).and_then(Value::as_bool).unwrap_or(false)
+/// Optional boolean flag. Absent/`null` ⇒ `Ok(false)`; present but not a
+/// JSON boolean (e.g. the string `"true"`) ⇒ `"expected boolean for `key`,
+/// got string"` (NWS-2944).
+pub(crate) fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
+    match optional_arg(args, key) {
+        None => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!(
+            "expected boolean for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
 }
 
 /// Optional numeric field — [`require_f64`]'s absent-is-`None` sibling,
-/// used by `figmog_images`'s optional `scale` (v0.0.2 spec §5).
-pub(crate) fn arg_f64(args: &Value, key: &str) -> Option<f64> {
-    args.get(key).and_then(Value::as_f64)
+/// used by `figmog_images`'s optional `scale` (v0.0.2 spec §5). Absent or
+/// `null` ⇒ `Ok(None)`; any other non-number is an error (NWS-2944).
+pub(crate) fn arg_f64(args: &Value, key: &str) -> Result<Option<f64>, String> {
+    match optional_arg(args, key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| format!("expected number for `{key}`, got {}", json_type_name(v))),
+    }
+}
+
+/// Optional array-of-strings field — `figmog_subtree`'s `fields`.
+/// Absent/`null` ⇒ `Ok(None)`; an empty array is allowed (project to the
+/// always-kept keys only). A non-array, or a non-string element, is named
+/// precisely, mirroring [`require_str_array`] (NWS-2944 — a bare string
+/// used to be silently ignored, returning every field).
+pub(crate) fn arg_str_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match optional_arg(args, key) {
+        None => Ok(None),
+        Some(Value::Array(items)) => str_items(key, items).map(Some),
+        Some(other) => Err(format!(
+            "expected array for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
+}
+
+fn str_items(key: &str, items: &[Value]) -> Result<Vec<String>, String> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_str().map(str::to_string).ok_or_else(|| {
+                format!(
+                    "expected string for `{key}[{i}]`, got {}",
+                    json_type_name(v)
+                )
+            })
+        })
+        .collect()
 }
 
 /// A required array-of-strings field — `figmog_images`'s `ids` (v0.0.2
@@ -134,18 +238,7 @@ pub(crate) fn require_str_array(args: &Value, key: &str) -> Result<Vec<String>, 
             if items.is_empty() {
                 return Err(format!("`{key}` must not be empty"));
             }
-            items
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    v.as_str().map(str::to_string).ok_or_else(|| {
-                        format!(
-                            "expected string for `{key}[{i}]`, got {}",
-                            json_type_name(v)
-                        )
-                    })
-                })
-                .collect()
+            str_items(key, items)
         }
         Some(other) => Err(format!(
             "expected array for `{key}`, got {}",
@@ -174,15 +267,465 @@ pub(crate) fn require_f64(args: &Value, key: &str) -> Result<f64, String> {
 /// from a pasted node/frame URL when the call omits an explicit `file`.
 pub(crate) fn infer_file_from_node_ref(args: &Value) -> Option<String> {
     ["id", "under", "target", "page"].iter().find_map(|key| {
-        let raw = arg_str(args, key)?;
-        crate::ident::parse_node_ref(&raw)?.0
+        // Best-effort routing hint only: a wrong-typed value can't name a
+        // file, and the dispatched tool itself reports the type error.
+        let raw = args.get(key)?.as_str()?;
+        crate::ident::parse_node_ref(raw)?.0
     })
 }
 
+/// `figmog_search`'s `limit` when omitted (or `null`), and `figmog search
+/// -n`'s clap default — one constant so the two adapters can't drift.
+pub(crate) const DEFAULT_SEARCH_LIMIT: usize = 10;
+
+/// One of the 17 local reads of the mirror, with typed, already-validated
+/// arguments (NWS-2902). Every adapter converges here: tool JSON (MCP,
+/// the socket, `figmog call`) via [`ReadCommand::from_tool_args`], the
+/// clap read commands via `cli::read_command`, and the CLI's socket
+/// client back to tool JSON via [`ReadCommand::to_tool_call`]. Each
+/// variant has exactly one query arm, in [`ReadCommand::execute`].
+///
+/// Defaults are explicit in the payload: an omitted (or `null`) optional
+/// is `None`/`false`, except `Search::limit`, which is resolved to
+/// [`DEFAULT_SEARCH_LIMIT`]. `Where::equals` is `None` only when the key
+/// is omitted — `Some(Value::Null)` is equality to null (NWS-2897).
+/// Routing (`file`, URL-inferred files) and status transport metadata
+/// stay with the adapters, not here.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ReadCommand {
+    Status,
+    Pages,
+    Tree {
+        id: Option<String>,
+        depth: Option<usize>,
+    },
+    Node {
+        id: String,
+        children: bool,
+        resolve_vars: bool,
+    },
+    Subtree {
+        id: String,
+        depth: Option<usize>,
+        fields: Option<Vec<String>>,
+        resolve_vars: bool,
+    },
+    Find {
+        node_type: String,
+        page: Option<String>,
+        under: Option<String>,
+    },
+    Search {
+        query: String,
+        limit: usize,
+        under: Option<String>,
+    },
+    Instances {
+        target: String,
+    },
+    Components,
+    Styles {
+        style_type: Option<String>,
+        values: bool,
+        resolve_vars: bool,
+    },
+    Uses {
+        id: String,
+    },
+    Vars {
+        id: Option<String>,
+        snapshot: bool,
+    },
+    Stats,
+    Path {
+        id: String,
+    },
+    Text {
+        page: Option<String>,
+        under: Option<String>,
+    },
+    Where {
+        pointer: String,
+        // Canonical JSON keeps deep equality values safe to clone and drop.
+        equals: Option<String>,
+        page: Option<String>,
+        under: Option<String>,
+    },
+    At {
+        x: f64,
+        y: f64,
+        page: String,
+        under: Option<String>,
+        limit: usize,
+    },
+}
+
+impl ReadCommand {
+    /// Parse a local read tool call. `Ok(None)` for any name that isn't
+    /// one of the 17 local reads (`figmog_sync`, `figmog_images`,
+    /// management and desktop tools are the caller's business). Arguments
+    /// are validated in schema order with the `arg_*`/`require_*`
+    /// helpers, so the first bad argument names the error (NWS-2944).
+    /// Unknown keys — the routing `file` among them — are ignored.
+    pub(crate) fn from_tool_args(name: &str, args: &Value) -> Result<Option<Self>, String> {
+        if !matches!(
+            name,
+            "figmog_status"
+                | "figmog_pages"
+                | "figmog_tree"
+                | "figmog_node"
+                | "figmog_subtree"
+                | "figmog_find"
+                | "figmog_search"
+                | "figmog_instances"
+                | "figmog_components"
+                | "figmog_styles"
+                | "figmog_uses"
+                | "figmog_vars"
+                | "figmog_stats"
+                | "figmog_path"
+                | "figmog_text"
+                | "figmog_where"
+                | "figmog_at"
+        ) {
+            return Ok(None);
+        }
+        validate_object_args(args)?;
+        Ok(Some(match name {
+            "figmog_status" => Self::Status,
+            "figmog_pages" => Self::Pages,
+            "figmog_tree" => Self::Tree {
+                id: arg_str(args, "id")?,
+                depth: arg_usize(args, "depth")?,
+            },
+            "figmog_node" => Self::Node {
+                id: require_str(args, "id")?,
+                children: arg_bool(args, "children")?,
+                resolve_vars: arg_bool(args, "resolve_vars")?,
+            },
+            "figmog_subtree" => Self::Subtree {
+                id: require_str(args, "id")?,
+                depth: arg_usize(args, "depth")?,
+                fields: arg_str_array(args, "fields")?,
+                resolve_vars: arg_bool(args, "resolve_vars")?,
+            },
+            "figmog_find" => Self::Find {
+                node_type: require_str(args, "type")?,
+                page: arg_str(args, "page")?,
+                under: arg_str(args, "under")?,
+            },
+            "figmog_search" => Self::Search {
+                query: require_str(args, "query")?,
+                limit: arg_usize(args, "limit")?.unwrap_or(DEFAULT_SEARCH_LIMIT),
+                under: arg_str(args, "under")?,
+            },
+            "figmog_instances" => Self::Instances {
+                target: require_str(args, "target")?,
+            },
+            "figmog_components" => Self::Components,
+            "figmog_styles" => Self::Styles {
+                style_type: arg_str(args, "type")?,
+                values: arg_bool(args, "values")?,
+                resolve_vars: arg_bool(args, "resolve_vars")?,
+            },
+            "figmog_uses" => Self::Uses {
+                id: require_str(args, "id")?,
+            },
+            "figmog_vars" => Self::Vars {
+                id: arg_str(args, "id")?,
+                snapshot: arg_bool(args, "snapshot")?,
+            },
+            "figmog_stats" => Self::Stats,
+            "figmog_path" => Self::Path {
+                id: require_str(args, "id")?,
+            },
+            "figmog_text" => Self::Text {
+                page: arg_str(args, "page")?,
+                under: arg_str(args, "under")?,
+            },
+            "figmog_where" => Self::Where {
+                pointer: require_str(args, "pointer")?,
+                // Presence means equality to this JSON value, including
+                // null; only an omitted key means "pointer exists".
+                equals: args
+                    .get("equals")
+                    .map(crate::deep_json::to_string)
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
+                page: arg_str(args, "page")?,
+                under: arg_str(args, "under")?,
+            },
+            "figmog_at" => Self::At {
+                x: require_f64(args, "x")?,
+                y: require_f64(args, "y")?,
+                page: require_str(args, "page")?,
+                under: arg_str(args, "under")?,
+                limit: match args.get("limit") {
+                    None => query::DEFAULT_AT_LIMIT,
+                    Some(value) => json_usize(value)
+                        .ok_or_else(|| "expected non-negative integer for `limit`".to_string())?,
+                },
+            },
+            _ => return Ok(None),
+        }))
+    }
+
+    /// The local tool name and arguments that [`Self::from_tool_args`]
+    /// parses back to `self` — what the CLI sends over the socket (spec
+    /// §6a). `None` optionals are omitted rather than sent as `null`;
+    /// flags and `limit` are always sent; `equals` is sent (possibly as
+    /// `null`) exactly when present.
+    pub(crate) fn to_tool_call(&self) -> (&'static str, Value) {
+        fn put<T: serde::Serialize>(args: &mut Value, key: &str, value: Option<T>) {
+            if let Some(value) = value {
+                args[key] = json!(value);
+            }
+        }
+        let mut args = json!({});
+        let name = match self {
+            Self::Status => "figmog_status",
+            Self::Pages => "figmog_pages",
+            Self::Tree { id, depth } => {
+                put(&mut args, "id", id.as_ref());
+                put(&mut args, "depth", *depth);
+                "figmog_tree"
+            }
+            Self::Node {
+                id,
+                children,
+                resolve_vars,
+            } => {
+                args = json!({"id": id, "children": children, "resolve_vars": resolve_vars});
+                "figmog_node"
+            }
+            Self::Subtree {
+                id,
+                depth,
+                fields,
+                resolve_vars,
+            } => {
+                args = json!({"id": id, "resolve_vars": resolve_vars});
+                put(&mut args, "depth", *depth);
+                put(&mut args, "fields", fields.as_ref());
+                "figmog_subtree"
+            }
+            Self::Find {
+                node_type,
+                page,
+                under,
+            } => {
+                args = json!({"type": node_type});
+                put(&mut args, "page", page.as_ref());
+                put(&mut args, "under", under.as_ref());
+                "figmog_find"
+            }
+            Self::Search {
+                query,
+                limit,
+                under,
+            } => {
+                args = json!({"query": query, "limit": limit});
+                put(&mut args, "under", under.as_ref());
+                "figmog_search"
+            }
+            Self::Instances { target } => {
+                args = json!({"target": target});
+                "figmog_instances"
+            }
+            Self::Components => "figmog_components",
+            Self::Styles {
+                style_type,
+                values,
+                resolve_vars,
+            } => {
+                args = json!({"values": values, "resolve_vars": resolve_vars});
+                put(&mut args, "type", style_type.as_ref());
+                "figmog_styles"
+            }
+            Self::Uses { id } => {
+                args = json!({"id": id});
+                "figmog_uses"
+            }
+            Self::Vars { id, snapshot } => {
+                args = json!({"snapshot": snapshot});
+                put(&mut args, "id", id.as_ref());
+                "figmog_vars"
+            }
+            Self::Stats => "figmog_stats",
+            Self::Path { id } => {
+                args = json!({"id": id});
+                "figmog_path"
+            }
+            Self::Text { page, under } => {
+                put(&mut args, "page", page.as_ref());
+                put(&mut args, "under", under.as_ref());
+                "figmog_text"
+            }
+            Self::Where {
+                pointer,
+                equals,
+                page,
+                under,
+            } => {
+                args = json!({"pointer": pointer});
+                if let Some(equals) = equals {
+                    args["equals"] = crate::deep_json::from_str(equals)
+                        .expect("read equality contains serialized JSON")
+                        .into_inner();
+                }
+                put(&mut args, "page", page.as_ref());
+                put(&mut args, "under", under.as_ref());
+                "figmog_where"
+            }
+            Self::At {
+                x,
+                y,
+                page,
+                under,
+                limit,
+            } => {
+                args = json!({"x": x, "y": y, "page": page, "limit": limit});
+                put(&mut args, "under", under.as_ref());
+                "figmog_at"
+            }
+        };
+        (name, args)
+    }
+
+    /// Run the query against one open snapshot — the single semantic arm
+    /// per local read. Returns the `query::*` value unchanged; adapters
+    /// add transport metadata (`figmog_status`'s `upstream`, serve's
+    /// `ready`/`pull`) themselves.
+    pub(crate) fn execute<R: Readable>(self, r: &RootReaders<'_, R>) -> Result<Value, String> {
+        let (
+            (nodes, children, text, instances_of, styled_by, bound_to, by_type),
+            components,
+            component_sets,
+            styles,
+            variables,
+            variable_collections,
+            meta,
+            _cache,
+            _mirror_config,
+            _images,
+            _image_pins,
+            variable_snapshot,
+        ) = r;
+        match self {
+            Self::Status => query::status(
+                nodes,
+                meta,
+                variables,
+                variable_collections,
+                variable_snapshot,
+            ),
+            Self::Pages => query::pages(nodes, by_type),
+            Self::Tree { id, depth } => query::tree(nodes, children, by_type, id, depth),
+            Self::Node {
+                id,
+                children: with_children,
+                resolve_vars,
+            } => query::node(
+                nodes,
+                children,
+                variables,
+                variable_collections,
+                id,
+                with_children,
+                resolve_vars,
+            ),
+            Self::Subtree {
+                id,
+                depth,
+                fields,
+                resolve_vars,
+            } => query::subtree(
+                nodes,
+                children,
+                variables,
+                variable_collections,
+                id,
+                depth,
+                fields.as_deref(),
+                resolve_vars,
+            ),
+            Self::Find {
+                node_type,
+                page,
+                under,
+            } => query::find(nodes, children, by_type, node_type, page, under),
+            Self::Search {
+                query: q,
+                limit,
+                under,
+            } => query::search(text, nodes, children, &q, limit, under),
+            Self::Instances { target } => {
+                query::instances(nodes, components, component_sets, instances_of, &target)
+            }
+            Self::Components => query::components(nodes, components, component_sets),
+            Self::Styles {
+                style_type,
+                values,
+                resolve_vars,
+            } => query::styles(
+                nodes,
+                styles,
+                styled_by,
+                variables,
+                variable_collections,
+                style_type,
+                values,
+                resolve_vars,
+            ),
+            Self::Uses { id } => query::uses(nodes, styled_by, bound_to, &id),
+            Self::Vars { id, snapshot } => query::vars(
+                nodes,
+                variables,
+                variable_collections,
+                variable_snapshot,
+                id,
+                snapshot,
+            ),
+            Self::Stats => query::stats(
+                nodes,
+                components,
+                component_sets,
+                styles,
+                variables,
+                by_type,
+            ),
+            Self::Path { id } => query::path(nodes, id),
+            Self::Text { page, under } => query::text(nodes, children, by_type, page, under),
+            Self::Where {
+                pointer,
+                equals,
+                page,
+                under,
+            } => {
+                let equals = equals
+                    .as_deref()
+                    .map(crate::deep_json::from_str)
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                query::where_(nodes, children, &pointer, equals.as_deref(), page, under)
+            }
+            Self::At {
+                x,
+                y,
+                page,
+                under,
+                limit,
+            } => query::at(nodes, children, x, y, page, under, limit),
+        }
+    }
+}
+
 /// Dispatch one of the 17 read-only `figmog_*` tools against an open
-/// snapshot. `upstream_status` is spliced into `figmog_status`'s output
-/// (`"connected"` / `"unreachable"` / `"disabled"`) without changing
-/// `query::status`'s own signature (spec §12 point 4).
+/// snapshot: [`ReadCommand::from_tool_args`] then
+/// [`ReadCommand::execute`]. `upstream_status` is spliced into
+/// `figmog_status`'s output (`"connected"` / `"unreachable"` /
+/// `"disabled"`) without changing `query::status`'s own signature (spec
+/// §12 point 4).
 ///
 /// Returns `None` for any name this function doesn't recognize — `figmog_*`
 /// names it doesn't know (a genuine bug, since the registry gates
@@ -194,169 +737,18 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
     upstream_status: &str,
     r: &RootReaders<'_, R>,
 ) -> Option<Result<Value, String>> {
-    let (
-        (nodes, children, text, instances_of, styled_by, bound_to, by_type),
-        components,
-        component_sets,
-        styles,
-        variables,
-        variable_collections,
-        meta,
-        _cache,
-        _mirror_config,
-        _images,
-        _image_pins,
-        variable_snapshot,
-    ) = r;
-
-    match name {
-        "figmog_status" => Some(
-            query::status(
-                nodes,
-                meta,
-                variables,
-                variable_collections,
-                variable_snapshot,
-            )
-            .map(|mut v| {
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("upstream".to_string(), json!(upstream_status));
-                }
-                v
-            }),
-        ),
-        "figmog_pages" => Some(query::pages(nodes, by_type)),
-        "figmog_tree" => {
-            let id = arg_str(args, "id");
-            let depth = arg_usize(args, "depth");
-            Some(query::tree(nodes, children, by_type, id, depth))
+    let cmd = match ReadCommand::from_tool_args(name, args) {
+        Ok(Some(cmd)) => cmd,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    let is_status = cmd == ReadCommand::Status;
+    Some(cmd.execute(r).map(|mut v| {
+        if is_status && let Some(obj) = v.as_object_mut() {
+            obj.insert("upstream".to_string(), json!(upstream_status));
         }
-        "figmog_node" => Some((|| {
-            let id = require_str(args, "id")?;
-            let with_children = arg_bool(args, "children");
-            let resolve_vars = arg_bool(args, "resolve_vars");
-            query::node(
-                nodes,
-                children,
-                variables,
-                variable_collections,
-                id,
-                with_children,
-                resolve_vars,
-            )
-        })()),
-        "figmog_subtree" => Some((|| {
-            let id = require_str(args, "id")?;
-            let depth = arg_usize(args, "depth");
-            let fields = args.get("fields").and_then(Value::as_array).map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            });
-            let resolve_vars = arg_bool(args, "resolve_vars");
-            query::subtree(
-                nodes,
-                children,
-                variables,
-                variable_collections,
-                id,
-                depth,
-                fields.as_deref(),
-                resolve_vars,
-            )
-        })()),
-        "figmog_find" => Some((|| {
-            let node_type = require_str(args, "type")?;
-            let page = arg_str(args, "page");
-            let under = arg_str(args, "under");
-            query::find(nodes, children, by_type, node_type, page, under)
-        })()),
-        "figmog_search" => Some((|| {
-            let q = require_str(args, "query")?;
-            let limit = arg_usize(args, "limit").unwrap_or(10);
-            let under = arg_str(args, "under");
-            query::search(text, nodes, children, &q, limit, under)
-        })()),
-        "figmog_instances" => Some((|| {
-            let target = require_str(args, "target")?;
-            query::instances(nodes, components, component_sets, instances_of, &target)
-        })()),
-        "figmog_components" => Some(query::components(nodes, components, component_sets)),
-        "figmog_styles" => {
-            let style_type = arg_str(args, "type");
-            let values = arg_bool(args, "values");
-            let resolve_vars = arg_bool(args, "resolve_vars");
-            Some(query::styles(
-                nodes,
-                styles,
-                styled_by,
-                variables,
-                variable_collections,
-                style_type,
-                values,
-                resolve_vars,
-            ))
-        }
-        "figmog_uses" => Some((|| {
-            let id = require_str(args, "id")?;
-            query::uses(nodes, styled_by, bound_to, &id)
-        })()),
-        "figmog_vars" => {
-            let id = arg_str(args, "id");
-            let with_snapshot = arg_bool(args, "snapshot");
-            Some(query::vars(
-                nodes,
-                variables,
-                variable_collections,
-                variable_snapshot,
-                id,
-                with_snapshot,
-            ))
-        }
-        "figmog_stats" => Some(query::stats(
-            nodes,
-            components,
-            component_sets,
-            styles,
-            variables,
-            by_type,
-        )),
-        "figmog_path" => Some((|| {
-            let id = require_str(args, "id")?;
-            query::path(nodes, id)
-        })()),
-        "figmog_text" => {
-            let page = arg_str(args, "page");
-            let under = arg_str(args, "under");
-            Some(query::text(nodes, children, by_type, page, under))
-        }
-        "figmog_where" => Some((|| {
-            let pointer = require_str(args, "pointer")?;
-            // Presence means equality to this JSON value, including null;
-            // only an omitted key means "pointer exists".
-            let equals = args.get("equals");
-            let page = arg_str(args, "page");
-            let under = arg_str(args, "under");
-            query::where_(nodes, children, &pointer, equals, page, under)
-        })()),
-        "figmog_at" => Some((|| {
-            let x = require_f64(args, "x")?;
-            let y = require_f64(args, "y")?;
-            let page = require_str(args, "page")?;
-            let under = args
-                .get("under")
-                .map(|_| require_str(args, "under"))
-                .transpose()?;
-            let limit = match args.get("limit") {
-                None => query::DEFAULT_AT_LIMIT,
-                Some(value) => json_usize(value)
-                    .ok_or_else(|| "expected non-negative integer for `limit`".to_string())?,
-            };
-            query::at(nodes, children, x, y, page, under, limit)
-        })()),
-        _ => None,
-    }
+        v
+    }))
 }
 
 /// The optional `file` property every local tool's schema carries as of
@@ -384,29 +776,29 @@ fn file_arg_property() -> Value {
 pub(crate) fn tool_registry() -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
-            name: "figmog_status",
-            description: "Committed file name/version/time/node count plus ready and pull lifecycle (job progress, last successful version/churn and errors). Local reads remain available during a pull; ready=false means no successful mirror yet. No Figma API cost.",
+            name: "figmog_status".into(),
+            description: "Committed file name/version/time/node count plus ready and pull lifecycle (job progress, last successful version/churn and errors). Local reads remain available during a pull; ready=false means no successful mirror yet. No Figma API cost.".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_pages",
-            description: "List the file's pages (CANVAS nodes), in document order — reads the local mirror (no Figma API cost).",
+            name: "figmog_pages".into(),
+            description: "List the file's pages (CANVAS nodes), in document order — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_tree",
-            description: "Subtree outline (id, name, type, children) rooted at a node, defaulting to the whole document — reads the local mirror (no Figma API cost).",
+            name: "figmog_tree".into(),
+            description: "Subtree outline (id, name, type, children) rooted at a node, defaulting to the whole document — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Root node id; defaults to the DOCUMENT node."},
-                    "depth": {"type": "integer", "description": "Max depth to descend; omitted means unlimited."}
+                    "depth": {"type": "integer", "minimum": 0, "description": "Max depth to descend; omitted means unlimited."}
                 }
             }),
         },
         ToolDef {
-            name: "figmog_node",
-            description: "Full raw JSON of one node by id, optionally with a one-level children summary and/or a resolved_variables annotation — reads the local mirror (no Figma API cost).",
+            name: "figmog_node".into(),
+            description: "Full raw JSON of one node by id, optionally with a one-level children summary and/or a resolved_variables annotation — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -418,13 +810,13 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_subtree",
-            description: "Full raw JSON of a node and its descendants, nested under `children` in child-index order — reads the local mirror (no Figma API cost). Use `depth` and `fields` to keep the response small; an unbounded dump of a large subtree can be huge.",
+            name: "figmog_subtree".into(),
+            description: "Full raw JSON of a node and its descendants, nested under `children` in child-index order — reads the local mirror (no Figma API cost). Use `depth` and `fields` to keep the response small; an unbounded dump of a large subtree can be huge.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "Root node id (12:34 or 12-34 form)."},
-                    "depth": {"type": "integer", "description": "Max depth to descend; omitted means unlimited."},
+                    "depth": {"type": "integer", "minimum": 0, "description": "Max depth to descend; omitted means unlimited."},
                     "fields": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -436,8 +828,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_find",
-            description: "Nodes by Figma node type, optionally scoped to one page and/or a subtree — reads the local mirror (no Figma API cost).",
+            name: "figmog_find".into(),
+            description: "Nodes by Figma node type, optionally scoped to one page and/or a subtree — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -449,21 +841,21 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_search",
-            description: "BM25 search over layer names and text content, optionally scoped to a subtree — reads the local mirror (no Figma API cost).",
+            name: "figmog_search".into(),
+            description: "BM25 search over layer names and text content, optionally scoped to a subtree — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "description": "Max hits (default 10)."},
+                    "limit": {"type": "integer", "minimum": 0, "description": "Max hits (default 10)."},
                     "under": {"type": "string", "description": "Scope to the subtree rooted at this node id (inclusive)."}
                 },
                 "required": ["query"]
             }),
         },
         ToolDef {
-            name: "figmog_instances",
-            description: "Instances of a component, resolved by node id, global key, or component/component-set name — reads the local mirror (no Figma API cost).",
+            name: "figmog_instances".into(),
+            description: "Instances of a component, resolved by node id, global key, or component/component-set name — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -473,13 +865,13 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_components",
-            description: "Design-system inventory: component sets with their variant axes, plus standalone components — reads the local mirror (no Figma API cost).",
+            name: "figmog_components".into(),
+            description: "Design-system inventory: component sets with their variant axes, plus standalone components — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_styles",
-            description: "Styles with usage counts; `values` derives each style's definition from a consumer node — reads the local mirror (no Figma API cost).",
+            name: "figmog_styles".into(),
+            description: "Styles with usage counts; `values` derives each style's definition from a consumer node — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -490,8 +882,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_uses",
-            description: "Nodes using a style id or bound to a variable id — reads the local mirror (no Figma API cost).",
+            name: "figmog_uses".into(),
+            description: "Nodes using a style id or bound to a variable id — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"id": {"type": "string", "description": "A style id or variable id."}},
@@ -499,8 +891,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_vars",
-            description: "Variables: the authoritative record (with code_syntax, hidden_from_publishing, remote) if imported via figmog import-variables or an Enterprise pull, else inferred from bindings — reads the local mirror (no Figma API cost).",
+            name: "figmog_vars".into(),
+            description: "Variables: the authoritative record (with code_syntax, hidden_from_publishing, remote) if imported via figmog import-variables or an Enterprise pull, else inferred from bindings — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -510,18 +902,18 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_sync",
-            description: "Queue a background pull from Figma. Returns {accepted, key, job_id, state} immediately; poll figmog_status or figmog_files for completion, version/churn or errors. Duplicate active requests coalesce. Spends Tier-1 rate budget. Direct CLI sync without serve remains synchronous.",
+            name: "figmog_sync".into(),
+            description: "Queue a background pull from Figma. Returns {accepted, key, job_id, state} immediately; poll figmog_status or figmog_files for completion, version/churn or errors. Duplicate active requests coalesce. Spends Tier-1 rate budget. Direct CLI sync without serve remains synchronous.".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_stats",
-            description: "Node counts by type and by page, component/set/style/variable totals, text-node count, max tree depth — reads the local mirror (no Figma API cost).",
+            name: "figmog_stats".into(),
+            description: "Node counts by type and by page, component/set/style/variable totals, text-node count, max tree depth — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({"type": "object", "properties": {}}),
         },
         ToolDef {
-            name: "figmog_path",
-            description: "Ancestor chain from the document root to a node, as [{id, name, type}] — reads the local mirror (no Figma API cost).",
+            name: "figmog_path".into(),
+            description: "Ancestor chain from the document root to a node, as [{id, name, type}] — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -529,8 +921,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_text",
-            description: "Every TEXT node's (id, characters, page_id), optionally scoped to one page and/or a subtree, sorted by id — reads the local mirror (no Figma API cost).",
+            name: "figmog_text".into(),
+            description: "Every TEXT node's (id, characters, page_id), optionally scoped to one page and/or a subtree, sorted by id — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -540,8 +932,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_where",
-            description: "Nodes whose raw JSON matches an RFC 6901 pointer, optionally filtered by value and/or scoped to a page/subtree — reads the local mirror (no Figma API cost).",
+            name: "figmog_where".into(),
+            description: "Nodes whose raw JSON matches an RFC 6901 pointer, optionally filtered by value and/or scoped to a page/subtree — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -554,8 +946,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_images",
-            description: "Download node renders and/or fill images (v0.0.2 spec §5), cached by file version — spends Figma API budget (the images endpoints are the most rate-limited; never called automatically). Returns a JSON manifest plus, per item up to 1MB encoded: an image content block (base64) for raster formats, or the raw SVG markup as a text block for format=svg; larger items point at the CLI's `figmog images --out` instead.",
+            name: "figmog_images".into(),
+            description: "Download node renders and/or fill images (v0.0.2 spec §5), cached by file version — spends Figma API budget (the images endpoints are the most rate-limited; never called automatically). Returns a JSON manifest plus, per item up to 1MB encoded: an image content block (base64) for raster formats, or the raw SVG markup as a text block for format=svg; larger items point at the CLI's `figmog images --out` instead.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -571,8 +963,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "figmog_at",
-            description: "Visible nodes on one page whose absolute bounds contain a point, sorted by area ascending then id. Excludes hidden branches; optionally intersects a subtree. Returns at most limit matches (default 100) — reads the local mirror (no Figma API cost).",
+            name: "figmog_at".into(),
+            description: "Visible nodes on one page whose absolute bounds contain a point, sorted by area ascending then id. Excludes hidden branches; optionally intersects a subtree. Returns at most limit matches (default 100) — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -598,8 +990,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
     }
 
     tools.push(ToolDef {
-        name: "figmog_open",
-        description: "Queue a background mirror pull (Tier-1 API cost). Returns {accepted, key, job_id, state} immediately. Poll figmog_status or figmog_files for ready, job progress, version/churn or errors. Duplicate active requests coalesce; a geometry upgrade can queue one follow-up.",
+        name: "figmog_open".into(),
+        description: "Queue a background mirror pull (Tier-1 API cost). Returns {accepted, key, job_id, state} immediately. Poll figmog_status or figmog_files for ready, job progress, version/churn or errors. Duplicate active requests coalesce; a geometry upgrade can queue one follow-up.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -613,8 +1005,8 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         }),
     });
     tools.push(ToolDef {
-        name: "figmog_files",
-        description: "List every session: key, committed name/version/node count/time, default, ready, and pull lifecycle (job, queued, last_completed, last_success with version/churn). Failed jobs retain actionable errors and the previous successful mirror. Local state only (no Figma API cost).",
+        name: "figmog_files".into(),
+        description: "List every session: key, committed name/version/node count/time, default, ready, and pull lifecycle (job, queued, last_completed, last_success with version/churn). Failed jobs retain actionable errors and the previous successful mirror. Local state only (no Figma API cost).".into(),
         input_schema: json!({"type": "object", "properties": {}}),
     });
 
@@ -665,5 +1057,194 @@ mod tests {
     fn require_f64_reports_missing_when_key_absent() {
         let err = require_f64(&json!({}), "x").unwrap_err();
         assert_eq!(err, "missing required field: x");
+    }
+
+    #[test]
+    fn optional_args_absent_or_null_keep_defaults() {
+        for args in [json!({}), json!({"k": null})] {
+            assert_eq!(arg_str(&args, "k"), Ok(None));
+            assert_eq!(arg_usize(&args, "k"), Ok(None));
+            assert_eq!(arg_bool(&args, "k"), Ok(false));
+            assert_eq!(arg_f64(&args, "k"), Ok(None));
+            assert_eq!(arg_str_array(&args, "k"), Ok(None));
+        }
+    }
+
+    #[test]
+    fn at_under_accepts_null_without_changing_the_default_scope() {
+        let mut args = json!({"x": 0, "y": 0, "page": "0:1"});
+        let expected = Some(ReadCommand::At {
+            x: 0.0,
+            y: 0.0,
+            page: "0:1".into(),
+            under: None,
+            limit: query::DEFAULT_AT_LIMIT,
+        });
+        assert_eq!(
+            ReadCommand::from_tool_args("figmog_at", &args),
+            Ok(expected.clone())
+        );
+        args["under"] = Value::Null;
+        assert_eq!(
+            ReadCommand::from_tool_args("figmog_at", &args),
+            Ok(expected)
+        );
+
+        args["under"] = json!("1:1");
+        assert!(matches!(
+            ReadCommand::from_tool_args("figmog_at", &args),
+            Ok(Some(ReadCommand::At { under: Some(under), .. })) if under == "1:1"
+        ));
+        args["under"] = json!(123);
+        assert_eq!(
+            ReadCommand::from_tool_args("figmog_at", &args),
+            Err("expected string for `under`, got number".into())
+        );
+    }
+
+    #[test]
+    fn optional_args_accept_their_own_type() {
+        assert_eq!(arg_str(&json!({"k": "a"}), "k"), Ok(Some("a".into())));
+        assert_eq!(arg_usize(&json!({"k": 0}), "k"), Ok(Some(0)));
+        assert_eq!(arg_usize(&json!({"k": 7}), "k"), Ok(Some(7)));
+        assert_eq!(arg_bool(&json!({"k": true}), "k"), Ok(true));
+        assert_eq!(arg_f64(&json!({"k": 1.5}), "k"), Ok(Some(1.5)));
+        assert_eq!(arg_f64(&json!({"k": 2}), "k"), Ok(Some(2.0)));
+        assert_eq!(arg_str_array(&json!({"k": []}), "k"), Ok(Some(vec![])));
+    }
+
+    #[test]
+    fn optional_args_reject_wrong_types() {
+        let cases: [(Result<(), String>, &str); 10] = [
+            (
+                arg_usize(&json!({"depth": "2"}), "depth").map(drop),
+                "expected integer for `depth`, got string",
+            ),
+            (
+                arg_usize(&json!({"depth": 1.5}), "depth").map(drop),
+                "expected integer for `depth`, got floating-point number 1.5",
+            ),
+            (
+                arg_usize(&json!({"depth": -1}), "depth").map(drop),
+                "expected non-negative integer for `depth`, got -1",
+            ),
+            (
+                arg_usize(&json!({"limit": true}), "limit").map(drop),
+                "expected integer for `limit`, got boolean",
+            ),
+            (
+                arg_bool(&json!({"children": "true"}), "children").map(drop),
+                "expected boolean for `children`, got string",
+            ),
+            (
+                arg_bool(&json!({"children": 1}), "children").map(drop),
+                "expected boolean for `children`, got number",
+            ),
+            (
+                arg_f64(&json!({"scale": "2"}), "scale").map(drop),
+                "expected number for `scale`, got string",
+            ),
+            (
+                arg_str(&json!({"page": ["0:1"]}), "page").map(drop),
+                "expected string for `page`, got array",
+            ),
+            (
+                arg_str_array(&json!({"fields": "name"}), "fields").map(drop),
+                "expected array for `fields`, got string",
+            ),
+            (
+                arg_str_array(&json!({"fields": ["name", {}]}), "fields").map(drop),
+                "expected string for `fields[1]`, got object",
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, Err(want.to_string()));
+        }
+    }
+
+    #[test]
+    fn read_arguments_require_an_object_but_null_keeps_defaults() {
+        for args in [json!("x"), json!([1, 2]), json!(17), json!(false)] {
+            assert!(
+                ReadCommand::from_tool_args("figmog_tree", &args)
+                    .unwrap_err()
+                    .starts_with("expected object for `arguments`, got ")
+            );
+            assert_eq!(ReadCommand::from_tool_args("desktop_tool", &args), Ok(None));
+        }
+        assert_eq!(
+            ReadCommand::from_tool_args("figmog_tree", &Value::Null),
+            ReadCommand::from_tool_args("figmog_tree", &json!({}))
+        );
+        for raw in ["2.0", "-0", "1e20"] {
+            let number: Value = serde_json::from_str(raw).unwrap();
+            let error = arg_usize(&json!({"depth": number}), "depth").unwrap_err();
+            assert!(
+                error.contains("got floating-point number"),
+                "{raw}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_file_ignores_wrong_typed_node_refs() {
+        assert_eq!(infer_file_from_node_ref(&json!({"id": 12})), None);
+    }
+
+    /// NWS-2902: only the 17 local reads become a `ReadCommand`; sync,
+    /// images, management and desktop tools stay with their callers.
+    #[test]
+    fn read_command_covers_exactly_the_local_reads() {
+        let reads: Vec<_> = tool_registry()
+            .iter()
+            .filter(|t| {
+                ReadCommand::from_tool_args(
+                    t.name.as_ref(),
+                    &json!({"id": "1:1", "type": "T",
+                    "query": "q", "target": "t", "pointer": "/a", "x": 0, "y": 0, "page": "0:1"}),
+                )
+                .unwrap()
+                .is_some()
+            })
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(reads.len(), 17, "{reads:?}");
+        for name in [
+            "figmog_sync",
+            "figmog_images",
+            "figmog_open",
+            "figmog_files",
+            "get_code",
+        ] {
+            assert_eq!(
+                ReadCommand::from_tool_args(name, &json!({})),
+                Ok(None),
+                "{name}"
+            );
+        }
+        // Explicit-null `equals` is a value; an omitted one is not.
+        let parse = |args| {
+            ReadCommand::from_tool_args("figmog_where", &args)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(matches!(
+            parse(json!({"pointer": "/a", "equals": null})),
+            ReadCommand::Where {
+                equals: Some(ref equals),
+                ..
+            } if equals == "null"
+        ));
+        assert!(matches!(
+            parse(json!({"pointer": "/a"})),
+            ReadCommand::Where { equals: None, .. }
+        ));
+        assert!(matches!(
+            ReadCommand::from_tool_args("figmog_search", &json!({"query": "q", "limit": null})),
+            Ok(Some(ReadCommand::Search {
+                limit: DEFAULT_SEARCH_LIMIT,
+                ..
+            }))
+        ));
     }
 }

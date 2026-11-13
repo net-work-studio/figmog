@@ -124,7 +124,7 @@ pub(super) fn cmd_tools(upstream_url: String, no_upstream: bool) -> Result<(), S
         .map(|t| {
             json!({
                 "name": t.name,
-                "source": if proxy::is_local_tool(t.name) { "local" } else { "upstream" },
+                "source": if proxy::is_local_tool(t.name.as_ref()) { "local" } else { "upstream" },
                 "cacheable": false,
             })
         })
@@ -142,7 +142,12 @@ pub(super) fn cmd_call(
     upstream_url: String,
     no_upstream: bool,
 ) -> Result<(), String> {
-    let args = parse_args(args.as_deref())?;
+    let args = crate::deep_json::OwnedValue(parse_args(args.as_deref())?);
+    // `file` is routing (already resolved into `db`), so neither dispatch
+    // nor `do_pull` reads it; still reject a wrong-typed one as serve does
+    // (NWS-2944) — before the `figmog_sync` early return and before any
+    // store is opened.
+    validate_local_args(&tool, &args)?;
 
     // `figmog_sync` delegates entirely to `do_pull`, which opens its own
     // `open_store!` handle at `db.path`. fjall allows only one open handle
@@ -176,7 +181,7 @@ pub(super) fn cmd_call(
         let up = upstream
             .as_mut()
             .ok_or_else(|| format!("upstream not attached: {tool}"))?;
-        proxy::proxy_call(up, &tool, &args).map(|(value, trigger_poll)| {
+        proxy::proxy_call(up, &tool, &args).map_err(|e| e.to_string()).map(|(value, trigger_poll)| {
             if trigger_poll {
                 eprintln!(
                     "figmog: {tool} may have changed the file — run `figmog pull` (or `figmog serve`, which polls automatically) to refresh the mirror"
@@ -189,10 +194,23 @@ pub(super) fn cmd_call(
     print_call_result(result)
 }
 
+/// Reject malformed local calls before mirror selection, socket routing,
+/// upstream attachment, or opening a store can have side effects.
+pub(super) fn validate_local_args(tool: &str, args: &Value) -> Result<(), String> {
+    if proxy::is_local_tool(tool) {
+        dispatch::validate_object_args(args)?;
+        dispatch::arg_str(args, "file")?;
+        dispatch::ReadCommand::from_tool_args(tool, args)?;
+    }
+    Ok(())
+}
+
 /// Parse call arguments identically for mirror selection and dispatch.
 pub(super) fn parse_args(raw: Option<&str>) -> Result<Value, String> {
     match raw {
-        Some(raw) => serde_json::from_str(raw).map_err(|e| format!("--args: invalid JSON: {e}")),
+        Some(raw) => crate::deep_json::from_str(raw)
+            .map(crate::deep_json::OwnedValue::into_inner)
+            .map_err(|e| format!("--args: invalid JSON: {e}")),
         None => Ok(json!({})),
     }
 }

@@ -1,9 +1,12 @@
 //! MCP protocol core — pure JSON-RPC dispatch over stdio frames.
 //!
-//! This module owns no I/O and no store: [`handle_message`] takes one raw
+//! This module owns no I/O and no store: [`dispatch_message`] takes one raw
 //! JSON-RPC message, a registry of [`ToolDef`]s, and a [`ToolHandler`], and
-//! returns the response frame to write (or `None` for notifications). The
-//! serve loop that actually reads/writes stdio lives in a later task.
+//! returns the response frame to write (or `None` for notifications), or —
+//! when the handler defers a `tools/call` — the [`PendingCall`] that frames
+//! its response once the result arrives. The serve loop owns the I/O.
+
+use std::borrow::Cow;
 
 use serde_json::{Value, json};
 
@@ -21,10 +24,12 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 /// This server's name, reported in `initialize`'s `serverInfo.name`.
 pub const SERVER_NAME: &str = "figmog";
 
-/// One registered tool: metadata for `tools/list`.
+/// One registered tool: metadata for `tools/list`. Static local metadata
+/// is borrowed; dynamic upstream metadata is freed with its registry.
+#[derive(Debug, PartialEq)]
 pub struct ToolDef {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: Cow<'static, str>,
+    pub description: Cow<'static, str>,
     /// JSON Schema for the tool's arguments.
     pub input_schema: Value,
 }
@@ -45,6 +50,10 @@ pub enum ToolOutput {
     /// JSON-RPC `result` member. Used for proxied calls, whose shape (and
     /// `isError`) is the upstream's to own.
     Raw(Value),
+    /// The handler accepted the call as off-loop work identified by this
+    /// token; its result arrives later and is turned into a response with
+    /// [`PendingCall::finish`]. Only [`dispatch_message`] supports this.
+    Deferred(u64),
 }
 
 /// Executes a `tools/call`. `Ok(output)` becomes the success result per
@@ -52,16 +61,41 @@ pub enum ToolOutput {
 /// on stdio or a JSON-RPC error on the socket control plane.
 pub trait ToolHandler {
     fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String>;
+
+    /// Whether this server can announce changes to its exposed tools.
+    fn tools_list_changes(&self) -> bool {
+        false
+    }
+
+    /// The client sent `initialize`: it speaks MCP and may be sent
+    /// notifications such as `notifications/tools/list_changed`.
+    fn initialized(&mut self) {}
+
+    /// A `tools/call` named `name`, which is not in the registry, was
+    /// refused with `unknown tool`.
+    fn unknown_tool(&mut self, name: &str) {
+        let _ = name;
+    }
 }
 
-/// Adapts a closure to [`ToolHandler`]. `figmog serve`'s store handle has
+/// The notification `figmog serve` sends to clients that sent `initialize`
+/// when its merged tool list changes (the desktop app appeared or went
+/// away, NWS-2959).
+pub(crate) fn tools_list_changed() -> Value {
+    json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+}
+
+/// Adapts a closure to [`ToolHandler`] (tests; the serve loop records
+/// protocol events with its own handler). `figmog serve`'s store handle has
 /// an unnameable type (the `open_store!` pipeline contains fn items), so
 /// it can't be held in a named struct field generic over the store's
 /// pipeline type; wrapping a closure that captures the store by unique
 /// reference sidesteps that entirely — the closure's environment can hold
 /// whatever concrete type it was defined against.
+#[cfg(test)]
 pub struct FnHandler<F>(pub F);
 
+#[cfg(test)]
 impl<F: FnMut(&str, &Value) -> Result<ToolOutput, String>> ToolHandler for FnHandler<F> {
     fn call(&mut self, name: &str, args: &Value) -> Result<ToolOutput, String> {
         (self.0)(name, args)
@@ -70,45 +104,133 @@ impl<F: FnMut(&str, &Value) -> Result<ToolOutput, String>> ToolHandler for FnHan
 
 /// Handle one incoming JSON-RPC message. Returns the response frame to
 /// write, or `None` for notifications (a message with no `id`, or whose
-/// method starts with `notifications/`).
+/// method starts with `notifications/`). For handlers that never defer: a
+/// [`ToolOutput::Deferred`] here has nowhere to be delivered and becomes a
+/// tool error.
+#[cfg(test)]
 pub fn handle_message(
     raw: &str,
     tools: &[ToolDef],
     handler: &mut dyn ToolHandler,
 ) -> Option<Value> {
-    handle_message_with_tool_errors(raw, tools, handler, ToolErrorMode::McpContent)
+    immediate(dispatch_message(
+        raw,
+        tools,
+        handler,
+        ToolErrorMode::McpContent,
+    ))
 }
 
-/// Handle a control-plane request. Serve-generated tool failures use a
-/// JSON-RPC error so CLI clients can distinguish them from genuine upstream
-/// `CallToolResult`s, whose tool-level `isError` belongs to the desktop.
-pub(crate) fn handle_socket_message(
+#[cfg(test)]
+fn handle_socket_message(
     raw: &str,
     tools: &[ToolDef],
     handler: &mut dyn ToolHandler,
 ) -> Option<Value> {
-    handle_message_with_tool_errors(raw, tools, handler, ToolErrorMode::JsonRpc)
+    immediate(dispatch_message(
+        raw,
+        tools,
+        handler,
+        ToolErrorMode::JsonRpc,
+    ))
 }
 
-enum ToolErrorMode {
+#[cfg(test)]
+fn immediate(reply: Option<Reply>) -> Option<Value> {
+    reply.map(|reply| match reply {
+        Reply::Now(value) => value,
+        Reply::Later(pending) => pending.finish(Err(
+            "internal error: deferred call has no delivery path".into(),
+        )),
+    })
+}
+
+/// How a transport reports serve-generated tool failures: MCP `isError`
+/// content (stdio) or a top-level JSON-RPC error (socket control plane), so
+/// CLI clients can distinguish them from genuine upstream
+/// `CallToolResult`s, whose tool-level `isError` belongs to the desktop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolErrorMode {
     McpContent,
     JsonRpc,
 }
 
-fn handle_message_with_tool_errors(
+/// One dispatched message's response: ready now, or owed later for a
+/// `tools/call` whose handler returned [`ToolOutput::Deferred`].
+pub(crate) enum Reply {
+    Now(Value),
+    Later(PendingCall),
+}
+
+/// A `tools/call` answered off the main loop. Keeps exactly what the
+/// eventual response needs — the caller's JSON-RPC `id`, the tool name
+/// (for `structuredContent`) and the transport's error mode — so a late
+/// result is framed identically to an immediate one.
+pub(crate) struct PendingCall {
+    id: OwnedValue,
+    name: String,
+    mode: ToolErrorMode,
+    token: u64,
+}
+
+impl Clone for PendingCall {
+    fn clone(&self) -> Self {
+        Self {
+            id: crate::deep_json::from_str(&crate::deep_json::to_string(&self.id.0).unwrap())
+                .unwrap(),
+            name: self.name.clone(),
+            mode: self.mode,
+            token: self.token,
+        }
+    }
+}
+
+impl std::fmt::Debug for PendingCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingCall")
+            .field("id", &crate::deep_json::to_string(&self.id.0).unwrap())
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("token", &self.token)
+            .finish()
+    }
+}
+
+impl PendingCall {
+    /// The handler's token from [`ToolOutput::Deferred`].
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Frame the deferred handler result as this call's response.
+    pub(crate) fn finish(self, output: Result<ToolOutput, String>) -> Value {
+        let result = match output {
+            Ok(ToolOutput::Deferred(_)) => {
+                Err("internal error: deferred call deferred again".to_string())
+            }
+            Ok(output) => Ok(tool_output_result(&self.name, output)),
+            Err(message) => Err(message),
+        };
+        call_response(self.id, self.mode, result)
+    }
+}
+
+/// Handle one message, allowing the handler to defer a `tools/call`.
+/// `None` for notifications.
+pub(crate) fn dispatch_message(
     raw: &str,
     tools: &[ToolDef],
     handler: &mut dyn ToolHandler,
     tool_errors: ToolErrorMode,
-) -> Option<Value> {
+) -> Option<Reply> {
     let mut msg = match crate::deep_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => {
-            return Some(json!({
+            return Some(Reply::Now(json!({
                 "jsonrpc": "2.0",
                 "id": Value::Null,
                 "error": {"code": -32700, "message": "parse error"},
-            }));
+            })));
         }
     };
 
@@ -124,54 +246,75 @@ fn handle_message_with_tool_errors(
             .map(std::mem::take)
             .unwrap_or(Value::Null),
     );
-
-    // Notifications: no `id`, or method under the `notifications/` namespace.
     if id.is_none() || method.starts_with("notifications/") {
         return None;
     }
-    let mut response = OwnedValue(json!({"jsonrpc": "2.0"}));
-    response.insert("id".to_string(), id.unwrap());
-
+    let id = id.unwrap();
     let result = match method.as_str() {
-        "initialize" => Some(initialize_result(&params)),
+        "initialize" => {
+            handler.initialized();
+            Some(initialize_result(&params, handler.tools_list_changes()))
+        }
         "ping" => Some(json!({})),
         "tools/list" => Some(tools_list_result(tools)),
-        "tools/call" => match tools_call_result(&mut params, tools, handler) {
-            Ok(result) => Some(result),
-            Err(message) => match tool_errors {
-                ToolErrorMode::McpContent => Some(error_content(&message)),
-                ToolErrorMode::JsonRpc => {
-                    response.insert(
-                        "error".to_string(),
-                        OwnedValue(json!({"code": -32000, "message": message})),
-                    );
-                    return Some(response.into_inner());
-                }
-            },
-        },
+        "tools/call" => {
+            return Some(match tools_call_result(&mut params, tools, handler) {
+                Ok(Called::Now(result)) => Reply::Now(call_response(id, tool_errors, Ok(result))),
+                Ok(Called::Later { name, token }) => Reply::Later(PendingCall {
+                    id,
+                    name,
+                    mode: tool_errors,
+                    token,
+                }),
+                Err(message) => Reply::Now(call_response(id, tool_errors, Err(message))),
+            });
+        }
         _ => None,
     };
-
+    let mut response = OwnedValue(json!({"jsonrpc": "2.0"}));
+    response.insert("id".to_string(), id);
     match result {
-        Some(result) => {
-            response.insert("result".to_string(), OwnedValue(result));
-        }
+        Some(result) => response.insert("result".to_string(), OwnedValue(result)),
         None => response.insert(
             "error".to_string(),
-            OwnedValue(json!({"code": -32601, "message": "method not found"})),
+            OwnedValue(json!({
+                "code": -32601, "message": "method not found",
+            })),
         ),
     }
-    Some(response.into_inner())
+    Some(Reply::Now(response.into_inner()))
 }
 
-fn initialize_result(params: &Value) -> Value {
+/// Frame a `tools/call` outcome per the transport's error mode. Move deep
+/// IDs/results into the response rather than recursively cloning them.
+fn call_response(id: OwnedValue, mode: ToolErrorMode, result: Result<Value, String>) -> Value {
+    let mut response = OwnedValue(json!({"jsonrpc": "2.0"}));
+    response.insert("id".into(), id);
+    match result {
+        Ok(result) => response.insert("result".into(), OwnedValue(result)),
+        Err(message) => match mode {
+            ToolErrorMode::McpContent => {
+                response.insert("result".into(), OwnedValue(error_content(&message)))
+            }
+            ToolErrorMode::JsonRpc => response.insert(
+                "error".into(),
+                OwnedValue(json!({
+                    "code": -32000, "message": message,
+                })),
+            ),
+        },
+    }
+    response.into_inner()
+}
+
+fn initialize_result(params: &Value, list_changes: bool) -> Value {
     let protocol_version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_PROTOCOL_VERSION);
     json!({
         "protocolVersion": protocol_version,
-        "capabilities": {"tools": {}},
+        "capabilities": {"tools": {"listChanged": list_changes}},
         "serverInfo": {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION"),
@@ -189,7 +332,7 @@ fn tools_list_result(tools: &[ToolDef]) -> Value {
                 "description": t.description,
                 "inputSchema": t.input_schema,
             });
-            if let Some(schema) = crate::dispatch::output_schema(t.name) {
+            if let Some(schema) = crate::dispatch::output_schema(t.name.as_ref()) {
                 tool["outputSchema"] = schema;
             }
             tool
@@ -198,20 +341,24 @@ fn tools_list_result(tools: &[ToolDef]) -> Value {
     json!({"tools": list})
 }
 
+enum Called {
+    Now(Value),
+    Later { name: String, token: u64 },
+}
+
 fn tools_call_result(
     params: &mut OwnedValue,
     tools: &[ToolDef],
     handler: &mut dyn ToolHandler,
-) -> Result<Value, String> {
+) -> Result<Called, String> {
     let name = match params.get("name").and_then(Value::as_str) {
         Some(name) => name.to_string(),
         None => return Err("missing required field: name".to_string()),
     };
-
     if !tools.iter().any(|t| t.name == name) {
+        handler.unknown_tool(&name);
         return Err(format!("unknown tool: {name}"));
     }
-
     let args = OwnedValue(
         params
             .0
@@ -220,19 +367,31 @@ fn tools_call_result(
             .unwrap_or(json!({})),
     );
     Ok(match handler.call(&name, &args)? {
+        ToolOutput::Deferred(token) => Called::Later { name, token },
+        output => Called::Now(tool_output_result(&name, output)),
+    })
+}
+
+/// The `tools/call` result member for a completed tool output.
+fn tool_output_result(name: &str, output: ToolOutput) -> Value {
+    match output {
         ToolOutput::Json(v) => {
-            let mut v = crate::deep_json::OwnedValue(v);
-            let mut result = json!({
+            let mut v = OwnedValue(v);
+            let mut result = OwnedValue(json!({
                 "content": [{"type": "text", "text": crate::deep_json::to_string(&v.0).unwrap()}],
                 "isError": false,
-            });
-            if crate::dispatch::output_schema(&name).is_some() {
-                result["structuredContent"] = std::mem::take(&mut v.0);
+            }));
+            if crate::dispatch::output_schema(name).is_some() {
+                result.insert(
+                    "structuredContent".into(),
+                    OwnedValue(std::mem::take(&mut v.0)),
+                );
             }
-            result
+            result.into_inner()
         }
         ToolOutput::Raw(v) => v,
-    })
+        ToolOutput::Deferred(_) => error_content("internal error: unexpected deferred output"),
+    }
 }
 
 fn error_content(msg: &str) -> Value {
@@ -273,6 +432,39 @@ mod tests {
         });
     }
 
+    #[test]
+    fn deep_deferred_ids_and_results_are_safe_on_a_small_stack() {
+        crate::test_support::small_stack(|| {
+            let payload = format!("{}null{}", "[".repeat(5_000), "]".repeat(5_000));
+            let request = format!(
+                r#"{{"jsonrpc":"2.0","id":{payload},"method":"tools/call","params":{{"name":"ok"}}}}"#,
+            );
+            for raw in [false, true] {
+                let call = match dispatch_message(
+                    &request,
+                    &fake_tools(),
+                    &mut DeferringHandler,
+                    ToolErrorMode::McpContent,
+                ) {
+                    Some(Reply::Later(call)) => call,
+                    _ => panic!("expected deferred call"),
+                };
+                // Clone and abandoning a pending call must also clean its
+                // deep id iteratively, without recursively dropping it.
+                drop(call.clone());
+                let output = crate::deep_json::from_str(&payload).unwrap().into_inner();
+                let output = if raw {
+                    ToolOutput::Raw(output)
+                } else {
+                    ToolOutput::Json(output)
+                };
+                let response = OwnedValue(call.finish(Ok(output)));
+                let serialized = crate::deep_json::to_string(&response.0).unwrap();
+                assert!(serialized.contains(&format!(r#""id":{payload}"#)));
+            }
+        });
+    }
+
     /// A `ToolHandler` test double: returns `Ok(Json({"ok":true}))` for a
     /// tool named `"ok"`, `Ok(Raw(...))` for `"raw"` (an already-complete
     /// MCP result, as a proxied call would produce), `Err("boom")` for
@@ -297,18 +489,18 @@ mod tests {
     fn fake_tools() -> Vec<ToolDef> {
         vec![
             ToolDef {
-                name: "ok",
-                description: "always succeeds",
+                name: "ok".into(),
+                description: "always succeeds".into(),
                 input_schema: json!({"type": "object"}),
             },
             ToolDef {
-                name: "raw",
-                description: "returns a raw passthrough result",
+                name: "raw".into(),
+                description: "returns a raw passthrough result".into(),
                 input_schema: json!({"type": "object"}),
             },
             ToolDef {
-                name: "err",
-                description: "always fails",
+                name: "err".into(),
+                description: "always fails".into(),
                 input_schema: json!({"type": "object"}),
             },
         ]
@@ -344,7 +536,7 @@ mod tests {
                 "id": 1,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": "figmog", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": "figmog is your Figma server: a local, instant mirror of one Figma file plus a proxy to Figma's native capabilities. Call figmog for everything Figma-related. figmog_* tools answer from the local mirror at zero API cost; native-named tools (get_*, …) go live to Figma desktop and are forwarded uncached. Pass the Figma file URL as the `file` argument to figmog_* tools when you have one; figmog queues a background pull on first reference. Open/sync return a job acknowledgement; poll figmog_status or figmog_files for ready, progress, version/churn and errors.",
                 },
@@ -585,5 +777,58 @@ mod tests {
         .to_string();
         let resp = handle_message(&raw, &[], &mut FakeHandler).unwrap();
         assert_eq!(resp["id"], json!("abc-123"));
+    }
+
+    /// Defers every call with token 42.
+    struct DeferringHandler;
+
+    impl ToolHandler for DeferringHandler {
+        fn call(&mut self, _: &str, _: &Value) -> Result<ToolOutput, String> {
+            Ok(ToolOutput::Deferred(42))
+        }
+    }
+
+    fn deferred(mode: ToolErrorMode) -> PendingCall {
+        let raw = json!({"jsonrpc": "2.0", "id": "x", "method": "tools/call",
+            "params": {"name": "ok"}})
+        .to_string();
+        match dispatch_message(&raw, &fake_tools(), &mut DeferringHandler, mode) {
+            Some(Reply::Later(call)) => call,
+            _ => panic!("expected a deferred call"),
+        }
+    }
+
+    #[test]
+    fn deferred_calls_are_framed_like_immediate_ones_when_finished() {
+        let call = deferred(ToolErrorMode::McpContent);
+        assert_eq!(call.token(), 42);
+        assert_eq!(
+            call.finish(Ok(ToolOutput::Json(json!({"ok": true})))),
+            json!({"jsonrpc": "2.0", "id": "x", "result": {
+                "content": [{"type": "text", "text": "{\"ok\":true}"}], "isError": false}})
+        );
+        let raw = json!({"content": [], "isError": true});
+        assert_eq!(
+            deferred(ToolErrorMode::JsonRpc).finish(Ok(ToolOutput::Raw(raw.clone()))),
+            json!({"jsonrpc": "2.0", "id": "x", "result": raw})
+        );
+        assert_eq!(
+            deferred(ToolErrorMode::McpContent).finish(Err("boom".into())),
+            json!({"jsonrpc": "2.0", "id": "x", "result": error_content("boom")})
+        );
+        assert_eq!(
+            deferred(ToolErrorMode::JsonRpc).finish(Err("boom".into())),
+            json!({"jsonrpc": "2.0", "id": "x",
+                "error": {"code": -32000, "message": "boom"}})
+        );
+    }
+
+    #[test]
+    fn handle_message_reports_a_deferral_it_cannot_deliver() {
+        let raw = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "ok"}})
+        .to_string();
+        let resp = handle_message(&raw, &fake_tools(), &mut DeferringHandler).unwrap();
+        assert_eq!(resp["result"]["isError"], true);
     }
 }
