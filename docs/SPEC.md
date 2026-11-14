@@ -54,8 +54,8 @@ Two commands spend Figma's API budget deliberately and explicitly: `pull`
                     ▼                                    ▼
          ┌─────────────────────┐              ┌─────────────────────────┐
          │  cli/ (ReadCommand)  │              │  dispatch.rs              │
-         │  pretty-JSON stdout, │              │  ReadCommand (17 reads) +  │
-         │  or a socket client  │              │  tool_registry (21 tools)  │
+         │  pretty-JSON stdout, │              │  ReadCommand (18 reads) +  │
+         │  or a socket client  │              │  tool_registry (22 tools)  │
          │  of serve (§6a)      │              └────────────┬────────────┘
          └─────────────────────┘                           │
                                                               ▼
@@ -554,12 +554,13 @@ client and never runs a whole-mirror scan.
   depth) — i.e. `figmog_node`, `figmog_components`, `figmog_tree`, `figmog_subtree`,
   `figmog_find`, `figmog_search`, `figmog_instances`, `figmog_styles`,
   `figmog_uses`, `figmog_vars`, `figmog_stats`, `figmog_text`,
-  `figmog_where`, `figmog_at`, plus `figmog_status` and `figmog_files`
+  `figmog_where`, `figmog_at`, `figmog_spec` (it joins a subtree with
+  the whole variables read, §17), plus `figmog_status` and `figmog_files`
   — runs on a pool of `min(4, available_parallelism)` read workers. Node
   reads always use workers because raw payloads and child lists can be
   arbitrarily large.
   Classification is by measured cost on a synthetic 100k-node mirror: the
-  inline three take under 0.2 ms; `figmog_components` is linear in sets +
+  inline point reads take under 0.2 ms; `figmog_components` is linear in sets +
   components (NWS-2942) — 65 ms on a 2k-set × 20k-component library
   (`measure_components_cost`); a whole-document subtree ~0.4 s (≈20 MB),
   stats ~0.2 s, vars ~0.1 s, tree/where ~0.2–0.4 s, the rest 25–150 ms
@@ -779,13 +780,13 @@ to the default (see "Startup" above). There is no idle-session eviction
 and no cross-file queries — once opened, a session stays open for the
 process's life.
 
-**The 21 `figmog_*` tools** (`dispatch::tool_registry`): 13 core reads
+**The 22 `figmog_*` tools** (`dispatch::tool_registry`): 13 core reads
 (`figmog_status`, `figmog_pages`, `figmog_tree`, `figmog_node`,
 `figmog_subtree`, `figmog_find`, `figmog_search`, `figmog_instances`,
 `figmog_components`, `figmog_styles`, `figmog_uses`, `figmog_vars`,
 `figmog_sync`) + 5 whole-file structural queries (`figmog_stats`,
 `figmog_path`, `figmog_text`, `figmog_where`, `figmog_at`) +
-`figmog_images` (§15) + 2 multi-file management tools that aren't
+`figmog_spec` (the binding-aware spec, §17) + `figmog_images` (§15) + 2 multi-file management tools that aren't
 per-file (`figmog_open`, `figmog_files`). Every tool but
 `figmog_sync`/`figmog_open`/`figmog_images` reads the local mirror at
 zero Figma API cost; `figmog_sync` and `figmog_open` schedule pulls, and `figmog_images` fetches renders and fills, so
@@ -796,7 +797,7 @@ request, §8 "Re-detection"), spliced in at the call site that knows it (never i
 variable snapshot summary under `variables` (§9).
 `figmog_open` also takes an optional `geometry` boolean (§14).
 
-The 19 per-file tools each carry the optional `file` property described
+The 20 per-file tools each carry the optional `file` property described
 above; `figmog_open` and `figmog_files` don't.
 
 **Argument types (NWS-2944):** local tool arguments are type-checked
@@ -817,7 +818,7 @@ remain rejected with `got floating-point number <value>`; point lookup's
 `limit` retains its non-negative integral-number rule (§10). CLI point
 coordinates must be finite so direct and socket serialization agree.
 
-**Read adapters (NWS-2902):** the 17 local reads (every `figmog_*` tool
+**Read adapters (NWS-2902):** the 18 local reads (every `figmog_*` tool
 except `figmog_sync`, `figmog_images`, `figmog_open` and `figmog_files`)
 share one typed representation, `dispatch::ReadCommand`. Tool JSON (MCP,
 the socket, `figmog call`) is parsed into it with the argument typing
@@ -1162,7 +1163,7 @@ tools`/`figmog call`, §10) probes Figma's native desktop app's Dev Mode
 MCP server (`http://127.0.0.1:3845/mcp` by default, streamable HTTP) at
 startup. This requires a **paid Dev/Full seat** and the desktop app
 running with Dev Mode MCP enabled. While it is connected, `tools/list`
-merges figmog's 21 local tools with every upstream tool verbatim
+merges figmog's 22 local tools with every upstream tool verbatim
 (description prefixed `"[via Figma desktop] "`); while it is missing,
 local-only tools. A failed startup probe prints one stderr line.
 
@@ -1343,14 +1344,127 @@ retains the full lifecycle details.
 or imported) over inference whenever one exists for a given variable id.
 Authoritative rows also carry `code_syntax` (platform → name object),
 `hidden_from_publishing` and `remote` from the snapshot row — null for a
-legacy snapshot. Without `--snapshot`/`snapshot: true` the result stays
-the plain row array; with it, `{snapshot, variables}`.
+legacy snapshot — plus the variable's sorted, deduplicated `scopes`, its
+existing `collection_id`, and its collection's `default_mode_id`.
+`values_by_mode_id` preserves every mode's value; `mode_names` maps IDs to
+display names, using the ID when unnamed. The presentation fields
+`default_mode` and `values_by_mode` retain names where unambiguous; when
+mode labels collide, `values_by_mode` uses IDs for the collection.
+Token export and spec matching select values by ID (NWS-2967). Without
+`--snapshot`/`snapshot: true` the result stays the plain row array; with
+it, `{snapshot, variables}`.
+
+### Token export (NWS-2967)
+
+`figmog tokens export [--out <path>] [--collection <name>] [--light-mode
+<mode>] [--dark-mode <mode>]` renders the variable snapshot as one CSS
+file (`src/tokens.rs`, pure; the CLI half is `src/cli/tokens.rs`).
+
+**How it reads.** It is not a new read tool: the CLI maps it to the
+existing `figmog_vars {snapshot: true}` read (`ReadCommand::Vars`), so it
+is socket-routed to a running serve/background owner or opens the store
+directly exactly like `figmog vars --snapshot` (§10 "Socket-first
+routing"), and renders that JSON locally. A serving binary older than the
+mode-identity or `collection_id` fields is reported as an error asking
+to restart it.
+
+**Snapshot.** Only state `current` exports; `none`, `legacy` (no
+provenance) and `empty` are exit-1 errors. Only authoritative rows are
+exported — an inferred-only variable (bound in the file, absent from the
+snapshot) is skipped and reported.
+
+**Output.** Deterministic, every block sorted by property name:
+
+1. a header comment with the snapshot's `source`, `format`,
+   `format_version`, `exported_at` and `digest` (null when absent) and the
+   theme choice;
+2. `:root { … }` — every exported variable's value in its collection's
+   default mode, except the theme collection, which uses its light mode;
+3. `[data-theme="dark"] { … }` — the theme collection's variables in the
+   dark mode (absent without a theme collection). Every theme-collection
+   variable, aliases included, is redeclared there, so `data-theme` works
+   on the root or on any subtree. A custom property's `var()` resolves
+   where the property is declared, so every variable outside the theme
+   collection that aliases a theme variable — directly or through a chain
+   — is also redeclared there, with its one value (otherwise
+   `var(--color-action-primary)` would keep its light value inside a dark
+   subtree);
+4. `@theme { … }` and `@theme inline { … }` — the Tailwind v4 theme
+   (below). Empty blocks are omitted.
+
+**Theme collection and modes.** Collections are grouped and tested for
+theme membership by ID. `--collection` selects a display name and rejects
+that name when more than one collection has it. Without `--collection`,
+the theme is the one collection with a mode whose name contains "dark"
+(ASCII-case-insensitive) — none ⇒ no dark block (an error if
+`--light-mode`/`--dark-mode` was given), several ⇒ an error asking for
+`--collection`. The dark mode is `--dark-mode`, else the collection's one
+mode named like "dark"; the light mode is `--light-mode`, else its one mode
+named like "light", else its default mode. Unknown names, several
+matches (including duplicate display names) and light = dark are errors.
+Mode display names select flags; mode IDs identify the chosen values.
+Other mode kinds and combining
+collections are out of scope.
+
+**Names.** `codeSyntax.WEB` (`--x` or `var(--x)`) when `x` is nonempty
+ASCII letters, digits, `-` and `_`; an invalid WEB value is reported and
+falls back to the name path: the variable name lower-cased, every run of
+non-alphanumerics (including the `/` group separators) one `-`, prefixed
+`--` (`Color/Brand Primary` → `--color-brand-primary`; no collection
+prefix). A name with no ASCII alphanumerics is skipped and reported. Two
+variables with one name are an error naming both (`token name collision:
+`a/b` (VariableID:…) and `a b` (VariableID:…) both export as `--a-b` …`).
+
+**Values.** COLOR → `#rrggbb`, or `#rrggbbaa` below full alpha (each
+channel `round(clamp(x, 0, 1) × 255)`). FLOAT → `<n>px` when its `scopes`
+include `GAP` or `WIDTH_HEIGHT` (spacing/size) or `CORNER_RADIUS`
+(radius); any other FLOAT is emitted unitless and reported. Numbers print
+in shortest round-trip form (`16`, `0.5`). An alias → `var(--target)`;
+CSS resolves chains. Every emitted FLOAT carries its own unit, so a px
+FLOAT aliasing a unitless one → `calc(var(--target) * 1px)` (a bare
+`var()` would make `padding: 16` invalid, i.e. 0px), while a unitless
+FLOAT aliasing a px one is skipped and reported (CSS cannot strip a
+unit; emitting the resolved number would silently detach the alias), as
+is an alias between COLOR and FLOAT. STRING, BOOLEAN and other types are skipped and
+reported, as is a variable missing a needed mode's value or aliasing a
+variable that isn't exported (transitively).
+
+**Tailwind namespaces.** COLOR → `--color-*`, spacing/size → `--spacing-*`,
+radius → `--radius-*`; unitless FLOATs get no theme entry. A name already
+in its namespace (`--color-brand`) is kept; otherwise the namespace is
+prefixed (`--surface` → `--color-surface`). Entries:
+
+- theme name ≠ token name ⇒ `@theme inline { --color-surface:
+  var(--surface) }`, so the utility reads the token where it is used;
+- theme name = token name and the value is the same alias in every
+  emitted mode ⇒ `@theme inline { --color-action-primary:
+  var(--color-brand) }` (the utility uses the alias target directly);
+- otherwise ⇒ `@theme { --color-brand: <root value> }`: the utility reads
+  `var(--color-brand)`, which the unlayered `:root`/`[data-theme]` blocks
+  override per mode.
+
+A theme name that collides with another theme name or another token's
+name is an error naming both variables.
+
+**Output and report.** Without `--out` the CSS goes to stdout and, when
+anything was reported, one `{"report": [...]}` JSON line to stderr. With
+`--out` the file is written and stdout gets `{out, tokens, theme,
+report}` JSON. Report entries are `{variable_id, name, reason}`, sorted.
+
+**Fixtures.** `tests/fixtures/tokens/variables.json` (synthetic: a
+Light/Dark `Theme` collection, an alias chain `action/hover →
+action/primary → brand → ocean/500` and a GAP alias of a unitless FLOAT)
+exports to the golden `tests/fixtures/tokens/export.css`
+(`tests/tokens.rs`; `FIGMOG_BLESS=1` regenerates it).
+`packages/react/test/tokens.test.ts` compiles that golden file with
+Tailwind v4 and asserts computed values in Chromium in both modes.
 
 ## 10. CLI surface
 
 JSON is the CLI's only output mode (there is no `--json` flag — there's
 nothing to select between). Every command prints pretty-printed JSON on
-stdout via one seam (`cli::write_json`); every failure prints
+stdout via one seam (`cli::write_json`) — the one exception is `tokens
+export` without `--out`, whose stdout is the CSS file itself (§9); every failure prints
 `{"error": "..."}` on stderr and exits 1 (a raw internal panic exits 101
 instead, still as one JSON stderr line — see `open_store_checked`'s doc
 comment in `src/cli/mod.rs`). A reader that vanishes mid-write (piped
@@ -1364,14 +1478,15 @@ text and exit before dispatch, like `--help`.
 
 The CLI is split by concern: `src/cli/mod.rs` (clap types, top-level
 dispatch, `run`, the shared store-opening/JSON-writing helpers, and the
-mapping of the 17 read-only query commands onto `dispatch::ReadCommand`),
+mapping of the 18 read-only query commands onto `dispatch::ReadCommand`),
 `src/cli/pull.rs` (`pull`, the typed `PullError`, `.figmog/current`),
 `src/cli/call.rs`
 (`tools`, `call`, `import-variables` — the desktop-proxy CLI parity
 surface, so every tool `figmog serve` would expose is reachable without
 an MCP client), `src/cli/images.rs` (`images`, §15),
-`src/cli/socket.rs` (the client half of the control plane, §6a), and
-`src/cli/migrate.rs` (`migrate`, §16).
+`src/cli/socket.rs` (the client half of the control plane, §6a),
+`src/cli/migrate.rs` (`migrate`, §16), and `src/cli/tokens.rs` (`tokens
+export`, §9 — mapped onto the `figmog_vars` read, then rendered as CSS).
 `src/cli/auth.rs` handles credential commands and hidden terminal input;
 `src/auth.rs` owns credential resolution and native storage.
 
@@ -1911,3 +2026,137 @@ Cleanup of unmarked staging directories and stray tombstones retains the
 existing anchor/native-lock protection without opening torn database contents.
 Missing lock files inside those partial private trees are created without
 initializing a database.
+
+## 17. Binding-aware spec (NWS-2968)
+
+`figmog spec <node>` and the `figmog_spec {id}` tool describe one
+auto-layout subtree — typically a card — the way a developer rebuilds it:
+layout plus values, every value either the variable token it is bound to
+or explicitly untokenized. Source: `src/spec.rs` (pure), composed in
+`query::spec`.
+
+**How it reads.** A local read like any other (`ReadCommand::Spec`, §6
+"Read adapters"): direct CLI, socket/owner-routed CLI, `figmog call` and
+MCP all return the same JSON, and the NWS-2902 parity tests cover it. It
+runs on a read worker. The inputs are exactly the `figmog_subtree {id}`
+answer (raw JSON, children nested) and the `figmog_vars {snapshot: true}`
+answer, so the output is a function of the mirror alone. `id` takes a
+bare id, a `12-34` id or a Figma URL (§12); an unknown id is the standard
+`no node … in the mirror` error.
+
+**Output.** One JSON object, every key sorted (`serde_json` without
+`preserve_order`):
+
+```
+{
+  "node": <spec node>,
+  "tokens_snapshot": {state, source, format, format_version, exported_at,
+                      digest, variables, collections, theme, css_unavailable},
+  "unsupported": [{"id", "reason"}, ...]   // sorted by id, then reason
+}
+```
+
+A spec node is `{id, name, type, layout?, values, children}` with
+`children` in child-index order. `tokens_snapshot` is the §9 snapshot
+summary the names refer to, plus the theme the token export picks
+(`{collection, collection_id, light_mode, dark_mode}` or null) and
+`css_unavailable`:
+null, or the token export's error (no `current` snapshot, a name
+collision, an ambiguous theme), in which case every `css` is null.
+
+**Layout** (only on auto-layout frames and on children of one):
+
+- `direction`: `horizontal` | `vertical` (`layoutMode`);
+- `gap`: a value entry for `itemSpacing`, or `"auto"` under
+  `SPACE_BETWEEN`;
+- `padding`: `{top, right, bottom, left}` value entries (an absent padding
+  is Figma's 0);
+- `align`: `{primary, counter}` from `primaryAxisAlignItems` /
+  `counterAxisAlignItems` — `start`, `center`, `end`, `space-between`,
+  `baseline` (absent ⇒ `start`);
+- `sizing`: `{horizontal, vertical}`, each `hug` | `fill` | `fixed` —
+  `layoutSizingHorizontal`/`Vertical` when present, else the older fields:
+  `layoutGrow > 0` along the parent's direction or `layoutAlign: STRETCH`
+  across it ⇒ fill; the node's own `primaryAxisSizingMode` /
+  `counterAxisSizingMode` (absent ⇒ `AUTO`) ⇒ hug or fixed; a TEXT node's
+  `textAutoResize` (`WIDTH_AND_HEIGHT` both axes, `HEIGHT` vertical) ⇒
+  hug; else fixed. Emitted on children of an auto-layout parent, on
+  auto-layout frames, and on the spec root when it carries
+  `layoutSizing*`;
+- `size`: `{width, height}` from `absoluteBoundingBox`, whenever `layout`
+  is present.
+
+**Values:** `fill` and `stroke` (arrays, one entry per visible `SOLID`
+paint; the raw value is `#rrggbb`, or `#rrggbbaa` below full alpha, the
+paint's `opacity` folded into alpha — the token export's color form),
+`stroke_weight` (with visible uniform strokes, defaulting to 1 when
+`strokeWeight` is omitted), `radius` (`{top_left, top_right,
+bottom_right, bottom_left}` from `rectangleCornerRadii`, else
+`cornerRadius`; absent when the node has neither and no corner binding),
+and on TEXT nodes `typography`: `font_family`, `font_size`,
+`font_weight`, `line_height` (`lineHeightPx`; `"auto"` for
+`INTRINSIC_%`), `letter_spacing`, each present when the type style has it.
+
+**Value entries.** Bound:
+`{"token": <variable name | null>, "variable_id", "css": <name | null>,
+"raw": <Figma's baked value>}`. Bindings are read from the paint's
+`boundVariables.color`, else the node's `boundVariables.fills[i]` /
+`strokes[i]`; `itemSpacing`, `paddingTop`…; uniform stroke weight from
+`boundVariables.individualStrokeWeights.{top,right,bottom,left}` when
+all four sides name the same variable, with the flat `strokeWeight`
+binding also supported. Mixed or partially bound sides are unsupported.
+Corner bindings use `boundVariables.rectangleCornerRadii`'s
+`RECTANGLE_TOP_LEFT_CORNER_RADIUS` and corresponding keys, with the flat
+`topLeftRadius`… forms also supported. Text properties come from the
+node's `boundVariables`, else
+its type style's (`fontFamily`, `fontSize`, `fontWeight`, `lineHeight`,
+`letterSpacing`), an alias or an array of aliases naming one variable.
+`token` is the variable's name in the snapshot (null for a variable bound
+in the file but absent from the snapshot); `css` is the custom property
+name `figmog tokens export` emits for it (§9 "Token export", taken from
+that export run on the same snapshot, so they cannot drift) — null for a
+variable the export skips (STRING, BOOLEAN…). An alias variable is shown
+as itself (`surface`, not the primitive it aliases).
+
+Unbound: `{"untokenized": true, "raw", "matches"?}` — never token usage.
+`matches` lists (sorted by token name, then id) every snapshot variable
+`{token, variable_id, css}` whose value in its root mode — the theme
+collection's light mode, else its collection's default mode, aliases
+followed — equals the raw value (colors as `#rrggbb[aa]`, numbers within
+1e-6, strings exactly), of the property's type, and scoped for it:
+`ALL_SCOPES`, or `ALL_FILLS` plus `TEXT_FILL` / `FRAME_FILL` /
+`SHAPE_FILL` by node type for fills, `STROKE_COLOR`, `STROKE_FLOAT`,
+`CORNER_RADIUS`, `GAP` (gap and padding), `FONT_FAMILY`, `FONT_SIZE`,
+`FONT_WEIGHT`, `LINE_HEIGHT`, `LETTER_SPACING`. Omitted when nothing
+matches.
+
+**Unsupported, never approximated.** Each case is listed under
+`unsupported` with the node id and reason, and the affected part is left
+out of the spec:
+
+| case | left out |
+|---|---|
+| `visible: false` | the node's layout, values and children |
+| `layoutMode` other than `HORIZONTAL`/`VERTICAL`/`NONE` (e.g. `GRID`) | its own layout; children get no sizing |
+| `layoutWrap: WRAP` | its own layout; children get no sizing |
+| `layoutMode: NONE` with children (constraints-based frame, group) | children's positions (no sizing) |
+| `layoutPositioning: ABSOLUTE` | the node's position and sizing |
+| TEXT with nonzero `characterStyleOverrides` (mixed runs) | its fill and typography |
+| a visible non-`SOLID` paint (gradients, `IMAGE`, …) | that paint |
+| a property bound to several variables (mixed alias array) | that property |
+| visible `effects` | the effects |
+| layer `opacity` below 1 | the opacity |
+| `individualStrokeWeights` | the stroke weight |
+
+The node's other values and its children are still specified.
+
+**Fixtures.** `tests/fixtures/spec/card.json` (a synthetic file: a
+vertical auto-layout card with a horizontal row using the older sizing
+fields, a GRID child, an absolutely positioned ribbon with a gradient,
+and a mixed-run caption) and `tests/fixtures/spec/variables.json` (a
+synthetic export with a Light/Dark theme collection) produce the golden
+`tests/fixtures/spec/card.spec.json` (`tests/spec.rs`; `FIGMOG_BLESS=1`
+regenerates it). The tests also check that every binding in the
+specified nodes appears as its token, that each `css` name appears in
+the `tokens export` output for the same snapshot, the flagged unbound
+padding, the `matches` gap, and the unsupported grid child.

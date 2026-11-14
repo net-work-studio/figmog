@@ -30,7 +30,7 @@
 //!
 //! **v3 (build design §12):** unless `--no-upstream`, figmog also probes
 //! Figma's native desktop MCP server at startup and becomes the *only*
-//! Figma MCP an agent needs — `tools/list` merges the 21 local `figmog_*`
+//! Figma MCP an agent needs — `tools/list` merges the 22 local `figmog_*`
 //! tools with every upstream tool verbatim (`proxy::merge_registry`), and
 //! `tools/call` routes by the namespace rule (`proxy::is_local_tool`).
 //! Upstream routing is global, not per-session: the desktop server serves
@@ -2325,10 +2325,10 @@ mod tests {
         })]);
         let (tools, dropped) = proxy::merge_registry(local_registry(), upstream.tools());
         assert!(dropped.is_empty());
-        assert_eq!(tools.len(), 22);
-        assert!(tools[..21].iter().all(|t| t.name.starts_with("figmog_")));
-        assert_eq!(tools[21].name, "get_design_context");
-        assert!(tools[21].description.starts_with("[via Figma desktop] "));
+        assert_eq!(tools.len(), 23);
+        assert!(tools[..22].iter().all(|t| t.name.starts_with("figmog_")));
+        assert_eq!(tools[22].name, "get_design_context");
+        assert!(tools[22].description.starts_with("[via Figma desktop] "));
     }
 
     #[test]
