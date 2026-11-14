@@ -11,16 +11,31 @@ use std::path::{Path, PathBuf};
 /// returned absolute path must be used for all subsequent filesystem access.
 /// Call before opening a store: fold may write journals during open itself.
 pub(crate) fn ensure(path: &Path) -> Result<PathBuf, String> {
-    let protect = || -> io::Result<PathBuf> {
-        let resolved = resolve(path)?;
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(&resolved)?;
-        directory.set_permissions(Permissions::from_mode(0o700))?;
-        Ok(resolved)
-    };
-    protect().map_err(|e| format!("protecting mirror directory {}: {e}", path.display()))
+    protect(path, true).map_err(|e| format!("protecting mirror directory {}: {e}", path.display()))
+}
+
+/// [`ensure`] for a directory that must already exist: the same checks and
+/// tightening, but nothing is created — `Ok(None)` when `path` or one of
+/// its ancestors is missing.
+pub(crate) fn existing(path: &Path) -> Result<Option<PathBuf>, String> {
+    match protect(path, false) {
+        Ok(resolved) => Ok(Some(resolved)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "protecting mirror directory {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+fn protect(path: &Path, create: bool) -> io::Result<PathBuf> {
+    let resolved = resolve(path, create)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(&resolved)?;
+    directory.set_permissions(Permissions::from_mode(0o700))?;
+    Ok(resolved)
 }
 
 /// Resolve one component at a time, checking its parent before looking up or
@@ -28,7 +43,7 @@ pub(crate) fn ensure(path: &Path) -> Result<PathBuf, String> {
 /// prevents another OS user from substituting any already-checked component.
 /// Symlink targets re-enter the same walk; canonicalizing the whole path first
 /// would lose unsafe ancestors traversed along the way to the final target.
-fn resolve(path: &Path) -> io::Result<PathBuf> {
+fn resolve(path: &Path, create: bool) -> io::Result<PathBuf> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -70,7 +85,7 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
         let next = resolved.join(component);
         let metadata = match fs::symlink_metadata(&next) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
                 match DirBuilder::new().mode(0o700).create(&next) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}

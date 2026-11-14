@@ -59,11 +59,14 @@ fn successful_pull_updates_the_nearest_ignore_once_and_preserves_existing_bytes(
     fs::write(repo.path().join(".gitignore"), "root-entry\n").unwrap();
     let ignore = repo.path().join("packages/.gitignore");
     fs::write(&ignore, "# existing\r\nnode_modules/").unwrap();
+    // A figmog.toml makes the nested directory the project root (spec
+    // §16), and adds its machine-local override file to the ignore.
+    fs::write(nested.join("figmog.toml"), "").unwrap();
     pull(&nested);
     pull(&nested);
     assert_eq!(
         fs::read(&ignore).unwrap(),
-        b"# existing\r\nnode_modules/\r\n.figmog/\r\n"
+        b"# existing\r\nnode_modules/\r\n.figmog/\r\nfigmog.local.toml\r\n"
     );
     assert_eq!(
         fs::read_to_string(repo.path().join(".gitignore")).unwrap(),
@@ -90,10 +93,11 @@ fn existing_broad_ignore_is_respected_and_nested_negations_are_overridden() {
     let nested = repo.path().join("app");
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join(".gitignore"), "!.figmog/\n").unwrap();
+    fs::write(nested.join("figmog.toml"), "").unwrap();
     pull(&nested);
     assert_eq!(
         fs::read_to_string(nested.join(".gitignore")).unwrap(),
-        "!.figmog/\n.figmog/\n"
+        "!.figmog/\n.figmog/\nfigmog.local.toml\n"
     );
 }
 
@@ -144,10 +148,13 @@ fn fifo_ignore_at_the_root_or_an_ancestor_warns_without_blocking_a_pull() {
     let nested = repo.path().join("app");
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join(".gitignore"), "existing\n").unwrap();
+    // The nested project (spec §16) shares the repository's mirror, so
+    // only the first pull adds nodes.
+    fs::write(nested.join("figmog.toml"), "").unwrap();
 
     // The nested regular file is the nearest append destination, but
     // Git would still read the root FIFO unless all ancestors are checked.
-    for cwd in [repo.path(), nested.as_path()] {
+    for (cwd, added) in [(repo.path(), 18), (nested.as_path(), 0)] {
         let out = figmog()
             .timeout(Duration::from_secs(30))
             .current_dir(cwd)
@@ -157,7 +164,7 @@ fn fifo_ignore_at_the_root_or_an_ancestor_warns_without_blocking_a_pull() {
             .success();
         let output = out.get_output();
         let churn: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(churn["added"], 18);
+        assert_eq!(churn["added"], added);
         let warning: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
         assert!(
             warning["warning"]

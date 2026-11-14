@@ -3,6 +3,7 @@
 //! pointer every other command's [`super::resolve_db`] reads).
 
 use std::collections::BTreeSet;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,7 @@ use crate::ident::parse_file_ref;
 use crate::store::{self, Churn, collect_sweepable, collect_variable_ids};
 use crate::watch::BACKOFF_CAP;
 
-use super::{Db, open_store_checked, write_json};
+use super::{Db, write_json};
 
 /// Errors from [`do_pull`]: either a typed API failure (so callers can act
 /// on rate limits) or any other pull-mechanics failure. `Display` matches
@@ -41,28 +42,77 @@ pub(super) fn cmd_pull(
     fresh: bool,
     geometry: bool,
 ) -> Result<(), String> {
-    let (churn, _name, _version) = do_pull(db, file, from_file, fresh, geometry).map_err(|e| {
-        let message = e.to_string();
-        // `pull` is a writer (spec §1: it stays direct-open, never routed
-        // over the socket), so a running `figmog serve` holding the same
-        // store's single-writer lock is the single most common way this
-        // fails while serve is up — point at the one escape hatch that
-        // still works in that situation (`figmog call figmog_sync` reaches
-        // the *owning* process over the socket) rather than leaving the
-        // generic "is figmog serve running?" message to speak for itself.
-        // Scoped to exactly this message (not every `do_pull` failure) so
-        // an unrelated error (bad JSON, a real network failure, ...) isn't
-        // given a hint that doesn't apply to it.
-        if message == super::STORE_LOCKED_MSG {
-            format!("{message} — or ask the running serve: figmog call figmog_sync")
-        } else {
-            message
-        }
-    })?;
-    if db.key.is_some() {
-        let ignored = std::env::current_dir()
-            .map_err(|error| error.to_string())
-            .and_then(|cwd| super::gitignore::ignore_local_mirror(&cwd));
+    let (churn, _name, _version, compaction) = do_pull(db, file, from_file, fresh, geometry)
+        .map_err(|e| {
+            let message = e.to_string();
+            // A reachable serve already took this pull (NWS-2963,
+            // `cmd_pull_routed`); this direct path meets a held store only via
+            // `--db`/`--no-socket` or an owner without a socket. A serve owner
+            // is named by the lock error itself; for an unnamed one, point at
+            // the escape hatch that reaches a serve (`figmog call
+            // figmog_sync`) rather than leaving the generic message alone.
+            // Scoped to exactly this message (not every `do_pull` failure) so
+            // an unrelated error (bad JSON, a real network failure, ...) isn't
+            // given a hint that doesn't apply to it.
+            if message == super::STORE_LOCKED_MSG {
+                format!("{message} — or ask the running serve: figmog call figmog_sync")
+            } else {
+                message
+            }
+        })?;
+    let output = finish_pull(
+        db,
+        &serde_json::to_value(&churn).map_err(|e| e.to_string())?,
+    );
+    if let Some(compaction) = compaction {
+        compaction.run();
+    }
+    output
+}
+
+/// `figmog pull` through the running serve that owns the store (NWS-2963):
+/// a saved response is read, parsed and structurally validated here, in
+/// the invoking worktree, before the server can open a destination session.
+/// Serve applies it on the file's worker (`--fresh` behind
+/// the per-store reset barrier) and answers once the pull committed and was
+/// published. The output is the direct path's.
+pub(super) fn cmd_pull_routed(
+    db: &Db,
+    key: &str,
+    route: &super::socket::Route,
+    client: super::socket::Client,
+    from_file: Option<PathBuf>,
+    fresh: bool,
+    geometry: bool,
+) -> Result<(), String> {
+    let mut args = serde_json::json!({"file": key, "db_bytes": db.path.as_os_str().as_bytes(), "fresh": fresh, "geometry": geometry});
+    if let Some(path) = from_file {
+        let response = crate::deep_json::OwnedValue(read_saved_response(&path)?);
+        // Match the direct path's validation before a missing destination
+        // can be initialized. This work stays in the invoking CLI process.
+        flatten_file(&response).map_err(|error| error.to_string())?;
+        args["from_file"] = response.into_inner();
+    }
+    let done = super::socket::write_over(route, client, crate::serve::writes::PULL, args)?;
+    if let Some(layout) = &db.layout {
+        layout.write_current(key)?;
+    }
+    finish_pull(db, &done["result"])
+}
+
+/// After a successful pull (either path): keep `.figmog/` ignored, then
+/// print the churn.
+fn finish_pull(db: &Db, churn: &Value) -> Result<(), String> {
+    if db.key.is_some()
+        && let Some(layout) = &db.layout
+    {
+        let ignored = super::gitignore::ignore_local_mirror(
+            &layout.project_root,
+            layout
+                .project_root
+                .join(crate::project::CONFIG_FILE)
+                .is_file(),
+        );
         if let Err(error) = ignored {
             // Sync already succeeded. A read-only/invalid ignore file
             // must not turn that into a failed pull or corrupt stdout.
@@ -72,7 +122,16 @@ pub(super) fn cmd_pull(
             );
         }
     }
-    print_churn(&churn)
+    write_json(churn)
+}
+
+/// Read and parse a saved `GET /v1/files/:key` response (`--from-file`).
+fn read_saved_response(path: &std::path::Path) -> Result<Value, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    crate::deep_json::from_str(&content)
+        .map(crate::deep_json::OwnedValue::into_inner)
+        .map_err(|e| format!("parsing {}: {e}", path.display()))
 }
 
 /// The pull mechanics without any printing. `.figmog/current` is written
@@ -93,18 +152,15 @@ pub(super) fn do_pull(
     from_file: Option<PathBuf>,
     fresh: bool,
     geometry: bool,
-) -> Result<(Churn, String, String), PullError> {
+) -> Result<(Churn, String, String, Option<super::store_lock::Compaction>), PullError> {
     // `vars_resp` is only ever `Some` on the network path — `--from-file`
     // ingests a saved `GET /v1/files/:key` response and never touches the
     // network at all, so it never calls `variables_local` either.
     let (resp, vars_resp): (crate::deep_json::OwnedValue, Option<Value>) = match from_file {
-        Some(path) => {
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| format!("reading {}: {e}", path.display()))?;
-            let resp = crate::deep_json::from_str(&content)
-                .map_err(|e| format!("parsing {}: {e}", path.display()))?;
-            (resp, None)
-        }
+        Some(path) => (
+            crate::deep_json::OwnedValue(read_saved_response(&path)?),
+            None,
+        ),
         None => {
             let key = db
                 .key
@@ -128,7 +184,7 @@ pub(super) fn do_pull(
             let stored_geometry = if fresh || !db.path.exists() {
                 false
             } else {
-                open_store_checked(&db.path, |path| crate::open_store!(path))
+                db.open(|path| crate::open_store!(path))
                     .map(|st| {
                         st.rtx(|(.., mirror_config, _, _, _)| store::read_geometry(&mirror_config))
                     })
@@ -148,6 +204,25 @@ pub(super) fn do_pull(
     apply_pull(db, &resp, vars_resp.as_ref(), fresh, geometry)
 }
 
+/// [`apply_pull`] for in-crate tests comparing serve's writes with the
+/// direct path (NWS-2963).
+#[cfg(test)]
+pub(crate) fn apply_pull_at(
+    path: &std::path::Path,
+    resp: &Value,
+    fresh: bool,
+    geometry: bool,
+) -> Result<Churn, String> {
+    let db = Db {
+        path: path.to_path_buf(),
+        key: None,
+        layout: None,
+    };
+    apply_pull(&db, resp, None, fresh, geometry)
+        .map(|(churn, ..)| churn)
+        .map_err(|e| e.to_string())
+}
+
 /// Validate both responses before opening or changing a mirror. Fresh
 /// replacement preserves an in-store ownership anchor while clearing contents.
 fn apply_pull(
@@ -156,7 +231,7 @@ fn apply_pull(
     vars_resp: Option<&Value>,
     fresh: bool,
     geometry: bool,
-) -> Result<(Churn, String, String), PullError> {
+) -> Result<(Churn, String, String, Option<super::store_lock::Compaction>), PullError> {
     let mut flattened = flatten_file(resp).map_err(|e| e.to_string())?;
     if let Some(v) = vars_resp {
         flattened
@@ -164,7 +239,7 @@ fn apply_pull(
             .extend(crate::vars::enterprise_snapshot_recs(v).map_err(|e| e.to_string())?);
     }
 
-    let mut st = open_store_checked(&db.path, |path| crate::open_store!(path))?;
+    let mut st = db.open(|path| crate::open_store!(path))?;
     if fresh {
         st = st.reset(|path| crate::open_store!(path))?;
     }
@@ -223,19 +298,25 @@ fn apply_pull(
     let stored_now = st.rtx(|(.., mirror_config, _, _, _)| store::read_geometry(&mirror_config));
     store::upsert_mirror_config(&mut st, store::effective_geometry(geometry, stored_now));
 
-    if let Some(key) = &db.key {
-        write_current(key)?;
+    if let (Some(key), Some(layout)) = (&db.key, &db.layout) {
+        layout.write_current(key)?;
     }
+
+    // Move what this pull wrote out of fjall's journal (NWS-2941), so the
+    // next cold open doesn't replay it. A zero-churn pull wrote nothing
+    // worth it (just its meta/config rows).
+    let compaction = if fresh || churn.wrote() {
+        Some(st.close_for_compaction())
+    } else {
+        None
+    };
 
     Ok((
         churn,
         flattened.file.name.clone(),
         flattened.file.version.clone(),
+        compaction,
     ))
-}
-
-fn print_churn(churn: &Churn) -> Result<(), String> {
-    write_json(&serde_json::to_value(churn).map_err(|e| e.to_string())?)
 }
 
 /// How long a failed pull's caller (`figmog serve`'s sessions, via
@@ -265,9 +346,10 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub(crate) fn write_current(key: &str) -> Result<(), String> {
-    let root = crate::private_dir::ensure(std::path::Path::new(".figmog"))?;
-    std::fs::write(root.join("current"), key).map_err(|e| e.to_string())
+/// Record `key` in `<local_root>/current` (the project's per-checkout
+/// `.figmog`), the fallback default file when `figmog.toml` names none.
+pub(crate) fn write_current(local_root: &std::path::Path, key: &str) -> Result<(), String> {
+    crate::project::write_current(local_root, key)
 }
 
 #[cfg(test)]
@@ -281,6 +363,7 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let file = serde_json::json!({
             "name": "Synthetic", "version": "1", "lastModified": "2026-01-01T00:00:00Z",
@@ -293,7 +376,7 @@ mod tests {
         assert!(!db.path.exists(), "invalid data must not create a store");
 
         apply_pull(&db, &file, None, false, true).unwrap();
-        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        let st = db.open(|path| crate::open_store!(path)).unwrap();
         let meta = st.get(&crate::model::Id::Meta);
         let config = st.get(&crate::model::Id::MirrorConfig);
         // Holding the store also proves validation precedes ownership checks:
@@ -320,6 +403,7 @@ mod tests {
             let db = Db {
                 path: dir.path().join("db"),
                 key: None,
+                layout: None,
             };
             let mut file = synthetic_file();
             file["document"]["children"] = serde_json::json!([
@@ -417,7 +501,7 @@ mod tests {
     }
 
     fn snapshot_source(db: &Db) -> Option<String> {
-        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        let st = db.open(|path| crate::open_store!(path)).unwrap();
         st.rtx(|(.., snapshot)| snapshot.get(&0).map(|s| s.source))
     }
 
@@ -430,6 +514,7 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let file = synthetic_file();
         let vars = variables_export();
@@ -467,6 +552,7 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let file = synthetic_file();
         let mut vars = variables_export();
@@ -495,6 +581,7 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let path = dir.path().join("variables.json");
         let imported = variables_export();
@@ -515,7 +602,7 @@ mod tests {
         assert_eq!(churn.removed, 2);
         assert_eq!(snapshot_source(&db).as_deref(), Some("enterprise_rest"));
         let stored = {
-            let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            let st = db.open(|path| crate::open_store!(path)).unwrap();
             assert!(
                 st.get(&crate::model::Id::Variable("VariableID:200".into()))
                     .is_none()
@@ -524,7 +611,7 @@ mod tests {
         };
         apply_pull(&db, &synthetic_file(), None, false, false).unwrap();
         {
-            let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            let st = db.open(|path| crate::open_store!(path)).unwrap();
             assert_eq!(st.get(&crate::model::Id::VariableSnapshot), stored);
             assert!(
                 st.get(&crate::model::Id::Variable("VariableID:200".into()))
@@ -535,7 +622,7 @@ mod tests {
         super::super::call::cmd_import_variables(&db, path.clone(), false, false).unwrap();
         assert_eq!(snapshot_source(&db).as_deref(), Some("file"));
         {
-            let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            let st = db.open(|path| crate::open_store!(path)).unwrap();
             assert!(
                 st.get(&crate::model::Id::Variable("VariableID:200".into()))
                     .is_some()
@@ -543,7 +630,7 @@ mod tests {
         }
         std::fs::write(&path, br#"{"variables":{},"variableCollections":{}}"#).unwrap();
         super::super::call::cmd_import_variables(&db, path, true, false).unwrap();
-        let st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+        let st = db.open(|path| crate::open_store!(path)).unwrap();
         st.rtx(|(_, _, _, _, variables, collections, ..)| {
             assert!(collect_variable_ids(&variables, &collections).is_empty());
         });
@@ -557,12 +644,13 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let file = synthetic_file();
         let vars = variables_export();
         let (plain, ..) = apply_pull(&db, &file, None, false, false).unwrap();
         {
-            let mut st = open_store_checked(&db.path, |path| crate::open_store!(path)).unwrap();
+            let mut st = db.open(|path| crate::open_store!(path)).unwrap();
             let recs = crate::vars::parse_variables_export(&vars).unwrap();
             st.wtx(|tx| {
                 for (id, rec) in &recs {
@@ -593,6 +681,7 @@ mod tests {
         let db = Db {
             path: dir.path().join("db"),
             key: None,
+            layout: None,
         };
         let mut vars = variables_export();
         vars["meta"]["variables"]["VariableID:999"] = serde_json::json!(7);

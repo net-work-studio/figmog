@@ -597,6 +597,17 @@ impl ReadCommand {
     /// add transport metadata (`figmog_status`'s `upstream`, serve's
     /// `ready`/`pull`) themselves.
     pub(crate) fn execute<R: Readable>(self, r: &RootReaders<'_, R>) -> Result<Value, String> {
+        self.execute_counted(r, None)
+    }
+
+    /// [`execute`](Self::execute), with the snapshot's node count when the
+    /// caller already knows it (a published serve view, NWS-2942), so
+    /// `figmog_status` doesn't count the `nodes` table. Other reads ignore it.
+    pub(crate) fn execute_counted<R: Readable>(
+        self,
+        r: &RootReaders<'_, R>,
+        node_count: Option<usize>,
+    ) -> Result<Value, String> {
         let (
             (nodes, children, text, instances_of, styled_by, bound_to, by_type),
             components,
@@ -618,6 +629,7 @@ impl ReadCommand {
                 variables,
                 variable_collections,
                 variable_snapshot,
+                node_count,
             ),
             Self::Pages => query::pages(nodes, by_type),
             Self::Tree { id, depth } => query::tree(nodes, children, by_type, id, depth),
@@ -725,7 +737,8 @@ impl ReadCommand {
 /// [`ReadCommand::execute`]. `upstream_status` is spliced into
 /// `figmog_status`'s output (`"connected"` / `"unreachable"` /
 /// `"disabled"`) without changing `query::status`'s own signature (spec
-/// §12 point 4).
+/// §12 point 4). `node_count` is passed through to
+/// [`ReadCommand::execute_counted`].
 ///
 /// Returns `None` for any name this function doesn't recognize — `figmog_*`
 /// names it doesn't know (a genuine bug, since the registry gates
@@ -736,6 +749,7 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
     args: &Value,
     upstream_status: &str,
     r: &RootReaders<'_, R>,
+    node_count: Option<usize>,
 ) -> Option<Result<Value, String>> {
     let cmd = match ReadCommand::from_tool_args(name, args) {
         Ok(Some(cmd)) => cmd,
@@ -743,7 +757,7 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         Err(e) => return Some(Err(e)),
     };
     let is_status = cmd == ReadCommand::Status;
-    Some(cmd.execute(r).map(|mut v| {
+    Some(cmd.execute_counted(r, node_count).map(|mut v| {
         if is_status && let Some(obj) = v.as_object_mut() {
             obj.insert("upstream".to_string(), json!(upstream_status));
         }
