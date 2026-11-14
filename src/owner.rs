@@ -64,10 +64,6 @@ const DISCOVERY_FILE: &str = "owner.json";
 const LOG_FILE: &str = "owner.log";
 /// The owner's log is truncated before a launch once it exceeds this.
 const LOG_LIMIT: u64 = 1 << 20;
-/// Bounds every handshake read: an owner answers its hello from the loop,
-/// after opening any startup files the client asked for.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// This binary's version, as compared in the handshake.
 pub(crate) fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -406,16 +402,32 @@ pub(crate) fn bind_socket(socket: &Path) -> Result<UnixListener, String> {
         .map_err(|e| format!("preparing the owner socket directory: {e}; use a private XDG_RUNTIME_DIR or ask the administrator to remove a foreign runtime directory"))?;
     check_runtime_directory(dir)?;
     if let Ok(meta) = std::fs::symlink_metadata(socket) {
-        if UnixStream::connect(socket).is_ok() {
-            return Err(format!(
-                "another process is listening at {} although this project's owner lock is free; \
-                 stop it and retry",
-                socket.display()
-            ));
-        }
         if !meta.file_type().is_socket() || meta.uid() != euid() {
             return Err(format!(
                 "refusing to remove {}: not a socket owned by the current user",
+                socket.display()
+            ));
+        }
+        let probe =
+            std::os::unix::net::UnixDatagram::unbound().map_err(|error| error.to_string())?;
+        probe
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        // A datagram connect to a live stream socket reports EPROTOTYPE,
+        // without entering its accept queue. A stream connect on macOS
+        // can report ECONNREFUSED even when a live backlog is merely full.
+        // Refuse every ambiguous result; only a positively stale path is
+        // removable. No data is sent by this liveness check.
+        let stale = probe.connect(socket).is_err_and(|error| {
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ECONNREFUSED | libc::ENOENT)
+            )
+        });
+        if !stale {
+            return Err(format!(
+                "another process is listening at {} although this project's owner lock is free; \
+                 stop it and retry",
                 socket.display()
             ));
         }
@@ -701,20 +713,27 @@ impl ConnectCancel {
 
 /// Look for `paths`' owner and handshake with it. `Err` is final: the
 /// owner refused this client (or is a different figmog build).
-pub(crate) fn probe(
-    paths: &OwnerPaths,
-    relay: Option<(&Settings, &[String])>,
-) -> Result<Probe, String> {
-    probe_cancellable(paths, relay, None)
+#[cfg(test)]
+fn probe(paths: &OwnerPaths, relay: Option<(&Settings, &[String])>) -> Result<Probe, String> {
+    probe_until(
+        paths,
+        relay,
+        std::time::Instant::now() + START_TIMEOUT,
+        None,
+    )
 }
 
-fn probe_cancellable(
+fn probe_until(
     paths: &OwnerPaths,
     relay: Option<(&Settings, &[String])>,
+    deadline: std::time::Instant,
     cancel: Option<&ConnectCancel>,
 ) -> Result<Probe, String> {
-    if let Some(cancel) = cancel {
-        cancel.check()?;
+    let local_cancel = ConnectCancel::default();
+    let cancel = cancel.unwrap_or(&local_cancel);
+    cancel.check()?;
+    if std::time::Instant::now() >= deadline {
+        return Ok(Probe::Closing);
     }
     let Some(discovery) = read_discovery(paths) else {
         return Ok(Probe::Absent);
@@ -722,25 +741,19 @@ fn probe_cancellable(
     if !validate_discovery_socket(paths, &discovery.socket)? {
         return Ok(Probe::Absent);
     }
-    let stream = if let Some(cancel) = cancel {
-        let Some(stream) = connect_socket_cancelled(&discovery.socket, cancel)? else {
-            cancel.release();
-            return Ok(Probe::Absent);
-        };
-        stream
-    } else {
-        let Ok(stream) = UnixStream::connect(&discovery.socket) else {
-            return Ok(Probe::Absent);
-        };
-        stream
+    let Some(stream) = connect_socket_cancelled(&discovery.socket, cancel, deadline)? else {
+        cancel.release();
+        return Ok(if std::time::Instant::now() >= deadline {
+            Probe::Closing
+        } else {
+            Probe::Absent
+        });
     };
     check_peer(&stream)?;
-    let result = probe_connected(paths, relay, &discovery, stream);
-    if let Some(cancel) = cancel {
-        cancel.check()?;
-        if !matches!(&result, Ok(Probe::Ready(_))) {
-            cancel.release();
-        }
+    let result = probe_connected(paths, relay, &discovery, stream, deadline, cancel);
+    cancel.check()?;
+    if !matches!(&result, Ok(Probe::Ready(_))) {
+        cancel.release();
     }
     result
 }
@@ -751,9 +764,10 @@ fn probe_cancellable(
 fn connect_socket_cancelled(
     path: &Path,
     cancel: &ConnectCancel,
+    deadline: std::time::Instant,
 ) -> Result<Option<UnixStream>, String> {
-    use std::os::fd::FromRawFd;
     cancel.check()?;
+    use std::os::fd::FromRawFd;
     #[cfg(target_os = "linux")]
     let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
     #[cfg(not(target_os = "linux"))]
@@ -789,7 +803,6 @@ fn connect_socket_cancelled(
     stream
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
-    cancel.track(&stream)?;
     // SAFETY: sockaddr_un is a plain C structure; zero fills the path terminator.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     let bytes = path.as_os_str().as_bytes();
@@ -805,17 +818,17 @@ fn connect_socket_cancelled(
     {
         address.sun_len = length as u8;
     }
-    let deadline = std::time::Instant::now() + HELLO_TIMEOUT;
+    cancel.track(&stream)?;
     loop {
         cancel.check()?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
         // SAFETY: address and its initialized pathname live through the call.
         let connected =
             unsafe { libc::connect(fd, (&raw const address).cast(), length as libc::socklen_t) };
         let error = std::io::Error::last_os_error();
         if connected == 0 || error.raw_os_error() == Some(libc::EISCONN) {
-            stream
-                .set_nonblocking(false)
-                .map_err(|error| error.to_string())?;
             cancel.check()?;
             return Ok(Some(stream));
         }
@@ -828,8 +841,19 @@ fn connect_socket_cancelled(
         if std::time::Instant::now() >= deadline {
             return Ok(None);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        wait_for_connection_io(deadline, cancel)?;
     }
+}
+
+/// Polling waits share the caller's budget and remain cancellation-aware.
+fn wait_for_connection_io(
+    deadline: std::time::Instant,
+    cancel: &ConnectCancel,
+) -> Result<(), String> {
+    cancel.check()?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    std::thread::sleep(Duration::from_millis(10).min(remaining));
+    cancel.check()
 }
 
 /// Handshake on a connection whose address and peer have been validated.
@@ -838,42 +862,68 @@ fn probe_connected(
     relay: Option<(&Settings, &[String])>,
     discovery: &Discovery,
     stream: UnixStream,
+    deadline: std::time::Instant,
+    cancel: &ConnectCancel,
 ) -> Result<Probe, String> {
     let io = |e: std::io::Error| format!("talking to the background figmog: {e}");
-    // On macOS, setting socket timeouts can fail with EINVAL after the
-    // peer closes. This is the same idle-exit race as a failed HELLO read
-    // or write: reconnect instead of making startup fail permanently.
-    if stream
-        .set_read_timeout(Some(HELLO_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(HELLO_TIMEOUT)))
-        .is_err()
-    {
+    // Keep both directions nonblocking throughout HELLO. One absolute
+    // deadline covers connect, partial frames and unrelated notifications;
+    // a read_line timeout alone could be renewed by each arriving byte.
+    if stream.set_nonblocking(true).is_err() {
         return Ok(Probe::Closing);
     }
     let mut writer = stream.try_clone().map_err(io)?;
     let mut reader = BufReader::new(stream);
-    let hello = hello_request(paths, relay);
-    // A connection that is accepted and then closed without an answer is
-    // an owner past its last request, still closing its stores: wait. (A
-    // dead one refuses the next connect, which reads as `Absent`.)
-    if writeln!(writer, "{hello}")
-        .and_then(|()| writer.flush())
-        .is_err()
-    {
-        return Ok(Probe::Closing);
-    }
-    let response = loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return Ok(Probe::Closing),
-            Ok(_) => {}
+    let hello = format!("{}\n", hello_request(paths, relay));
+    let mut remaining = hello.as_bytes();
+    while !remaining.is_empty() {
+        cancel.check()?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(Probe::Closing);
         }
-        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+        match writer.write(remaining) {
+            Ok(0) => return Ok(Probe::Closing),
+            Ok(written) => remaining = &remaining[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_connection_io(deadline, cancel)?;
+            }
+            Err(_) => return Ok(Probe::Closing),
+        }
+    }
+    let mut line = Vec::new();
+    let response = loop {
+        cancel.check()?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(Probe::Closing);
+        }
+        let buffer = match reader.fill_buf() {
+            Ok([]) => return Ok(Probe::Closing),
+            Ok(buffer) => buffer,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_connection_io(deadline, cancel)?;
+                continue;
+            }
+            Err(_) => return Ok(Probe::Closing),
+        };
+        let count = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |i| i + 1);
+        let complete = buffer[count - 1] == b'\n';
+        line.extend_from_slice(&buffer[..count]);
+        reader.consume(count);
+        if !complete {
+            continue;
+        }
+        let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
             return Err("the background figmog sent an unreadable handshake".into());
         };
         if frame.get("method").is_none() && frame["id"] == HELLO_ID {
             break frame;
         }
+        line.clear();
     };
     if let Some(error) = response.get("error") {
         return match error["code"].as_i64() {
@@ -926,8 +976,12 @@ fn probe_connected(
         attach_errors,
     };
     let stream = reader.get_ref();
+    if std::time::Instant::now() >= deadline {
+        return Ok(Probe::Closing);
+    }
     if stream
-        .set_read_timeout(None)
+        .set_nonblocking(false)
+        .and_then(|()| stream.set_read_timeout(None))
         .and_then(|()| stream.set_write_timeout(None))
         .is_err()
     {
@@ -949,9 +1003,12 @@ pub(crate) fn probe_after_close(
 ) -> Result<Probe, String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match probe(paths, relay)? {
+        match probe_until(paths, relay, deadline, None)? {
             Probe::Closing if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
             }
             Probe::Closing => {
                 return Err(
@@ -982,34 +1039,38 @@ fn open_log(paths: &OwnerPaths) -> Result<File, String> {
     Ok(file)
 }
 
+fn check_start_budget(
+    cancel: Option<&ConnectCancel>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    if let Some(cancel) = cancel {
+        cancel.check()?;
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("owner startup deadline expired".into());
+    }
+    Ok(())
+}
+
 /// Start `figmog serve --background <args>` detached: its own session (so
 /// closing the agent's terminal or process group never signals it), stdin
 /// and stdout on `/dev/null`, stderr appended to the owner log, working
 /// directory `cwd`. Returns a channel that receives its exit status (a
 /// thread reaps it, so it never lingers as a zombie of the relay).
-pub(crate) fn launch(
-    paths: &OwnerPaths,
-    cwd: &Path,
-    args: &[String],
-) -> Result<std::sync::mpsc::Receiver<std::process::ExitStatus>, String> {
-    launch_cancellable(paths, cwd, args, None)
-}
-
 fn launch_cancellable(
     paths: &OwnerPaths,
     cwd: &Path,
     args: &[String],
     cancel: Option<&ConnectCancel>,
+    deadline: std::time::Instant,
 ) -> Result<std::sync::mpsc::Receiver<std::process::ExitStatus>, String> {
-    if let Some(cancel) = cancel {
-        cancel.check()?;
-    }
+    check_start_budget(cancel, deadline)?;
     #[cfg(target_os = "macos")]
     if let Some(addchdir) = macos_spawn::addchdir() {
-        return macos_spawn::launch(paths, cwd, args, addchdir, cancel)
+        return macos_spawn::launch(paths, cwd, args, addchdir, cancel, deadline)
             .map_err(|e| format!("starting the background figmog: {e}"));
     }
-    launch_command(paths, cwd, args, cancel)
+    launch_command(paths, cwd, args, cancel, deadline)
 }
 
 // Linux uses close_range(CLOEXEC); older platforms without an atomic
@@ -1019,6 +1080,7 @@ fn launch_command(
     cwd: &Path,
     args: &[String],
     cancel: Option<&ConnectCancel>,
+    deadline: std::time::Instant,
 ) -> Result<std::sync::mpsc::Receiver<std::process::ExitStatus>, String> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1063,9 +1125,7 @@ fn launch_command(
             Ok(())
         });
     }
-    if let Some(cancel) = cancel {
-        cancel.check()?;
-    }
+    check_start_budget(cancel, deadline)?;
     let mut child = command
         .spawn()
         .map_err(|e| format!("starting the background figmog: {e}"))?;
@@ -1171,6 +1231,7 @@ mod macos_spawn {
         args: &[String],
         addchdir: AddChdir,
         cancel: Option<&ConnectCancel>,
+        deadline: std::time::Instant,
     ) -> io::Result<std::sync::mpsc::Receiver<std::process::ExitStatus>> {
         let exe = std::env::current_exe()?;
         let exe = cstring(exe.as_os_str().as_bytes())?;
@@ -1263,9 +1324,7 @@ mod macos_spawn {
                 log.as_raw_fd(),
             ))?;
             check(addchdir(&raw mut spawn.actions, cwd.as_ptr()))?;
-            if let Some(cancel) = cancel {
-                cancel.check().map_err(io::Error::other)?;
-            }
+            check_start_budget(cancel, deadline).map_err(io::Error::other)?;
             check(libc::posix_spawn(
                 &raw mut pid,
                 exe.as_ptr(),
@@ -1343,25 +1402,30 @@ fn connect_or_launch_inner(
     let deadline = std::time::Instant::now() + timeout;
     let mut launched: Option<std::sync::mpsc::Receiver<std::process::ExitStatus>> = None;
     let mut delay = Duration::from_millis(25);
+    let mut unreachable_lock_holder = false;
     loop {
         if let Some(cancel) = cancel {
             cancel.check()?;
         }
-        let mut unreachable_lock_holder = false;
-        match probe_cancellable(paths, Some((settings, attach)), cancel)? {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        unreachable_lock_holder = false;
+        match probe_until(paths, Some((settings, attach)), deadline, cancel)? {
             Probe::Ready(conn) => return Ok(conn),
-            Probe::Absent if launched.is_none() => {
+            Probe::Absent if launched.is_none() && std::time::Instant::now() < deadline => {
                 // Do not spawn a losing process every time an owner holds
                 // the election lock but cannot yet publish/reach its socket.
                 match OwnerLock::try_acquire(paths)? {
                     Some(lock) => {
                         drop(lock);
-                        launched = Some(match cancel {
-                            Some(cancel) => {
-                                launch_cancellable(paths, cwd, &settings.args(), Some(cancel))?
-                            }
-                            None => launch(paths, cwd, &settings.args())?,
-                        });
+                        launched = Some(launch_cancellable(
+                            paths,
+                            cwd,
+                            &settings.args(),
+                            cancel,
+                            deadline,
+                        )?);
                     }
                     None => {
                         // Desktop initialization happens before discovery
@@ -1390,28 +1454,272 @@ fn connect_or_launch_inner(
             launched = None;
         }
         if std::time::Instant::now() >= deadline {
-            if unreachable_lock_holder {
-                return Err(format!(
-                    "background figmog owner lock is held but its socket is unreachable; \
-                     wait for startup or shutdown, and check whether the processes use \
-                     different /tmp namespaces or XDG_RUNTIME_DIR values; see {}",
-                    paths.log().display()
-                ));
-            }
-            return Err(format!(
-                "the background figmog did not become ready within {}s; see {}",
-                timeout.as_secs(),
-                paths.log().display()
-            ));
+            break;
         }
-        std::thread::sleep(delay);
+        std::thread::sleep(
+            delay.min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
         delay = (delay * 2).min(Duration::from_millis(250));
     }
+    if unreachable_lock_holder {
+        return Err(format!(
+            "background figmog owner lock is held but its socket is unreachable; \
+                     wait for startup or shutdown, and check whether the processes use \
+                     different /tmp namespaces or XDG_RUNTIME_DIR values; see {}",
+            paths.log().display()
+        ));
+    }
+    Err(format!(
+        "the background figmog did not become ready within {}s; see {}",
+        timeout.as_secs(),
+        paths.log().display()
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn full_socket_backlog(paths: &OwnerPaths) -> (UnixListener, Vec<UnixStream>) {
+        let listener = bind_socket(&paths.socket()).unwrap();
+        // SAFETY: listener is a live AF_UNIX socket; reduce its queue size.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let mut queued = Vec::new();
+        let mut full = false;
+        for _ in 0..32 {
+            let cancel = std::sync::Arc::new(ConnectCancel::default());
+            let worker_cancel = cancel.clone();
+            let timer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                worker_cancel.cancel();
+            });
+            match connect_socket_cancelled(
+                &paths.socket(),
+                &cancel,
+                std::time::Instant::now() + START_TIMEOUT,
+            ) {
+                Ok(Some(stream)) => {
+                    cancel.release();
+                    queued.push(stream);
+                }
+                Err(_) | Ok(None) => full = true,
+            }
+            timer.join().unwrap();
+            if full {
+                break;
+            }
+        }
+        assert!(full && !queued.is_empty());
+        (listener, queued)
+    }
+
+    #[test]
+    fn a_full_listener_backlog_is_not_unlinked_during_owner_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let (listener, queued) = full_socket_backlog(&paths);
+        let before = std::fs::symlink_metadata(paths.socket()).unwrap();
+        let start = std::time::Instant::now();
+        let error = bind_socket(&paths.socket()).unwrap_err();
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(error.contains("listening"), "{error}");
+        let after = std::fs::symlink_metadata(paths.socket()).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        drop(listener);
+        drop(queued);
+        std::fs::remove_file(paths.socket()).unwrap();
+    }
+
+    #[test]
+    fn an_expired_startup_budget_cannot_launch_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        assert!(
+            launch_cancellable(
+                &paths,
+                dir.path(),
+                &[],
+                None,
+                std::time::Instant::now() - Duration::from_millis(1)
+            )
+            .is_err()
+        );
+        assert!(!paths.log().exists());
+        assert!(!paths.discovery().exists());
+    }
+
+    #[test]
+    fn initial_handshake_observes_the_overall_startup_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let _lock = OwnerLock::try_acquire(&paths).unwrap().unwrap();
+        let listener = bind_socket(&paths.socket()).unwrap();
+        write_discovery(
+            &paths,
+            &Discovery {
+                socket: paths.socket(),
+                pid: 42,
+                generation: "silent-initial".into(),
+                version: version().into(),
+                protocol: PROTOCOL,
+            },
+        )
+        .unwrap();
+        let worker_paths = paths.clone();
+        let cwd = dir.path().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = connect_or_launch_with_timeout(
+                &worker_paths,
+                &cwd,
+                &Settings {
+                    watch: false,
+                    interval: 10,
+                    upstream: None,
+                },
+                &[],
+                Duration::from_millis(100),
+            );
+            send.send(result.map(|_| ())).unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        assert!(hello.contains(HELLO));
+        let timely = receive.recv_timeout(Duration::from_millis(350));
+        // Release even the broken implementation before asserting, so
+        // this regression never leaves a sixty-second worker behind.
+        drop(reader);
+        drop(listener);
+        if timely.is_err() {
+            receive
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err();
+        }
+        worker.join().unwrap();
+        std::fs::remove_file(paths.socket()).unwrap();
+        assert!(
+            timely.is_ok(),
+            "initial HELLO exceeded the shared startup budget"
+        );
+        assert!(timely.unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert!(!paths.log().exists());
+    }
+
+    #[test]
+    fn partial_frames_and_notifications_do_not_renew_a_cli_probe_budget() {
+        for notifications in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = OwnerPaths::ensure(dir.path()).unwrap();
+            let listener = bind_socket(&paths.socket()).unwrap();
+            write_discovery(
+                &paths,
+                &Discovery {
+                    socket: paths.socket(),
+                    pid: 42,
+                    generation: "trickling".into(),
+                    version: version().into(),
+                    protocol: PROTOCOL,
+                },
+            )
+            .unwrap();
+            let peer = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut hello = String::new();
+                reader.read_line(&mut hello).unwrap();
+                let end = std::time::Instant::now() + Duration::from_secs(1);
+                while std::time::Instant::now() < end {
+                    let frame: &[u8] = if notifications {
+                        b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n"
+                    } else {
+                        b" "
+                    };
+                    if stream.write_all(frame).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let started = std::time::Instant::now();
+            let result = probe_after_close(&paths, None, Duration::from_millis(100));
+            let elapsed = started.elapsed();
+            peer.join().unwrap();
+            std::fs::remove_file(paths.socket()).unwrap();
+            assert!(result.is_err());
+            assert!(
+                elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(400),
+                "{elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_initial_connection_with_a_full_backlog_observes_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnerPaths::ensure(dir.path()).unwrap();
+        let _lock = OwnerLock::try_acquire(&paths).unwrap().unwrap();
+        let (listener, queued) = full_socket_backlog(&paths);
+        write_discovery(
+            &paths,
+            &Discovery {
+                socket: paths.socket(),
+                pid: 42,
+                generation: "full-backlog".into(),
+                version: version().into(),
+                protocol: PROTOCOL,
+            },
+        )
+        .unwrap();
+        let worker_paths = paths.clone();
+        let cwd = dir.path().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = connect_or_launch_with_timeout(
+                &worker_paths,
+                &cwd,
+                &Settings {
+                    watch: false,
+                    interval: 10,
+                    upstream: None,
+                },
+                &[],
+                Duration::from_millis(100),
+            );
+            send.send(result.map(|_| ())).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let timely = receive.recv_timeout(Duration::from_millis(350));
+        // Linux waits on a full queue; macOS may reject immediately.
+        // Close the listener even if a regression blocks the worker.
+        drop(listener);
+        drop(queued);
+        if timely.is_err() {
+            receive
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err();
+        }
+        worker.join().unwrap();
+        std::fs::remove_file(paths.socket()).unwrap();
+        assert!(
+            timely.is_ok(),
+            "initial connect exceeded the startup budget"
+        );
+        assert!(timely.unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert!(!paths.log().exists());
+    }
 
     #[test]
     fn cancelling_a_reconnect_interrupts_an_unanswered_hello() {
@@ -1516,7 +1824,11 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
                 timer_cancel.cancel();
             });
-            match connect_socket_cancelled(&paths.socket(), &cancel) {
+            match connect_socket_cancelled(
+                &paths.socket(),
+                &cancel,
+                std::time::Instant::now() + START_TIMEOUT,
+            ) {
                 Ok(Some(stream)) => {
                     cancel.release();
                     queued.push(stream);
@@ -1847,7 +2159,14 @@ mod tests {
         drop(owner);
         assert!(
             matches!(
-                probe_connected(&paths, None, &discovery, client),
+                probe_connected(
+                    &paths,
+                    None,
+                    &discovery,
+                    client,
+                    std::time::Instant::now() + START_TIMEOUT,
+                    &ConnectCancel::default()
+                ),
                 Ok(Probe::Closing)
             ),
             "a peer closing before HELLO must allow reconnecting"
@@ -1862,8 +2181,15 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let paths = OwnerPaths::ensure(dir.path()).unwrap();
-        let error = macos_spawn::launch(&paths, &dir.path().join("missing"), &[], addchdir, None)
-            .unwrap_err();
+        let error = macos_spawn::launch(
+            &paths,
+            &dir.path().join("missing"),
+            &[],
+            addchdir,
+            None,
+            std::time::Instant::now() + START_TIMEOUT,
+        )
+        .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
     }
 

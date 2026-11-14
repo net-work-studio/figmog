@@ -3340,6 +3340,79 @@ fn every_local_read_matches_across_direct_socket_and_mcp() {
 // ---- NWS-2963: writers through a running serve ----
 
 #[test]
+fn watched_relay_startup_requires_owner_credentials_for_every_selected_default() {
+    const KEY: &str = "SyntheticWatchCredentials0001";
+    for selection in ["explicit", "configured", "current"] {
+        let dir = default_root_fixture(KEY, common::fixture_v1());
+        if selection != "current" {
+            std::fs::remove_file(dir.path().join(".figmog/current")).unwrap();
+        }
+        if selection == "configured" {
+            std::fs::write(
+                dir.path().join("figmog.toml"),
+                format!("[files]\ndefault = \"{KEY}\"\n"),
+            )
+            .unwrap();
+        }
+        let mut cmd = common::command();
+        cmd.args(["serve", "--no-upstream"])
+            .current_dir(dir.path())
+            .env("FIGMA_TOKEN", "")
+            .env("FIGMOG_OWNER_IDLE_MS", "1000")
+            .timeout(TIMEOUT);
+        if selection == "explicit" {
+            cmd.arg(KEY);
+        }
+        let output = cmd.output().unwrap();
+        wait_for_owner_exit(&dir.path().join(".figmog"));
+        assert!(
+            !output.status.success(),
+            "{selection} accepted watched startup without credentials"
+        );
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains("watch") && error.contains("credentials") && error.contains("restart"),
+            "{selection}: {error}"
+        );
+    }
+}
+
+#[test]
+fn an_existing_watched_owner_uses_its_own_startup_credentials() {
+    const KEY: &str = "SyntheticLatchedCredentials0001";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    std::fs::remove_file(dir.path().join(".figmog/current")).unwrap();
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("figmog"));
+    command
+        .args(["serve", "--no-upstream"])
+        .current_dir(dir.path());
+    let (mut guard, mut stdin, rx) = spawn_child(command);
+    handshake(&mut stdin, &rx);
+    let output = common::command()
+        .args(["serve", "--no-upstream", KEY])
+        .current_dir(dir.path())
+        .env("FIGMA_TOKEN", "synthetic-caller-token")
+        .timeout(TIMEOUT)
+        .output()
+        .unwrap();
+    let files = result_json(&call(&mut stdin, &rx, 2, "figmog_files", json!({})));
+    drop(stdin);
+    assert!(wait_with_timeout(&mut guard.0, TIMEOUT).success());
+    wait_for_owner_exit(&dir.path().join(".figmog"));
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("credentials at startup") && error.contains("restart"),
+        "{error}"
+    );
+    assert_eq!(
+        files,
+        json!([]),
+        "failed attachment must not open a session"
+    );
+}
+
+#[test]
 fn no_watch_relay_attaches_the_selected_project_default_at_startup() {
     const KEY: &str = "SyntheticStartupDefault0001";
     for configured in [false, true] {

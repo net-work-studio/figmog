@@ -128,6 +128,13 @@ impl OwnerState {
         let mut attach_errors = serde_json::Map::new();
         for file in params["attach"].as_array().into_iter().flatten() {
             let Some(file) = file.as_str() else { continue };
+            if self.settings.watch && manager.token.is_none() {
+                attach_errors.insert(file.to_string(), json!(format!(
+                    "{}; this background owner reads credentials at startup; restart it after auth login or setting FIGMA_TOKEN",
+                    crate::auth::missing_token("watch")
+                )));
+                continue;
+            }
             match manager.open(file) {
                 Ok(session) => {
                     if self.settings.watch && !session.mirrored {
@@ -181,6 +188,75 @@ pub(crate) fn request_parts(line: &str) -> Option<(OwnedValue, String, OwnedValu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watched_attachment_checks_owner_credentials_before_opening_a_store() {
+        const KEY: &str = "SyntheticWatchAdmission0001";
+        for watch in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("mirrors");
+            let paths = OwnerPaths::ensure(&root).unwrap();
+            let lock = Arc::new(OwnerLock::try_acquire(&paths).unwrap().unwrap());
+            let socket = dir.path().join("o.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let guard = super::super::SocketGuard::new(socket).unwrap();
+            let settings = Settings {
+                watch,
+                interval: 10,
+                upstream: None,
+            };
+            // The owner's latched setting wins over the requesting relay.
+            let requested = Settings {
+                watch: !watch,
+                ..settings.clone()
+            };
+            let mut params =
+                owner::hello_request(&paths, Some((&requested, &[])))["params"].clone();
+            let state = OwnerState::new(
+                paths,
+                lock,
+                &guard,
+                "g".into(),
+                settings,
+                Duration::from_secs(1),
+            );
+            let mut manager = SessionManager {
+                sessions: vec![],
+                root: crate::sessions::StoreRoot::Fixed(root.clone()),
+                token: None,
+                default_key: None,
+                sole_default: false,
+                api: None,
+            };
+            let (empty, _) = state.hello(
+                OwnedValue(json!(1)),
+                &params,
+                &mut manager,
+                Duration::from_secs(10),
+            );
+            assert_eq!(empty["result"]["attach_errors"], json!({}));
+            assert!(manager.sessions.is_empty());
+            params["attach"] = json!([KEY]);
+            let (answer, _) = state.hello(
+                OwnedValue(json!(2)),
+                &params,
+                &mut manager,
+                Duration::from_secs(10),
+            );
+            if watch {
+                let error = answer["result"]["attach_errors"][KEY].as_str().unwrap();
+                assert!(
+                    error.contains("credentials at startup") && error.contains("restart"),
+                    "{error}"
+                );
+                assert!(manager.sessions.is_empty());
+                assert!(!root.join(KEY).exists());
+            } else {
+                assert_eq!(answer["result"]["attach_errors"], json!({}));
+                assert_eq!(manager.sessions.len(), 1);
+            }
+        }
+    }
 
     #[test]
     fn closes_after_the_idle_timeout_only_while_idle_and_on_a_lost_socket() {

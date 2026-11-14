@@ -25,23 +25,21 @@
 //!    remove `T` recursively, then the
 //!    marker.
 //!
-//! Interrupted states and what a rerun does: a crash in 3 leaves `L`
-//! intact (still the active store) plus a partial `S`, which the rerun
-//! discards and redoes; a crash after 4 leaves `D` with the marker, which
-//! the active-store rules report as an interrupted migration and a rerun
-//! finishes by doing 5 under both stores' anchors and fjall writer locks —
-//! but only from the checkout the marker names: another worktree's own old
-//! mirror is an independent copy, so there the rerun refuses and names the
-//! checkout that must finish (or, if the recorded source is already gone,
-//! just removes its tombstone, if any, and the marker). A tombstone is never
-//! opened as a store, only removed, so a deletion interrupted half way is
-//! simply finished (NWS-2964). An `L` an older binary's interrupted step 5
-//! left half deleted in place is still checked for live writers before it
-//! is retired, but a failure to open it as a store is not one.
+//! Interrupted states are recorded in a versioned marker with raw source
+//! path bytes, directory identity and a source cookie outside `db`. Before
+//! publication the marker is prepared; after source→tombstone rename it is
+//! atomically changed to retired and synced before any original data is
+//! deleted. Prepared recovery proves the original at L or T. Retired
+//! recovery never touches L, which an older opener may have recreated.
+//! Tombstone cleanup preserves its identity cookie until all other contents
+//! are gone; an unrelated or unprovable tree is refused, never guessed.
+//! Older pathname-only markers can be finished only when both source and
+//! tombstone are absent. Torn databases are locked without being opened.
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::DirBuilderExt;
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -206,31 +204,6 @@ fn lock_leftover(db: &Path) -> Result<Option<MigrationOwner>, String> {
     MigrationOwner::acquire(owner, true).map(Some)
 }
 
-/// Step 5: atomically move the (locked, checked) old store `legacy` to its
-/// tombstone — replacing a stale one — then remove the tombstone.
-fn retire(legacy: &Path, owner: &MigrationOwner) -> Result<(), String> {
-    retire_with_hook(legacy, owner, || Ok(()))
-}
-
-fn retire_with_hook(
-    legacy: &Path,
-    owner: &MigrationOwner,
-    renamed: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    let tomb = tombstone(legacy);
-    remove_tombstone(&tomb)?;
-    owner.validate_at(&legacy.join("db"))?;
-    fs::rename(legacy, &tomb).map_err(|e| format!("renaming {}: {e}", legacy.display()))?;
-    if let Some(parent) = legacy.parent() {
-        sync_path(parent)?;
-    }
-    renamed()?;
-    // The original inode is now under T. Never revisit L: an older binary
-    // may create a new independent store there after the rename.
-    owner.validate_at(&tomb.join("db"))?;
-    remove_tree(&tomb)
-}
-
 /// Remove a leftover tree while excluding raw fjall openers. It is never
 /// opened as a database, so partially deleted trees remain recoverable.
 fn remove_tombstone(tomb: &Path) -> Result<(), String> {
@@ -252,11 +225,217 @@ fn remove_tree(tree: &Path) -> Result<(), String> {
     fs::remove_dir_all(tree).map_err(|error| format!("removing {}: {error}", tree.display()))
 }
 
-/// The source path a [`MIGRATED_MARKER`] records (raw path bytes).
-fn read_marker(marker: &Path) -> Result<PathBuf, String> {
+const MARKER_MAGIC: &[u8] = b"figmog-migration-v1\n";
+const SOURCE_COOKIE: &str = ".figmog-migration-source";
+
+/// Kept outside `db`, so partial database cleanup does not erase proof.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceMarker {
+    source: Vec<u8>,
+    device: u64,
+    inode: u64,
+    cookie: Vec<u8>,
+    retired: bool,
+}
+
+enum Marker {
+    Current(SourceMarker),
+    Legacy(PathBuf),
+}
+
+impl SourceMarker {
+    fn prepare(source: &Path) -> Result<Self, String> {
+        use std::os::unix::ffi::OsStrExt;
+        let cookie_path = source.join(SOURCE_COOKIE);
+        let cookie = if exists(&cookie_path) {
+            read_cookie(source)?
+        } else {
+            let mut cookie = vec![0; 32];
+            fs::File::open("/dev/urandom")
+                .and_then(|mut file| file.read_exact(&mut cookie))
+                .map_err(|error| format!("creating migration identity: {error}"))?;
+            atomic_write(&cookie_path, &cookie)?;
+            cookie
+        };
+        sync_path(&cookie_path)?;
+        sync_path(source)?;
+        let metadata = fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "migration source is not a directory: {}",
+                source.display()
+            ));
+        }
+        Ok(Self {
+            source: source.as_os_str().as_bytes().to_vec(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            cookie,
+            retired: false,
+        })
+    }
+
+    fn source(&self) -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(self.source.clone()))
+    }
+
+    fn validate_at(&self, path: &Path) -> Result<(), String> {
+        let matches = fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.is_dir() && metadata.dev() == self.device && metadata.ino() == self.inode
+        }) && read_cookie(path).is_ok_and(|cookie| cookie == self.cookie);
+        if matches {
+            Ok(())
+        } else {
+            Err(unproven_source(path))
+        }
+    }
+
+    fn write(&self, path: &Path) -> Result<(), String> {
+        let mut bytes = MARKER_MAGIC.to_vec();
+        bytes.extend(
+            serde_json::to_vec(&json!({
+                "source": self.source, "device": self.device, "inode": self.inode,
+                "cookie": self.cookie, "retired": self.retired,
+            }))
+            .map_err(|error| error.to_string())?,
+        );
+        atomic_write(path, &bytes)
+    }
+}
+
+fn unproven_source(path: &Path) -> String {
+    format!(
+        "refusing migration cleanup: cannot prove {} is the original source; \
+         no source or tombstone was deleted. Inspect and preserve any independent copy \
+         before moving it aside or removing the migrated-from marker",
+        path.display()
+    )
+}
+
+fn read_cookie(source: &Path) -> Result<Vec<u8>, String> {
+    let path = source.join(SOURCE_COOKIE);
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|_| unproven_source(source))?;
+    let metadata = file.metadata().map_err(|_| unproven_source(source))?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() != 32 {
+        return Err(unproven_source(source));
+    }
+    let mut cookie = vec![0; 32];
+    file.read_exact(&mut cookie)
+        .map_err(|_| unproven_source(source))?;
+    Ok(cookie)
+}
+
+/// Atomic, durable protocol updates; a torn temporary is never authoritative.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temporary = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    if exists(&temporary) {
+        let metadata = fs::symlink_metadata(&temporary).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(format!(
+                "unsafe migration temporary: {}",
+                temporary.display()
+            ));
+        }
+        fs::remove_file(&temporary).map_err(|error| error.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    sync_path(path.parent().ok_or("migration marker has no parent")?)
+}
+
+fn valid_source_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_file_key)
+}
+
+/// Old pathname-only markers remain readable, but cannot prove a surviving source.
+fn read_marker(marker: &Path) -> Result<Marker, String> {
     use std::os::unix::ffi::OsStringExt;
     let bytes = fs::read(marker).map_err(|e| format!("reading {}: {e}", marker.display()))?;
-    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    if let Some(payload) = bytes.strip_prefix(MARKER_MAGIC) {
+        let current: SourceMarker = serde_json::from_slice(payload)
+            .map_err(|error| format!("invalid migration marker {}: {error}", marker.display()))?;
+        let source = current.source();
+        if current.cookie.len() != 32 || !valid_source_path(&source) || current.source.contains(&0)
+        {
+            return Err(format!("invalid migration marker {}", marker.display()));
+        }
+        Ok(Marker::Current(current))
+    } else {
+        let source = PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+        if !valid_source_path(&source) || bytes.contains(&0) {
+            return Err(format!(
+                "invalid or unsupported migration marker {}",
+                marker.display()
+            ));
+        }
+        Ok(Marker::Legacy(source))
+    }
+}
+
+/// Delete only a proven original tombstone, retaining its cookie until last.
+fn remove_original_tombstone(
+    tomb: &Path,
+    marker: &SourceMarker,
+    held: Option<&MigrationOwner>,
+) -> Result<(), String> {
+    if !exists(tomb) {
+        return Ok(());
+    }
+    marker.validate_at(tomb)?;
+    let acquired = if held.is_none() {
+        lock_leftover(&tomb.join("db"))?
+    } else {
+        None
+    };
+    let owner = held
+        .or(acquired.as_ref())
+        .ok_or_else(|| unproven_source(tomb))?;
+    owner.validate_at(&tomb.join("db"))?;
+    marker.validate_at(tomb)?;
+    let mut entries = fs::read_dir(tomb)
+        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| error.to_string())?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if entry.file_name() == SOURCE_COOKIE {
+            continue;
+        }
+        if entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            remove_tree(&entry.path())?;
+        } else {
+            fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+        }
+    }
+    marker.validate_at(tomb)?;
+    fs::remove_file(tomb.join(SOURCE_COOKIE)).map_err(|error| error.to_string())?;
+    fs::remove_dir(tomb).map_err(|error| error.to_string())?;
+    sync_path(tomb.parent().ok_or("tombstone has no parent")?)
 }
 
 /// Same directory, whether spelled identically or through equivalent paths.
@@ -274,6 +453,9 @@ enum MigrationEvent {
     BeforeCopy,
     BeforePublish,
     BeforeRetire,
+    AfterSourceRename,
+    BeforeTombstoneCleanup,
+    AfterRetire,
 }
 
 pub(super) fn migrate_key(layout: &Layout, key: &str) -> Result<Option<Moved>, String> {
@@ -320,43 +502,79 @@ fn migrate_key_with_hook(
 
     let marker = dest.join(MIGRATED_MARKER);
     if exists(&marker) {
-        // Step 5 of an interrupted run. The marker names the checkout whose
-        // old mirror was moved; this checkout's own old mirror may be an
-        // independent copy that must survive.
-        let source = read_marker(&marker)?;
+        let recorded = read_marker(&marker)?;
+        let source = match &recorded {
+            Marker::Current(recorded) => recorded.source(),
+            Marker::Legacy(source) => source.clone(),
+        };
+        let tomb = tombstone(&source);
         let ours = layout
             .legacy_roots()
             .iter()
             .any(|root| root != &layout.mirror_root && same_path(&source, &root.join(key)));
-        let legacy = source.clone();
-        if !ours && exists(&source) {
-            return Err(format!(
-                "an interrupted `figmog migrate` of {key} moved the old mirror at {} into {}; \
-                 finish it by running `figmog migrate` in that checkout",
-                source.display(),
-                dest.display()
-            ));
-        }
-        // Finish under both stores' anchors and fjall writer locks, checked
-        // on the old store before it moves to its tombstone.
         let dest_owner = lock_store(&dest.join("db"))?;
-        if ours {
-            let legacy_owner = lock_leftover(&legacy.join("db"))?;
-            if exists(&legacy) {
-                admitted(MigrationEvent::BeforeRetire)?;
-                let owner = legacy_owner
-                    .as_ref()
-                    .ok_or("legacy store changed before cleanup")?;
-                owner.validate_at(&legacy.join("db"))?;
-                dest_owner.validate_at(&dest.join("db"))?;
-                retire(&legacy, owner)?;
+        match recorded {
+            Marker::Legacy(_) => {
+                if exists(&source) || exists(&tomb) {
+                    return Err(unproven_source(if exists(&source) {
+                        &source
+                    } else {
+                        &tomb
+                    }));
+                }
+            }
+            Marker::Current(mut recorded) => {
+                let mut source_owner = None;
+                if !recorded.retired {
+                    if exists(&tomb) {
+                        // Rename happened before the durable state update. The
+                        // original inode is still pinned by its tombstone.
+                        recorded.validate_at(&tomb)?;
+                        source_owner = lock_leftover(&tomb.join("db"))?;
+                        source_owner
+                            .as_ref()
+                            .ok_or_else(|| unproven_source(&tomb))?
+                            .validate_at(&tomb.join("db"))?;
+                        recorded.validate_at(&tomb)?;
+                    } else if exists(&source) {
+                        if !ours {
+                            return Err(format!(
+                                "an interrupted migration names {}; finish it by running `figmog migrate` in that checkout",
+                                source.display()
+                            ));
+                        }
+                        recorded.validate_at(&source)?;
+                        let owner = lock_leftover(&source.join("db"))?
+                            .ok_or_else(|| unproven_source(&source))?;
+                        admitted(MigrationEvent::BeforeRetire)?;
+                        owner.validate_at(&source.join("db"))?;
+                        recorded.validate_at(&source)?;
+                        dest_owner.validate_at(&dest.join("db"))?;
+                        fs::rename(&source, &tomb).map_err(|error| error.to_string())?;
+                        sync_path(source.parent().ok_or("source has no parent")?)?;
+                        recorded.validate_at(&tomb)?;
+                        admitted(MigrationEvent::AfterSourceRename)?;
+                        source_owner = Some(owner);
+                    } else {
+                        return Err(unproven_source(&source));
+                    }
+                    source_owner
+                        .as_ref()
+                        .ok_or_else(|| unproven_source(&tomb))?
+                        .validate_at(&tomb.join("db"))?;
+                    recorded.validate_at(&tomb)?;
+                    dest_owner.validate_at(&dest.join("db"))?;
+                    recorded.retired = true;
+                    recorded.write(&marker)?;
+                }
+                admitted(MigrationEvent::BeforeTombstoneCleanup)?;
+                // Retired is durable before the original can disappear. Never
+                // inspect or acquire a replacement at the old source path.
+                remove_original_tombstone(&tomb, &recorded, source_owner.as_ref())?;
             }
         }
-        // A tombstone is past the point of no return, whichever checkout
-        // it is in: finish deleting it without opening it.
-        remove_tombstone(&tombstone(&source))?;
-        // The recorded source is gone now (or was already): drop the marker.
         fs::remove_file(&marker).map_err(|e| io("removing", &marker, e))?;
+        sync_path(&dest)?;
         return Ok(Some(Moved {
             key: key.to_string(),
             from: source,
@@ -392,15 +610,11 @@ fn migrate_key_with_hook(
     }
     admitted(MigrationEvent::BeforeCopy)?;
     source.validate_at(&legacy.join("db"))?;
+    let mut recorded = SourceMarker::prepare(&legacy)?;
     copy_tree(&legacy, &staging)?;
     let staged = MigrationOwner::acquire(StoreOwner::acquire(&staging.join("db"))?, false)?;
     let staged_marker = staging.join(MIGRATED_MARKER);
-    {
-        use std::os::unix::ffi::OsStrExt;
-        fs::write(&staged_marker, legacy.as_os_str().as_bytes())
-            .map_err(|e| io("writing", &staged_marker, e))?;
-    }
-    sync_path(&staged_marker)?;
+    recorded.write(&staged_marker)?;
     sync_path(&staging)?;
     admitted(MigrationEvent::BeforePublish)?;
     source.validate_at(&legacy.join("db"))?;
@@ -415,9 +629,25 @@ fn migrate_key_with_hook(
     sync_path(&layout.mirror_root)?;
     admitted(MigrationEvent::BeforeRetire)?;
     staged.validate_at(&dest.join("db"))?;
-    retire(&legacy, &source)?;
+    recorded.validate_at(&legacy)?;
+    let tomb = tombstone(&legacy);
+    remove_tombstone(&tomb)?;
+    source.validate_at(&legacy.join("db"))?;
+    recorded.validate_at(&legacy)?;
+    fs::rename(&legacy, &tomb).map_err(|error| io("renaming", &legacy, error))?;
+    sync_path(legacy.parent().ok_or("source has no parent")?)?;
+    recorded.validate_at(&tomb)?;
+    admitted(MigrationEvent::AfterSourceRename)?;
+    source.validate_at(&tomb.join("db"))?;
+    recorded.validate_at(&tomb)?;
+    recorded.retired = true;
+    recorded.write(&marker)?;
+    admitted(MigrationEvent::BeforeTombstoneCleanup)?;
+    remove_original_tombstone(&tomb, &recorded, Some(&source))?;
+    admitted(MigrationEvent::AfterRetire)?;
     drop(source);
     fs::remove_file(&marker).map_err(|e| io("removing", &marker, e))?;
+    sync_path(&dest)?;
     drop(staged);
     Ok(Some(Moved {
         key: key.to_string(),
@@ -428,9 +658,13 @@ fn migrate_key_with_hook(
 }
 
 /// Copy a closed store directory (regular files and directories only; the
-/// lock anchor is recreated by the destination's own owner), syncing every
+/// lock anchor and source-only cookie are not copied), syncing every
 /// file so the rename that publishes it never exposes unwritten data.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    copy_tree_inner(from, to, true)
+}
+
+fn copy_tree_inner(from: &Path, to: &Path, root: bool) -> Result<(), String> {
     fs::DirBuilder::new()
         .mode(0o700)
         .create(to)
@@ -446,9 +680,9 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
         let metadata = fs::symlink_metadata(&source)
             .map_err(|e| format!("reading {}: {e}", source.display()))?;
         if metadata.is_dir() {
-            copy_tree(&source, &target)?;
+            copy_tree_inner(&source, &target, false)?;
         } else if metadata.is_file() {
-            if name == LOCK_NAME {
+            if name == LOCK_NAME || root && name == SOURCE_COOKIE {
                 continue;
             }
             fs::copy(&source, &target).map_err(|e| format!("copying {}: {e}", source.display()))?;
@@ -596,11 +830,10 @@ mod tests {
         let dest = layout.shared_dir(KEY);
         crate::private_dir::ensure(&layout.mirror_root).unwrap();
         copy_tree(&layout.legacy_dir(KEY), &dest).unwrap();
-        fs::write(
-            dest.join(MIGRATED_MARKER),
-            layout.legacy_dir(KEY).display().to_string(),
-        )
-        .unwrap();
+        SourceMarker::prepare(&layout.legacy_dir(KEY))
+            .unwrap()
+            .write(&dest.join(MIGRATED_MARKER))
+            .unwrap();
         dest
     }
 
@@ -678,6 +911,15 @@ mod tests {
         let (resume, proceed) = mpsc::channel();
         let migration = std::thread::spawn(move || {
             migrate_key_with_hook(&layout, KEY, |phase| {
+                if !matches!(
+                    phase,
+                    MigrationEvent::SourceClosed
+                        | MigrationEvent::BeforeCopy
+                        | MigrationEvent::BeforePublish
+                        | MigrationEvent::BeforeRetire
+                ) {
+                    return Ok(());
+                }
                 events.send(phase).map_err(|error| error.to_string())?;
                 proceed
                     .recv_timeout(Duration::from_secs(30))
@@ -772,20 +1014,201 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = layout(dir.path());
         let legacy_db = legacy_store(&layout);
-        let legacy = layout.legacy_dir(KEY);
-        let held = lock_store(&legacy_db).unwrap();
-        let mut recreated = None;
-        retire_with_hook(&legacy, &held, || {
-            let mut store = crate::open_store!(&legacy_db);
-            crate::store::upsert_mirror_config(&mut store, true);
-            recreated = Some(store);
+        migrate_key_with_hook(&layout, KEY, |phase| {
+            if phase == MigrationEvent::AfterSourceRename {
+                let mut replacement = crate::open_store!(&legacy_db);
+                crate::store::upsert_mirror_config(&mut replacement, true);
+            }
             Ok(())
         })
+        .unwrap()
         .unwrap();
-        drop(recreated);
-        assert!(!tombstone(&legacy).exists());
+        assert!(!tombstone(&layout.legacy_dir(KEY)).exists());
+        assert!(layout.shared_dir(KEY).join("db/sentinel").exists());
         let store = crate::open_store!(&legacy_db);
         assert!(store.rtx(|(.., config, _, _, _)| crate::store::read_geometry(&config)));
+    }
+
+    #[test]
+    fn interrupted_cleanup_never_removes_a_recreated_legacy_store() {
+        for interrupted in [
+            MigrationEvent::AfterSourceRename,
+            MigrationEvent::AfterRetire,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = layout(dir.path());
+            let legacy_db = legacy_store(&layout);
+            let error = migrate_key_with_hook(&layout, KEY, |phase| {
+                if phase == MigrationEvent::AfterSourceRename {
+                    let mut replacement = crate::open_store!(&legacy_db);
+                    crate::store::upsert_mirror_config(&mut replacement, true);
+                    fs::write(legacy_db.join("replacement"), "independently committed").unwrap();
+                }
+                if phase == interrupted {
+                    return Err("interrupted before marker removal".into());
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(error, "interrupted before marker removal");
+            assert!(layout.shared_dir(KEY).join(MIGRATED_MARKER).exists());
+            let result = cmd_migrate(&layout, None).unwrap();
+            assert_eq!(result["failed"], json!([]), "{result}");
+            assert_eq!(result["migrated"][0]["resumed"], true);
+            assert_eq!(
+                fs::read_to_string(legacy_db.join("replacement")).unwrap(),
+                "independently committed"
+            );
+            assert_eq!(
+                fs::read_to_string(layout.shared_dir(KEY).join("db/sentinel")).unwrap(),
+                "synthetic"
+            );
+            let store = crate::open_store!(&legacy_db);
+            assert!(store.rtx(|(.., config, _, _, _)| crate::store::read_geometry(&config)));
+        }
+    }
+
+    #[test]
+    fn retired_cleanup_finishes_full_and_partial_original_tombstones_without_touching_replacements()
+    {
+        for partial in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = layout(dir.path());
+            let legacy_db = legacy_store(&layout);
+            let tomb = tombstone(&layout.legacy_dir(KEY));
+            migrate_key_with_hook(&layout, KEY, |phase| {
+                if phase == MigrationEvent::AfterSourceRename {
+                    drop(crate::open_store!(&legacy_db));
+                    fs::write(legacy_db.join("replacement"), "keep").unwrap();
+                }
+                if phase == MigrationEvent::BeforeTombstoneCleanup {
+                    if partial {
+                        half_delete(&tomb.join("db"));
+                    }
+                    return Err("interrupted cleanup".into());
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(tomb.join(SOURCE_COOKIE).exists());
+            let path = layout.shared_dir(KEY).join(MIGRATED_MARKER);
+            assert!(matches!(
+                read_marker(&path).unwrap(),
+                Marker::Current(SourceMarker { retired: true, .. })
+            ));
+            assert!(migrate_key(&layout, KEY).unwrap().unwrap().resumed);
+            assert!(!tomb.exists());
+            assert!(!path.exists());
+            assert_eq!(
+                fs::read_to_string(legacy_db.join("replacement")).unwrap(),
+                "keep"
+            );
+            assert!(layout.shared_dir(KEY).join("db/sentinel").exists());
+        }
+    }
+
+    #[test]
+    fn a_prepared_marker_never_retires_an_unrelated_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let legacy_db = legacy_store(&layout);
+        let dest = interrupted_after_rename(&layout);
+        fs::rename(layout.legacy_dir(KEY), dir.path().join("original")).unwrap();
+        drop(crate::open_store!(&legacy_db));
+        fs::write(legacy_db.join("replacement"), "keep").unwrap();
+        let error = migrate_key(&layout, KEY).unwrap_err();
+        assert!(error.contains("cannot prove"), "{error}");
+        assert_eq!(
+            fs::read_to_string(legacy_db.join("replacement")).unwrap(),
+            "keep"
+        );
+        assert!(dest.join(MIGRATED_MARKER).exists());
+        assert!(dir.path().join("original/db/sentinel").exists());
+    }
+
+    #[test]
+    fn retired_cleanup_requires_the_cookie_even_if_a_directory_identity_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        legacy_store(&layout);
+        migrate_key_with_hook(&layout, KEY, |phase| {
+            if phase == MigrationEvent::AfterRetire {
+                Err("interrupted".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        let tomb = tombstone(&layout.legacy_dir(KEY));
+        fs::create_dir_all(tomb.join("db")).unwrap();
+        fs::write(tomb.join("db/replacement"), "keep").unwrap();
+        let path = layout.shared_dir(KEY).join(MIGRATED_MARKER);
+        let Marker::Current(mut marker) = read_marker(&path).unwrap() else {
+            panic!()
+        };
+        let metadata = fs::metadata(&tomb).unwrap();
+        // Model inode reuse deterministically without relying on allocator timing.
+        marker.device = metadata.dev();
+        marker.inode = metadata.ino();
+        marker.write(&path).unwrap();
+        let error = migrate_key(&layout, KEY).unwrap_err();
+        assert!(error.contains("cannot prove"), "{error}");
+        assert_eq!(
+            fs::read_to_string(tomb.join("db/replacement")).unwrap(),
+            "keep"
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn legacy_path_only_markers_refuse_surviving_sources_and_tombstones() {
+        for retired in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = layout(dir.path());
+            legacy_store(&layout);
+            let dest = interrupted_after_rename(&layout);
+            let source = layout.legacy_dir(KEY);
+            use std::os::unix::ffi::OsStrExt;
+            fs::write(dest.join(MIGRATED_MARKER), source.as_os_str().as_bytes()).unwrap();
+            let remaining = if retired {
+                let tomb = tombstone(&source);
+                fs::rename(&source, &tomb).unwrap();
+                tomb
+            } else {
+                source
+            };
+            let error = migrate_key(&layout, KEY).unwrap_err();
+            assert!(error.contains("cannot prove"), "{error}");
+            assert!(remaining.join("db/sentinel").exists());
+            assert!(dest.join(MIGRATED_MARKER).exists());
+        }
+    }
+
+    #[test]
+    fn marker_paths_round_trip_non_utf8_bytes_and_invalid_formats_refuse() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let mut marker = SourceMarker::prepare(&source).unwrap();
+        marker.source = b"/synthetic/\xff/.figmog/SyntheticKey0001".to_vec();
+        let path = dir.path().join(MIGRATED_MARKER);
+        marker.write(&path).unwrap();
+        let Marker::Current(decoded) = read_marker(&path).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            decoded.source(),
+            PathBuf::from(std::ffi::OsString::from_vec(marker.source))
+        );
+        for bad in [
+            b"figmog-migration-v2\n{}".as_slice(),
+            b"figmog-migration-v1\n{}",
+            b"figmog-migration-v1\nnull",
+        ] {
+            fs::write(&path, bad).unwrap();
+            assert!(read_marker(&path).is_err());
+        }
     }
 
     #[test]
@@ -873,11 +1296,10 @@ mod tests {
         assert!(!tomb.exists());
     }
 
-    /// An older binary deleted the old store in place and was interrupted:
-    /// the half-deleted store is still checked for writers, but failing to
-    /// open as a store does not stop the rerun from retiring it.
+    /// Source identity survives partial database deletion. Cleanup still
+    /// checks writer locks without recovering the torn database.
     #[test]
-    fn rerun_finishes_an_old_versions_partially_deleted_source() {
+    fn rerun_finishes_a_proven_partially_deleted_source() {
         let dir = tempfile::tempdir().unwrap();
         let layout = layout(dir.path());
         let legacy_db = legacy_store(&layout);
