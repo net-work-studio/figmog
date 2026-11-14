@@ -221,3 +221,55 @@ fn unknown_node_is_the_standard_error() {
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(stderr.contains("no node 99:99 in the mirror"), "{stderr}");
 }
+
+#[test]
+fn imported_alias_chains_past_32_links_export_and_match_every_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db").display().to_string();
+    let file = dir.path().join("file.json");
+    let snapshot = dir.path().join("variables.json");
+    let mut nodes = common::fixture_v1();
+    nodes["document"]["children"][0]["children"][0]["itemSpacing"] = json!(16);
+    std::fs::write(&file, nodes.to_string()).unwrap();
+    let mut variables = serde_json::Map::new();
+    for i in 0..34 {
+        let value = if i == 33 {
+            json!(16)
+        } else {
+            json!({"type": "VARIABLE_ALIAS", "id": format!("V:{}", i + 1)})
+        };
+        variables.insert(
+            format!("V:{i}"),
+            json!({"name": format!("gap/{i:02}"), "resolvedType": "FLOAT",
+                "variableCollectionId": "C:spacing", "scopes": ["GAP"], "valuesByMode": {"M:1": value}}),
+        );
+    }
+    let export = json!({"variableCollections": {"C:spacing": {
+        "name": "Spacing", "defaultModeId": "M:1", "modes": [{"modeId": "M:1", "name": "Value"}]
+    }}, "variables": variables});
+    std::fs::write(&snapshot, export.to_string()).unwrap();
+    for (command, path) in [("pull", &file), ("import-variables", &snapshot)] {
+        let mut cli = common::command();
+        cli.args(["--db", &db, command]);
+        if command == "pull" {
+            cli.arg("--from-file");
+        }
+        cli.arg(path).assert().success();
+    }
+    let css = String::from_utf8(stdout(&db, &["tokens", "export"])).unwrap();
+    for i in 0..34 {
+        let value = if i == 33 {
+            "16px".to_string()
+        } else {
+            format!("var(--gap-{:02})", i + 1)
+        };
+        assert!(css.contains(&format!("  --gap-{i:02}: {value};")), "{css}");
+    }
+    let spec: Value = serde_json::from_slice(&stdout(&db, &["spec", "1:1"])).unwrap();
+    let matches = spec["node"]["layout"]["gap"]["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 34, "{spec}");
+    for (i, entry) in matches.iter().enumerate() {
+        assert_eq!(entry["variable_id"], format!("V:{i}"));
+        assert_eq!(entry["css"], format!("--gap-{i:02}"));
+    }
+}

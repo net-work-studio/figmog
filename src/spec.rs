@@ -181,9 +181,10 @@ impl<'a> Tokens<'a> {
                 },
             );
         }
+        let mut resolved = BTreeMap::new();
         let root = all
             .keys()
-            .filter_map(|id| Some((id.clone(), root_value(&all, theme, id, 0)?)))
+            .filter_map(|id| Some((id.clone(), root_value(&all, theme, id, &mut resolved)?)))
             .collect();
         Tokens {
             vars: all,
@@ -251,31 +252,54 @@ impl<'a> Tokens<'a> {
     }
 }
 
-/// A variable's value in its root mode, aliases followed (bounded, so a
-/// cyclic snapshot can't loop).
+/// A variable's value in its root mode. Follow aliases without a depth
+/// limit, rejecting actual cycles and memoizing both values and failures
+/// so shared alias tails are resolved only once.
 fn root_value(
     all: &BTreeMap<String, Var<'_>>,
     theme: Option<&Theme>,
     id: &str,
-    depth: usize,
+    resolved: &mut BTreeMap<String, Option<Lit>>,
 ) -> Option<Lit> {
-    let v = all.get(id)?;
-    let mode = match theme {
-        Some(t) if t.collection_id == v.collection_id => Some(&t.light_mode_id),
-        _ => v.default_mode_id.as_ref(),
-    }?;
-    let raw = v.values.get(mode)?;
-    if raw["type"] == "VARIABLE_ALIAS" {
-        return (depth < 32)
-            .then(|| root_value(all, theme, raw["id"].as_str()?, depth + 1))
-            .flatten();
+    let mut current = id;
+    let mut visited = BTreeSet::new();
+    let mut path = Vec::new();
+    let value = loop {
+        if let Some(value) = resolved.get(current) {
+            break value.clone();
+        }
+        if !visited.insert(current) {
+            break None;
+        }
+        path.push(current.to_string());
+        let Some(v) = all.get(current) else {
+            break None;
+        };
+        let mode = match theme {
+            Some(t) if t.collection_id == v.collection_id => Some(&t.light_mode_id),
+            _ => v.default_mode_id.as_ref(),
+        };
+        let Some(raw) = mode.and_then(|mode| v.values.get(mode)) else {
+            break None;
+        };
+        if raw["type"] == "VARIABLE_ALIAS" {
+            let Some(target) = raw["id"].as_str() else {
+                break None;
+            };
+            current = target;
+            continue;
+        }
+        break match v.resolved_type.as_str() {
+            "COLOR" => color(raw).map(Lit::Color),
+            "FLOAT" => raw.as_f64().map(Lit::Number),
+            "STRING" => raw.as_str().map(|s| Lit::Text(s.to_string())),
+            _ => None,
+        };
+    };
+    for id in path {
+        resolved.insert(id, value.clone());
     }
-    match v.resolved_type.as_str() {
-        "COLOR" => color(raw).map(Lit::Color),
-        "FLOAT" => raw.as_f64().map(Lit::Number),
-        "STRING" => raw.as_str().map(|s| Lit::Text(s.to_string())),
-        _ => None,
-    }
+    value
 }
 
 /// The variable id an alias (or an array of aliases) names. `Err` when an
@@ -1019,6 +1043,30 @@ mod tests {
         tree["itemSpacing"] = json!(32);
         let spec = build(&tree, &vars);
         assert!(spec["node"]["layout"]["gap"].get("matches").is_none());
+    }
+
+    #[test]
+    fn alias_cycles_and_missing_targets_do_not_become_matches() {
+        let tree = json!({"id": "1:1", "name": "Card", "type": "FRAME",
+            "layoutMode": "VERTICAL", "itemSpacing": 16, "children": []});
+        let variable = |id: &str, value: Value| {
+            json!({"variable_id": id, "name": id, "source": "imported", "resolved_type": "FLOAT",
+                "collection": "Spacing", "collection_id": "C:spacing", "default_mode_id": "M:1",
+                "scopes": ["GAP"], "mode_names": {"M:1": "Value"}, "values_by_mode_id": {"M:1": value}})
+        };
+        let alias = |id: &str| json!({"type": "VARIABLE_ALIAS", "id": id});
+        let vars = json!({"snapshot": {"state": "current"}, "variables": [
+            variable("V:cycle-a", alias("V:cycle-b")),
+            variable("V:cycle-b", alias("V:cycle-a")),
+            variable("V:cycle-prefix", alias("V:cycle-a")),
+            variable("V:missing", alias("V:absent")),
+            variable("V:literal", json!(16))
+        ]});
+        let spec = build(&tree, &vars);
+        assert_eq!(
+            spec["node"]["layout"]["gap"]["matches"],
+            json!([{"token": "V:literal", "variable_id": "V:literal", "css": "--v-literal"}])
+        );
     }
 
     #[test]
