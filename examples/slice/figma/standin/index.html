@@ -1,0 +1,79 @@
+<!doctype html>
+<!--
+  STAND-IN for a Figma render. figmog has no access to Figma here, so this page
+  re-draws node 1:1 ("Card") of ../card-file.json (version 4243) by hand, in
+  plain CSS, from the file's RAW values (absoluteBoundingBox, paddings,
+  itemSpacing, fills, strokes, style) -- not from tokens and not from the
+  app. `node app/scripts/slice.mjs standin` captures it with figmog-shot as
+  ../card-render-1440.png and ../card-render-390.png. It is rendered by the
+  same Chromium and fonts as the app, so it is NOT an independent rasteriser:
+  replace those PNGs with real Figma exports of version 4243 when available.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Figma render stand-in: Card 1:1 @ 4243</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { padding: 40px; }
+      .card {
+        /* FRAME 1:1: VERTICAL auto layout, FIXED 320 wide, HUG height */
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 16px;
+        width: 320px;
+        padding: 16px 24px;
+        border-radius: 12px;
+        background: #fafafc;
+        /* strokes[0] #e0e3e6, weight 1, strokeAlign INSIDE */
+        box-shadow: inset 0 0 0 1px #e0e3e6;
+        font-family: Inter, sans-serif;
+      }
+      .title {
+        /* TEXT 1:2: Inter Bold 20/28, fill #1a1a1f, FILL width */
+        width: 100%;
+        color: #1a1a1f;
+        font-size: 20px;
+        font-weight: 700;
+        line-height: 28px;
+        letter-spacing: 0;
+      }
+      .meta {
+        /* FRAME 1:3: HORIZONTAL auto layout, gap 8, centred */
+        display: flex;
+        width: 100%;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+      }
+      .body {
+        /* TEXT 1:4: Inter Regular 16/24, fill #1a1a1f, layoutGrow 1 */
+        flex-grow: 1;
+        color: #1a1a1f;
+        font-size: 16px;
+        font-weight: 400;
+        line-height: 24px;
+        letter-spacing: 0;
+      }
+      .badge {
+        /* RECTANGLE 1:5: 24 x 16, radius 4, fill #0066cc */
+        flex-shrink: 0;
+        width: 24px;
+        height: 16px;
+        border-radius: 4px;
+        background: #0066cc;
+      }
+    </style>
+  </head>
+  <body>
+    <article class="card" data-testid="slice-card">
+      <h2 class="title">Spring garden plan</h2>
+      <div class="meta">
+        <p class="body">Four raised beds, sown in May</p>
+        <span class="badge" aria-hidden="true"></span>
+      </div>
+    </article>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+/*
+ * Tailwind v4 WITHOUT its default theme: only preflight and the utilities
+ * engine are imported, so the only theme keys that exist are the ones
+ * `figmog tokens export` wrote to tokens.css. A utility naming a value the
+ * design system does not have (bg-blue-500, p-4 without a space/4 token, ...)
+ * generates nothing.
+ */
+@layer theme, base, components, utilities;
+@import "tailwindcss/preflight.css" layer(base);
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
+@import "./tokens.css";
+
+/* These sources are copied and hashed by the slice's build identity. */
+@source "./";
+@source "../index.html";

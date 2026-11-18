@@ -351,16 +351,16 @@ fn serve_e2e_initialize_tools_list_and_tool_calls() {
         &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    // -- tools/list: exactly 21 figmog_* tools (spec §14: the 17 v3 tools
-    // plus figmog_open/figmog_files, plus v0.0.2 §2's figmog_subtree and
-    // §5's figmog_images) --
+    // -- tools/list: exactly 22 figmog_* tools (spec §14: the 17 v3 tools
+    // plus figmog_open/figmog_files, plus v0.0.2 §2's figmog_subtree,
+    // §5's figmog_images and NWS-2968's figmog_spec) --
     send(
         &mut stdin,
         &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     );
     let resp = recv(&rx);
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 21, "tools: {tools:#?}");
+    assert_eq!(tools.len(), 22, "tools: {tools:#?}");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for name in &names {
         assert!(
@@ -894,14 +894,14 @@ fn serve_desktop_proxy_observes_file_switches_and_edits_with_unchanged_mirror() 
         &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    // -- tools/list: 21 local + 1 proxied, prefixed description --
+    // -- tools/list: 22 local + 1 proxied, prefixed description --
     send(
         &mut stdin,
         &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     );
     let resp = recv(&rx);
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 22, "tools: {tools:#?}");
+    assert_eq!(tools.len(), 23, "tools: {tools:#?}");
     let proxied = tools
         .iter()
         .find(|t| t["name"] == json!("get_code"))
@@ -1328,7 +1328,7 @@ fn serve_e2e_multi_file_routes_by_file_arg_and_first_startup_key_is_default() {
         &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    // -- tools/list: 21 tools; every tool but figmog_open/figmog_files
+    // -- tools/list: 22 tools; every tool but figmog_open/figmog_files
     // carries an *optional* `file` property, figmog_open's `file` is
     // required, figmog_files takes none (spec §14). --
     send(
@@ -1337,7 +1337,7 @@ fn serve_e2e_multi_file_routes_by_file_arg_and_first_startup_key_is_default() {
     );
     let resp = recv(&rx);
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 21, "tools: {tools:#?}");
+    assert_eq!(tools.len(), 22, "tools: {tools:#?}");
     for tool in tools {
         let name = tool["name"].as_str().expect("tool name");
         let schema = &tool["inputSchema"];
@@ -3172,6 +3172,14 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
         .stdout
         .clone();
     let direct_vars_json: Value = serde_json::from_slice(&direct_vars).unwrap();
+    let direct_tokens = common::command()
+        .args(["tokens", "export", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
 
     // `spawn_serve` runs with cwd = `dir`, so serve's socket lands at
     // `<dir>/.figmog/serve.sock`, which plain CLI reads from `dir` route to.
@@ -3205,6 +3213,18 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
         .stdout
         .clone();
     assert_eq!(routed_vars, direct_vars);
+
+    // Token export shares the vars read, but must still render CSS after
+    // socket routing rather than print the variables response as JSON.
+    let routed_tokens = common::command()
+        .args(["tokens", "export"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(routed_tokens, direct_tokens);
 
     // Serve holds the writer lock, so success here proves socket routing.
     let routed = common::command()

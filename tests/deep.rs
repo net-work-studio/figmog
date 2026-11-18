@@ -70,16 +70,25 @@ fn deep_imports_remain_readable_through_cli_and_mcp() {
         .arg(&response)
         .assert()
         .success();
-    for args in [vec!["tree"], vec!["dump", "0:0"]] {
+    for args in [vec!["tree"], vec!["dump", "0:0"], vec!["spec", "0:0"]] {
+        let is_spec = args[0] == "spec";
         let output = common::command()
             .arg("--db")
             .arg(&db)
             .args(args)
             .assert()
             .success();
-        assert_chain(parse_deep(&output.get_output().stdout));
+        let mut result = parse_deep(&output.get_output().stdout);
+        if is_spec {
+            result = result["node"].take();
+        }
+        assert_chain(result);
     }
-    for (tool, args) in [("figmog_tree", "{}"), ("figmog_subtree", r#"{"id":"0:0"}"#)] {
+    for (tool, args) in [
+        ("figmog_tree", "{}"),
+        ("figmog_subtree", r#"{"id":"0:0"}"#),
+        ("figmog_spec", r#"{"id":"0:0"}"#),
+    ] {
         let request = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{args}}}}}
 "#
@@ -92,14 +101,130 @@ fn deep_imports_remain_readable_through_cli_and_mcp() {
             .assert()
             .success();
         let envelope = parse_deep(&output.get_output().stdout);
-        assert_eq!(envelope["result"]["isError"], false);
+        assert_eq!(envelope["result"]["isError"], false, "{tool}: {envelope}");
         let content = envelope["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .to_string();
-        assert_chain(parse_deep(content.as_bytes()));
+        let mut result = parse_deep(content.as_bytes());
+        if tool == "figmog_spec" {
+            result = result["node"].take();
+        }
+        assert_chain(result);
         assert!(envelope["result"].get("structuredContent").is_none());
     }
+}
+
+#[test]
+fn spec_and_token_export_handle_deep_raw_and_invalid_mode_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("file.json");
+    let db = dir.path().join("db");
+    let mode_nesting = 15_000;
+    let raw_nesting = 1_500;
+    let nested = |depth| format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+    let raw = nested(raw_nesting);
+    // The file/variables shapes are valid, but neither a numeric node field
+    // nor a FLOAT mode value can use this nested array as a number.
+    let file = deep_file::file(1).replace(
+        r#""type":"FRAME""#,
+        &format!(r#""type":"FRAME","layoutMode":"VERTICAL","itemSpacing":{raw}"#),
+    );
+    std::fs::write(&response, file).unwrap();
+    common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .assert()
+        .success();
+    // Seed through the public store API: the CLI importer intentionally caps
+    // JSON nesting, while persisted values_by_mode stores arbitrary JSON text.
+    let mode = nested(mode_nesting);
+    let fixture = serde_json::json!({
+        "variableCollections": {"C:1": {"name": "Synthetic", "defaultModeId": "M:1",
+            "modes": [{"modeId": "M:1", "name": "Default"}]}},
+        "variables": {"V:1": {"name": "invalid/number", "resolvedType": "FLOAT",
+            "variableCollectionId": "C:1", "scopes": ["GAP"], "valuesByMode": {"M:1": null}}}
+    });
+    let bytes = fixture.to_string().replace("null", &mode);
+    let mut parsed = figmog::vars::parse_variables_snapshot(
+        &fixture,
+        figmog::vars::SOURCE_FILE,
+        figmog::vars::snapshot_digest(bytes.as_bytes()),
+    )
+    .unwrap();
+    for (_, rec) in &mut parsed.recs {
+        if let figmog::model::Rec::Variable(variable) = rec {
+            variable.values_by_mode[0].1 = mode.clone();
+        }
+    }
+    {
+        let mut store = figmog::open_store!(&db);
+        figmog::store::replace_variable_snapshot(
+            &mut store,
+            &std::collections::BTreeSet::new(),
+            &parsed.recs,
+            parsed.snapshot,
+        );
+    }
+    let css = dir.path().join("tokens.css");
+    let output = common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["tokens", "export", "--out"])
+        .arg(&css)
+        .assert()
+        .success();
+    let report: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(report["tokens"], 0);
+    assert_eq!(report["report"][0]["variable_id"], "V:1");
+    assert!(
+        report["report"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("is not a number: skipped")
+    );
+    assert!(!std::fs::read_to_string(css).unwrap().contains("--invalid"));
+
+    let output = common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["spec", "0:0"])
+        .assert()
+        .success();
+    assert_deep_spec_raw(parse_deep(&output.get_output().stdout), raw_nesting);
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"figmog_spec","arguments":{"id":"0:0"}}}
+"#;
+    let output = common::command()
+        .arg("--db")
+        .arg(&db)
+        .args(["--no-socket", "serve", "--no-watch", "--no-upstream"])
+        .write_stdin(request)
+        .assert()
+        .success();
+    let envelope: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["result"]["isError"], false);
+    assert_deep_spec_raw(
+        parse_deep(
+            envelope["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        ),
+        raw_nesting,
+    );
+}
+
+fn assert_deep_spec_raw(mut spec: serde_json::Value, nesting: usize) {
+    assert_eq!(spec["tokens_snapshot"]["state"], "current");
+    let gap = &mut spec["node"]["children"][0]["children"][0]["layout"]["gap"];
+    assert_eq!(gap["untokenized"], true);
+    let mut raw = gap["raw"].take();
+    for _ in 0..nesting {
+        raw = raw[0].take();
+    }
+    assert!(raw.is_null());
 }
 
 #[test]

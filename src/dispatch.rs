@@ -1,4 +1,4 @@
-//! The 17 read-only `figmog_*` tools: one dispatch function, generic over
+//! The 18 read-only `figmog_*` tools: one dispatch function, generic over
 //! the store's reader types, shared by `figmog serve`'s request loop and
 //! the CLI's `figmog call`/`figmog tools`. (`figmog_sync` is not here — it
 //! writes to the store and drives watch/backoff state that only exists at
@@ -278,7 +278,7 @@ pub(crate) fn infer_file_from_node_ref(args: &Value) -> Option<String> {
 /// -n`'s clap default — one constant so the two adapters can't drift.
 pub(crate) const DEFAULT_SEARCH_LIMIT: usize = 10;
 
-/// One of the 17 local reads of the mirror, with typed, already-validated
+/// One of the 18 local reads of the mirror, with typed, already-validated
 /// arguments (NWS-2902). Every adapter converges here: tool JSON (MCP,
 /// the socket, `figmog call`) via [`ReadCommand::from_tool_args`], the
 /// clap read commands via `cli::read_command`, and the CLI's socket
@@ -358,11 +358,15 @@ pub(crate) enum ReadCommand {
         under: Option<String>,
         limit: usize,
     },
+    /// `figmog_spec` (NWS-2968): binding-aware layout/value spec of a subtree.
+    Spec {
+        id: String,
+    },
 }
 
 impl ReadCommand {
     /// Parse a local read tool call. `Ok(None)` for any name that isn't
-    /// one of the 17 local reads (`figmog_sync`, `figmog_images`,
+    /// one of the 18 local reads (`figmog_sync`, `figmog_images`,
     /// management and desktop tools are the caller's business). Arguments
     /// are validated in schema order with the `arg_*`/`require_*`
     /// helpers, so the first bad argument names the error (NWS-2944).
@@ -387,6 +391,7 @@ impl ReadCommand {
                 | "figmog_text"
                 | "figmog_where"
                 | "figmog_at"
+                | "figmog_spec"
         ) {
             return Ok(None);
         }
@@ -465,6 +470,9 @@ impl ReadCommand {
                     Some(value) => json_usize(value)
                         .ok_or_else(|| "expected non-negative integer for `limit`".to_string())?,
                 },
+            },
+            "figmog_spec" => Self::Spec {
+                id: require_str(args, "id")?,
             },
             _ => return Ok(None),
         }))
@@ -587,6 +595,10 @@ impl ReadCommand {
                 args = json!({"x": x, "y": y, "page": page, "limit": limit});
                 put(&mut args, "under", under.as_ref());
                 "figmog_at"
+            }
+            Self::Spec { id } => {
+                args = json!({"id": id});
+                "figmog_spec"
             }
         };
         (name, args)
@@ -728,11 +740,19 @@ impl ReadCommand {
                 under,
                 limit,
             } => query::at(nodes, children, x, y, page, under, limit),
+            Self::Spec { id } => query::spec(
+                nodes,
+                children,
+                variables,
+                variable_collections,
+                variable_snapshot,
+                id,
+            ),
         }
     }
 }
 
-/// Dispatch one of the 17 read-only `figmog_*` tools against an open
+/// Dispatch one of the 18 read-only `figmog_*` tools against an open
 /// snapshot: [`ReadCommand::from_tool_args`] then
 /// [`ReadCommand::execute`]. `upstream_status` is spliced into
 /// `figmog_status`'s output (`"connected"` / `"unreachable"` /
@@ -776,10 +796,10 @@ fn file_arg_property() -> Value {
     })
 }
 
-/// The 21 `figmog_*` MCP tools (spec §14, v4; `figmog_subtree` added by
-/// v0.0.2 §2, `figmog_images` by v0.0.2 §5): 17 reads of the local mirror
-/// (`figmog_subtree` among them) plus `figmog_sync` and `figmog_images` —
-/// 19 total — every one of which gains the optional `file` routing
+/// The 22 `figmog_*` MCP tools (spec §14, v4; `figmog_subtree` added by
+/// v0.0.2 §2, `figmog_images` by v0.0.2 §5, `figmog_spec` by NWS-2968): 18
+/// reads of the local mirror (`figmog_subtree` and `figmog_spec` among
+/// them) plus `figmog_sync` and `figmog_images` — 20 total — every one of which gains the optional `file` routing
 /// property below — plus the two v4 additions, `figmog_open` and
 /// `figmog_files`, which don't (routing *to* a file, and listing every
 /// file, aren't themselves per-file operations). Every tool but
@@ -906,7 +926,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "figmog_vars".into(),
-            description: "Variables: the authoritative record (with code_syntax, hidden_from_publishing, remote) if imported via figmog import-variables or an Enterprise pull, else inferred from bindings — reads the local mirror (no Figma API cost).".into(),
+            description: "Variables: the authoritative record (with default_mode, scopes, code_syntax, hidden_from_publishing, remote) if imported via figmog import-variables or an Enterprise pull, else inferred from bindings — reads the local mirror (no Figma API cost).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -989,6 +1009,17 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                     "limit": {"type": "integer", "minimum": 0, "default": query::DEFAULT_AT_LIMIT, "description": "Maximum matches after filtering and sorting; zero returns an empty array."}
                 },
                 "required": ["x", "y", "page"]
+            }),
+        },
+        ToolDef {
+            name: "figmog_spec".into(),
+            description: "Binding-aware spec of an auto-layout subtree: per node, layout (direction, gap, padding, alignment, hug/fill/fixed sizing) and values (fill, stroke, radius, typography), each shown as its bound variable token (name plus the CSS name `figmog tokens export` emits) with the raw value, or flagged untokenized (with any token of equal default/light value under `matches`). Grid/wrap layout, absolute children, constraints frames, mixed text runs, non-solid paints, effects and the like are listed under `unsupported`, never approximated — reads the local mirror (no Figma API cost).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Root node id (12:34 or 12-34 form, or a Figma URL)."}
+                },
+                "required": ["id"]
             }),
         },
     ];
@@ -1205,7 +1236,7 @@ mod tests {
         assert_eq!(infer_file_from_node_ref(&json!({"id": 12})), None);
     }
 
-    /// NWS-2902: only the 17 local reads become a `ReadCommand`; sync,
+    /// NWS-2902: only the 18 local reads become a `ReadCommand`; sync,
     /// images, management and desktop tools stay with their callers.
     #[test]
     fn read_command_covers_exactly_the_local_reads() {
@@ -1222,7 +1253,7 @@ mod tests {
             })
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(reads.len(), 17, "{reads:?}");
+        assert_eq!(reads.len(), 18, "{reads:?}");
         for name in [
             "figmog_sync",
             "figmog_images",
