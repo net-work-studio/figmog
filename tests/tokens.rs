@@ -112,6 +112,142 @@ fn a_name_collision_fails_naming_both_variables() {
 }
 
 #[test]
+fn skips_root_alias_cycles_and_their_dependents() {
+    let alias = |id| serde_json::json!({"type": "VARIABLE_ALIAS", "id": id});
+    let token = |name, value| {
+        serde_json::json!({"name": name, "resolvedType": "FLOAT", "variableCollectionId": "C:base",
+            "valuesByMode": {"M:base": value}, "scopes": ["GAP"]})
+    };
+    let mut self_cycle = token("self", alias("V:self"));
+    self_cycle["scopes"] = serde_json::json!([]);
+    let (store, db) = import_snapshot(serde_json::json!({
+        "variableCollections": {
+            "C:base": {"name": "Base", "defaultModeId": "M:base", "modes": [
+                {"modeId": "M:base", "name": "Base"}]}
+        },
+        "variables": {
+            "V:self": self_cycle,
+            "V:a": token("a", alias("V:b")),
+            "V:b": token("b", alias("V:a")),
+            "V:child": token("child", alias("V:a")),
+            "V:grandchild": token("grandchild", alias("V:child")),
+            "V:valid": token("valid", serde_json::json!(8))
+        }
+    }));
+    let (css, summary) = export_summary(store.path(), &db);
+    assert_eq!(summary["tokens"], 1, "{summary}");
+    assert_eq!(
+        summary["report"],
+        serde_json::json!([
+            {"variable_id": "V:a", "name": "a", "reason": "alias cycle in root mode: skipped"},
+            {"variable_id": "V:b", "name": "b", "reason": "alias cycle in root mode: skipped"},
+            {"variable_id": "V:child", "name": "child", "reason": "aliases V:a, which is not exported: skipped"},
+            {"variable_id": "V:grandchild", "name": "grandchild", "reason": "aliases V:child, which is not exported: skipped"},
+            {"variable_id": "V:self", "name": "self", "reason": "alias cycle in root mode: skipped"}
+        ])
+    );
+    assert!(css.contains("  --valid: 8px;"), "{css}");
+    for name in ["a", "b", "child", "grandchild", "self"] {
+        assert!(!css.contains(&format!("--{name}:")), "{css}");
+        assert!(!css.contains(&format!("--spacing-{name}:")), "{css}");
+    }
+}
+
+#[test]
+fn checks_dark_aliases_with_redeclared_tokens_and_separate_mode_edges() {
+    let alias = |id| serde_json::json!({"type": "VARIABLE_ALIAS", "id": id});
+    let token = |name, collection, values| {
+        serde_json::json!({"name": name, "resolvedType": "FLOAT", "variableCollectionId": collection,
+            "valuesByMode": values, "scopes": ["GAP"]})
+    };
+    let (store, db) = import_snapshot(serde_json::json!({
+        "variableCollections": {
+            "C:base": {"name": "Base", "defaultModeId": "M:base", "modes": [
+                {"modeId": "M:base", "name": "Base"}]},
+            "C:theme": {"name": "Theme", "defaultModeId": "M:light", "modes": [
+                {"modeId": "M:light", "name": "Light"}, {"modeId": "M:dark", "name": "Dark"}]}
+        },
+        "variables": {
+            "VariableID:200": token("themed", "C:theme", serde_json::json!({"M:light": 4, "M:dark": alias("V:base")})),
+            "V:base": token("base", "C:base", serde_json::json!({"M:base": alias("VariableID:200")})),
+            "V:dependent": token("dependent", "C:theme", serde_json::json!({"M:light": 8, "M:dark": alias("VariableID:200")})),
+            "V:flip-a": token("flip-a", "C:theme", serde_json::json!({"M:light": alias("V:flip-b"), "M:dark": 16})),
+            "V:flip-b": token("flip-b", "C:theme", serde_json::json!({"M:light": 24, "M:dark": alias("V:flip-a")}))
+        }
+    }));
+    let (css, summary) = export_summary(store.path(), &db);
+    assert_eq!(summary["tokens"], 2, "{summary}");
+    assert_eq!(
+        summary["report"],
+        serde_json::json!([
+            {"variable_id": "V:base", "name": "base", "reason": "alias cycle in dark mode: skipped"},
+            {"variable_id": "V:dependent", "name": "dependent", "reason": "aliases VariableID:200, which is not exported: skipped"},
+            {"variable_id": "VariableID:200", "name": "themed", "reason": "alias cycle in dark mode: skipped"}
+        ])
+    );
+    assert!(
+        css.contains(":root {\n  --flip-a: var(--flip-b);\n  --flip-b: 24px;\n}"),
+        "{css}"
+    );
+    assert!(
+        css.contains("[data-theme=\"dark\"] {\n  --flip-a: 16px;\n  --flip-b: var(--flip-a);\n}"),
+        "{css}"
+    );
+    for name in ["base", "dependent", "themed"] {
+        assert!(!css.contains(&format!("--{name}:")), "{css}");
+        assert!(!css.contains(&format!("--spacing-{name}:")), "{css}");
+    }
+
+    // A dark-only cycle does not erase the Figma binding or light value.
+    let mut nodes = common::fixture_v1();
+    nodes["document"]["children"][0]["children"][0]["itemSpacing"] = serde_json::json!(4);
+    let file = store.path().join("nodes.json");
+    std::fs::write(&file, nodes.to_string()).unwrap();
+    common::command()
+        .args(["--db", &db, "pull", "--from-file"])
+        .arg(file)
+        .assert()
+        .success();
+    let out = common::command()
+        .args(["--db", &db, "spec", "1:1"])
+        .assert()
+        .success();
+    let spec: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let layout = &spec["node"]["layout"];
+    assert_eq!(
+        layout["gap"]["matches"],
+        serde_json::json!([
+            {"token": "base", "variable_id": "V:base", "css": null},
+            {"token": "themed", "variable_id": "VariableID:200", "css": null}
+        ])
+    );
+    let bound = &layout["padding"]["left"];
+    assert_eq!(bound["variable_id"], "VariableID:200");
+    assert_eq!(bound["token"], "themed");
+    assert_eq!(bound["css"], serde_json::Value::Null);
+}
+
+fn import_snapshot(snapshot: serde_json::Value) -> (tempfile::TempDir, String) {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().join("variables.json");
+    std::fs::write(&path, snapshot.to_string()).unwrap();
+    imported(&path)
+}
+
+fn export_summary(dir: &Path, db: &str) -> (String, serde_json::Value) {
+    let output = dir.join("tokens.css");
+    let result = common::command()
+        .args(["--db", db, "tokens", "export", "--out"])
+        .arg(&output)
+        .assert()
+        .success();
+    (
+        std::fs::read_to_string(output).unwrap(),
+        serde_json::from_slice(&result.get_output().stdout).unwrap(),
+    )
+}
+
+#[test]
 fn a_store_without_a_snapshot_is_a_clear_error() {
     let (_dir, db) = common::fixture_db();
     let out = common::command()

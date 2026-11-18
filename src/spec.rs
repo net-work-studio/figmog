@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 
 use crate::deep_json::OwnedValue;
-use crate::tokens::{ExportOptions, Theme, color, export_css};
+use crate::tokens::{ExportOptions, Theme, color, prepare_export, render_css};
 
 /// One authoritative variable row of `figmog vars --snapshot`.
 struct Var<'a> {
@@ -111,9 +111,13 @@ fn fill_prop(node_type: &str) -> Prop {
 /// Build the spec. `tree` is the `figmog_subtree` answer for the node;
 /// `vars` the `figmog_vars {snapshot: true}` answer.
 pub fn build(tree: &Value, vars: &Value) -> Value {
-    let (css, theme, css_unavailable) = match export_css(vars, &ExportOptions::default()) {
-        Ok(export) => (export.names, export.theme, Value::Null),
-        Err(e) => (BTreeMap::new(), None, Value::String(e)),
+    let (theme, export) = match prepare_export(vars, &ExportOptions::default()) {
+        Ok(prepared) => (prepared.theme.clone(), render_css(prepared)),
+        Err(error) => (None, Err(error)),
+    };
+    let (css, css_unavailable) = match export {
+        Ok(export) => (export.names, Value::Null),
+        Err(error) => (BTreeMap::new(), Value::String(error)),
     };
     let tokens = Tokens::new(vars, css, theme.as_ref());
     let mut cx = Cx {

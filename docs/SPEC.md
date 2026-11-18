@@ -1426,7 +1426,8 @@ FLOAT aliasing a unitless one → `calc(var(--target) * 1px)` (a bare
 FLOAT aliasing a px one is skipped and reported (CSS cannot strip a
 unit; emitting the resolved number would silently detach the alias), as
 is an alias between COLOR and FLOAT. STRING, BOOLEAN and other types are skipped and
-reported, as is a variable missing a needed mode's value or aliasing a
+reported, as is a variable missing a needed mode's value, belonging to
+an alias cycle in either the root or dark mode, or aliasing a
 variable that isn't exported (transitively).
 
 **Tailwind namespaces.** COLOR → `--color-*`, spacing/size → `--spacing-*`,
@@ -2058,11 +2059,13 @@ bare id, a `12-34` id or a Figma URL (§12); an unknown id is the standard
 
 A spec node is `{id, name, type, layout?, values, children}` with
 `children` in child-index order. `tokens_snapshot` is the §9 snapshot
-summary the names refer to, plus the theme the token export picks
-(`{collection, collection_id, light_mode, dark_mode}` or null) and
+summary the names refer to, plus the theme selected for root-mode value
+matching and token export (`{collection, collection_id, light_mode,
+light_mode_id, dark_mode, dark_mode_id}` or null) and
 `css_unavailable`:
 null, or the token export's error (no `current` snapshot, a name
-collision, an ambiguous theme), in which case every `css` is null.
+collision, an ambiguous theme), in which case every `css` is null. A
+rendering error still preserves the selected theme for value matching.
 
 **Layout** (only on auto-layout frames and on children of one):
 

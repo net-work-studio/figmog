@@ -25,7 +25,8 @@
 //!   unitless FLOAT aliasing a px one, or an alias across types, is
 //!   skipped and reported (CSS cannot strip a unit). STRING, BOOLEAN and
 //!   other types are skipped and reported, as is a variable lacking a
-//!   value for a mode it needs or aliasing a skipped variable.
+//!   value for a mode it needs, belonging to a root or dark alias cycle,
+//!   or depending on a skipped variable.
 //! - **Dark subtrees.** `var()` in a custom property resolves where the
 //!   property is declared, so `[data-theme="dark"]` redeclares — with its
 //!   one value — every variable that aliases, directly or through a chain,
@@ -141,6 +142,22 @@ impl Val {
 /// returns it) to CSS. Errors: no current snapshot, an ambiguous or
 /// unknown theme collection/mode, a name collision.
 pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> {
+    render_css(prepare_export(vars, opts)?)
+}
+
+/// A validated snapshot with the mode selection used by both CSS rendering
+/// and spec value matching.
+pub(crate) struct PreparedExport<'a> {
+    snapshot: &'a Value,
+    all: BTreeMap<String, Var<'a>>,
+    report: BTreeSet<ReportEntry>,
+    pub(crate) theme: Option<Theme>,
+}
+
+pub(crate) fn prepare_export<'a>(
+    vars: &'a Value,
+    opts: &ExportOptions,
+) -> Result<PreparedExport<'a>, String> {
     let snapshot = &vars["snapshot"];
     let state = snapshot["state"].as_str().unwrap_or("none");
     if state != "current" {
@@ -207,6 +224,21 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
     }
 
     let theme = choose_theme(&all, opts)?;
+    Ok(PreparedExport {
+        snapshot,
+        all,
+        report,
+        theme,
+    })
+}
+
+pub(crate) fn render_css(prepared: PreparedExport<'_>) -> Result<Export, String> {
+    let PreparedExport {
+        snapshot,
+        all,
+        mut report,
+        theme,
+    } = prepared;
     // The modes each variable is emitted in: its root mode (the theme's
     // light mode for the theme collection, else its default) and, for the
     // theme collection, the dark mode.
@@ -220,11 +252,6 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
     };
 
     // First pass: type, name and per-mode values.
-    struct Token {
-        name: String,
-        kind: Kind,
-        vals: Vec<Val>,
-    }
     let mut tokens: BTreeMap<String, Token> = BTreeMap::new();
     for v in all.values() {
         let kind = match v.resolved_type.as_str() {
@@ -295,13 +322,6 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             report.insert(entry(&v.id, &v.name, &why));
             continue;
         }
-        if kind == Kind::Number {
-            report.insert(entry(
-                &v.id,
-                &v.name,
-                "FLOAT without a spacing, size or radius scope: emitted unitless, no Tailwind theme entry",
-            ));
-        }
         tokens.insert(v.id.clone(), Token { name, kind, vals });
     }
     // Units across aliases. Every emitted FLOAT carries its own kind's
@@ -338,30 +358,43 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
         let name = all.get(&id).map(|v| v.name.as_str()).unwrap_or_default();
         report.insert(entry(&id, name, &why));
     }
-    // Drop aliases to variables that aren't exported, until none remain
-    // (an alias chain to a skipped variable drops as a whole).
-    loop {
-        let dangling: Vec<(String, String)> = tokens
-            .iter()
-            .filter_map(|(id, t)| {
-                t.vals.iter().find_map(|val| match val.target() {
-                    Some(target) if !tokens.contains_key(target) => {
-                        Some((id.clone(), target.to_string()))
-                    }
-                    _ => None,
-                })
-            })
-            .collect();
-        if dangling.is_empty() {
-            break;
-        }
-        for (id, target) in dangling {
-            tokens.remove(&id);
-            let name = all.get(&id).map(|v| v.name.as_str()).unwrap_or_default();
+    // A CSS cycle invalidates every member in that mode. Check root and
+    // dark before dropping any members, then prune references to all skips.
+    let mut cyclic = Vec::new();
+    let mode_count = if theme.is_some() { 2 } else { 1 };
+    for (mode, label) in ["root", "dark"].into_iter().take(mode_count).enumerate() {
+        for id in alias_cycle_members(&tokens, mode) {
             report.insert(entry(
-                &id,
-                name,
+                id,
+                &all[id].name,
+                &format!("alias cycle in {label} mode: skipped"),
+            ));
+            cyclic.push(id.to_string());
+        }
+    }
+    for id in cyclic {
+        tokens.remove(&id);
+    }
+    let dangling: Vec<_> = unavailable_aliases(&tokens)
+        .into_iter()
+        .map(|(id, target)| {
+            report.insert(entry(
+                id,
+                &all[id].name,
                 &format!("aliases {target}, which is not exported: skipped"),
+            ));
+            id.to_string()
+        })
+        .collect();
+    for id in dangling {
+        tokens.remove(&id);
+    }
+    for (id, token) in &tokens {
+        if token.kind == Kind::Number {
+            report.insert(entry(
+                id,
+                &all[id].name,
+                "FLOAT without a spacing, size or radius scope: emitted unitless, no Tailwind theme entry",
             ));
         }
     }
@@ -501,6 +534,79 @@ pub fn export_css(vars: &Value, opts: &ExportOptions) -> Result<Export, String> 
             .map(|(id, t)| (id.clone(), t.name.clone()))
             .collect(),
     })
+}
+
+struct Token {
+    name: String,
+    kind: Kind,
+    vals: Vec<Val>,
+}
+
+/// Follow each mode's aliases once. An edge back into the current path
+/// closes a cycle, while a previously walked suffix is already handled.
+fn alias_cycle_members(tokens: &BTreeMap<String, Token>, mode: usize) -> Vec<&str> {
+    let mut visited = BTreeSet::new();
+    let mut cycles = Vec::new();
+    for mut id in tokens.keys().map(String::as_str) {
+        let mut path = Vec::new();
+        while let Some(token) = tokens.get(id) {
+            if !visited.insert(id) {
+                if let Some(start) = path.iter().position(|&member| member == id) {
+                    let cycle = &path[start..];
+                    // Every edge in a dark cycle that reaches a themed
+                    // token is redeclared in the dark block. A cycle of
+                    // inherited aliases alone is already reported at root.
+                    if mode == 0 || cycle.iter().any(|&member| tokens[member].vals.len() > 1) {
+                        cycles.extend_from_slice(cycle);
+                    }
+                }
+                break;
+            }
+            path.push(id);
+            let Some(target) = token.vals.get(mode).unwrap_or(&token.vals[0]).target() else {
+                break;
+            };
+            id = target;
+        }
+    }
+    cycles
+}
+
+/// Propagate unavailable targets through both modes, visiting dependents
+/// in waves so simultaneous failures prefer the same root edge as before.
+fn unavailable_aliases(tokens: &BTreeMap<String, Token>) -> BTreeMap<&str, &str> {
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut unavailable = BTreeSet::new();
+    for (id, token) in tokens {
+        for target in token.vals.iter().filter_map(Val::target) {
+            dependents.entry(target).or_default().push(id);
+            if !tokens.contains_key(target) {
+                unavailable.insert(target);
+            }
+        }
+    }
+    let mut skipped = BTreeMap::new();
+    while !unavailable.is_empty() {
+        let mut next = BTreeSet::new();
+        for id in unavailable
+            .iter()
+            .flat_map(|target| dependents.remove(target).into_iter().flatten())
+        {
+            if skipped.contains_key(id) {
+                continue;
+            }
+            let target = tokens[id]
+                .vals
+                .iter()
+                .filter_map(Val::target)
+                .find(|target| unavailable.contains(target))
+                .expect("dependent references an unavailable target");
+            skipped.insert(id, target);
+            next.insert(id);
+        }
+        unavailable = next;
+    }
+    skipped
 }
 
 fn entry(id: &str, name: &str, reason: &str) -> ReportEntry {

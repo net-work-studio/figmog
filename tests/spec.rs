@@ -223,6 +223,64 @@ fn unknown_node_is_the_standard_error() {
 }
 
 #[test]
+fn spec_matches_light_mode_values_when_css_names_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db").display().to_string();
+    let file = dir.path().join("file.json");
+    let snapshot = dir.path().join("variables.json");
+    let mut nodes = common::fixture_v1();
+    let hero = &mut nodes["document"]["children"][0]["children"][0];
+    hero["itemSpacing"] = json!(16);
+    hero["paddingRight"] = json!(24);
+    std::fs::write(&file, nodes.to_string()).unwrap();
+    stdout(&db, &["pull", "--from-file", file.to_str().unwrap()]);
+
+    let export = json!({
+        "variableCollections": {
+            "C:theme": {"name": "Theme", "defaultModeId": "M:dark", "modes": [
+                {"modeId": "M:dark", "name": "Dark"}, {"modeId": "M:light", "name": "Light"}
+            ]},
+            "C:other": {"name": "Other", "defaultModeId": "M:other", "modes": [
+                {"modeId": "M:other", "name": "Value"}
+            ]}
+        },
+        "variables": {
+            "VariableID:200": {"name": "theme/gap", "resolvedType": "FLOAT",
+                "variableCollectionId": "C:theme", "scopes": ["GAP"],
+                "valuesByMode": {"M:dark": 24, "M:light": 16}},
+            "V:one": {"name": "other/gap", "resolvedType": "FLOAT",
+                "variableCollectionId": "C:other", "scopes": ["GAP"],
+                "valuesByMode": {"M:other": 4}},
+            "V:two": {"name": "other-gap", "resolvedType": "FLOAT",
+                "variableCollectionId": "C:other", "scopes": ["GAP"],
+                "valuesByMode": {"M:other": 8}}
+        }
+    });
+    std::fs::write(&snapshot, export.to_string()).unwrap();
+    stdout(&db, &["import-variables", snapshot.to_str().unwrap()]);
+
+    let spec: Value = serde_json::from_slice(&stdout(&db, &["spec", "1:1"])).unwrap();
+    let summary = &spec["tokens_snapshot"];
+    assert!(summary["css_unavailable"].as_str().is_some_and(|reason| {
+        reason.contains("token name collision") && reason.contains("--other-gap")
+    }));
+    let layout = &spec["node"]["layout"];
+    assert_eq!(
+        layout["gap"]["matches"],
+        json!([
+            {"token": "theme/gap", "variable_id": "VariableID:200", "css": null}
+        ])
+    );
+    assert_eq!(
+        layout["padding"]["right"],
+        json!({"raw": 24, "untokenized": true})
+    );
+    assert_eq!(layout["padding"]["left"]["variable_id"], "VariableID:200");
+    assert_eq!(layout["padding"]["left"]["css"], Value::Null);
+    assert_eq!(summary["theme"]["light_mode_id"], "M:light");
+}
+
+#[test]
 fn imported_alias_chains_past_32_links_export_and_match_every_token() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("db").display().to_string();
