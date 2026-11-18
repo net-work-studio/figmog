@@ -122,13 +122,17 @@ fn spec_and_token_export_handle_deep_raw_and_invalid_mode_values() {
     let db = dir.path().join("db");
     let mode_nesting = 15_000;
     let raw_nesting = 1_500;
+    let width_nesting = 15_000;
     let nested = |depth| format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
     let raw = nested(raw_nesting);
+    let width = nested(width_nesting);
     // The file/variables shapes are valid, but neither a numeric node field
     // nor a FLOAT mode value can use this nested array as a number.
     let file = deep_file::file(1).replace(
         r#""type":"FRAME""#,
-        &format!(r#""type":"FRAME","layoutMode":"VERTICAL","itemSpacing":{raw}"#),
+        &format!(
+            r#""type":"FRAME","layoutMode":"VERTICAL","itemSpacing":{raw},"absoluteBoundingBox":{{"x":0,"y":0,"width":{width},"height":20}}"#
+        ),
     );
     std::fs::write(&response, file).unwrap();
     common::command()
@@ -193,7 +197,11 @@ fn spec_and_token_export_handle_deep_raw_and_invalid_mode_values() {
         .args(["spec", "0:0"])
         .assert()
         .success();
-    assert_deep_spec_raw(parse_deep(&output.get_output().stdout), raw_nesting);
+    assert_deep_spec_raw(
+        parse_deep(&output.get_output().stdout),
+        raw_nesting,
+        width_nesting,
+    );
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"figmog_spec","arguments":{"id":"0:0"}}}
 "#;
     let output = common::command()
@@ -213,18 +221,30 @@ fn spec_and_token_export_handle_deep_raw_and_invalid_mode_values() {
                 .as_bytes(),
         ),
         raw_nesting,
+        width_nesting,
     );
 }
 
-fn assert_deep_spec_raw(mut spec: serde_json::Value, nesting: usize) {
+fn assert_deep_spec_raw(mut spec: serde_json::Value, raw_nesting: usize, width_nesting: usize) {
     assert_eq!(spec["tokens_snapshot"]["state"], "current");
-    let gap = &mut spec["node"]["children"][0]["children"][0]["layout"]["gap"];
-    assert_eq!(gap["untokenized"], true);
-    let mut raw = gap["raw"].take();
-    for _ in 0..nesting {
-        raw = raw[0].take();
+    let frame = &mut spec["node"]["children"][0]["children"][0];
+    assert_eq!(frame["layout"]["gap"]["untokenized"], true);
+    assert_eq!(frame["layout"]["size"]["height"], 20);
+    for (value, nesting) in [
+        (frame["layout"]["gap"]["raw"].take(), raw_nesting),
+        (frame["design"]["itemSpacing"].take(), raw_nesting),
+        (frame["layout"]["size"]["width"].take(), width_nesting),
+        (
+            frame["design"]["absoluteBoundingBox"]["width"].take(),
+            width_nesting,
+        ),
+    ] {
+        let mut raw = value;
+        for _ in 0..nesting {
+            raw = raw[0].take();
+        }
+        assert!(raw.is_null());
     }
-    assert!(raw.is_null());
 }
 
 #[test]

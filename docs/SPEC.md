@@ -2398,16 +2398,16 @@ A spec node is
 with `children` in child-index order. A hidden layer (`visible: false`)
 keeps only `{id, name, type, design?}`.
 
-- **`design`** is the recorded layout, copied verbatim (never
-  normalized): `layoutMode`, `layoutWrap`, `layoutPositioning`,
+- **`design`** copies the recorded layout and variable mode overrides
+  verbatim. Fields include `layoutMode`, `layoutWrap`, `layoutPositioning`,
   `layoutAlign`, `layoutGrow`, `layoutSizingHorizontal`/`Vertical`,
   `primaryAxisSizingMode`, `counterAxisSizingMode`,
   `primaryAxisAlignItems`, `counterAxisAlignItems`,
   `counterAxisAlignContent`, `itemSpacing`, `counterAxisSpacing`,
   `itemReverseZIndex`, `strokesIncludedInLayout`, `padding*`,
   `min/maxWidth`, `min/maxHeight`, `constraints`, `clipsContent`,
-  `rotation`, `absoluteBoundingBox`, `textAutoResize`, the twelve `grid*`
-  fields, and for TEXT `style: {textAutoResize, textTruncation, maxLines,
+  `rotation`, `absoluteBoundingBox`, `explicitVariableModes`, `textAutoResize`,
+  the twelve `grid*` fields, and for TEXT `style: {textAutoResize, textTruncation, maxLines,
   textAlignHorizontal, textAlignVertical}` — whichever the node has.
 - **figmog's interpretation** is everything else: `layout` and `values`
   (value entries, below), `content`, `instance`, and `css` — a
@@ -2596,6 +2596,13 @@ name is its `var()` — matched to the unit the token export writes it in
 `calc(var(--x) / 100)`, a `%` one as opacity as is; a unit the property
 can't take (a `%` token as a gap, a px token as a font weight) is listed
 and left out.
+
+The nearest `explicitVariableModes` entry for each collection pins that
+mode for the node and its descendants, including when the pin is above
+the requested subtree. Spec reports a pin when a bound declaration
+depends on its collection directly or through aliases and omits that
+declaration from CSS and Tailwind. The binding and its recorded value
+stay in the spec.
 
 **Tailwind hint** (`tailwind`). One class per declaration, ordered by
 property group (position, layout, size, paint, text): keyword utilities
@@ -2906,8 +2913,8 @@ sanitizer), `src/cli/assets.rs` (reads, fetches and writes).
   version (a re-export after unrelated edits is byte-identical). `url` is
   the root-relative URL when the images folder is `public` or under
   `public/` (the Vite / Next.js static folder), else null. URL path
-  segments are percent-encoded; filesystem paths keep their original
-  spelling. `sources`
+  segments are normalized and percent-encoded. Filesystem paths keep
+  their original spelling. `sources`
   records the file and the roots, so a plain `figmog assets export`
   repeats the last export — and refuses when the project's file is no
   longer the recorded one (the roots are that file's node ids; pass
@@ -2934,15 +2941,17 @@ data); node ids reach a comment only after a strict character check
 names are the validated component name or the content hash (SHA-256 via
 `ring`, already compiled in through rustls). Every write target is
 checked before anything is written. Path comparisons normalize relative
-components, including `.`. The manifest must not sit inside an output
-directory or occupy one of its ancestors. The complete planned output
-graph rejects duplicate destinations and file/directory conflicts before
-any write, including with `--force`. Every target must stay inside the
-project. Symlinks anywhere below the project root are refused, including
-with `--force`. An existing target must be a regular file. Directory
-spellings must match the names on disk; case aliases produce an error
-that names the existing spelling. Missing directories are created one at a
-time, each checked (never `create_dir_all` through a link). Each file is
+components, including `.`, and compare their lowercase spellings. The
+manifest must not sit inside an output directory or occupy one of its
+ancestors. The complete planned output graph rejects duplicate
+destinations, file/directory conflicts, and differently spelled shared
+directories before any write, including with `--force`. Every target
+must stay inside the project. Symlinks anywhere below the project root
+are refused, including with `--force`. An existing target must be a
+regular file. Directory spellings must match the names on disk. Case
+aliases produce an error that names the existing spelling. Missing
+directories are created one at a time, each checked (never
+`create_dir_all` through a link). Each file is
 written atomically: a new temporary file in the same directory (created
 exclusively, `O_NOFOLLOW`), then renamed over the target. A target that
 exists only under another case (a renamed icon on a case-insensitive

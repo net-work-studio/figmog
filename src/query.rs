@@ -536,10 +536,10 @@ pub fn subtree<R: Readable>(
 }
 
 /// Binding-aware spec of the subtree rooted at `id` (NWS-2968): the
-/// [`subtree`] answer and the [`vars`] `{snapshot, variables}` answer,
-/// rendered by [`crate::spec::build`] with the project's token `tokens`
-/// options (NWS-2948), Figma → code component `map` (NWS-2949) and
-/// asset manifest `assets` (NWS-2952).
+/// [`subtree`] answer, ancestor mode pins and the [`vars`] snapshot,
+/// rendered by [`crate::spec::build`] with the project's `tokens` options
+/// (NWS-2948), Figma → code component `map` (NWS-2949) and asset manifest
+/// `assets` (NWS-2952).
 #[allow(clippy::too_many_arguments)]
 pub fn spec<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
@@ -555,16 +555,40 @@ pub fn spec<R: Readable>(
     map: Option<&crate::map::CodeMap>,
     assets: Option<&crate::assets::AssetIndex>,
 ) -> Result<Value, String> {
-    let tree = OwnedValue(subtree(
+    let id = normalize_node_ref(&id);
+    let root = nodes
+        .get(&id)
+        .ok_or_else(|| format!("no node {id} in the mirror"))?;
+    let tree = OwnedValue(build_subtree(
         nodes,
         children,
         variables,
         variable_collections,
-        id,
+        &root,
         None,
         None,
         false,
     )?);
+    // Start with the nearest ancestor. It supplies each collection's mode
+    // ahead of more distant ancestors, unless the spec root overrides it.
+    let mut inherited_modes = BTreeMap::new();
+    let mut visited = BTreeSet::from([id]);
+    let mut parent_id = root.parent_id;
+    while let Some(id) = parent_id {
+        if !visited.insert(id.clone()) {
+            return Err(format!("parent cycle detected at {id}"));
+        }
+        let Some(parent) = nodes.get(&id) else { break };
+        if parent.raw.contains("\"explicitVariableModes\"") {
+            let raw = crate::deep_json::from_str(&parent.raw).map_err(|e| e.to_string())?;
+            for (collection, mode) in crate::spec::explicit_modes(&raw) {
+                inherited_modes
+                    .entry(collection.to_string())
+                    .or_insert_with(|| mode.to_string());
+            }
+        }
+        parent_id = parent.parent_id;
+    }
     let vars = OwnedValue(vars(
         nodes,
         variables,
@@ -610,7 +634,10 @@ pub fn spec<R: Readable>(
         records.insert(cid, record);
     }
     Ok(crate::spec::build(
-        &tree,
+        crate::spec::SpecTree {
+            root: &tree,
+            inherited_modes,
+        },
         &vars,
         &Value::Object(records),
         tokens,

@@ -1816,6 +1816,25 @@ fn file_mismatch_note(msg: String, explicit_key: Option<&str>, url_key: Option<&
     }
 }
 
+struct ImageArgs {
+    ids: Vec<String>,
+    format: String,
+    scale: Option<f64>,
+    renders: bool,
+}
+
+impl ImageArgs {
+    /// Shared by the owner and relay before either resolves a file.
+    fn parse(args: &Value) -> Result<Self, String> {
+        Ok(Self {
+            ids: dispatch::require_str_array(args, "ids")?,
+            format: dispatch::arg_str(args, "format")?.unwrap_or_else(|| "png".into()),
+            scale: dispatch::arg_f64(args, "scale")?,
+            renders: dispatch::arg_bool_opt(args, "renders")?.unwrap_or(true),
+        })
+    }
+}
+
 /// Route one `tools/call`. `figmog_files`/`figmog_open` aren't per-file
 /// and are handled first; every other local tool's optional `file`
 /// argument is extracted (and stripped before tool-specific arg parsing)
@@ -1855,6 +1874,9 @@ fn handle_tool_call(
         // shared dispatcher against the selected published view below.
         dispatch::ReadCommand::from_tool_args(name, args)?;
     }
+    let image_args = (name == "figmog_images")
+        .then(|| ImageArgs::parse(args))
+        .transpose()?;
     if name == "figmog_files" {
         let read = manager.files_read();
         return offload.defer_read(cancel, ReadTask::Files(read));
@@ -1982,21 +2004,16 @@ fn handle_tool_call(
         {
             session.request_pull(false, interval);
         }
-        if name == "figmog_images" {
+        if let Some(images) = image_args {
             // Failed first mirrors share the data-read retry path above.
             // Once ready, the file's worker scans, fetches and caches;
             // the response is delivered when it finishes.
-            let ids = dispatch::require_str_array(args, "ids")?;
-            let format = dispatch::arg_str(args, "format")?;
-            let format = format.as_deref().unwrap_or("png");
-            let scale = dispatch::arg_f64(args, "scale")?;
-            let renders = dispatch::arg_bool_opt(args, "renders")?.unwrap_or(true);
             let (token, reply) = offload.reply();
             session.images(
-                &ids,
-                format,
-                scale,
-                renders,
+                &images.ids,
+                &images.format,
+                images.scale,
+                images.renders,
                 Box::new(move |result| {
                     let output =
                         result.map(|items| ToolOutput::Raw(crate::images::to_mcp_content(&items)));

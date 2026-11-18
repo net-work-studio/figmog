@@ -1247,11 +1247,12 @@ fn alias_cycles(
         })
         .collect();
     let mut out = BTreeMap::new();
-    for comp in strongly_connected(&adj) {
-        if comp.len() == 1 && !adj[comp[0]].contains(&comp[0]) {
+    let mut visits = vec![AliasVisit::Finished; ids.len()];
+    for mut members in strongly_connected(&adj) {
+        if members.len() == 1 && !adj[members[0]].contains(&members[0]) {
             continue;
         }
-        let members: BTreeSet<usize> = comp.into_iter().collect();
+        members.sort_unstable();
         let col_keys: Vec<&str> = members
             .iter()
             .map(|&i| tokens[ids[i]].col.as_str())
@@ -1278,7 +1279,6 @@ fn alias_cycles(
                     .get(ctx[t.col.as_str()])?
                     .target()
                     .and_then(|x| index.get(x).copied())
-                    .filter(|j| members.contains(j))
             };
             let modes_text = || {
                 col_keys
@@ -1290,45 +1290,26 @@ fn alias_cycles(
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            let mut on_cycle: BTreeSet<usize> = BTreeSet::new();
-            for &start in &members {
-                let mut path = vec![start];
-                while let Some(j) = next(path[path.len() - 1]) {
-                    if let Some(pos) = path.iter().position(|&p| p == j) {
-                        let cycle = &path[pos..];
-                        if cycle.iter().all(|c| !on_cycle.contains(c)) {
-                            let first = cycle
-                                .iter()
-                                .enumerate()
-                                .min_by_key(|(_, c)| **c)
-                                .map_or(0, |(k, _)| k);
-                            let mut names: Vec<&str> = cycle[first..]
-                                .iter()
-                                .chain(&cycle[..first])
-                                .map(|&c| tokens[ids[c]].name.as_str())
-                                .collect();
-                            names.push(names[0]);
-                            let text = names.join(" -> ");
-                            for &c in cycle {
-                                on_cycle.insert(c);
-                                found
-                                    .entry(c)
-                                    .or_insert_with(|| (text.clone(), modes_text(), 0));
-                            }
-                        }
-                        break;
-                    }
-                    if path.len() > members.len() {
-                        break;
-                    }
-                    path.push(j);
+            walk_alias_cycles(&members, &mut visits, next, |cycle| {
+                let first = cycle
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, c)| **c)
+                    .map_or(0, |(k, _)| k);
+                let mut names: Vec<&str> = cycle[first..]
+                    .iter()
+                    .chain(&cycle[..first])
+                    .map(|&c| tokens[ids[c]].name.as_str())
+                    .collect();
+                names.push(names[0]);
+                let text = names.join(" -> ");
+                for &c in cycle {
+                    found
+                        .entry(c)
+                        .and_modify(|entry| entry.2 += 1)
+                        .or_insert_with(|| (text.clone(), modes_text(), 1));
                 }
-            }
-            for c in on_cycle {
-                if let Some(f) = found.get_mut(&c) {
-                    f.2 += 1;
-                }
-            }
+            });
         }
         for (i, (cycle, modes, count)) in found {
             let reason = if count == total {
@@ -1340,6 +1321,49 @@ fn alias_cycles(
         }
     }
     out
+}
+
+#[derive(Clone, Copy)]
+enum AliasVisit {
+    Unseen,
+    Visiting(usize),
+    Finished,
+}
+
+/// In a single mode context a token has at most one outgoing edge. Reuse
+/// finished paths and use the visiting state as the position in the current
+/// path. Tokens outside this component stay finished, so edges to them stop.
+fn walk_alias_cycles(
+    members: &[usize],
+    visits: &mut [AliasVisit],
+    mut next: impl FnMut(usize) -> Option<usize>,
+    mut record: impl FnMut(&[usize]),
+) {
+    for &i in members {
+        visits[i] = AliasVisit::Unseen;
+    }
+    let mut path = Vec::new();
+    for &start in members {
+        let mut i = start;
+        loop {
+            match visits[i] {
+                AliasVisit::Finished => break,
+                AliasVisit::Visiting(pos) => {
+                    record(&path[pos..]);
+                    break;
+                }
+                AliasVisit::Unseen => {
+                    visits[i] = AliasVisit::Visiting(path.len());
+                    path.push(i);
+                }
+            }
+            let Some(target) = next(i) else { break };
+            i = target;
+        }
+        for i in path.drain(..) {
+            visits[i] = AliasVisit::Finished;
+        }
+    }
 }
 
 /// Tarjan's strongly connected components, iteratively (no recursion, so
@@ -2622,6 +2646,60 @@ mod tests {
         );
         assert!(out.css.contains("--d: var(--e);"), "{}", out.css);
         assert!(out.css.contains("--e: var(--d);"), "{}", out.css);
+    }
+
+    #[test]
+    fn long_alias_ring_open_in_each_mode_exports_all_tokens() {
+        const COUNT: usize = 5_000;
+        let vars = snap(
+            (0..COUNT)
+                .map(|i| {
+                    let target = format!("V:{}", (i + 1) % COUNT);
+                    let alias = json!({"type": "VARIABLE_ALIAS", "id": target});
+                    let light = if i == COUNT - 1 {
+                        json!(1)
+                    } else {
+                        alias.clone()
+                    };
+                    let dark = if i == 0 { json!(2) } else { alias };
+                    in_collection(
+                        row(
+                            &format!("V:{i}"),
+                            &format!("gap/{i}"),
+                            "FLOAT",
+                            json!({"Light": light, "Dark": dark}),
+                            json!(["GAP"]),
+                            None,
+                        ),
+                        "Theme",
+                        "Light",
+                    )
+                })
+                .collect(),
+        );
+        let out = export_css(&vars, &ExportOptions::default()).unwrap();
+        assert_eq!(out.tokens, COUNT);
+        assert!(out.report.is_empty(), "{:?}", out.report);
+    }
+
+    #[test]
+    fn cycle_walk_visits_each_edge_once_even_when_paths_share_tails() {
+        let targets = [None, Some(0), Some(1), Some(2), Some(5), Some(4), Some(5)];
+        let members: Vec<_> = (0..targets.len()).collect();
+        let mut visits = vec![AliasVisit::Finished; targets.len()];
+        let mut calls = [0; 7];
+        let mut cycles = Vec::new();
+        walk_alias_cycles(
+            &members,
+            &mut visits,
+            |i| {
+                calls[i] += 1;
+                targets[i]
+            },
+            |cycle| cycles.push(cycle.to_vec()),
+        );
+        assert_eq!(calls, [1; 7]);
+        assert_eq!(cycles, [vec![4, 5]]);
     }
 
     /// Review: collections sharing a selector switch together, so a loop

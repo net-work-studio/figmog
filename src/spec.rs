@@ -30,6 +30,7 @@
 mod css;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use serde_json::{Map, Value, json};
 
@@ -144,7 +145,7 @@ const VECTOR_LIKE: [&str; 5] = [
 ];
 
 /// The recorded layout properties the `design` layer copies verbatim.
-const DESIGN_KEYS: [&str; 41] = [
+const DESIGN_KEYS: [&str; 42] = [
     "absoluteBoundingBox",
     "clipsContent",
     "constraints",
@@ -152,6 +153,7 @@ const DESIGN_KEYS: [&str; 41] = [
     "counterAxisAlignItems",
     "counterAxisSizingMode",
     "counterAxisSpacing",
+    "explicitVariableModes",
     "gridChildHorizontalAlign",
     "gridChildVerticalAlign",
     "gridColumnAnchorIndex",
@@ -198,7 +200,13 @@ const DESIGN_STYLE_KEYS: [&str; 5] = [
     "textTruncation",
 ];
 
-/// Build the spec. `tree` is the `figmog_subtree` answer for the node;
+/// The `figmog_subtree` answer and mode pins from ancestors outside it.
+pub(crate) struct SpecTree<'a> {
+    pub root: &'a Value,
+    pub inherited_modes: BTreeMap<String, String>,
+}
+
+/// Build the spec for `tree`.
 /// `vars` the `figmog_vars {snapshot: true}` answer; `components` maps a
 /// component id to `{name, key, remote, component_set}` for the subtree's
 /// instances ([`component_ids`]); `tokens` the token export options (the
@@ -208,8 +216,8 @@ const DESIGN_STYLE_KEYS: [&str; 5] = [
 /// fills each mapped instance's `code_component`; `assets` the project's
 /// asset manifest (NWS-2952), which names the exported icon component
 /// and image file in `content.assets`.
-pub fn build(
-    tree: &Value,
+pub(crate) fn build(
+    tree: SpecTree<'_>,
     vars: &Value,
     components: &Value,
     tokens: &ExportOptions,
@@ -246,14 +254,17 @@ pub fn build(
         unsupported: BTreeSet::new(),
         consumed: BTreeSet::new(),
         style_base: "/style".into(),
+        modes: Rc::default(),
+        mode_dependents: BTreeMap::new(),
     };
     let node = cx.node(
-        tree,
+        tree.root,
         &Up {
             kind: Parent::Root,
             bbox: None,
             margin: None,
             border: None,
+            modes: Rc::new(tree.inherited_modes),
         },
     );
     let unsupported: Vec<Value> = cx
@@ -267,6 +278,15 @@ pub fn build(
     let mut out = json!({"tokens_snapshot": snapshot, "unsupported": unsupported});
     out["node"] = node;
     out
+}
+
+/// The explicit collection and mode IDs recorded on one node.
+pub(crate) fn explicit_modes(node: &Value) -> impl Iterator<Item = (&str, &str)> {
+    node["explicitVariableModes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(collection, mode)| Some((collection.as_str(), mode.as_str()?)))
 }
 
 /// The component ids of every INSTANCE in `tree`, and of every component
@@ -341,6 +361,34 @@ impl<'a> Tokens<'a> {
             units: BTreeMap::new(),
             root,
         }
+    }
+
+    /// Variables in the collection, and any aliases that can reach them.
+    /// CSS can select another mode, so any mode's alias edge can matter.
+    fn mode_dependents(&self, collection: &str) -> BTreeSet<&str> {
+        let mut reverse_aliases: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        for (id, variable) in &self.vars {
+            if variable.collection_key == collection {
+                seen.insert(id.as_str());
+            }
+            for value in variable.values.values() {
+                if value["type"] == "VARIABLE_ALIAS"
+                    && let Some(target) = value["id"].as_str()
+                {
+                    reverse_aliases.entry(target).or_default().push(id);
+                }
+            }
+        }
+        let mut pending: Vec<&str> = seen.iter().copied().collect();
+        while let Some(id) = pending.pop() {
+            for &alias in reverse_aliases.get(id).into_iter().flatten() {
+                if seen.insert(alias) {
+                    pending.push(alias);
+                }
+            }
+        }
+        seen
     }
 
     /// A bound value: the token, its CSS name, the raw value, and the
@@ -581,6 +629,8 @@ struct Up {
     /// The parent's CSS border width (a stroke included in layout): CSS
     /// offsets an absolute child from the padding box, inside it.
     border: Option<CssVal>,
+    /// Effective Figma mode pins, shared by descendants until overridden.
+    modes: Rc<BTreeMap<String, String>>,
 }
 
 /// What a node is as a container.
@@ -608,6 +658,9 @@ struct Cx<'a> {
     /// Where the type style read by [`Cx::binding`] lives in the node
     /// (`/style`, or a run's `/styleOverrideTable/<n>`).
     style_base: String,
+    modes: Rc<BTreeMap<String, String>>,
+    /// Only computed for collections pinned within the spec's context.
+    mode_dependents: BTreeMap<String, BTreeSet<&'a str>>,
 }
 
 /// `SOLID` paint color as `#rrggbb[aa]`, the paint's opacity folded into
@@ -861,7 +914,22 @@ impl Cx<'_> {
     /// unsupported when the export's unit can't be converted — else the
     /// raw value. `None` when neither exists.
     fn css_value(&mut self, id: &str, prop: &str, e: &Value, want: Want) -> Option<CssVal> {
-        if let Some(var) = e["variable_id"].as_str()
+        let var = e["variable_id"].as_str();
+        if let Some(var) = var
+            && let Some((collection, mode)) = self.modes.iter().find(|(collection, _)| {
+                self.mode_dependents
+                    .entry((*collection).clone())
+                    .or_insert_with(|| self.tokens.mode_dependents(collection))
+                    .contains(var)
+            })
+        {
+            self.unsupported(
+                id,
+                format!("{prop}: variable {var} depends on explicitVariableModes ({collection} = {mode}): CSS not specified"),
+            );
+            return None;
+        }
+        if let Some(var) = var
             && let Some(name) = self.tokens.css.get(var)
         {
             let plain = CssVal {
@@ -956,6 +1024,10 @@ impl Cx<'_> {
     }
 
     fn node_shallow<'n>(&mut self, n: &'n Value, up: &Up) -> (Value, Vec<(&'n Value, Up)>) {
+        self.modes = Rc::clone(&up.modes);
+        for (collection, mode) in explicit_modes(n) {
+            Rc::make_mut(&mut self.modes).insert(collection.to_string(), mode.to_string());
+        }
         let id = n["id"].as_str().unwrap_or_default().to_string();
         let node_type = n["type"].as_str().unwrap_or_default().to_string();
         let mut out = Map::new();
@@ -1056,10 +1128,11 @@ impl Cx<'_> {
         if !layout.is_empty()
             && let Some(b) = n.get("absoluteBoundingBox")
         {
-            layout.insert(
-                "size".into(),
-                json!({"width": b["width"], "height": b["height"]}),
-            );
+            let size = Map::from_iter([
+                ("width".into(), copy_value(&b["width"])),
+                ("height".into(), copy_value(&b["height"])),
+            ]);
+            layout.insert("size".into(), Value::Object(size));
         }
         if !layout.is_empty() {
             out.insert("layout".into(), Value::Object(layout));
@@ -1189,6 +1262,7 @@ impl Cx<'_> {
                 bbox,
                 margin: margin.clone().filter(|_| in_flow && seen_in_flow),
                 border: border.clone(),
+                modes: Rc::clone(&self.modes),
             };
             seen_in_flow |= in_flow;
             children.push((k, child_up));
@@ -2570,10 +2644,17 @@ fn sizing(n: &Value, axis: &str, own: Option<&str>, parent: Option<&str>) -> Str
 mod tests {
     use super::*;
 
+    fn subtree(root: &Value) -> SpecTree<'_> {
+        SpecTree {
+            root,
+            inherited_modes: BTreeMap::new(),
+        }
+    }
+
     fn spec(tree: &Value) -> Value {
         let vars = json!({"snapshot": {"state": "none"}, "variables": []});
         build(
-            tree,
+            subtree(tree),
             &vars,
             &json!({}),
             &ExportOptions::default(),
@@ -2670,7 +2751,7 @@ mod tests {
         let components = json!({"9:9": {"key": "MainKey"}});
         let run = |assets: &AssetIndex, components: &Value| {
             build(
-                &tree,
+                subtree(&tree),
                 &vars,
                 components,
                 &ExportOptions::default(),
@@ -2718,7 +2799,7 @@ mod tests {
             let tree = json!({"id": "1:1", "type": ty, "characters": "A", "fills": [paint],
                 "strokes": [paint], "strokeWeight": 2, "strokeAlign": "INSIDE"});
             let out = build(
-                &tree,
+                subtree(&tree),
                 &vars,
                 &json!({}),
                 &ExportOptions::default(),
@@ -2758,7 +2839,7 @@ mod tests {
                 "absoluteBoundingBox": {"x": 10, "y": 10, "width": 20, "height": 10}}]});
         let run = |tree: &Value| {
             build(
-                tree,
+                subtree(tree),
                 &unit_vars(),
                 &json!({}),
                 &ExportOptions::default(),
@@ -2802,7 +2883,9 @@ mod tests {
         };
         for (gap, id) in [(2, "V:1"), (4, "V:2")] {
             let out = build(
-                &json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL", "itemSpacing": gap}),
+                subtree(
+                    &json!({"id": "1:1", "type": "FRAME", "layoutMode": "HORIZONTAL", "itemSpacing": gap}),
+                ),
                 &vars,
                 &json!({}),
                 &options,
@@ -3056,7 +3139,7 @@ mod tests {
                 "opacity": alias("V:2"), "itemSpacing": alias("V:2")},
             "children": []});
         let out = build(
-            &tree,
+            subtree(&tree),
             &unit_vars(),
             &json!({}),
             &ExportOptions::default(),
@@ -3083,7 +3166,7 @@ mod tests {
         let mut tree = tree;
         tree["boundVariables"]["opacity"] = alias("V:1");
         let out = build(
-            &tree,
+            subtree(&tree),
             &unit_vars(),
             &json!({}),
             &ExportOptions::default(),
@@ -3110,7 +3193,7 @@ mod tests {
                 "absoluteBoundingBox": {"x": 10, "y": 10, "width": 80, "height": 10},
                 "boundVariables": {"size": {"x": alias("V:3")}}}]});
         let out = build(
-            &tree,
+            subtree(&tree),
             &unit_vars(),
             &json!({}),
             &ExportOptions::default(),

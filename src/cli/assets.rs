@@ -23,7 +23,7 @@
 //! this one no longer produces are reported as `stale`, never deleted.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -89,9 +89,9 @@ pub(super) fn run(
         .ok_or("assets export writes into the project and does not take --db")?;
     let settings = layout.settings().assets;
     let root = &layout.project_root;
-    let manifest = normalized_path(&settings.manifest)?;
+    let manifest = casefolded_path(&normalized_path(&settings.manifest)?);
     for (key, dir) in [("icons", &settings.icons), ("images", &settings.images)] {
-        let output = normalized_path(dir)?;
+        let output = casefolded_path(&normalized_path(dir)?);
         if manifest.starts_with(&output) {
             return Err(format!(
                 "[assets] manifest ({}) must not be inside the {key} folder ({dir}): figmog writes that folder's files itself",
@@ -537,10 +537,7 @@ struct Existing {
 /// non-file itself, and no directory spelled differently on disk.
 fn check_target(root: &Path, rel: &str) -> Result<Existing, String> {
     check_project_path(rel).map_err(|e| format!("{rel}: {e}"))?;
-    let parts: Vec<&str> = rel
-        .split('/')
-        .filter(|p| !p.is_empty() && *p != ".")
-        .collect();
+    let parts: Vec<&str> = assets::path_parts(rel).collect();
     let mut path = root.to_path_buf();
     let mut alias = None;
     for (i, part) in parts.iter().enumerate() {
@@ -664,32 +661,65 @@ fn ensure_dirs(root: &Path, rel_dir: &[&str]) -> Result<(), String> {
 /// reports and manifests, but compare the components the writer will use.
 fn normalized_path(path: &str) -> Result<PathBuf, String> {
     check_project_path(path).map_err(|e| format!("{path}: {e}"))?;
-    Ok(Path::new(path)
-        .components()
-        .filter(|component| matches!(component, Component::Normal(_)))
-        .collect())
+    Ok(assets::path_parts(path).collect())
+}
+
+/// Compare planned destinations case-insensitively so exports can be
+/// written with the same directory spellings across filesystems.
+fn casefolded_path(path: &Path) -> PathBuf {
+    path.components()
+        .map(|part| {
+            part.as_os_str()
+                .to_str()
+                .expect("asset paths are UTF-8")
+                .to_lowercase()
+        })
+        .collect()
 }
 
 /// Validate the entire planned file/directory graph before looking at or
 /// writing targets. Existing-file checks cannot see directories introduced
 /// by another planned output.
 fn check_planned_paths(plan: &Plan) -> Result<(), String> {
-    let mut destinations = BTreeMap::new();
-    for path in plan.files.keys() {
+    let mut entries = BTreeMap::new();
+    for path in plan.files.keys().map(String::as_str) {
         let destination = normalized_path(path)?;
-        if let Some(previous) = destinations.insert(destination.clone(), path) {
-            return Err(format!(
-                "planned asset paths {previous:?} and {path:?} name the same file ({})",
-                destination.display()
-            ));
-        }
-    }
-    for (destination, path) in &destinations {
-        for parent in destination.ancestors().skip(1) {
-            if let Some(file) = destinations.get(parent) {
-                return Err(format!(
-                    "planned asset file {file:?} must be a directory for {path:?}"
-                ));
+        let casefolded = casefolded_path(&destination);
+        for (depth, (entry, folded)) in destination
+            .ancestors()
+            .zip(casefolded.ancestors())
+            .enumerate()
+        {
+            let is_file = depth == 0;
+            let Some((previous, source, was_file)) = entries.get(folded) else {
+                entries.insert(folded.to_path_buf(), (entry.to_path_buf(), path, is_file));
+                continue;
+            };
+            match (*was_file, is_file) {
+                (true, true) => {
+                    return Err(format!(
+                        "planned asset paths {source:?} and {path:?} name the same file ({})",
+                        entry.display()
+                    ));
+                }
+                (true, false) | (false, true) => {
+                    let (file, nested) = if is_file {
+                        (path, *source)
+                    } else {
+                        (*source, path)
+                    };
+                    return Err(format!(
+                        "planned asset file {file:?} must be a directory for {nested:?}"
+                    ));
+                }
+                (false, false) if previous != entry => {
+                    return Err(format!(
+                        "planned asset paths {source:?} and {path:?} use different spellings for the same directory ({} and {})",
+                        previous.display(),
+                        entry.display()
+                    ));
+                }
+                (false, false) => {}
             }
         }
     }
@@ -737,10 +767,7 @@ fn write_files(
         if *status != "written" {
             continue;
         }
-        let parts: Vec<&str> = rel
-            .split('/')
-            .filter(|p| !p.is_empty() && *p != ".")
-            .collect();
+        let parts: Vec<&str> = assets::path_parts(rel).collect();
         let (name, dirs) = parts.split_last().expect("checked: a file path");
         ensure_dirs(root, dirs)?;
         let dir = dirs.iter().fold(root.to_path_buf(), |p, d| p.join(d));
@@ -818,6 +845,7 @@ mod tests {
         for paths in [
             ["src/./icons/index.ts", "src/icons/index.ts"],
             ["./src/icons/index.ts", "src//icons/index.ts"],
+            ["src/icons/Index.ts", "src/icons/index.ts"],
             ["src", "src/icons/IconA.tsx"],
             ["src/./icons/svg", "src/icons/svg/IconA.svg"],
         ] {

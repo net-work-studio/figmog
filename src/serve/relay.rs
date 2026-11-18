@@ -725,9 +725,7 @@ impl Relay {
             return Ok(());
         }
         if name == "figmog_images" {
-            crate::dispatch::require_str_array(args, "ids")?;
-            crate::dispatch::arg_str(args, "format")?;
-            crate::dispatch::arg_f64(args, "scale")?;
+            super::ImageArgs::parse(args)?;
         }
         let explicit = crate::dispatch::arg_str(args, "file")?;
         if let Some(file) = explicit {

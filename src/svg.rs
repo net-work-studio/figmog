@@ -1025,6 +1025,10 @@ fn paint_alpha(value: &str) -> Option<f64> {
     Some(alpha)
 }
 
+fn inherits(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("inherit")
+}
+
 /// Decline conversion if a mask/clip shape would inherit a changed paint,
 /// or references outside geometry whose paints might be converted.
 fn protected_paints_change(el: &El, color: &str, inherited: [bool; 4], protected: bool) -> bool {
@@ -1033,7 +1037,7 @@ fn protected_paints_change(el: &El, color: &str, inherited: [bool; 4], protected
     for (i, paint) in PAINT_ATTRS.iter().enumerate() {
         if let Some((_, value)) = el.attrs.iter().find(|(name, _)| name == paint) {
             match value {
-                Val::Lit(value) if value == "inherit" => {}
+                Val::Lit(value) if inherits(value) => {}
                 Val::Lit(value) => {
                     changed[i] = !protected && color_of(value).as_deref() == Some(color)
                 }
@@ -1115,7 +1119,7 @@ impl Sanitized {
                     *name,
                     "fill-opacity" | "stroke-opacity" | "stop-opacity" | "flood-opacity"
                 ) && let Val::Lit(value) = value
-                    && value != "inherit"
+                    && !inherits(value)
                 {
                     opacity.insert(*name, value.clone());
                 }
@@ -1631,6 +1635,19 @@ mod tests {
     }
 
     #[test]
+    fn current_color_combines_alpha_with_mixed_case_inherited_opacity() {
+        let mut svg = sanitize(
+            r##"<svg fill="none" fill-opacity="0.4" stroke-opacity="0.8"><rect width="1" height="1" fill="rgb(255 0 0 / 50%)" stroke="rgb(255 0 0 / 50%)" fill-opacity="INHERIT" stroke-opacity="Inherit"/></svg>"##,
+        )
+        .unwrap();
+        let color = svg.single_color().unwrap();
+        assert!(svg.use_current_color(&color));
+        let output = svg.to_svg("x");
+        assert!(output.contains("fill-opacity=\"0.2\""), "{output}");
+        assert!(output.contains("stroke-opacity=\"0.4\""), "{output}");
+    }
+
+    #[test]
     fn current_color_preserves_use_site_paint_opacity_on_referenced_shapes() {
         for (paint, opacity) in [("fill", "fill-opacity"), ("stroke", "stroke-opacity")] {
             for use_opacities in [vec!["0"], vec!["0", "0.25", "0.75"]] {
@@ -1718,13 +1735,16 @@ mod tests {
     fn current_color_does_not_change_inherited_or_referenced_mask_paints() {
         for svg in [
             r##"<svg fill="white"><mask id="m"><rect width="10" height="10"/></mask><rect width="10" height="10" mask="url(#m)"/></svg>"##,
+            r##"<svg fill="white"><mask id="m"><rect width="10" height="10" fill="INHERIT"/></mask><rect width="10" height="10" mask="url(#m)"/></svg>"##,
+            r##"<svg fill="white"><mask id="m" fill="InHerIt" style="mask-type:luminance"><rect width="10" height="10" fill=" Inherit "/></mask><rect width="10" height="10" mask="url(#m)"/></svg>"##,
             r##"<svg><defs><rect id="shape" width="10" height="10" fill="white"/><mask id="m"><use href="#shape"/></mask></defs><rect width="10" height="10" fill="white" mask="url(#m)"/></svg>"##,
             r##"<svg stroke="white" fill="none"><clipPath id="m"><path d="M0 0h1"/></clipPath><path d="M0 0h1" clip-path="url(#m)"/></svg>"##,
         ] {
             let mut s = sanitize(svg).unwrap();
+            assert!(s.removed.is_empty(), "{svg}: {:?}", s.removed);
             let before = s.to_svg("x");
             let color = s.single_color().unwrap();
-            assert!(!s.use_current_color(&color));
+            assert!(!s.use_current_color(&color), "{svg}");
             assert_eq!(s.to_svg("x"), before);
         }
     }

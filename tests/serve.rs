@@ -3178,7 +3178,7 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
         .clone();
     let direct_vars_json: Value = serde_json::from_slice(&direct_vars).unwrap();
     let direct_tokens = common::command()
-        .args(["tokens", "export", "--db"])
+        .args(["tokens", "export", "--stdout", "--db"])
         .arg(&db)
         .assert()
         .success()
@@ -3222,7 +3222,7 @@ fn serve_e2e_import_only_store_reports_variable_snapshot_before_first_pull() {
     // Token export shares the vars read, but must still render CSS after
     // socket routing rather than print the variables response as JSON.
     let routed_tokens = common::command()
-        .args(["tokens", "export"])
+        .args(["tokens", "export", "--stdout"])
         .current_dir(dir.path())
         .assert()
         .success()
@@ -3423,6 +3423,11 @@ fn relay_rejected_arguments_preserve_sole_reference_routing() {
             "figmog_images",
             json!({"file": KEY_B, "ids": ["1:1"], "scale": "invalid"}),
             "scale",
+        ),
+        (
+            "figmog_images",
+            json!({"file": KEY_B, "ids": ["1:1"], "renders": "false"}),
+            "renders",
         ),
     ] {
         let rejected = call(&mut stdin, &rx, 4, name, args);

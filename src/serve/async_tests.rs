@@ -21,6 +21,10 @@ fn invalid_local_arguments_do_not_open_or_pull_a_mirror() {
             "figmog_search",
             json!({"file": missing, "query": "q", "limit": false}),
         ),
+        (
+            "figmog_images",
+            json!({"file": missing, "ids": ["1:1"], "renders": "false"}),
+        ),
         ("figmog_tree", json!([1, 2])),
     ] {
         let response = h.call(name, args);

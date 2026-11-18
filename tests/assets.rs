@@ -297,6 +297,27 @@ fn public_image_paths_with_reserved_characters_support_spec_and_reexport() {
 }
 
 #[test]
+fn normalized_public_image_paths_support_spec_and_reexport() {
+    for images in ["public//figma", "./public/figma", "public/./figma"] {
+        let dir = project(&format!("images = {images:?}\n"), &[]);
+        let root = dir.path();
+        let out = figmog(root, &["assets", "export", "--images", "2:1"]).success();
+        let summary = json_of(&out.get_output().stdout);
+        let image = &summary["images"][0];
+        let filename = "a3979dcc5fa7ded8.png";
+        assert!(root.join("public/figma").join(filename).exists());
+        assert_eq!(image["path"], format!("{images}/{filename}"));
+        assert_eq!(image["url"], format!("/figma/{filename}"));
+
+        figmog(root, &["spec", "2:1", "--no-tailwind"]).success();
+        let reexport = figmog(root, &["assets", "export"]).success();
+        let summary = json_of(&reexport.get_output().stdout);
+        assert_eq!(summary["written"], 0, "{summary}");
+        assert_eq!(&summary["images"][0], image);
+    }
+}
+
+#[test]
 fn spec_references_the_manifest_instead_of_raw_ids() {
     let dir = project(GOLDEN_ASSETS, &ICONS);
     let root = dir.path();
@@ -383,6 +404,8 @@ fn aliased_or_ancestral_manifest_paths_fail_before_creating_any_outputs() {
         "manifest = \"./src/icons/index.ts\"\nicons = \"src/./icons\"\n",
         "manifest = \"src\"\n",
         "manifest = \"public\"\n",
+        "manifest = \"src/ICONS/manifest.json\"\n",
+        "manifest = \"PUBLIC\"\n",
     ] {
         let dir = project(settings, &ICONS);
         let output = figmog(
@@ -401,17 +424,23 @@ fn aliased_or_ancestral_manifest_paths_fail_before_creating_any_outputs() {
 
 #[test]
 fn planned_file_directory_conflicts_fail_before_any_asset_is_written() {
-    let dir = project("images = \"src/icons/index.ts\"\n", &ICONS);
-    let output = figmog(
-        dir.path(),
-        &["assets", "export", "--icons", "1:1", "--images", "2:1"],
-    )
-    .failure()
-    .code(1);
-    let error = String::from_utf8_lossy(&output.get_output().stderr);
-    assert!(error.contains("planned asset"), "{error}");
-    assert!(tree(dir.path()).is_empty());
-    assert!(!dir.path().join("src").exists());
+    for images in [
+        "src/icons/index.ts",
+        "src/ICONS/index.ts",
+        "src/ICONS/images",
+    ] {
+        let dir = project(&format!("images = {images:?}\n"), &ICONS);
+        let output = figmog(
+            dir.path(),
+            &["assets", "export", "--icons", "1:1", "--images", "2:1"],
+        )
+        .failure()
+        .code(1);
+        let error = String::from_utf8_lossy(&output.get_output().stderr);
+        assert!(error.contains("planned asset"), "{error}");
+        assert!(tree(dir.path()).is_empty(), "{images}");
+        assert!(!dir.path().join("src").exists(), "{images}");
+    }
 }
 
 #[test]

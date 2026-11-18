@@ -456,15 +456,19 @@ fn join(dir: &str, file: &str) -> String {
     format!("{}/{file}", dir.trim_end_matches('/'))
 }
 
+/// The normalized segments of a checked, project-relative asset path.
+pub(crate) fn path_parts(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|p| !p.is_empty() && *p != ".")
+}
+
 /// The URL an image in `dir` is served at, when `dir` is under `public/`
 /// (the Vite / Next.js static folder, served from `/`).
 fn public_url(dir: &str, file: &str) -> Option<String> {
-    let dir = dir.trim_end_matches('/');
-    let relative = if dir == "public" {
-        file.to_string()
-    } else {
-        format!("{}/{file}", dir.strip_prefix("public/")?)
-    };
+    let mut parts = path_parts(dir);
+    if parts.next() != Some("public") {
+        return None;
+    }
+    let relative = parts.chain([file]).collect::<Vec<_>>().join("/");
     let mut url = String::from("/");
     for byte in relative.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {

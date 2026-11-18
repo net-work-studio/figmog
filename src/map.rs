@@ -372,9 +372,9 @@ impl PropMap {
 }
 
 /// The map key naming Figma property `name` among `names` (every
-/// property of the instance or the component): the exact name, else —
-/// when exactly one of `names` strips to it — `name` without its `#…`
-/// suffix. `Err` names the ambiguity.
+/// property of the instance or the component): the exact name, else
+/// `name` without its `#…` suffix when no other property shares that
+/// base name. `Err` names the ambiguity.
 fn map_key<'a>(
     props: &'a BTreeMap<String, PropMap>,
     name: &str,
@@ -389,11 +389,9 @@ fn map_key<'a>(
     let Some(found) = props.get_key_value(base) else {
         return Ok(None);
     };
-    let alike = names
-        .iter()
-        .filter(|n| n.rsplit_once('#').is_some_and(|(b, _)| b == base))
-        .count();
-    if alike > 1 {
+    if names.iter().any(|&other| {
+        other != name && (other == base || other.rsplit_once('#').is_some_and(|(b, _)| b == base))
+    }) {
         return Err(format!(
             "map key {base:?} matches several properties: use the full name {name:?}"
         ));
@@ -655,10 +653,17 @@ pub(crate) fn code_component(
                 }
             },
         };
-        mapped.insert(name.as_str());
         if !value.is_null() {
-            props.insert(pm.prop.clone(), value);
+            let serde_json::map::Entry::Vacant(slot) = props.entry(pm.prop.as_str()) else {
+                unmapped_properties.push(unmapped(format!(
+                    "code prop {:?} is already emitted by another property",
+                    pm.prop
+                )));
+                continue;
+            };
+            slot.insert(value);
         }
+        mapped.insert(name.as_str());
     }
 
     // Overrides on the instance and on every nested instance, swapped
@@ -1334,5 +1339,36 @@ mod tests {
         assert!(map_key(&props, "Label#1:0", &names).is_err());
         let names: BTreeSet<&str> = ["Label#1:0"].into();
         assert!(map_key(&props, "Label#1:0", &names).unwrap().is_some());
+    }
+
+    #[test]
+    fn exact_variant_name_takes_precedence_over_suffix_fallback() {
+        let mut definition = json!({"version": 1, "components": [{
+            "figma": {"component_set": "set-key"},
+            "code": {"path": "src/Card.tsx", "export": "Card"},
+            "props": {"Size": {"prop": "size"}}
+        }]});
+        let recs = records();
+        let n = instance(
+            json!({"Size": {"type": "VARIANT", "value": "Large"},
+                   "Size#2:0": {"type": "TEXT", "value": "caption"}}),
+            json!([]),
+        );
+        let map = parse(definition.clone()).unwrap();
+        let out = code_component(Some(&map), &n, &recs["10:1"], &recs);
+        assert_eq!(out["jsx"], "<Card size=\"Large\" />");
+        assert_eq!(out["coverage"], "partial");
+        assert_eq!(
+            out["unmapped_properties"],
+            json!([{"name": "Size#2:0", "type": "TEXT", "value": "caption",
+                "reason": "map key \"Size\" matches several properties: use the full name \"Size#2:0\""}])
+        );
+
+        definition["components"][0]["props"]["Size#2:0"] = json!({"prop": "caption"});
+        let map = parse(definition).unwrap();
+        let out = code_component(Some(&map), &n, &recs["10:1"], &recs);
+        assert_eq!(out["jsx"], "<Card caption=\"caption\" size=\"Large\" />");
+        assert_eq!(out["coverage"], "full");
+        assert_eq!(out["unmapped_properties"], json!([]));
     }
 }

@@ -596,6 +596,106 @@ fn spec_follows_the_projects_token_mode_mapping() {
 }
 
 #[test]
+fn explicit_variable_modes_withhold_css_for_direct_and_inherited_bindings() {
+    let alias = |id| json!({"type": "VARIABLE_ALIAS", "id": id});
+    let paint = |id, channel| {
+        json!({"type": "SOLID", "color": {"r": channel, "g": channel, "b": channel, "a": 1},
+            "boundVariables": {"color": alias(id)}})
+    };
+    let file = json!({"name": "Synthetic pinned modes", "version": "1",
+    "lastModified": "2026-01-01T00:00:00Z", "document": {"id": "0:0", "type": "DOCUMENT",
+        "children": [{"id": "0:1", "type": "CANVAS", "children": [
+            {"id": "1:1", "type": "FRAME", "layoutMode": "VERTICAL", "paddingTop": 8,
+                "explicitVariableModes": {"C:theme": "M:dark"}, "fills": [paint("V:surface", 0)],
+                "boundVariables": {"paddingTop": alias("V:space")},
+                "children": [
+                    {"id": "1:2", "type": "RECTANGLE", "fills": [paint("V:alias", 0)]},
+                    {"id": "1:3", "type": "RECTANGLE", "fills": [paint("V:alias", 1)],
+                        "explicitVariableModes": {"C:theme": "M:light"}}
+                ]},
+            {"id": "1:4", "type": "RECTANGLE", "fills": [paint("V:alias", 1)]}
+        ]}]
+    }});
+    let variables = json!({"variableCollections": {
+        "C:theme": {"name": "Theme", "defaultModeId": "M:light", "modes": [
+            {"modeId": "M:light", "name": "Light"}, {"modeId": "M:dark", "name": "Dark"}]},
+        "C:base": {"name": "Base", "defaultModeId": "M:base", "modes": [
+            {"modeId": "M:base", "name": "Value"}]}
+    }, "variables": {
+        "V:surface": {"name": "surface", "resolvedType": "COLOR", "variableCollectionId": "C:theme",
+            "valuesByMode": {"M:light": {"r": 1, "g": 1, "b": 1, "a": 1},
+                "M:dark": {"r": 0, "g": 0, "b": 0, "a": 1}}},
+        "V:alias": {"name": "surface/alias", "resolvedType": "COLOR", "variableCollectionId": "C:base",
+            "valuesByMode": {"M:base": alias("V:surface")}},
+        "V:space": {"name": "space/2", "resolvedType": "FLOAT", "variableCollectionId": "C:base",
+            "scopes": ["GAP"], "valuesByMode": {"M:base": 8}}
+    }});
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db").display().to_string();
+    let file_path = dir.path().join("file.json");
+    let variables_path = dir.path().join("variables.json");
+    std::fs::write(&file_path, file.to_string()).unwrap();
+    std::fs::write(&variables_path, variables.to_string()).unwrap();
+    stdout(&db, &["pull", "--from-file", file_path.to_str().unwrap()]);
+    stdout(&db, &["import-variables", variables_path.to_str().unwrap()]);
+    let spec = |id| -> Value {
+        serde_json::from_slice(&stdout(&db, &["spec", id, "--tailwind"])).unwrap()
+    };
+
+    let subtree = spec("1:1");
+    let root = &subtree["node"];
+    assert_eq!(subtree["tokens_snapshot"]["css_unavailable"], Value::Null);
+    assert_eq!(
+        root["design"]["explicitVariableModes"],
+        json!({"C:theme": "M:dark"})
+    );
+    assert_eq!(root["css"]["padding-top"], "var(--space-2)");
+    for (node, variable_id, raw, mode) in [
+        (root, "V:surface", "#000000", "M:dark"),
+        (&root["children"][0], "V:alias", "#000000", "M:dark"),
+        (&root["children"][1], "V:alias", "#ffffff", "M:light"),
+    ] {
+        assert!(node["css"].get("background-color").is_none(), "{node}");
+        assert!(
+            !node["tailwind"].as_str().unwrap_or("").contains("bg-"),
+            "{node}"
+        );
+        assert_eq!(node["values"]["fill"][0]["variable_id"], variable_id);
+        assert_eq!(node["values"]["fill"][0]["raw"], raw);
+        assert!(node["values"]["fill"][0]["css"].is_string());
+        assert!(
+            subtree["unsupported"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|case| {
+                    case["id"] == node["id"]
+                        && case["reason"].as_str().is_some_and(|why| {
+                            why.contains("background-color")
+                                && why.contains("explicitVariableModes")
+                                && why.contains(mode)
+                        })
+                }),
+            "{subtree}"
+        );
+    }
+
+    let descendant = spec("1:2");
+    assert!(descendant["node"]["css"].get("background-color").is_none());
+    assert!(
+        descendant["unsupported"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("M:dark")
+    );
+    let unpinned = spec("1:4");
+    assert_eq!(
+        unpinned["node"]["css"]["background-color"],
+        "var(--surface-alias)"
+    );
+}
+
+#[test]
 fn font_family_hints_match_the_css_string_values() {
     let families = [
         "Foo_Bar",
